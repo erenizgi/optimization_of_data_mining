@@ -5,6 +5,7 @@ require('dotenv').config();
 
 function createWindow() {
     const path1 = path.join(__dirname, 'preload.js');
+    console.log("Preload path:", path1);
 
     const win = new BrowserWindow({
         width: 900,
