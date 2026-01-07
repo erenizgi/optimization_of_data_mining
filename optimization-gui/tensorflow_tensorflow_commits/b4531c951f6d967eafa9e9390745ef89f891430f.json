@@ -1,0 +1,60 @@
+{
+    "author": "tensorflower-gardener",
+    "message": "[Autotuner] Implement xla_gpu_deterministic_ops and xla_gpu_exclude_nondeterministic_ops.\n\n- Added the select_first_config option until we have a default config assigner.\n\nPiperOrigin-RevId: 811295863",
+    "sha": "b4531c951f6d967eafa9e9390745ef89f891430f",
+    "files": [
+        {
+            "sha": "390b2030f042a2a2ca58e58c4eede466b041ee0e",
+            "filename": "third_party/xla/xla/backends/autotuner/autotuner.cc",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b4531c951f6d967eafa9e9390745ef89f891430f/third_party%2Fxla%2Fxla%2Fbackends%2Fautotuner%2Fautotuner.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b4531c951f6d967eafa9e9390745ef89f891430f/third_party%2Fxla%2Fxla%2Fbackends%2Fautotuner%2Fautotuner.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fautotuner%2Fautotuner.cc?ref=b4531c951f6d967eafa9e9390745ef89f891430f",
+            "patch": "@@ -346,6 +346,9 @@ absl::StatusOr<Autotuner::ConfigResult> Autotuner::PickBestConfig(\n   if (best_result == nullptr) {\n     return absl::InternalError(\"No valid config found!\");\n   }\n+  if (autotune_config_.select_first_config) {\n+    return std::move(results[0]);\n+  }\n \n   return std::move(*best_result);\n }"
+        },
+        {
+            "sha": "fd60b311434f2d0c31496ac870e5d771019c7aab",
+            "filename": "third_party/xla/xla/backends/autotuner/autotuner.h",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b4531c951f6d967eafa9e9390745ef89f891430f/third_party%2Fxla%2Fxla%2Fbackends%2Fautotuner%2Fautotuner.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b4531c951f6d967eafa9e9390745ef89f891430f/third_party%2Fxla%2Fxla%2Fbackends%2Fautotuner%2Fautotuner.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fautotuner%2Fautotuner.h?ref=b4531c951f6d967eafa9e9390745ef89f891430f",
+            "patch": "@@ -70,6 +70,11 @@ struct AutotuneConfig {\n   // configs as they can be used to check numerical issues with triton but they\n   // are not considered for selection.\n   bool exclude_cublas_config = false;\n+  // TODO b/446870267- Remove this option and use default configs rather than\n+  // the first config.\n+  // If true, the autotuner selects the first valid config instead of the best\n+  // performing one. This is to guarantee run-to-run determinism.\n+  bool select_first_config = false;\n };\n \n class Autotuner {"
+        },
+        {
+            "sha": "05fc77aac6dc41bdbd18d668248f4b32d57f3b44",
+            "filename": "third_party/xla/xla/backends/autotuner/autotuner_test.cc",
+            "status": "modified",
+            "additions": 34,
+            "deletions": 0,
+            "changes": 34,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b4531c951f6d967eafa9e9390745ef89f891430f/third_party%2Fxla%2Fxla%2Fbackends%2Fautotuner%2Fautotuner_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b4531c951f6d967eafa9e9390745ef89f891430f/third_party%2Fxla%2Fxla%2Fbackends%2Fautotuner%2Fautotuner_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fautotuner%2Fautotuner_test.cc?ref=b4531c951f6d967eafa9e9390745ef89f891430f",
+            "patch": "@@ -611,5 +611,39 @@ TEST_F(AutotunerTest, ExcludeCublasConfig) {\n               StatusIs(absl::StatusCode::kInternal));\n }\n \n+TEST_F(AutotunerTest, SelectFirstConfig) {\n+  config_.select_first_config = true;\n+\n+  std::vector<std::unique_ptr<BackendConfig>> configs;\n+  configs.push_back(GetTestConfig(\"test_config_1\"));\n+  configs.push_back(GetTestConfig(\"test_config_2\"));\n+\n+  auto backend = std::make_unique<MockCodegenBackend>();\n+  EXPECT_CALL(*backend, GetSupportedConfigs(_))\n+      .WillOnce(Return(std::move(configs)));\n+  EXPECT_CALL(*backend, Compile(_, _))\n+      .WillOnce(Return(std::unique_ptr<Executable>()))\n+      .WillOnce(Return(std::unique_ptr<Executable>()));\n+  EXPECT_CALL(*backend, ApplyConfig(_, ConfigMatcher(\"test_config_1\")))\n+      .Times(1)\n+      .WillRepeatedly(Return(absl::OkStatus()));\n+  std::vector<std::unique_ptr<CodegenBackend>> backends;\n+  backends.push_back(std::move(backend));\n+\n+  auto profiler = std::make_unique<MockProfiler>();\n+  EXPECT_CALL(*profiler, CreateInputBuffers(_))\n+      .WillOnce(Return(std::make_unique<InputBuffers>()));\n+  EXPECT_CALL(*profiler, Profile(_, _))\n+      .WillOnce(Return(ProfileResult({absl::Seconds(2)})))\n+      .WillOnce(Return(ProfileResult({absl::Seconds(1)})));\n+\n+  TF_ASSERT_OK_AND_ASSIGN(\n+      auto autotuner, Autotuner::Create(std::move(backends),\n+                                        std::move(profiler), config_, nullptr));\n+  auto module = ParseAndReturnVerifiedModule(kHlo).value();\n+  auto dummy_instr = module->entry_computation()->root_instruction();\n+  EXPECT_THAT(autotuner->Autotune(dummy_instr), absl_testing::IsOk());\n+}\n+\n }  // namespace\n }  // namespace xla"
+        },
+        {
+            "sha": "020c4aa995a68cdbf0726c72674dcb6c380ca064",
+            "filename": "third_party/xla/xla/service/gpu/autotuning/autotuner_pass.cc",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b4531c951f6d967eafa9e9390745ef89f891430f/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fautotuner_pass.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b4531c951f6d967eafa9e9390745ef89f891430f/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fautotuner_pass.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fautotuner_pass.cc?ref=b4531c951f6d967eafa9e9390745ef89f891430f",
+            "patch": "@@ -58,6 +58,9 @@ AutotuneConfig GetAutotuneConfig(const DebugOptions& debug_options) {\n   autotune_config.dump_logs_to = debug_options.xla_gpu_dump_autotune_logs_to();\n   autotune_config.exclude_cublas_config =\n       !debug_options.xla_gpu_cublas_fallback();\n+  autotune_config.select_first_config =\n+      debug_options.xla_gpu_deterministic_ops() ||\n+      debug_options.xla_gpu_exclude_nondeterministic_ops();\n   return autotune_config;\n }\n "
+        }
+    ],
+    "stats": {
+        "total": 45,
+        "additions": 45,
+        "deletions": 0
+    }
+}

@@ -1,0 +1,48 @@
+{
+    "author": "sergachev",
+    "message": "PR #34704: [GPU] Fix mixed inputs F8 dot in Triton codegen.\n\nImported from GitHub PR https://github.com/openxla/xla/pull/34704\n\n📝 Summary of Changes\nFix mixed inputs F8 dot in Triton codegen.\n\n🚀 Kind of Contribution\n🐛 Bug Fix\n\n📊 Benchmark (for Performance Improvements)\n-\n\n🧪 Unit Tests:\nyes\n\n🧪 Execution Tests:\nyes\n\nCopybara import of the project:\n\n--\nc86721933a4c4b1a574499362557d45b9bf292dc by Ilia Sergachev <isergachev@nvidia.com>:\n\n[GPU] Fix mixed inputs F8 dot in Triton codegen.\n\nMerging this change closes #34704\n\nPiperOrigin-RevId: 840967911",
+    "sha": "cdc6037be59cc5c368cd53793c1a3dd6662afe3a",
+    "files": [
+        {
+            "sha": "de63f5dd6691281705400cd3c7f56768824d0bef",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/support.cc",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 1,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/cdc6037be59cc5c368cd53793c1a3dd6662afe3a/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Fsupport.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/cdc6037be59cc5c368cd53793c1a3dd6662afe3a/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Fsupport.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Fsupport.cc?ref=cdc6037be59cc5c368cd53793c1a3dd6662afe3a",
+            "patch": "@@ -464,8 +464,12 @@ CodegenDecision IsTritonSupportedDot(\n         \"Only operands that are fusions are supported.\");\n   }\n \n+  auto types_are = [&](PrimitiveType compare1, PrimitiveType compare2) {\n+    return (lhs_type == compare1 && rhs_type == compare2) ||\n+           (lhs_type == compare2 && rhs_type == compare1);\n+  };\n   // TODO(b/393299275): add support tests for mixed types.\n-  if (lhs_type != rhs_type) {\n+  if (lhs_type != rhs_type && !types_are(F8E5M2, F8E4M3FN)) {\n     return CodegenDecision::Forbid(\n         \"Dot operation only supports same types for lhs and rhs.\");\n   }"
+        },
+        {
+            "sha": "bbb7ac9a3e931ac7c3d26edb744472c2ec44635e",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/support_test.cc",
+            "status": "modified",
+            "additions": 74,
+            "deletions": 0,
+            "changes": 74,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/cdc6037be59cc5c368cd53793c1a3dd6662afe3a/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Fsupport_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/cdc6037be59cc5c368cd53793c1a3dd6662afe3a/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Fsupport_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Fsupport_test.cc?ref=cdc6037be59cc5c368cd53793c1a3dd6662afe3a",
+            "patch": "@@ -1909,6 +1909,80 @@ INSTANTIATE_TEST_SUITE_P(\n         ::testing::ValuesIn(AllDevicesToTest())),\n     DotTypesTest::ParamToString);\n \n+class MixedF8DotTest\n+    : public TritonSupportTest,\n+      public ::testing::WithParamInterface<\n+          std::tuple<PrimitiveType, PrimitiveType, se::GpuComputeCapability>> {\n+ public:\n+  static std::string ParamToString(\n+      const ::testing::TestParamInfo<ParamType>& info) {\n+    auto [lhs_type, rhs_type, cc] = info.param;\n+    return absl::StrCat(primitive_util::LowercasePrimitiveTypeName(lhs_type),\n+                        \"_\",\n+                        primitive_util::LowercasePrimitiveTypeName(rhs_type),\n+                        \"_\", ComputeCapabilityToString(cc));\n+  }\n+};\n+\n+TEST_P(MixedF8DotTest, MixedF8Dot) {\n+  auto [lhs_type, rhs_type, cc] = GetParam();\n+  if (lhs_type == rhs_type) {\n+    GTEST_SKIP() << \"Skipping same-type tests, covered by DotTypesTest\";\n+  }\n+\n+  if (auto* cuda_cc = cc.cuda_compute_capability();\n+      cuda_cc && !cuda_cc->IsAtLeastHopper()) {\n+    GTEST_SKIP() << \"F8 requires Hopper+ GPUs\";\n+  }\n+\n+  std::string hlo_text = R\"(\n+flhs {\n+  result = $0[128,256] parameter(0)\n+}\n+\n+frhs {\n+  result = $1[256,512] parameter(0)\n+}\n+\n+triton_computation {\n+  p0 = $0[128,256] parameter(0)\n+  p1 = $1[256,512] parameter(1)\n+  lhs = $0[128,256] fusion(p0), kind=kCustom, calls=flhs, backend_config={\n+    \"fusion_backend_config\":{\n+      \"kind\":\"__triton_nested_gemm_fusion\", \"block_level_fusion_config\":{\n+        \"output_tiles\":[{\"sizes\":[\"16\", \"64\"]}]\n+      }\n+    }\n+  }\n+  rhs = $1[256,512] fusion(p1), kind=kCustom, calls=frhs, backend_config={\n+    \"fusion_backend_config\":{\n+      \"kind\":\"__triton_nested_gemm_fusion\", \"block_level_fusion_config\":{\n+        \"output_tiles\":[{\"sizes\":[\"64\", \"32\"]}]\n+      }\n+    }\n+  }\n+  result = f32[128,512] dot(lhs, rhs),\n+    lhs_contracting_dims={1}, rhs_contracting_dims={0}\n+}\n+)\";\n+  hlo_text = absl::Substitute(\n+      hlo_text, primitive_util::LowercasePrimitiveTypeName(lhs_type),\n+      primitive_util::LowercasePrimitiveTypeName(rhs_type));\n+\n+  TF_ASSERT_OK_AND_ASSIGN(\n+      TestedInstruction ti,\n+      ParseTemplateAndGetInstruction(hlo_text, PRIMITIVE_TYPE_INVALID,\n+                                     HloOpcode::kDot));\n+  RunSupportTest(std::move(ti), /*output_tile_sizes=*/{16, 32}, cc);\n+}\n+\n+INSTANTIATE_TEST_SUITE_P(\n+    MixedF8DotTestSuite, MixedF8DotTest,\n+    ::testing::Combine(::testing::Values(F8E5M2, F8E4M3FN),\n+                       ::testing::Values(F8E5M2, F8E4M3FN),\n+                       ::testing::ValuesIn(AllDevicesToTest())),\n+    MixedF8DotTest::ParamToString);\n+\n TEST_F(DotTest, NonFusionRhs) {\n   const std::string kHloTestTemplate = R\"(\n flhs {"
+        },
+        {
+            "sha": "038a0ad926d7291dd26b546d3b1907c5795f9dc9",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/triton_gemm_fusion_test.cc",
+            "status": "modified",
+            "additions": 41,
+            "deletions": 0,
+            "changes": 41,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/cdc6037be59cc5c368cd53793c1a3dd6662afe3a/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftriton_gemm_fusion_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/cdc6037be59cc5c368cd53793c1a3dd6662afe3a/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftriton_gemm_fusion_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftriton_gemm_fusion_test.cc?ref=cdc6037be59cc5c368cd53793c1a3dd6662afe3a",
+            "patch": "@@ -3112,6 +3112,47 @@ ENTRY e {\n                   /*run_hlo_passes=*/false));\n }\n \n+TEST_F(TritonGemmTest, MixedF8DotExecutesCorrectly) {\n+  if (!GetCudaComputeCapability().IsAtLeastHopper()) {\n+    GTEST_SKIP() << \"Requires a Hopper+ GPU\";\n+  }\n+\n+  TF_ASSERT_OK_AND_ASSIGN(ModuleAndNestedFusionMetadata module_and_metadata,\n+                          GetModuleAndNestedFusionMetadata(R\"(\n+triton_dot {\n+  p0 = f8e5m2[32,32] parameter(0)\n+  p1 = f8e4m3fn[32,32] parameter(1)\n+  _ = f32[32,32] dot(p0, p1),\n+    lhs_contracting_dims={1}, rhs_contracting_dims={0}\n+}\n+\n+e {\n+  p0 = f8e5m2[32,32] parameter(0)\n+  p1 = f8e4m3fn[32,32] parameter(1)\n+  _ = f32[32,32] fusion(p0, p1), kind=kCustom, calls=triton_dot,\n+    backend_config={\"fusion_backend_config\": {kind: \"__triton_gemm\",\n+    triton_gemm_config: {\"block_m\":32,\"block_n\":32,\"block_k\":32,\n+                         \"split_k\":1,\"num_stages\":2,\"num_warps\":4,\n+                         \"num_ctas\":1}}}\n+})\"));\n+\n+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> ref_module,\n+                          ParseAndReturnVerifiedModule(R\"(\n+e {\n+  p0 = f8e5m2[32,32] parameter(0)\n+  p0c = f16[32,32] convert(p0)\n+  p1 = f8e4m3fn[32,32] parameter(1)\n+  p1c = f16[32,32] convert(p1)\n+  _ = f32[32,32] dot(p0c, p1c),\n+    lhs_contracting_dims={1}, rhs_contracting_dims={0}\n+})\"));\n+\n+  EXPECT_TRUE(RunAndCompareTwoModules(std::move(ref_module),\n+                                      std::move(module_and_metadata.module),\n+                                      ErrorSpec{/*aabs=*/1e-6, /*arel=*/1e-6},\n+                                      /*run_hlo_passes=*/false));\n+}\n+\n TEST_F(TritonGemmTest, Fp8DotWithManyWarpsDoesNotCrash) {\n   if (!GetCudaComputeCapability().IsAtLeastHopper()) {\n     GTEST_SKIP() << \"Doesn't pass on pre-Hopper GPUs.\";"
+        }
+    ],
+    "stats": {
+        "total": 121,
+        "additions": 120,
+        "deletions": 1
+    }
+}

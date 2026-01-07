@@ -1,0 +1,36 @@
+{
+    "author": "ezhulenev",
+    "message": "[xla:cpu] Add an end-to-end test for ynn fusions\n\nPiperOrigin-RevId: 826318525",
+    "sha": "7ad55e8818ed0fcc0a443a342f2277b68a485def",
+    "files": [
+        {
+            "sha": "0e63cc568a6459de53e4986d213e178d41ff74d0",
+            "filename": "third_party/xla/xla/backends/cpu/tests/BUILD",
+            "status": "modified",
+            "additions": 19,
+            "deletions": 0,
+            "changes": 19,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/7ad55e8818ed0fcc0a443a342f2277b68a485def/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Ftests%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/7ad55e8818ed0fcc0a443a342f2277b68a485def/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Ftests%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Ftests%2FBUILD?ref=7ad55e8818ed0fcc0a443a342f2277b68a485def",
+            "patch": "@@ -33,3 +33,22 @@ xla_test(\n         \"@com_google_googletest//:gtest_main\",\n     ],\n )\n+\n+xla_test(\n+    name = \"ynn_fusion_test\",\n+    srcs = [\"ynn_fusion_test.cc\"],\n+    backends = [\"cpu\"],\n+    tags = [\"test_migrated_to_hlo_runner_pjrt\"],\n+    deps = [\n+        \"//xla:error_spec\",\n+        \"//xla/pjrt/plugin/xla_cpu:xla_cpu_pjrt_client\",\n+        \"//xla/tests:hlo_pjrt_interpreter_reference_mixin\",\n+        \"//xla/tests:hlo_pjrt_test_base\",\n+        \"//xla/tsl/platform:test\",\n+        \"@com_google_absl//absl/container:flat_hash_map\",\n+        \"@com_google_absl//absl/strings\",\n+        \"@com_google_absl//absl/strings:string_view\",\n+        \"@com_google_googletest//:gtest_main\",\n+        \"@local_tsl//tsl/platform:platform_port\",\n+    ],\n+)"
+        },
+        {
+            "sha": "413f90b4ab959b634464b84f5001c606086edd77",
+            "filename": "third_party/xla/xla/backends/cpu/tests/ynn_fusion_test.cc",
+            "status": "added",
+            "additions": 92,
+            "deletions": 0,
+            "changes": 92,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/7ad55e8818ed0fcc0a443a342f2277b68a485def/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Ftests%2Fynn_fusion_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/7ad55e8818ed0fcc0a443a342f2277b68a485def/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Ftests%2Fynn_fusion_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Ftests%2Fynn_fusion_test.cc?ref=7ad55e8818ed0fcc0a443a342f2277b68a485def",
+            "patch": "@@ -0,0 +1,92 @@\n+/* Copyright 2025 The OpenXLA Authors.\n+\n+Licensed under the Apache License, Version 2.0 (the \"License\");\n+you may not use this file except in compliance with the License.\n+You may obtain a copy of the License at\n+\n+    http://www.apache.org/licenses/LICENSE-2.0\n+\n+Unless required by applicable law or agreed to in writing, software\n+distributed under the License is distributed on an \"AS IS\" BASIS,\n+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+See the License for the specific language governing permissions and\n+limitations under the License.\n+==============================================================================*/\n+\n+#include <string>\n+#include <vector>\n+\n+#include <gtest/gtest.h>\n+#include \"absl/strings/str_cat.h\"\n+#include \"absl/strings/str_replace.h\"\n+#include \"absl/strings/string_view.h\"\n+#include \"xla/error_spec.h\"\n+#include \"xla/tests/hlo_pjrt_interpreter_reference_mixin.h\"\n+#include \"xla/tests/hlo_pjrt_test_base.h\"\n+#include \"xla/tsl/platform/test.h\"\n+\n+namespace xla::cpu {\n+namespace {\n+\n+struct YnnFusionTestParams {\n+  std::string in_dtype;\n+  std::string out_dtype;  // Only used for mixed input/output types.\n+};\n+\n+class YnnFusionTest\n+    : public HloPjRtInterpreterReferenceMixin<HloPjRtTestBase>,\n+      public ::testing::WithParamInterface<YnnFusionTestParams> {\n+ public:\n+  static std::string Name(\n+      const ::testing::TestParamInfo<YnnFusionTestParams>& info) {\n+    return absl::StrCat(info.param.in_dtype, \"x\", info.param.out_dtype);\n+  }\n+\n+ protected:\n+  void RunTest(absl::string_view hlo_template) {\n+    YnnFusionTestParams params = GetParam();\n+    std::string hlo_text =\n+        absl::StrReplaceAll(hlo_template, {{\"$dtype\", params.in_dtype},\n+                                           {\"$in_dtype\", params.in_dtype},\n+                                           {\"$out_dtype\", params.out_dtype}});\n+    bool bf16_compute = params.in_dtype == \"bf16\" || params.out_dtype == \"bf16\";\n+    double tolerance = bf16_compute ? 1e-2 : 1e-7;\n+    EXPECT_TRUE(RunAndCompareNoHloPasses(\n+        hlo_text, ErrorSpec{/*aabs=*/tolerance, /*arel=*/tolerance}));\n+  }\n+};\n+\n+TEST_P(YnnFusionTest, AddAndMultiply) {\n+  constexpr absl::string_view kModuleStr = R\"(\n+    HloModule add_and_multiply\n+\n+    ynn_fusion {\n+      %lhs = $dtype[4] parameter(0)\n+      %rhs = $dtype[4] parameter(1)\n+      %add = $dtype[4] add(%lhs, %rhs)\n+      ROOT %mul = $in_dtype[4] multiply(%add, %add)\n+    }\n+\n+    ENTRY entry {\n+      %p0 = $dtype[4] parameter(0)\n+      %p1 = $dtype[4] parameter(1)\n+      ROOT %fusion = $dtype[4] fusion(%p0, %p1), kind=kCustom, calls=ynn_fusion,\n+        backend_config={\"fusion_config\": {kind: \"__ynn_fusion\"}}\n+    })\";\n+\n+  RunTest(kModuleStr);\n+}\n+\n+std::vector<YnnFusionTestParams> GetSameTypeTestCases() {\n+  return std::vector<YnnFusionTestParams>({\n+      YnnFusionTestParams{\"bf16\", \"bf16\"},\n+      YnnFusionTestParams{\"f32\", \"f32\"},\n+  });\n+}\n+\n+INSTANTIATE_TEST_SUITE_P(YnnFusionTestInstantiation, YnnFusionTest,\n+                         ::testing::ValuesIn(GetSameTypeTestCases()),\n+                         YnnFusionTest::Name);\n+\n+}  // namespace\n+}  // namespace xla::cpu"
+        }
+    ],
+    "stats": {
+        "total": 111,
+        "additions": 111,
+        "deletions": 0
+    }
+}

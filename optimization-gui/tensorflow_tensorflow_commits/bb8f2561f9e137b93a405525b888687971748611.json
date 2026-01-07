@@ -1,0 +1,48 @@
+{
+    "author": "Eetusjo",
+    "message": "PR #34956:  [ROCm] flush rocprofiler buffer when disabling RocmTracer\n\nImported from GitHub PR https://github.com/openxla/xla/pull/34956\n\nFixes a bug in RocmTracer where events not reaching the rocprofiler watermark are not captured when disabling the tracer. Happens e.g. when the workload is very small.\n\nAdded an explicit buffer flush in and a relevant test that fails without the flush: `//xla/backends/profiler/gpu:rocm_tracer_test`\n\n🚀 Kind of Contribution\n🐛 Bug Fix\nCopybara import of the project:\n\n--\n7d27ae5615c5dd1ba244e6b55b16200ff7f45d2c by Eetu Sjöblom <eetu.sjoblom@amd.com>:\n\nflush rocprofiler buffer when disabling RocmTracer\n\nMerging this change closes #34956\n\nPiperOrigin-RevId: 841698424",
+    "sha": "bb8f2561f9e137b93a405525b888687971748611",
+    "files": [
+        {
+            "sha": "1a559898f65e3ea7b7c246e5269b1db5dd2a3b35",
+            "filename": "third_party/xla/xla/backends/profiler/gpu/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/bb8f2561f9e137b93a405525b888687971748611/third_party%2Fxla%2Fxla%2Fbackends%2Fprofiler%2Fgpu%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/bb8f2561f9e137b93a405525b888687971748611/third_party%2Fxla%2Fxla%2Fbackends%2Fprofiler%2Fgpu%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fprofiler%2Fgpu%2FBUILD?ref=bb8f2561f9e137b93a405525b888687971748611",
+            "patch": "@@ -533,6 +533,7 @@ xla_cc_test(\n         \"@com_google_absl//absl/log\",\n         \"@com_google_absl//absl/strings:string_view\",\n         \"@com_google_googletest//:gtest_main\",\n+        \"@local_config_rocm//rocm:hip\",\n         \"@local_tsl//tsl/profiler/protobuf:xplane_proto_cc\",\n     ],\n )"
+        },
+        {
+            "sha": "a15f2e4bb690d18a3a6ba4c5c1b9c90d98fb4300",
+            "filename": "third_party/xla/xla/backends/profiler/gpu/rocm_tracer.cc",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/bb8f2561f9e137b93a405525b888687971748611/third_party%2Fxla%2Fxla%2Fbackends%2Fprofiler%2Fgpu%2Frocm_tracer.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/bb8f2561f9e137b93a405525b888687971748611/third_party%2Fxla%2Fxla%2Fbackends%2Fprofiler%2Fgpu%2Frocm_tracer.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fprofiler%2Fgpu%2Frocm_tracer.cc?ref=bb8f2561f9e137b93a405525b888687971748611",
+            "patch": "@@ -499,6 +499,10 @@ void RocmTracer::toolFinalize(void* tool_data) {\n }\n \n void RocmTracer::Disable() {\n+  rocprofiler_status_t status = rocprofiler_flush_buffer(buffer_);\n+  if (status != ROCPROFILER_STATUS_SUCCESS) {\n+    LOG(WARNING) << \"rocprofiler_flush_buffer failed with error \" << status;\n+  }\n   absl::MutexLock lock(collector_mutex_);\n   collector_->Flush();\n   collector_ = nullptr;"
+        },
+        {
+            "sha": "d03bb15dc805274514ec1d6aaf06e585daa83a6e",
+            "filename": "third_party/xla/xla/backends/profiler/gpu/rocm_tracer_test.cc",
+            "status": "modified",
+            "additions": 69,
+            "deletions": 0,
+            "changes": 69,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/bb8f2561f9e137b93a405525b888687971748611/third_party%2Fxla%2Fxla%2Fbackends%2Fprofiler%2Fgpu%2Frocm_tracer_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/bb8f2561f9e137b93a405525b888687971748611/third_party%2Fxla%2Fxla%2Fbackends%2Fprofiler%2Fgpu%2Frocm_tracer_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fprofiler%2Fgpu%2Frocm_tracer_test.cc?ref=bb8f2561f9e137b93a405525b888687971748611",
+            "patch": "@@ -18,10 +18,12 @@ limitations under the License.\n #include <cstdint>\n #include <memory>\n #include <string>\n+#include <vector>\n \n #include <gtest/gtest.h>\n #include \"absl/log/log.h\"\n #include \"absl/strings/string_view.h\"\n+#include \"rocm/include/hip/hip_runtime.h\"\n #include \"xla/backends/profiler/gpu/rocm_collector.h\"\n #include \"xla/backends/profiler/gpu/rocm_tracer_utils.h\"\n #include \"tsl/profiler/protobuf/xplane.pb.h\"\n@@ -124,6 +126,73 @@ TEST(RocmTracerTest, AnnotationMapWorks) {\n   EXPECT_EQ(result, annotation);\n }\n \n+// Simple collector that tracks received events for verification.\n+class EventCapturingCollector : public RocmTraceCollector {\n+ public:\n+  EventCapturingCollector() : RocmTraceCollector(MakeCollectorOptions()) {}\n+\n+  void AddEvent(RocmTracerEvent&& event, bool is_auxiliary) override {\n+    event_count_++;\n+  }\n+\n+  void OnEventsDropped(const std::string& reason,\n+                       uint32_t num_events) override {}\n+  void Flush() override {}\n+  void Export(tsl::profiler::XSpace* space) override {}\n+\n+  int event_count() const { return event_count_; }\n+\n+ private:\n+  static RocmTraceCollectorOptions MakeCollectorOptions() {\n+    RocmTraceCollectorOptions options;\n+    options.max_callback_api_events = 2 * 1024 * 1024;\n+    options.max_activity_api_events = 2 * 1024 * 1024;\n+    options.max_annotation_strings = 1024 * 1024;\n+    options.num_gpus = RocmTracer::GetRocmTracerSingleton().NumGpus();\n+    return options;\n+  }\n+  int event_count_ = 0;\n+};\n+\n+std::unique_ptr<EventCapturingCollector> CreateEventCapturingCollector() {\n+  return std::make_unique<EventCapturingCollector>();\n+}\n+\n+TEST(RocmTracerTest, CapturesHipEvents) {\n+#define HIP_ASSERT_OK(expr) ASSERT_EQ((expr), hipSuccess) << #expr \" failed\"\n+\n+  int device_count = 0;\n+  HIP_ASSERT_OK(hipGetDeviceCount(&device_count));\n+  ASSERT_GT(device_count, 0) << \"No HIP devices available\";\n+\n+  auto collector = CreateEventCapturingCollector();\n+  EventCapturingCollector* collector_ptr = collector.get();\n+\n+  RocmTracer& tracer = RocmTracer::GetRocmTracerSingleton();\n+  RocmTracerOptions tracer_options{/*max_annotation_strings=*/1024 * 1024};\n+  tracer.Enable(tracer_options, collector.get());\n+\n+  constexpr size_t kNumFloats = 1024;\n+  constexpr size_t kSize = kNumFloats * sizeof(float);\n+  std::vector<float> host_data(kNumFloats, 1.0f);\n+  void* device_data = nullptr;\n+\n+  HIP_ASSERT_OK(hipMalloc(&device_data, kSize));\n+  HIP_ASSERT_OK(\n+      hipMemcpy(device_data, host_data.data(), kSize, hipMemcpyHostToDevice));\n+  HIP_ASSERT_OK(\n+      hipMemcpy(host_data.data(), device_data, kSize, hipMemcpyDeviceToHost));\n+  HIP_ASSERT_OK(hipDeviceSynchronize());\n+\n+  tracer.Disable();\n+  hipFree(device_data);\n+\n+#undef HIP_ASSERT_OK\n+\n+  EXPECT_GT(collector_ptr->event_count(), 0)\n+      << \"Expected to capture at least one trace event\";\n+}\n+\n }  // namespace\n }  // namespace profiler\n }  // namespace xla"
+        }
+    ],
+    "stats": {
+        "total": 74,
+        "additions": 74,
+        "deletions": 0
+    }
+}

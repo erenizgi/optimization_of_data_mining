@@ -1,0 +1,48 @@
+{
+    "author": "tensorflower-gardener",
+    "message": "[XLA:GPU] Add other collectives and allow to return the last result.\n\nPiperOrigin-RevId: 800073011",
+    "sha": "903611a470a803ec148493f9eb0e4835a4539c03",
+    "files": [
+        {
+            "sha": "f03b26eee19c23107e2279a64d401a31bf60c420",
+            "filename": "third_party/xla/xla/tools/extract_collective_operations.cc",
+            "status": "modified",
+            "additions": 43,
+            "deletions": 6,
+            "changes": 49,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/903611a470a803ec148493f9eb0e4835a4539c03/third_party%2Fxla%2Fxla%2Ftools%2Fextract_collective_operations.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/903611a470a803ec148493f9eb0e4835a4539c03/third_party%2Fxla%2Fxla%2Ftools%2Fextract_collective_operations.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Ftools%2Fextract_collective_operations.cc?ref=903611a470a803ec148493f9eb0e4835a4539c03",
+            "patch": "@@ -39,20 +39,21 @@ limitations under the License.\n \n namespace {\n const char* const kUsage = R\"(\n-This tool extracts collective operations (all-reduce and all-gather) from HLO module and saves them together\n+This tool extracts collective operations from HLO module and saves them together\n to the separate module.\n \n Usage:\n bazel run extract_collective_operations -- --input=path/to/hlo_module\n-  --output=path/to/hlo_module --operations=all-reduce,all-gather\n+  --output=path/to/hlo_module --operations=all-reduce,all-gather,reduce-scatter,collective-permute,all-to-all\n+  --return_tuple=false\n )\";\n }  // namespace\n \n namespace xla {\n \n absl::Status ExtractCollectiveOperations(\n     const std::string& input, const std::string& output,\n-    const absl::flat_hash_set<HloOpcode>& operation_types) {\n+    const absl::flat_hash_set<HloOpcode>& operation_types, bool return_tuple) {\n   TF_ASSIGN_OR_RETURN(\n       std::unique_ptr<HloModule> test_module,\n       LoadModuleFromFile(input, std::string(tsl::io::Extension(input)),\n@@ -68,6 +69,10 @@ absl::Status ExtractCollectiveOperations(\n     non_optimized_ops.insert(HloOpcode::kAllGather);\n     done_ops.insert(HloOpcode::kAllGatherDone);\n   }\n+  if (operation_types.contains(HloOpcode::kCollectivePermute)) {\n+    non_optimized_ops.insert(HloOpcode::kCollectivePermuteStart);\n+    done_ops.insert(HloOpcode::kCollectivePermuteDone);\n+  }\n \n   std::vector<xla::HloInstruction*> collective_instructions;\n   for (const auto& op : test_module->computations()) {\n@@ -83,14 +88,31 @@ absl::Status ExtractCollectiveOperations(\n                            HloOpcode::kAllGatherDone>(instr)) {\n         collective_instructions.push_back(instr);\n       }\n+\n+      if (operation_types.contains(HloOpcode::kReduceScatter) &&\n+          HloPredicateIsOp<HloOpcode::kReduceScatter>(instr)) {\n+        collective_instructions.push_back(instr);\n+      }\n+\n+      if (operation_types.contains(HloOpcode::kCollectivePermute) &&\n+          HloPredicateIsOp<HloOpcode::kCollectivePermute,\n+                           HloOpcode::kCollectivePermuteStart,\n+                           HloOpcode::kCollectivePermuteDone>(instr)) {\n+        collective_instructions.push_back(instr);\n+      }\n+\n+      if (operation_types.contains(HloOpcode::kAllToAll) &&\n+          HloPredicateIsOp<HloOpcode::kAllToAll>(instr)) {\n+        collective_instructions.push_back(instr);\n+      }\n     }\n   }\n \n   if (collective_instructions.empty()) {\n     return absl::InternalError(\"No collective instructions found.\");\n   }\n   auto collectives_module = ExtractCollectiveOperationsIntoNewModule(\n-      collective_instructions, done_ops, non_optimized_ops);\n+      collective_instructions, done_ops, non_optimized_ops, return_tuple);\n \n   QCHECK_OK(tsl::WriteStringToFile(tsl::Env::Default(), output,\n                                    collectives_module->ToString()))\n@@ -103,11 +125,15 @@ int main(int argc, char** argv) {\n   std::string input;\n   std::string output;\n   std::string operations;\n+  bool return_tuple;\n   std::vector<tsl::Flag> flag_list = {\n       tsl::Flag(\"input\", &input, \"input file\"),\n       tsl::Flag(\"output\", &output, \"output file\"),\n       tsl::Flag(\"operations\", &operations,\n-                \"operations. possible values: all-reduce, all-gather\")};\n+                \"operations. possible values: all-reduce, all-gather, \"\n+                \"reduce-scatter, collective-permute, all-to-all\"),\n+      tsl::Flag(\"return_tuple\", &return_tuple,\n+                \"return collectives results as tuple?\")};\n   xla::AppendDebugOptionsFlags(&flag_list);\n   const std::string kUsageString =\n       absl::StrCat(kUsage, \"\\n\\n\", tsl::Flags::Usage(argv[0], flag_list));\n@@ -124,6 +150,17 @@ int main(int argc, char** argv) {\n   if (absl::StrContains(operations, \"all-gather\")) {\n     operation_types.insert(xla::HloOpcode::kAllGather);\n   }\n-  TF_CHECK_OK(xla::ExtractCollectiveOperations(input, output, operation_types));\n+  if (absl::StrContains(operations, \"reduce-scatter\")) {\n+    operation_types.insert(xla::HloOpcode::kReduceScatter);\n+  }\n+  if (absl::StrContains(operations, \"collective-permute\")) {\n+    operation_types.insert(xla::HloOpcode::kCollectivePermute);\n+  }\n+  if (absl::StrContains(operations, \"all-to-all\")) {\n+    operation_types.insert(xla::HloOpcode::kAllToAll);\n+  }\n+\n+  TF_CHECK_OK(xla::ExtractCollectiveOperations(input, output, operation_types,\n+                                               return_tuple));\n   return 0;\n }"
+        },
+        {
+            "sha": "7372f15147d8a72e35e32fff06676ba3279b6dcd",
+            "filename": "third_party/xla/xla/tools/hlo_decomposer.cc",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 4,
+            "changes": 11,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/903611a470a803ec148493f9eb0e4835a4539c03/third_party%2Fxla%2Fxla%2Ftools%2Fhlo_decomposer.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/903611a470a803ec148493f9eb0e4835a4539c03/third_party%2Fxla%2Fxla%2Ftools%2Fhlo_decomposer.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Ftools%2Fhlo_decomposer.cc?ref=903611a470a803ec148493f9eb0e4835a4539c03",
+            "patch": "@@ -119,7 +119,8 @@ absl::StatusOr<std::vector<std::unique_ptr<HloModule>>> DecomposeHloModule(\n std::unique_ptr<HloModule> ExtractCollectiveOperationsIntoNewModule(\n     const std::vector<HloInstruction*>& instructions,\n     const absl::flat_hash_set<HloOpcode>& done_ops,\n-    const absl::flat_hash_set<HloOpcode>& non_optimized_ops) {\n+    const absl::flat_hash_set<HloOpcode>& non_optimized_ops,\n+    bool return_tuple) {\n   CHECK(!instructions.empty());\n   HloInstruction& first_instruction = *instructions[0];\n   auto new_hlo_module = std::make_unique<HloModule>(\n@@ -164,9 +165,11 @@ std::unique_ptr<HloModule> ExtractCollectiveOperationsIntoNewModule(\n     }\n   }\n \n-  std::unique_ptr<HloInstruction> tuple_instruction =\n-      HloInstruction::CreateTuple(result_instructions);\n-  builder.AddInstruction(std::move(tuple_instruction));\n+  if (return_tuple) {\n+    std::unique_ptr<HloInstruction> tuple_instruction =\n+        HloInstruction::CreateTuple(result_instructions);\n+    builder.AddInstruction(std::move(tuple_instruction));\n+  }\n   new_hlo_module->AddEntryComputationWithLayouts(builder.Build());\n   return new_hlo_module;\n }"
+        },
+        {
+            "sha": "b2d256581180852db5ae2c1804ba7dae8f418bb8",
+            "filename": "third_party/xla/xla/tools/hlo_decomposer.h",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 1,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/903611a470a803ec148493f9eb0e4835a4539c03/third_party%2Fxla%2Fxla%2Ftools%2Fhlo_decomposer.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/903611a470a803ec148493f9eb0e4835a4539c03/third_party%2Fxla%2Fxla%2Ftools%2Fhlo_decomposer.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Ftools%2Fhlo_decomposer.h?ref=903611a470a803ec148493f9eb0e4835a4539c03",
+            "patch": "@@ -49,10 +49,14 @@ std::unique_ptr<HloModule> ExtractInstructionIntoNewModule(\n //   done_ops: Set of HLO opcodes that are done operations (e.g. AllReduceDone).\n //   non_optimized_ops: Set of HLO opcodes that are not optimized (e.g.\n //   AllReduce).\n+//   return_tuple: Whether to return the results of all operations in a tuple.\n+//   this is useful for a non-optimized HLO modules sine the compiler will\n+//   optimize collective calls otherwise. For non-optimized HLO modules it's\n+//   better to turn off since otherwise memory consuption will be too high.\n std::unique_ptr<HloModule> ExtractCollectiveOperationsIntoNewModule(\n     const std::vector<HloInstruction*>& instructions,\n     const absl::flat_hash_set<HloOpcode>& done_ops,\n-    const absl::flat_hash_set<HloOpcode>& non_optimized_ops);\n+    const absl::flat_hash_set<HloOpcode>& non_optimized_ops, bool return_tuple);\n \n // Extracts producer and consumer HLO instruction into a new HLO module\n // replacing its operands with parameter instructions."
+        }
+    ],
+    "stats": {
+        "total": 66,
+        "additions": 55,
+        "deletions": 11
+    }
+}

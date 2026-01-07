@@ -1,0 +1,36 @@
+{
+    "author": "ezhulenev",
+    "message": "[xla:cpu] Destroy PjRt CPU client thread pools before destroying other members\n\nPiperOrigin-RevId: 813718611",
+    "sha": "bbf06714e67e6052b2b0d98c01d95a8643e72ddf",
+    "files": [
+        {
+            "sha": "85dfefa54274a319de955f1d59f00a198d3b1f1a",
+            "filename": "third_party/xla/xla/pjrt/cpu/cpu_client.cc",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 9,
+            "changes": 18,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/bbf06714e67e6052b2b0d98c01d95a8643e72ddf/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fcpu_client.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/bbf06714e67e6052b2b0d98c01d95a8643e72ddf/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fcpu_client.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fcpu_client.cc?ref=bbf06714e67e6052b2b0d98c01d95a8643e72ddf",
+            "patch": "@@ -245,6 +245,14 @@ PjRtCpuClient::PjRtCpuClient(\n       owned_devices_(std::move(devices)),\n       computation_placer_(std::make_unique<ComputationPlacer>()),\n       allocator_(std::move(allocator)),\n+      last_collective_launch_event_(\n+          tsl::MakeAvailableAsyncValueRef<CpuEvent>()),\n+      transpose_cache_(1024),\n+      collectives_(std::move(collectives)),\n+      topology_(platform_id(), platform_name(), platform_version(),\n+                GetCpuDevices(owned_devices_), cpu::DetectMachineAttributes()),\n+      asynchronous_(asynchronous),\n+      customize_hlo_module_config_(std::move(customize_hlo_module_config)),\n       eigen_intraop_pool_(new tsl::thread::ThreadPool(\n           tsl::Env::Default(), GetThreadOptions(), \"XLAEigen\",\n           std::min(num_threads, kMaxIntraOpThreads))),\n@@ -255,15 +263,7 @@ PjRtCpuClient::PjRtCpuClient(\n           new tsl::thread::ThreadPool(tsl::Env::Default(), GetThreadOptions(),\n                                       \"XLAPjRtCpuClient\", num_threads)),\n       async_work_runner_(\n-          MakeThreadPoolAsyncWorkRunner(pjrt_client_thread_pool_.get())),\n-      last_collective_launch_event_(\n-          tsl::MakeAvailableAsyncValueRef<CpuEvent>()),\n-      transpose_cache_(1024),\n-      collectives_(std::move(collectives)),\n-      topology_(platform_id(), platform_name(), platform_version(),\n-                GetCpuDevices(owned_devices_), cpu::DetectMachineAttributes()),\n-      asynchronous_(asynchronous),\n-      customize_hlo_module_config_(std::move(customize_hlo_module_config)) {\n+          MakeThreadPoolAsyncWorkRunner(pjrt_client_thread_pool_.get())) {\n   for (const std::unique_ptr<PjRtCpuDevice>& device : owned_devices_) {\n     devices_.push_back(device.get());\n     CHECK("
+        },
+        {
+            "sha": "d4a8161e7be169dafd04a247f60cad1f836f26f4",
+            "filename": "third_party/xla/xla/pjrt/cpu/cpu_client.h",
+            "status": "modified",
+            "additions": 14,
+            "deletions": 8,
+            "changes": 22,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/bbf06714e67e6052b2b0d98c01d95a8643e72ddf/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fcpu_client.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/bbf06714e67e6052b2b0d98c01d95a8643e72ddf/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fcpu_client.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fcpu_client.h?ref=bbf06714e67e6052b2b0d98c01d95a8643e72ddf",
+            "patch": "@@ -22,6 +22,7 @@ limitations under the License.\n #include <memory>\n #include <optional>\n #include <string>\n+#include <tuple>\n #include <utility>\n #include <vector>\n \n@@ -288,14 +289,6 @@ class PjRtCpuClient final : public CommonPjRtClient {\n   // temporary allocations passed to XLA:CPU executable.\n   std::shared_ptr<CpuDeviceMemory::Allocator> allocator_;\n \n-  // TODO(zhangqiaorjc): Use tsl::compat::EigenHostContextThreadPool.\n-  std::unique_ptr<tsl::thread::ThreadPool> eigen_intraop_pool_;\n-  std::unique_ptr<Eigen::ThreadPoolDevice> eigen_intraop_device_;\n-\n-  // Thread pool for running PjRtClient tasks.\n-  std::unique_ptr<tsl::thread::ThreadPool> pjrt_client_thread_pool_;\n-  std::unique_ptr<AsyncWorkRunner> async_work_runner_;\n-\n   // Launching collectives are prone to deadlock when we use fixed-sized\n   // threadpools since ExecuteHelper will block until all replicas reach the\n   // barrier. We ensure that\n@@ -326,6 +319,19 @@ class PjRtCpuClient final : public CommonPjRtClient {\n \n   // A callback to customize the HloModuleConfig for each compiled module.\n   std::function<void(HloModuleConfig&)> customize_hlo_module_config_;\n+\n+  // IMPORTANT: All thread pools must be destroyed first, because thread pool\n+  // destruction guarantees that all scheduled tasks are completed. Otherwise,\n+  // we might get use-after-free races when dispatched executables try to access\n+  // the member variables of this class that are already destroyed.\n+\n+  // TODO(zhangqiaorjc): Use tsl::compat::EigenHostContextThreadPool.\n+  std::unique_ptr<tsl::thread::ThreadPool> eigen_intraop_pool_;\n+  std::unique_ptr<Eigen::ThreadPoolDevice> eigen_intraop_device_;\n+\n+  // Thread pool for running PjRtClient tasks.\n+  std::unique_ptr<tsl::thread::ThreadPool> pjrt_client_thread_pool_;\n+  std::unique_ptr<AsyncWorkRunner> async_work_runner_;\n };\n \n class PjRtCpuExecutable final : public PjRtLoadedExecutable {"
+        }
+    ],
+    "stats": {
+        "total": 40,
+        "additions": 23,
+        "deletions": 17
+    }
+}

@@ -1,0 +1,72 @@
+{
+    "author": "loislo",
+    "message": "[XLA:GPU] Add tests for GPU float check logging and reduce log spam.\n\nThis change introduces `float_check_device_test.cc` to verify that NaN and Inf detections on GPU trigger the expected error logging, including details about the HLO instruction. To reduce redundant error messages, `thunk_buffer_debug_float_check.cc` is updated to log NaN/Inf errors only once per unique thunk profile annotation.\n\nPiperOrigin-RevId: 832376719",
+    "sha": "4c92c131440d84cf992a24bbf6ab83cdfa98d134",
+    "files": [
+        {
+            "sha": "f7c008efaeb5ee16e7af55b71b74ef504a4636aa",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4c92c131440d84cf992a24bbf6ab83cdfa98d134/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4c92c131440d84cf992a24bbf6ab83cdfa98d134/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2FBUILD?ref=4c92c131440d84cf992a24bbf6ab83cdfa98d134",
+            "patch": "@@ -2995,6 +2995,7 @@ cc_library(\n         \"@com_google_absl//absl/algorithm:container\",\n         \"@com_google_absl//absl/base:nullability\",\n         \"@com_google_absl//absl/container:flat_hash_map\",\n+        \"@com_google_absl//absl/container:flat_hash_set\",\n         \"@com_google_absl//absl/functional:any_invocable\",\n         \"@com_google_absl//absl/functional:bind_front\",\n         \"@com_google_absl//absl/log\","
+        },
+        {
+            "sha": "4737d114570ed74a8c7ab75622d23053228606aa",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/thunk_buffer_debug_float_check.cc",
+            "status": "modified",
+            "additions": 25,
+            "deletions": 4,
+            "changes": 29,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4c92c131440d84cf992a24bbf6ab83cdfa98d134/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fthunk_buffer_debug_float_check.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4c92c131440d84cf992a24bbf6ab83cdfa98d134/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fthunk_buffer_debug_float_check.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fthunk_buffer_debug_float_check.cc?ref=4c92c131440d84cf992a24bbf6ab83cdfa98d134",
+            "patch": "@@ -25,6 +25,7 @@ limitations under the License.\n \n #include \"absl/base/nullability.h\"\n #include \"absl/container/flat_hash_map.h\"\n+#include \"absl/container/flat_hash_set.h\"\n #include \"absl/functional/any_invocable.h\"\n #include \"absl/functional/bind_front.h\"\n #include \"absl/log/check.h\"\n@@ -187,30 +188,50 @@ absl::Status BufferDebugFloatCheck(\n   int non_zero_inf_check_modules_count = 0;\n   CHECK_EQ(entries.size(), entries_metadata.size());\n \n+  absl::flat_hash_set<std::string> reported_nan_thunks;\n+  absl::flat_hash_set<std::string> reported_inf_thunks;\n   for (int i = 0; i < entries.size(); ++i) {\n     const auto& entry = entries[i];\n     const auto& metadata = entries_metadata[i];\n     if (!metadata.has_value()) {\n-      LOG(WARNING) << \"Entry ID \" << entry.entry_id\n-                   << \" for float check not found in metadata\";\n+      VLOG(1) << \"Entry ID \" << entry.entry_id\n+              << \" for float check not found in metadata\";\n       continue;\n     }\n     if (metadata->check_type !=\n         BufferDebugLogEntryProto::CHECK_TYPE_FLOAT_CHECKS) {\n+      VLOG(1) << \"Entry ID \" << entry.entry_id\n+              << \" for float check has unsupported check type \"\n+              << BufferDebugLogEntryProto::CheckType_Name(metadata->check_type);\n       continue;\n     }\n     if (nan_check_enabled && entry.nan_count > 0) {\n+      if (reported_nan_thunks.contains(metadata->profile_annotation)) {\n+        VLOG(1) << \"Skipping entry with non zero nan count \" << entry.nan_count\n+                << \" for thunk \" << entry.entry_id << \" and execution \"\n+                << \"with metadata: \" << metadata->profile_annotation;\n+        continue;\n+      }\n+      reported_nan_thunks.insert(metadata->profile_annotation);\n       LOG(ERROR) << \"Found entry with non zero nan count \" << entry.nan_count\n                  << \" for thunk \" << entry.entry_id << \" and execution \"\n                  << \"with metadata: \" << metadata->profile_annotation;\n       non_zero_nan_check_modules_count++;\n       LogHloInstructionWithId(hlo_module, metadata->profile_annotation);\n     }\n     if (inf_check_enabled && entry.inf_count > 0) {\n+      if (reported_inf_thunks.contains(metadata->profile_annotation)) {\n+        VLOG(1) << \"Skipping entry with non zero inf count \" << entry.inf_count\n+                << \" for thunk \" << entry.entry_id << \" with execution_id \"\n+                << metadata->execution_id\n+                << \" and profile annotation: \" << metadata->profile_annotation;\n+        continue;\n+      }\n+      reported_inf_thunks.insert(metadata->profile_annotation);\n       LOG(ERROR) << \"Found entry with non zero inf count \" << entry.inf_count\n-                 << \" for thunk \" << entry.entry_id << \" and execution \"\n+                 << \" for thunk \" << entry.entry_id << \" with execution_id \"\n                  << metadata->execution_id\n-                 << \"with metadata: \" << metadata->profile_annotation;\n+                 << \" and profile annotation: \" << metadata->profile_annotation;\n       non_zero_inf_check_modules_count++;\n       LogHloInstructionWithId(hlo_module, metadata->profile_annotation);\n     }"
+        },
+        {
+            "sha": "2ae5b9612315cb9d8b6d202acdef332117b1a29a",
+            "filename": "third_party/xla/xla/service/debug/BUILD",
+            "status": "modified",
+            "additions": 28,
+            "deletions": 1,
+            "changes": 29,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4c92c131440d84cf992a24bbf6ab83cdfa98d134/third_party%2Fxla%2Fxla%2Fservice%2Fdebug%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4c92c131440d84cf992a24bbf6ab83cdfa98d134/third_party%2Fxla%2Fxla%2Fservice%2Fdebug%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fdebug%2FBUILD?ref=4c92c131440d84cf992a24bbf6ab83cdfa98d134",
+            "patch": "@@ -1,6 +1,7 @@\n load(\"@rules_cc//cc:cc_library.bzl\", \"cc_library\")\n load(\"//xla:xla.default.bzl\", \"xla_cc_test\")\n-load(\"//xla/tsl:tsl.bzl\", \"internal_visibility\")\n+load(\"//xla/tests:build_defs.bzl\", \"xla_test\")\n+load(\"//xla/tsl:tsl.bzl\", \"if_google\", \"internal_visibility\")\n \n package(\n     # copybara:uncomment default_applicable_licenses = [\"//tensorflow:license\"],\n@@ -78,3 +79,29 @@ xla_cc_test(\n         \"@com_google_googletest//:gtest_main\",\n     ],\n )\n+\n+xla_test(\n+    name = \"float_check_device_test\",\n+    srcs = [\"float_check_device_test.cc\"],\n+    backend_args = if_google(\n+        {\n+            \"b200\": [\"--heap_check=\"],\n+            \"h100\": [\"--heap_check=\"],\n+        },\n+        {},\n+    ),\n+    backends = [\n+        \"h100\",\n+        \"b200\",\n+    ],\n+    deps = [\n+        \"//xla:xla_proto_cc\",\n+        \"//xla/hlo/parser:hlo_parser\",\n+        \"//xla/service/gpu/tests:gpu_codegen_test\",\n+        \"//xla/tsl/platform:statusor\",\n+        \"@com_google_absl//absl/base:log_severity\",\n+        \"@com_google_absl//absl/log:scoped_mock_log\",\n+        \"@com_google_absl//absl/strings:string_view\",\n+        \"@com_google_googletest//:gtest_main\",\n+    ],\n+)"
+        },
+        {
+            "sha": "a99ab11f0ef16093aa23ab2383ac2605a542b48f",
+            "filename": "third_party/xla/xla/service/debug/float_check_device_test.cc",
+            "status": "added",
+            "additions": 92,
+            "deletions": 0,
+            "changes": 92,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4c92c131440d84cf992a24bbf6ab83cdfa98d134/third_party%2Fxla%2Fxla%2Fservice%2Fdebug%2Ffloat_check_device_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4c92c131440d84cf992a24bbf6ab83cdfa98d134/third_party%2Fxla%2Fxla%2Fservice%2Fdebug%2Ffloat_check_device_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fdebug%2Ffloat_check_device_test.cc?ref=4c92c131440d84cf992a24bbf6ab83cdfa98d134",
+            "patch": "@@ -0,0 +1,92 @@\n+/* Copyright 2025 The OpenXLA Authors.\n+\n+Licensed under the Apache License, Version 2.0 (the \"License\");\n+you may not use this file except in compliance with the License.\n+You may obtain a copy of the License at\n+\n+    http://www.apache.org/licenses/LICENSE-2.0\n+\n+Unless required by applicable law or agreed to in writing, software\n+distributed under the License is distributed on an \"AS IS\" BASIS,\n+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+See the License for the specific language governing permissions and\n+limitations under the License.\n+==============================================================================*/\n+\n+#include <utility>\n+\n+#include <gmock/gmock.h>\n+#include <gtest/gtest.h>\n+#include \"absl/base/log_severity.h\"\n+#include \"absl/log/scoped_mock_log.h\"\n+#include \"absl/strings/string_view.h\"\n+#include \"xla/hlo/parser/hlo_parser.h\"\n+#include \"xla/service/gpu/tests/gpu_codegen_test.h\"\n+#include \"xla/tsl/platform/statusor.h\"\n+#include \"xla/xla.pb.h\"\n+\n+namespace xla::gpu {\n+\n+using ::testing::_;\n+\n+namespace {\n+\n+TEST_F(GpuCodegenTest, OnNanShouldLogHloInstruction) {\n+  static constexpr absl::string_view kHloModule = R\"hlo(\n+    HloModule test_module\n+    ENTRY main {\n+      zero = f32[] constant(0)\n+      zero_init = f32[1024] broadcast(zero), dimensions={}\n+      ROOT div = f32[1024] divide(zero_init, zero_init)\n+    }\n+  )hlo\";\n+\n+  TF_ASSERT_OK_AND_ASSIGN(auto module,\n+                          ParseAndReturnUnverifiedModule(kHloModule));\n+  module->mutable_config().mutable_debug_options().set_xla_gpu_detect_nan(\n+      DebugOptions::DETECTION_MODE_WARNING);\n+  absl::ScopedMockLog log;\n+  EXPECT_CALL(\n+      log, Log(absl::LogSeverity::kError, _,\n+               ::testing::HasSubstr(\"Found entry with non zero nan count \")));\n+  EXPECT_CALL(log, Log(absl::LogSeverity::kError, _,\n+                       ::testing::HasSubstr(\"HLO instruction with id \")));\n+  EXPECT_CALL(log,\n+              Log(absl::LogSeverity::kError, _,\n+                  ::testing::HasSubstr(\"HLO fusion instruction computation\")));\n+  log.StartCapturingLogs();\n+  EXPECT_TRUE(Run(std::move(module), /*run_hlo_passes=*/true));\n+  log.StopCapturingLogs();\n+}\n+\n+TEST_F(GpuCodegenTest, OnInfShouldLogHloInstruction) {\n+  static constexpr absl::string_view kHloModule = R\"hlo(\n+    HloModule test_module\n+    ENTRY main {\n+      p0 = f32[1024] parameter(0)\n+      zero = f32[] constant(0)\n+      zero_init = f32[1024] broadcast(zero), dimensions={}\n+      ROOT div = f32[1024] divide(p0, zero_init)\n+    }\n+  )hlo\";\n+\n+  TF_ASSERT_OK_AND_ASSIGN(auto module,\n+                          ParseAndReturnUnverifiedModule(kHloModule));\n+  module->mutable_config().mutable_debug_options().set_xla_gpu_detect_inf(\n+      DebugOptions::DETECTION_MODE_WARNING);\n+  absl::ScopedMockLog log;\n+  EXPECT_CALL(\n+      log, Log(absl::LogSeverity::kError, _,\n+               ::testing::HasSubstr(\"Found entry with non zero inf count \")));\n+  EXPECT_CALL(log, Log(absl::LogSeverity::kError, _,\n+                       ::testing::HasSubstr(\"HLO instruction with id \")));\n+  EXPECT_CALL(log,\n+              Log(absl::LogSeverity::kError, _,\n+                  ::testing::HasSubstr(\"HLO fusion instruction computation\")));\n+  log.StartCapturingLogs();\n+  EXPECT_TRUE(Run(std::move(module), /*run_hlo_passes=*/true));\n+  log.StopCapturingLogs();\n+}\n+\n+}  // namespace\n+}  // namespace xla::gpu"
+        },
+        {
+            "sha": "41b3b5fb463f43ed748a1d4a79763299d6253fa5",
+            "filename": "third_party/xla/xla/service/gpu/gpu_executable.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4c92c131440d84cf992a24bbf6ab83cdfa98d134/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_executable.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4c92c131440d84cf992a24bbf6ab83cdfa98d134/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_executable.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_executable.cc?ref=4c92c131440d84cf992a24bbf6ab83cdfa98d134",
+            "patch": "@@ -186,6 +186,7 @@ static absl::Status RunThunkPasses(const DebugOptions& debug_options,\n        DebugOptions::DETECTION_MODE_NONE) ||\n       (debug_options.xla_gpu_detect_inf() !=\n        DebugOptions::DETECTION_MODE_NONE)) {\n+    LOG(ERROR) << \"Adding ThunkBufferDebugPass for nan/inf checking\";\n     pipeline.AddPass(std::make_unique<ThunkBufferDebugPass>(\n         ThunkBufferDebugPass::Mode::kFloatChecker));\n   }"
+        }
+    ],
+    "stats": {
+        "total": 152,
+        "additions": 147,
+        "deletions": 5
+    }
+}

@@ -1,0 +1,36 @@
+{
+    "author": "akuegel",
+    "message": "[XLA:GPU] Remove a source of non-determinism from DotMerger pass.\n\nWhen removing ops, we need to do that in a deterministic order. The reason is\nthat removing users works by finding the position of the user in the users\nvector, then swapping with the last element of the vector, then popping the\nlast element of the vector. So if more than one element is removed from a users\nlist, it matters in which order the elements are removed.\n\nPiperOrigin-RevId: 822026351",
+    "sha": "e756c2161152242a33047cc99a4b1835dbe8be35",
+    "files": [
+        {
+            "sha": "2e927f6ac99eef379e80fe1fe0d61e0a8a94fc42",
+            "filename": "third_party/xla/xla/hlo/transforms/simplifiers/dot_merger.cc",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 2,
+            "changes": 14,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e756c2161152242a33047cc99a4b1835dbe8be35/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fsimplifiers%2Fdot_merger.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e756c2161152242a33047cc99a4b1835dbe8be35/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fsimplifiers%2Fdot_merger.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fsimplifiers%2Fdot_merger.cc?ref=e756c2161152242a33047cc99a4b1835dbe8be35",
+            "patch": "@@ -564,8 +564,18 @@ absl::StatusOr<bool> MergeDots(HloComputation* comp, int64_t max_size_to_merge,\n     }\n   }\n \n-  // Now it's finally safe to delete the old instructions from the graph.\n-  for (HloInstruction* instr : dead_instrs) {\n+  // Now it's finally safe to delete the old instructions from the graph. We\n+  // need to sort by unique id again to make the removal order deterministic.\n+  // Otherwise the users list of HloInstructions would be non-deterministic, as\n+  // removal works by swapping with the last element of the vector and then\n+  // popping the last element.\n+  std::vector<HloInstruction*> sorted_dead_instrs(dead_instrs.begin(),\n+                                                  dead_instrs.end());\n+  absl::c_sort(sorted_dead_instrs,\n+               [](const HloInstruction* a, const HloInstruction* b) {\n+                 return a->unique_id() < b->unique_id();\n+               });\n+  for (HloInstruction* instr : sorted_dead_instrs) {\n     TF_RETURN_IF_ERROR(comp->RemoveInstruction(instr));\n   }\n "
+        },
+        {
+            "sha": "3e6d3e109c6196d2927cf8d33830f43af87d6203",
+            "filename": "third_party/xla/xla/hlo/transforms/simplifiers/dot_merger_test.cc",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 4,
+            "changes": 12,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e756c2161152242a33047cc99a4b1835dbe8be35/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fsimplifiers%2Fdot_merger_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e756c2161152242a33047cc99a4b1835dbe8be35/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fsimplifiers%2Fdot_merger_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fsimplifiers%2Fdot_merger_test.cc?ref=e756c2161152242a33047cc99a4b1835dbe8be35",
+            "patch": "@@ -59,7 +59,7 @@ TEST_F(DotMergerTest, MergeRHS) {\n     rhs1 = f32[100, 50] parameter(2)\n     dot0 = f32[200, 10] dot(lhs, rhs0), lhs_contracting_dims={1}, rhs_contracting_dims={0}\n     dot1 = f32[200, 50] dot(lhs, rhs1), lhs_contracting_dims={1}, rhs_contracting_dims={0}\n-    ROOT tuple = (f32[200,10], f32[200,50]) tuple(dot0, dot1)\n+    ROOT tuple = (f32[200,10], f32[200,50], f32[200,100]) tuple(dot0, dot1, lhs)\n   })\";\n   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,\n                           ParseAndReturnVerifiedModule(module_string));\n@@ -68,14 +68,18 @@ TEST_F(DotMergerTest, MergeRHS) {\n   EXPECT_TRUE(changed);\n   const HloInstruction* dot0 = nullptr;\n   const HloInstruction* dot1 = nullptr;\n-  EXPECT_THAT(\n-      module->entry_computation()->root_instruction(),\n-      GmockMatch(m::Tuple(m::Slice(m::Op(&dot0)), m::Slice(m::Op(&dot1)))));\n+  const HloInstruction* lhs = nullptr;\n+  EXPECT_THAT(module->entry_computation()->root_instruction(),\n+              GmockMatch(m::Tuple(m::Slice(m::Op(&dot0)),\n+                                  m::Slice(m::Op(&dot1)), m::Op(&lhs))));\n   EXPECT_EQ(dot0, dot1);\n   EXPECT_THAT(dot0,\n               GmockMatch(m::Dot(m::Parameter(0),\n                                 m::Concatenate().WithBinaryOperandsAnyOrder(\n                                     m::Parameter(1), m::Parameter(2)))));\n+  EXPECT_TRUE(lhs != nullptr);\n+  // We want a deterministic first user.\n+  EXPECT_EQ(lhs->users()[0], dot0);\n }\n \n TEST_F(DotMergerTest, MergeRHSWithLHS) {"
+        }
+    ],
+    "stats": {
+        "total": 26,
+        "additions": 20,
+        "deletions": 6
+    }
+}

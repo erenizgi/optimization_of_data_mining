@@ -1,0 +1,72 @@
+{
+    "author": "hsgkim",
+    "message": "Normalize device identifiers for autotuning by rounding GPU RAM.\n\nThis change introduces `DeviceIdentifierForAutotuning` to process the device model string. It uses a regex to find and round the reported GPU RAM size to the nearest tenth of a gigabyte in a known type of device string, ensuring that devices with the same model but slightly different RAM reporting are treated as identical for autotuning purposes. The autotune serialization and `ConvParameters` now use this normalized identifier.\n\nPiperOrigin-RevId: 838986466",
+    "sha": "04c1582544fbd2e3f699d2f552e367908eb0d445",
+    "files": [
+        {
+            "sha": "24e21a8588619cc0ee8a25f5195a70a3c8850715",
+            "filename": "tensorflow/core/util/autotune_maps/BUILD",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 0,
+            "changes": 15,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/04c1582544fbd2e3f699d2f552e367908eb0d445/tensorflow%2Fcore%2Futil%2Fautotune_maps%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/04c1582544fbd2e3f699d2f552e367908eb0d445/tensorflow%2Fcore%2Futil%2Fautotune_maps%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcore%2Futil%2Fautotune_maps%2FBUILD?ref=04c1582544fbd2e3f699d2f552e367908eb0d445",
+            "patch": "@@ -123,8 +123,10 @@ tf_cuda_library(\n         \"//tensorflow/core/platform:hash\",\n         \"//tensorflow/core/platform:protobuf\",\n         \"//tensorflow/core/platform:stream_executor\",\n+        \"@com_google_absl//absl/strings\",\n         \"@com_google_absl//absl/strings:str_format\",\n         \"@com_google_absl//absl/types:optional\",\n+        \"@local_tsl//tsl/platform:regexp\",\n     ],\n )\n \n@@ -203,3 +205,16 @@ tf_cuda_only_cc_test(\n         \"@local_xla//xla/stream_executor/gpu:gpu_init\",\n     ],\n )\n+\n+tf_cuda_only_cc_test(\n+    name = \"conv_parameters_test\",\n+    size = \"small\",\n+    srcs = [\"conv_parameters_test.cc\"],\n+    features = [\"-layering_check\"],\n+    tags = [\"no_rocm\"],\n+    deps = [\n+        \":conv_parameters\",\n+        \"//tensorflow/core:test\",\n+        \"//tensorflow/core:test_main\",\n+    ],\n+)"
+        },
+        {
+            "sha": "d8a4acbe514e48eb8eff74588dbde84cb2b3b23e",
+            "filename": "tensorflow/core/util/autotune_maps/autotune_serialize.cc",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/04c1582544fbd2e3f699d2f552e367908eb0d445/tensorflow%2Fcore%2Futil%2Fautotune_maps%2Fautotune_serialize.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/04c1582544fbd2e3f699d2f552e367908eb0d445/tensorflow%2Fcore%2Futil%2Fautotune_maps%2Fautotune_serialize.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcore%2Futil%2Fautotune_maps%2Fautotune_serialize.cc?ref=04c1582544fbd2e3f699d2f552e367908eb0d445",
+            "patch": "@@ -106,7 +106,8 @@ Status PopulateConvMap(\n   for (int i = 0; i < platform->VisibleDeviceCount(); i++) {\n     TF_ASSIGN_OR_RETURN(std::unique_ptr<se::DeviceDescription> device_desc,\n                         platform->DescriptionForDevice(i));\n-    device_descs.push_back(device_desc->model_str());\n+    device_descs.push_back(\n+        DeviceIdentifierForAutotuning(device_desc->model_str()));\n   }\n \n   std::set<std::string> unmatched_device_descs;"
+        },
+        {
+            "sha": "3ef5626eeb8d61aaadda4f2988dcd3d6b0788635",
+            "filename": "tensorflow/core/util/autotune_maps/conv_parameters.cc",
+            "status": "modified",
+            "additions": 23,
+            "deletions": 8,
+            "changes": 31,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/04c1582544fbd2e3f699d2f552e367908eb0d445/tensorflow%2Fcore%2Futil%2Fautotune_maps%2Fconv_parameters.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/04c1582544fbd2e3f699d2f552e367908eb0d445/tensorflow%2Fcore%2Futil%2Fautotune_maps%2Fconv_parameters.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcore%2Futil%2Fautotune_maps%2Fconv_parameters.cc?ref=04c1582544fbd2e3f699d2f552e367908eb0d445",
+            "patch": "@@ -16,12 +16,15 @@ limitations under the License.\n #if GOOGLE_CUDA || TENSORFLOW_USE_ROCM\n #include \"tensorflow/core/util/autotune_maps/conv_parameters.h\"\n \n+#include <cstddef>\n #include <vector>\n \n #include \"absl/strings/str_format.h\"\n+#include \"absl/strings/str_replace.h\"\n #include \"xla/tsl/lib/strings/proto_serialization.h\"\n #include \"tensorflow/core/platform/hash.h\"\n #include \"tensorflow/core/util/autotune_maps/conv_parameters.pb.h\"\n+#include \"tsl/platform/regexp.h\"\n \n namespace tensorflow {\n \n@@ -37,6 +40,22 @@ uint64 ComputeHash(int device_id, const MatmulParametersProto& proto) {\n }\n }  // namespace\n \n+std::string DeviceIdentifierForAutotuning(absl::string_view device_identifier) {\n+  static const LazyRE2 kDevicePattern = {\n+      R\"regexp(^sm_[^ ]+ with ([\\d]+)B RAM, [\\d]+ cores, [\\d]+KHz clock, [\\d]+KHz mem clock, [\\d]+B L2\\$$)regexp\"};\n+\n+  uint64_t ram_bytes;\n+  if (!RE2::FullMatch(device_identifier, *kDevicePattern, &ram_bytes)) {\n+    return std::string(device_identifier);\n+  }\n+\n+  // Round up RAM to GB with 1 decimal place.\n+  double ram_gb = static_cast<double>(ram_bytes) / 1e9;\n+  return absl::StrReplaceAll(device_identifier,\n+                             {{absl::StrCat(ram_bytes, \"B RAM\"),\n+                               absl::StrFormat(\"%.1fGB RAM\", ram_gb)}});\n+}\n+\n ConvParameters::ConvParameters(\n     se::StreamExecutor* stream_exec, int64_t batch, int64_t in_depths,\n     const absl::Span<const int64_t> in, int data_format, int64_t out_depths,\n@@ -65,10 +84,8 @@ ConvParameters::ConvParameters(\n     fusion_proto.set_is_contrib(fusion_info.value().is_contrib);\n     *proto_.mutable_fusion() = fusion_proto;\n   }\n-  // Have to convert to std::string because apparently our open-source protobuf\n-  // does not speak absl::string_view.\n-  proto_.set_device_identifier(\n-      std::string(stream_exec->GetDeviceDescription().model_str()));\n+  proto_.set_device_identifier(DeviceIdentifierForAutotuning(\n+      stream_exec->GetDeviceDescription().model_str()));\n   proto_.set_version(version);\n   hash_code_ = ComputeHash(device_id_, proto_);\n }\n@@ -103,10 +120,8 @@ MatmulParameters::MatmulParameters(\n   proto_.set_ldc(ldc);\n   proto_.set_activation_mode(activation_mode);\n \n-  // Have to convert to std::string because apparently our open-source protobuf\n-  // does not speak absl::string_view.\n-  proto_.set_device_identifier(\n-      std::string(stream_exec->GetDeviceDescription().model_str()));\n+  proto_.set_device_identifier(DeviceIdentifierForAutotuning(\n+      stream_exec->GetDeviceDescription().model_str()));\n   proto_.set_version(version);\n   hash_code_ = ComputeHash(device_id_, proto_);\n }"
+        },
+        {
+            "sha": "b213dba9298dd35a2c82f6ad3d52cadcec555c19",
+            "filename": "tensorflow/core/util/autotune_maps/conv_parameters.h",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 0,
+            "changes": 8,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/04c1582544fbd2e3f699d2f552e367908eb0d445/tensorflow%2Fcore%2Futil%2Fautotune_maps%2Fconv_parameters.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/04c1582544fbd2e3f699d2f552e367908eb0d445/tensorflow%2Fcore%2Futil%2Fautotune_maps%2Fconv_parameters.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcore%2Futil%2Fautotune_maps%2Fconv_parameters.h?ref=04c1582544fbd2e3f699d2f552e367908eb0d445",
+            "patch": "@@ -22,6 +22,14 @@ limitations under the License.\n #include \"tensorflow/core/util/autotune_maps/conv_parameters.pb.h\"\n \n namespace tensorflow {\n+\n+// Returns a string that uniquely identifies the device model based on the\n+// device identifier string from the stream executor. There are cases where\n+// the same device model may have different identifiers (e.g. different RAM).\n+// This function normalizes the identifier to make it comparable to other\n+// autotuning results.\n+std::string DeviceIdentifierForAutotuning(absl::string_view device_identifier);\n+\n // Uniquely identifies a convolution operation that runs on a particular device\n // model.\n //"
+        },
+        {
+            "sha": "403fadf14d8a568966dabef740307c1fa26731da",
+            "filename": "tensorflow/core/util/autotune_maps/conv_parameters_test.cc",
+            "status": "added",
+            "additions": 46,
+            "deletions": 0,
+            "changes": 46,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/04c1582544fbd2e3f699d2f552e367908eb0d445/tensorflow%2Fcore%2Futil%2Fautotune_maps%2Fconv_parameters_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/04c1582544fbd2e3f699d2f552e367908eb0d445/tensorflow%2Fcore%2Futil%2Fautotune_maps%2Fconv_parameters_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcore%2Futil%2Fautotune_maps%2Fconv_parameters_test.cc?ref=04c1582544fbd2e3f699d2f552e367908eb0d445",
+            "patch": "@@ -0,0 +1,46 @@\n+/* Copyright 2025 The TensorFlow Authors. All Rights Reserved.\n+\n+Licensed under the Apache License, Version 2.0 (the \"License\");\n+you may not use this file except in compliance with the License.\n+You may obtain a copy of the License at\n+\n+    http://www.apache.org/licenses/LICENSE-2.0\n+\n+Unless required by applicable law or agreed to in writing, software\n+distributed under the License is distributed on an \"AS IS\" BASIS,\n+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+See the License for the specific language governing permissions and\n+limitations under the License.\n+==============================================================================*/\n+\n+#include \"tensorflow/core/util/autotune_maps/conv_parameters.h\"\n+\n+#include \"tensorflow/core/platform/test.h\"\n+\n+namespace tensorflow {\n+\n+namespace {\n+\n+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM\n+\n+using ::testing::StrEq;\n+\n+TEST(DeviceIdentifierForAutotuning, RoundsUpRamToGb) {\n+  EXPECT_THAT(\n+      DeviceIdentifierForAutotuning(\n+          \"sm_7.0 with 98765432100B RAM, 97 cores, 777KHz clock, 204KHz \"\n+          \"mem clock, 888B L2$\"),\n+      StrEq(\"sm_7.0 with 98.8GB RAM, 97 cores, 777KHz clock, 204KHz mem clock, \"\n+            \"888B L2$\"));\n+}\n+\n+TEST(DeviceIdentifierForAutotuning, NoChangeIfRegexDoesNotMatch) {\n+  EXPECT_THAT(DeviceIdentifierForAutotuning(\"expect no change 123456B RAM\"),\n+              StrEq(\"expect no change 123456B RAM\"));\n+}\n+\n+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM\n+\n+}  // namespace\n+\n+}  // namespace tensorflow"
+        }
+    ],
+    "stats": {
+        "total": 103,
+        "additions": 94,
+        "deletions": 9
+    }
+}

@@ -1,0 +1,48 @@
+{
+    "author": "beckerhe",
+    "message": "Fix fission handling for cublasLt\n\nThere were 2 bugs in the cublasLt/cublas handling logic.\n\n1. It assumed that cublasLt is disabled by default and only needs to be explicitly enable. Since I'm looking\ninto making cublasLt the default this breaks.\n\n2. The logic was assuming that we can distinguish between cublas and cublasLt via the backend config type.\nBut both use the GemmKey. Therefore we need to use the debug option to distinguish between cublas and cublasLt.\n\nPiperOrigin-RevId: 805269578",
+    "sha": "f858c82b2c083730a526b9b4662674902928733b",
+    "files": [
+        {
+            "sha": "fa587d9ef5794d32c6faa2c11d4708c312797805",
+            "filename": "third_party/xla/xla/backends/gpu/autotuner/BUILD",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 1,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f858c82b2c083730a526b9b4662674902928733b/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f858c82b2c083730a526b9b4662674902928733b/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2FBUILD?ref=f858c82b2c083730a526b9b4662674902928733b",
+            "patch": "@@ -463,7 +463,6 @@ xla_test(\n         \"//xla/service/gpu:nvptx_compiler_impl\",\n         \"//xla/stream_executor:device_description_proto_cc\",\n         \"//xla/tsl/lib/core:status_test_util\",\n-        \"//xla/tsl/platform:status_matchers\",\n         \"//xla/tsl/platform:statusor\",\n         \"@com_google_absl//absl/status\",\n         \"@com_google_absl//absl/status:status_matchers\","
+        },
+        {
+            "sha": "fd2224b33575b70836562b9bacb82b77378087a7",
+            "filename": "third_party/xla/xla/backends/gpu/autotuner/fission.cc",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 10,
+            "changes": 21,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f858c82b2c083730a526b9b4662674902928733b/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Ffission.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f858c82b2c083730a526b9b4662674902928733b/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Ffission.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Ffission.cc?ref=f858c82b2c083730a526b9b4662674902928733b",
+            "patch": "@@ -27,10 +27,10 @@ limitations under the License.\n #include \"absl/status/statusor.h\"\n #include \"absl/strings/string_view.h\"\n #include \"xla/autotuning.pb.h\"\n+#include \"xla/backends/autotuner/codegen_backend.h\"\n #include \"xla/backends/gpu/autotuner/cublas.h\"\n #include \"xla/backends/gpu/autotuner/cublaslt.h\"\n #include \"xla/backends/gpu/autotuner/custom_kernel.h\"\n-#include \"xla/backends/autotuner/codegen_backend.h\"\n #include \"xla/hlo/ir/hlo_casting_utils.h\"\n #include \"xla/hlo/ir/hlo_instruction.h\"\n #include \"xla/hlo/ir/hlo_instructions.h\"\n@@ -58,8 +58,7 @@ namespace xla {\n namespace gpu {\n \n namespace se = ::stream_executor;\n-using CublasBackendConfig = AutotuneResult::GemmKey;\n-using CublasLtBackendConfig = AutotuneResult::GemmKey;\n+using CublasOrCublasLtBackendConfig = AutotuneResult::GemmKey;\n using CustomKernelBackendConfig = AutotuneResult::CustomKernelFusionKey;\n \n namespace {\n@@ -79,11 +78,10 @@ HloCostAnalysis::Options PriorityFusionOptions() {\n absl::Status FissionToCublas(HloModule* hlo_module,\n                              const se::DeviceDescription& device_description,\n                              bool rewrite_to_cublaslt) {\n-  if (rewrite_to_cublaslt) {\n-    hlo_module->mutable_config()\n-        .mutable_debug_options()\n-        .set_xla_gpu_enable_cublaslt(true);\n-  }\n+  hlo_module->mutable_config()\n+      .mutable_debug_options()\n+      .set_xla_gpu_enable_cublaslt(rewrite_to_cublaslt);\n+\n   HloInstruction* dot = hlo_query::GetFirstInstructionWithOpcode(\n       *hlo_module->entry_computation(), HloOpcode::kDot);\n \n@@ -306,7 +304,10 @@ absl::Status FissionBackend::ApplyConfig(HloInstruction& instr,\n       /*uniquify_channel_ids=*/true);\n   TF_RETURN_IF_ERROR(call_inliner.Run(hlo_module).status());\n \n-  if (config.Is<CublasBackendConfig>()) {\n+  bool use_cublaslt =\n+      computation->parent()->config().debug_options().xla_gpu_enable_cublaslt();\n+\n+  if (!use_cublaslt && config.Is<CublasOrCublasLtBackendConfig>()) {\n     TF_RETURN_IF_ERROR(FissionToCublas(hlo_module,\n                                        target_config().device_description,\n                                        /*rewrite_to_cublaslt=*/false));\n@@ -322,7 +323,7 @@ absl::Status FissionBackend::ApplyConfig(HloInstruction& instr,\n     return absl::OkStatus();\n   }\n \n-  if (config.Is<CublasLtBackendConfig>()) {\n+  if (use_cublaslt && config.Is<CublasOrCublasLtBackendConfig>()) {\n     TF_RETURN_IF_ERROR(FissionToCublas(hlo_module,\n                                        target_config().device_description,\n                                        /*rewrite_to_cublaslt=*/true));"
+        },
+        {
+            "sha": "50ecfc500cec185c22b3112a5620b9aec0779c7e",
+            "filename": "third_party/xla/xla/backends/gpu/autotuner/fission_test.cc",
+            "status": "modified",
+            "additions": 23,
+            "deletions": 3,
+            "changes": 26,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f858c82b2c083730a526b9b4662674902928733b/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Ffission_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f858c82b2c083730a526b9b4662674902928733b/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Ffission_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Ffission_test.cc?ref=f858c82b2c083730a526b9b4662674902928733b",
+            "patch": "@@ -34,17 +34,16 @@ limitations under the License.\n #include \"xla/service/platform_util.h\"\n #include \"xla/stream_executor/device_description.pb.h\"\n #include \"xla/tsl/lib/core/status_test_util.h\"\n-#include \"xla/tsl/platform/status_matchers.h\"\n #include \"xla/tsl/platform/statusor.h\"\n #include \"xla/xla.pb.h\"\n \n namespace xla {\n namespace gpu {\n namespace {\n \n+using ::absl_testing::IsOkAndHolds;\n+using ::absl_testing::StatusIs;\n using ::testing::SizeIs;\n-using ::tsl::testing::IsOkAndHolds;\n-using ::tsl::testing::StatusIs;\n \n const char kTritonFusionHlo[] = R\"(\n   HloModule module\n@@ -132,17 +131,38 @@ TEST_F(FissionBackendTest, GetDefaultConfigFails) {\n TEST_F(FissionBackendTest, ApplyCublasConfigToFusionInstruction) {\n   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> hlo_module,\n                           ParseAndReturnVerifiedModule(kTritonFusionHlo));\n+  hlo_module->mutable_config()\n+      .mutable_debug_options()\n+      .set_xla_gpu_enable_cublaslt(false);\n   AutotuneResult::GemmKey config;\n   config.set_algorithm(3);\n   google::protobuf::Any any;\n   any.PackFrom(config);\n   TF_EXPECT_OK(backend_.ApplyConfig(\n       *hlo_module->entry_computation()->root_instruction(), any));\n   EXPECT_THAT(RunFileCheck(hlo_module->ToString(),\n+                           \"CHECK: \\\"__cublas$gemm\\\"\\n\"\n                            \"CHECK: \\\"selected_algorithm\\\":\\\"3\\\"\"),\n               IsOkAndHolds(true));\n }\n \n+TEST_F(FissionBackendTest, ApplyCublasLtConfigToFusionInstruction) {\n+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> hlo_module,\n+                          ParseAndReturnVerifiedModule(kTritonFusionHlo));\n+  hlo_module->mutable_config()\n+      .mutable_debug_options()\n+      .set_xla_gpu_enable_cublaslt(true);\n+  AutotuneResult::GemmKey config;\n+  config.set_algorithm(3);\n+  google::protobuf::Any any;\n+  any.PackFrom(config);\n+  TF_EXPECT_OK(backend_.ApplyConfig(\n+      *hlo_module->entry_computation()->root_instruction(), any));\n+  EXPECT_THAT(\n+      RunFileCheck(hlo_module->ToString(), \"CHECK: \\\"__cublas$lt$matmul\\\"\"),\n+      IsOkAndHolds(true));\n+}\n+\n TEST_F(FissionBackendTest, ApplyCustomKernelConfigToFusionInstruction) {\n   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> hlo_module,\n                           ParseAndReturnVerifiedModule(kTritonFusionHlo));"
+        }
+    ],
+    "stats": {
+        "total": 48,
+        "additions": 34,
+        "deletions": 14
+    }
+}

@@ -1,0 +1,132 @@
+{
+    "author": "mwhittaker",
+    "message": "Propagate NCCL aborts into user exceptions.\n\nIf a multi-controller JAX program is running a collective (e.g., AllReduce) and\none of the collective participants fails, we'll abort the collective.\nPreviously, a JAX programmer didn't have a way to know that their collective\nwas aborted. The collective would just return garbage data. This commit changes\nthe TFRT GPU client to propagate aborted collectives into Python exceptions.\n\nThere is some subtlety in detecting when we abort a collective. The NCCL API\nunfortunately doesn't provide a direct way to query whether or not a collective\nwas aborted. Instead, we check the health of the participants after the\ncollective returns. If the participants are stale, then we conservatively\nassume the collective was canceled.\n\nThis leads to the possibility that some processes think the collective was\naborted and some don't. I'll address this lack of atomicity in future changes.\n\nPiperOrigin-RevId: 820272371",
+    "sha": "7a51446051c2be7e7f07d49080fa67c8f2f612a6",
+    "files": [
+        {
+            "sha": "a41432ca3c773b33e72038ab310eade978822e9e",
+            "filename": "third_party/xla/xla/backends/gpu/collectives/gpu_cliques.cc",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 11,
+            "changes": 24,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/7a51446051c2be7e7f07d49080fa67c8f2f612a6/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcollectives%2Fgpu_cliques.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/7a51446051c2be7e7f07d49080fa67c8f2f612a6/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcollectives%2Fgpu_cliques.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcollectives%2Fgpu_cliques.cc?ref=7a51446051c2be7e7f07d49080fa67c8f2f612a6",
+            "patch": "@@ -228,12 +228,8 @@ static absl::StatusOr<bool> EnablePeerAccess(\n   return true;\n }\n \n-// Returns a non-ok status if the provided clique key is \"stale\". A clique key\n-// is stale if its incarnations don't match the latest incarnations or if any of\n-// the tasks specified in the clique key have failed.\n-//\n // REQUIRES: GetProcessGpuCliques().mu held\n-static absl::Status CheckCliqueKeyIsntStale(\n+static absl::Status CheckCliqueKeyIsntStaleImpl(\n     absl::Span<const tensorflow::CoordinatedTaskStateInfo> task_state_infos,\n     const GpuCliqueKey& clique_key) {\n   if (task_state_infos.empty()) {\n@@ -265,6 +261,12 @@ static absl::Status CheckCliqueKeyIsntStale(\n   return absl::OkStatus();\n }\n \n+absl::Status CheckCliqueKeyIsntStale(const GpuCliqueKey& clique_key) {\n+  ProcessGpuCliques& cliques = GetProcessGpuCliques();\n+  absl::MutexLock lock(&cliques.mu);\n+  return CheckCliqueKeyIsntStaleImpl(cliques.task_state_infos, clique_key);\n+}\n+\n // Joins a GpuClique initialization rendezvous for a `clique_key` and returns\n // a lock that gives an access to initialized clique (access is shared between\n // all participating ranks that own a shared pointer).\n@@ -347,7 +349,7 @@ InitializeGpuClique(GpuCollectives* collectives, se::StreamExecutor* device,\n       VLOG(5) << \"Checking clique key \" << clique_key.ToString()\n               << \" for staleness\";\n       TF_RETURN_IF_ERROR(\n-          CheckCliqueKeyIsntStale(cliques.task_state_infos, clique_key));\n+          CheckCliqueKeyIsntStaleImpl(cliques.task_state_infos, clique_key));\n     }\n \n     VLOG(5) << \"Creating communicators\";\n@@ -370,7 +372,7 @@ InitializeGpuClique(GpuCollectives* collectives, se::StreamExecutor* device,\n     VLOG(5) << \"Locking cliques.mu\";\n     absl::MutexLock lock(cliques.mu);\n     if (absl::Status s =\n-            CheckCliqueKeyIsntStale(cliques.task_state_infos, clique_key);\n+            CheckCliqueKeyIsntStaleImpl(cliques.task_state_infos, clique_key);\n         !s.ok()) {\n       LOG(WARNING) << \"Clique key \" << clique_key.ToString()\n                    << \" is stale. Aborting recently created communicators.\";\n@@ -541,7 +543,7 @@ InitializeGpuClique(GpuCollectives* collectives, se::StreamExecutor* device,\n       VLOG(5) << \"Checking clique key \" << clique_key.ToString()\n               << \" for staleness\";\n       TF_RETURN_IF_ERROR(\n-          CheckCliqueKeyIsntStale(cliques.task_state_infos, clique_key));\n+          CheckCliqueKeyIsntStaleImpl(cliques.task_state_infos, clique_key));\n     }\n \n     VLOG(5) << \"Splitting communicators\";\n@@ -565,7 +567,7 @@ InitializeGpuClique(GpuCollectives* collectives, se::StreamExecutor* device,\n     VLOG(5) << \"Locking cliques.mu\";\n     absl::MutexLock lock(cliques.mu);\n     if (absl::Status s =\n-            CheckCliqueKeyIsntStale(cliques.task_state_infos, clique_key);\n+            CheckCliqueKeyIsntStaleImpl(cliques.task_state_infos, clique_key);\n         !s.ok()) {\n       LOG(WARNING) << \"Clique key \" << clique_key.ToString()\n                    << \" is stale. Aborting recently split communicators.\";\n@@ -646,8 +648,8 @@ absl::StatusOr<std::shared_ptr<LockableGpuClique::Lock>> AcquireGpuClique(\n             auto lockable_clique = [&]() -> LockableGpuClique* {\n               absl::MutexLock lock(cliques.mu);\n               auto it = cliques.map.find(clique_key);\n-              absl::Status stale =\n-                  CheckCliqueKeyIsntStale(cliques.task_state_infos, clique_key);\n+              absl::Status stale = CheckCliqueKeyIsntStaleImpl(\n+                  cliques.task_state_infos, clique_key);\n               return it == cliques.map.end() || !stale.ok() ? nullptr\n                                                             : &it->second;\n             }();"
+        },
+        {
+            "sha": "44015365ce576d58895af32638cbf2ef06a27432",
+            "filename": "third_party/xla/xla/backends/gpu/collectives/gpu_cliques.h",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/7a51446051c2be7e7f07d49080fa67c8f2f612a6/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcollectives%2Fgpu_cliques.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/7a51446051c2be7e7f07d49080fa67c8f2f612a6/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcollectives%2Fgpu_cliques.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcollectives%2Fgpu_cliques.h?ref=7a51446051c2be7e7f07d49080fa67c8f2f612a6",
+            "patch": "@@ -69,6 +69,11 @@ absl::StatusOr<std::shared_ptr<LockableGpuClique::Lock>> AcquireGpuClique(\n     const GpuCollectives::CliqueIdCallback& clique_id_callback, RankId rank,\n     const AcquiredCliquesMap& acquired_cliques, int64_t max_nchannels = 0);\n \n+// Returns a non-ok status if the provided clique key is \"stale\". A clique key\n+// is stale if its incarnations don't match the latest incarnations or if any of\n+// the tasks specified in the clique key have failed.\n+absl::Status CheckCliqueKeyIsntStale(const GpuCliqueKey& clique_key);\n+\n // Updates the global set of task state information. This function aborts and\n // invalidates all cliques that were created via AcquireGpuClique with\n // incarnations that have become stale."
+        },
+        {
+            "sha": "cbf53b192d80dbff36fec4b047bc28c61c897b0b",
+            "filename": "third_party/xla/xla/executable_run_options.cc",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 0,
+            "changes": 13,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/7a51446051c2be7e7f07d49080fa67c8f2f612a6/third_party%2Fxla%2Fxla%2Fexecutable_run_options.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/7a51446051c2be7e7f07d49080fa67c8f2f612a6/third_party%2Fxla%2Fxla%2Fexecutable_run_options.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fexecutable_run_options.cc?ref=7a51446051c2be7e7f07d49080fa67c8f2f612a6",
+            "patch": "@@ -17,7 +17,9 @@ limitations under the License.\n \n #include <atomic>\n #include <cstdint>\n+#include <memory>\n #include <string>\n+#include <vector>\n \n namespace xla {\n \n@@ -180,4 +182,15 @@ int ExecutableRunOptions::local_device_count() const {\n   return local_device_count_;\n }\n \n+ExecutableRunOptions& ExecutableRunOptions::set_clique_keys(\n+    std::vector<std::unique_ptr<CliqueKey>>* clique_keys) {\n+  clique_keys_ = clique_keys;\n+  return *this;\n+}\n+\n+std::vector<std::unique_ptr<CliqueKey>>* ExecutableRunOptions::clique_keys()\n+    const {\n+  return clique_keys_;\n+}\n+\n }  // namespace xla"
+        },
+        {
+            "sha": "fb63e3ee72b5012dfa579837c41fac3d701af363",
+            "filename": "third_party/xla/xla/executable_run_options.h",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/7a51446051c2be7e7f07d49080fa67c8f2f612a6/third_party%2Fxla%2Fxla%2Fexecutable_run_options.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/7a51446051c2be7e7f07d49080fa67c8f2f612a6/third_party%2Fxla%2Fxla%2Fexecutable_run_options.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fexecutable_run_options.h?ref=7a51446051c2be7e7f07d49080fa67c8f2f612a6",
+            "patch": "@@ -20,6 +20,7 @@ limitations under the License.\n #include <functional>\n #include <memory>\n #include <string>\n+#include <vector>\n \n #include \"absl/container/flat_hash_map.h\"\n #include \"absl/status/statusor.h\"\n@@ -47,6 +48,7 @@ class AsyncValueRef;\n \n namespace xla {\n \n+class CliqueKey;\n class DeviceAssignment;\n class ExecutionProfile;\n class Shape;\n@@ -254,6 +256,10 @@ class ExecutableRunOptions {\n   ExecutableRunOptions& set_local_device_count(int local_device_count);\n   int local_device_count() const;\n \n+  ExecutableRunOptions& set_clique_keys(\n+      std::vector<std::unique_ptr<CliqueKey>>* clique_keys);\n+  std::vector<std::unique_ptr<CliqueKey>>* clique_keys() const;\n+\n  private:\n   stream_executor::DeviceMemoryAllocator* allocator_ = nullptr;\n   int device_ordinal_ = -1;\n@@ -274,6 +280,7 @@ class ExecutableRunOptions {\n   const cpu::CpuExecutableRunOptions* cpu_executable_run_options_ = nullptr;\n   const gpu::GpuExecutableRunOptions* gpu_executable_run_options_ = nullptr;\n   const ffi::ExecutionContext* ffi_execution_context_ = nullptr;\n+  std::vector<std::unique_ptr<CliqueKey>>* clique_keys_ = nullptr;\n };\n \n }  // namespace xla"
+        },
+        {
+            "sha": "feaae0ebaefbd4eda0c5e16738d162a3aec77154",
+            "filename": "third_party/xla/xla/pjrt/gpu/tfrt/BUILD",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/7a51446051c2be7e7f07d49080fa67c8f2f612a6/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Ftfrt%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/7a51446051c2be7e7f07d49080fa67c8f2f612a6/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Ftfrt%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Ftfrt%2FBUILD?ref=7a51446051c2be7e7f07d49080fa67c8f2f612a6",
+            "patch": "@@ -50,11 +50,13 @@ cc_library(\n         \"//xla:util\",\n         \"//xla:xla_data_proto_cc\",\n         \"//xla:xla_proto_cc\",\n+        \"//xla/backends/gpu/collectives:gpu_clique_key\",\n         \"//xla/backends/gpu/collectives:gpu_cliques\",\n         \"//xla/backends/gpu/collectives:gpu_collectives\",\n         \"//xla/client:executable_build_options\",\n         \"//xla/client:local_client\",\n         \"//xla/core/collectives\",\n+        \"//xla/core/collectives:clique_key\",\n         \"//xla/core/collectives:collectives_registry\",\n         \"//xla/hlo/builder:xla_computation\",\n         \"//xla/hlo/ir:hlo\","
+        },
+        {
+            "sha": "049f7927d4e7df5b5c94e37469ca0893cd1996f4",
+            "filename": "third_party/xla/xla/pjrt/gpu/tfrt/tfrt_gpu_executable.cc",
+            "status": "modified",
+            "additions": 28,
+            "deletions": 7,
+            "changes": 35,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/7a51446051c2be7e7f07d49080fa67c8f2f612a6/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Ftfrt%2Ftfrt_gpu_executable.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/7a51446051c2be7e7f07d49080fa67c8f2f612a6/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Ftfrt%2Ftfrt_gpu_executable.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Ftfrt%2Ftfrt_gpu_executable.cc?ref=7a51446051c2be7e7f07d49080fa67c8f2f612a6",
+            "patch": "@@ -35,8 +35,11 @@ limitations under the License.\n #include \"absl/synchronization/mutex.h\"\n #include \"absl/types/span.h\"\n #include \"unsupported/Eigen/CXX11/Tensor\"\n+#include \"xla/backends/gpu/collectives/gpu_clique_key.h\"\n+#include \"xla/backends/gpu/collectives/gpu_cliques.h\"\n #include \"xla/client/executable_build_options.h\"\n #include \"xla/client/local_client.h\"\n+#include \"xla/core/collectives/clique_key.h\"\n #include \"xla/executable_run_options.h\"\n #include \"xla/future.h\"\n #include \"xla/hlo/ir/hlo_module.h\"\n@@ -679,6 +682,8 @@ absl::StatusOr<PjRtLoadedExecutable::Result> TfrtGpuExecutable::ExecuteHelper(\n         run_options.set_send_device_memory_function(&send_device_memory);\n         run_options.set_recv_device_memory_function(&recv_device_memory);\n         run_options.set_execution_profile(execution_profile);\n+        std::vector<std::unique_ptr<CliqueKey>> clique_keys;\n+        run_options.set_clique_keys(&clique_keys);\n \n         // TODO(phawkins): *technically* this should probably happen after\n         // calling RunAsync(). But that causes a large performance problem: it\n@@ -776,21 +781,37 @@ absl::StatusOr<PjRtLoadedExecutable::Result> TfrtGpuExecutable::ExecuteHelper(\n         scheduled_event.SetStateConcrete();\n \n         absl::Status status = BlockHostUntilDoneWithHostCallback(stream);\n+        VLOG(1) << \"execute_fn for \" << executable_name\n+                << \", launch_id: \" << launch_id << \", replica=\" << replica\n+                << \", partition=\" << partition\n+                << \", device: \" << device->DebugString()\n+                << \" is done with status \" << status;\n+\n         if (!status.ok()) {\n           LOG(ERROR)\n               << \"BlockHostUntilDoneWithHostCallback failed for executable \"\n               << executable_name << \" on device \" << device->DebugString()\n               << \", status = \" << status;\n           complete_event.SetError(status);\n-        } else {\n-          complete_event.SetStateConcrete();\n+          return;\n         }\n \n-        VLOG(1) << \"execute_fn for \" << executable_name\n-                << \", launch_id: \" << launch_id << \", replica=\" << replica\n-                << \", partition=\" << partition\n-                << \", device: \" << device->DebugString()\n-                << \" is done with status \" << status;\n+        // If any collective is stale, then the collective may have aborted.\n+        // Note that NCCL doesn't provide a way to *know* if the collective was\n+        // aborted, but we conservatively assume it was.\n+        for (const std::unique_ptr<CliqueKey>& clique_key : clique_keys) {\n+          gpu::GpuCliqueKey* gpu_clique_key = CHECK_NOTNULL(\n+              tensorflow::down_cast<gpu::GpuCliqueKey*>(clique_key.get()));\n+          if (absl::Status s = CheckCliqueKeyIsntStale(*gpu_clique_key);\n+              !s.ok()) {\n+            VLOG(1) << \"GPU clique key \" << gpu_clique_key->ToString()\n+                    << \" is stale\";\n+            complete_event.SetError(s);\n+            return;\n+          }\n+        }\n+\n+        complete_event.SetStateConcrete();\n       };\n \n   auto prepare_inputs ="
+        },
+        {
+            "sha": "1b98aca38c52d4e0e6c858791393785a4c8bb3ea",
+            "filename": "third_party/xla/xla/service/gpu/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/7a51446051c2be7e7f07d49080fa67c8f2f612a6/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/7a51446051c2be7e7f07d49080fa67c8f2f612a6/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2FBUILD?ref=7a51446051c2be7e7f07d49080fa67c8f2f612a6",
+            "patch": "@@ -739,6 +739,7 @@ cc_library(\n         \"//xla/backends/gpu/runtime:thunk\",\n         \"//xla/backends/gpu/runtime:thunk_checksum_tracing_pass\",\n         \"//xla/backends/gpu/runtime:thunk_pass_pipeline\",\n+        \"//xla/core/collectives:clique_key\",\n         \"//xla/hlo/ir:hlo\",\n         \"//xla/service:buffer_assignment\",\n         \"//xla/service:computation_layout\","
+        },
+        {
+            "sha": "e187523b1b0bbb1d384bb7975122a98144129dc2",
+            "filename": "third_party/xla/xla/service/gpu/gpu_executable.cc",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/7a51446051c2be7e7f07d49080fa67c8f2f612a6/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_executable.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/7a51446051c2be7e7f07d49080fa67c8f2f612a6/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_executable.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_executable.cc?ref=7a51446051c2be7e7f07d49080fa67c8f2f612a6",
+            "patch": "@@ -47,6 +47,7 @@ limitations under the License.\n #include \"xla/backends/gpu/runtime/thunk.h\"\n #include \"xla/backends/gpu/runtime/thunk_checksum_tracing_pass.h\"\n #include \"xla/backends/gpu/runtime/thunk_pass_pipeline.h\"\n+#include \"xla/core/collectives/clique_key.h\"\n #include \"xla/executable_run_options.h\"\n #include \"xla/hlo/ir/hlo_input_output_alias_config.h\"\n #include \"xla/hlo/ir/hlo_instruction.h\"\n@@ -423,6 +424,14 @@ absl::Status ExecuteThunksImpl(\n         thunk_sequence.Prepare(prepare_params, resource_requests));\n   }\n \n+  std::vector<std::unique_ptr<CliqueKey>>* clique_keys =\n+      run_options->run_options().clique_keys();\n+  if (clique_keys != nullptr) {\n+    for (const GpuCliqueKey& clique_key : resource_requests.CliqueKeys()) {\n+      clique_keys->push_back(std::make_unique<GpuCliqueKey>(clique_key));\n+    }\n+  }\n+\n   // Acquire collective cliques requested by thunks.\n   Thunk::CollectiveCliques collective_cliques;\n   if (!mock_collectives) {"
+        },
+        {
+            "sha": "015b5c08c9529d2f0b32c5120d41835fc402dc1d",
+            "filename": "third_party/xla/xla/service/gpu/resource_requests.cc",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 0,
+            "changes": 8,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/7a51446051c2be7e7f07d49080fa67c8f2f612a6/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fresource_requests.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/7a51446051c2be7e7f07d49080fa67c8f2f612a6/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fresource_requests.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fresource_requests.cc?ref=7a51446051c2be7e7f07d49080fa67c8f2f612a6",
+            "patch": "@@ -68,6 +68,14 @@ absl::Status ResourceRequests::AddClique(const GpuCliqueKey& clique_key) {\n   return absl::OkStatus();\n }\n \n+std::vector<GpuCliqueKey> ResourceRequests::CliqueKeys() const {\n+  std::vector<GpuCliqueKey> clique_keys;\n+  for (const auto& [key, unused] : cliques_) {\n+    clique_keys.push_back(key);\n+  }\n+  return clique_keys;\n+}\n+\n absl::StatusOr<Thunk::CollectiveCliques>\n ResourceRequests::AcquireCollectiveCliques(\n     const Thunk::CollectiveExecuteParams& params, bool use_persistent_cliques) {"
+        },
+        {
+            "sha": "bd751bd089823f4d4f389e849a8be6f738b62458",
+            "filename": "third_party/xla/xla/service/gpu/resource_requests.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/7a51446051c2be7e7f07d49080fa67c8f2f612a6/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fresource_requests.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/7a51446051c2be7e7f07d49080fa67c8f2f612a6/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fresource_requests.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fresource_requests.h?ref=7a51446051c2be7e7f07d49080fa67c8f2f612a6",
+            "patch": "@@ -32,6 +32,7 @@ namespace gpu {\n class ResourceRequests : public Thunk::ResourceRequestsInterface {\n  public:\n   absl::Status AddClique(const GpuCliqueKey& clique_key) final;\n+  std::vector<GpuCliqueKey> CliqueKeys() const;\n \n   absl::StatusOr<Thunk::CollectiveCliques> AcquireCollectiveCliques(\n       const Thunk::CollectiveExecuteParams& params,"
+        }
+    ],
+    "stats": {
+        "total": 105,
+        "additions": 87,
+        "deletions": 18
+    }
+}

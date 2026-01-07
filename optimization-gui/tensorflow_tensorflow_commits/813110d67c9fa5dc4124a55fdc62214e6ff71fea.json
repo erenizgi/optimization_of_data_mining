@@ -1,0 +1,96 @@
+{
+    "author": "khasanovaa",
+    "message": "Add de/serialization for XLA FFI `ExecutionState`.\n\n* add `ExecutionStateProto` and methods to convert `ExecutionState` to and from this proto\n* `TypeRegistry` is extended with `GetTypeName(TypeId)` method that maps from TypeId to name\n* `TypeInfo` is iextended with serializer and deserializer function pointers, allowing custom types to define how they are serialized\n\nThis is a step towards shifting custom kernel compilation from runtime to the XLA compilation phase.\n\nPiperOrigin-RevId: 840318851",
+    "sha": "813110d67c9fa5dc4124a55fdc62214e6ff71fea",
+    "files": [
+        {
+            "sha": "898d6621fa964fc4fa1de16825930bde4d219f8f",
+            "filename": "third_party/xla/xla/ffi/BUILD",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 1,
+            "changes": 10,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/813110d67c9fa5dc4124a55fdc62214e6ff71fea/third_party%2Fxla%2Fxla%2Fffi%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/813110d67c9fa5dc4124a55fdc62214e6ff71fea/third_party%2Fxla%2Fxla%2Fffi%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fffi%2FBUILD?ref=813110d67c9fa5dc4124a55fdc62214e6ff71fea",
+            "patch": "@@ -105,14 +105,16 @@ cc_library(\n     srcs = [\"execution_state.cc\"],\n     hdrs = [\"execution_state.h\"],\n     deps = [\n+        \":execution_state_proto_cc\",\n         \":type_registry\",\n         \"//xla:util\",\n+        \"//xla/tsl/platform:errors\",\n         \"//xla/tsl/platform:statusor\",\n         \"//xla/tsl/util:safe_reinterpret_cast\",\n-        \"@com_google_absl//absl/base:core_headers\",\n         \"@com_google_absl//absl/log:check\",\n         \"@com_google_absl//absl/status\",\n         \"@com_google_absl//absl/status:statusor\",\n+        \"@com_google_absl//absl/strings:string_view\",\n     ],\n )\n \n@@ -125,6 +127,7 @@ xla_cc_test(\n         \"//xla/tsl/lib/core:status_test_util\",\n         \"//xla/tsl/platform:statusor\",\n         \"//xla/tsl/platform:test\",\n+        \"@com_google_absl//absl/status:statusor\",\n         \"@com_google_googletest//:gtest\",\n         \"@com_google_googletest//:gtest_main\",\n     ],\n@@ -273,6 +276,11 @@ tf_proto_library(\n     srcs = [\"attribute_map.proto\"],\n )\n \n+tf_proto_library(\n+    name = \"execution_state_proto\",\n+    srcs = [\"execution_state.proto\"],\n+)\n+\n xla_cc_test(\n     name = \"ffi_test\",\n     srcs = [\"ffi_test.cc\"],"
+        },
+        {
+            "sha": "8f5f5fd902b8b121eb5effade6db765b86091c83",
+            "filename": "third_party/xla/xla/ffi/execution_state.cc",
+            "status": "modified",
+            "additions": 48,
+            "deletions": 0,
+            "changes": 48,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/813110d67c9fa5dc4124a55fdc62214e6ff71fea/third_party%2Fxla%2Fxla%2Fffi%2Fexecution_state.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/813110d67c9fa5dc4124a55fdc62214e6ff71fea/third_party%2Fxla%2Fxla%2Fffi%2Fexecution_state.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fffi%2Fexecution_state.cc?ref=813110d67c9fa5dc4124a55fdc62214e6ff71fea",
+            "patch": "@@ -15,10 +15,16 @@ limitations under the License.\n \n #include \"xla/ffi/execution_state.h\"\n \n+#include <string>\n+#include <utility>\n+\n #include \"absl/log/check.h\"\n #include \"absl/status/status.h\"\n #include \"absl/status/statusor.h\"\n+#include \"absl/strings/string_view.h\"\n+#include \"xla/ffi/execution_state.pb.h\"\n #include \"xla/ffi/type_registry.h\"\n+#include \"xla/tsl/platform/errors.h\"\n #include \"xla/tsl/platform/statusor.h\"\n #include \"xla/util.h\"\n \n@@ -74,6 +80,48 @@ absl::StatusOr<void*> ExecutionState::Get(TypeId type_id) const {\n \n   return state_;\n }\n+absl::StatusOr<ExecutionStateProto> ExecutionState::ToProto() const {\n+  if (!IsSet()) {\n+    return ExecutionStateProto();\n+  }\n+  if (!type_info_.serializer) {\n+    return InvalidArgument(\"Type id %d does not have a registered serializer\",\n+                           type_id_.value());\n+  }\n+\n+  TF_ASSIGN_OR_RETURN(absl::string_view type_name,\n+                      TypeRegistry::GetTypeName(type_id_));\n+  TF_ASSIGN_OR_RETURN(std::string state, type_info_.serializer(state_));\n+\n+  ExecutionStateProto proto;\n+  proto.set_type_name(type_name);\n+  *proto.mutable_state() = std::move(state);\n+  return proto;\n+}\n+\n+absl::StatusOr<ExecutionState> ExecutionState::FromProto(\n+    const ExecutionStateProto& proto) {\n+  ExecutionState state;\n+  if (proto.type_name().empty()) {\n+    return state;\n+  }\n+\n+  TF_ASSIGN_OR_RETURN(TypeId type_id,\n+                      TypeRegistry::GetTypeId(proto.type_name()));\n+  TF_ASSIGN_OR_RETURN(TypeInfo type_info, TypeRegistry::GetTypeInfo(type_id));\n+\n+  if (!type_info.deserializer) {\n+    return InvalidArgument(\n+        \"Type name %s does not have a registered deserializer\",\n+        proto.type_name());\n+  }\n+\n+  TF_ASSIGN_OR_RETURN(void* opaque_state,\n+                      type_info.deserializer(proto.state()));\n+\n+  TF_RETURN_IF_ERROR(state.Set(type_id, type_info, opaque_state));\n+  return state;\n+}\n \n bool ExecutionState::IsSet() const {\n   return type_id_ != TypeRegistry::kUnknownTypeId;"
+        },
+        {
+            "sha": "17308665653dc6010ef282e87c0b3f29df36ca05",
+            "filename": "third_party/xla/xla/ffi/execution_state.h",
+            "status": "modified",
+            "additions": 22,
+            "deletions": 0,
+            "changes": 22,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/813110d67c9fa5dc4124a55fdc62214e6ff71fea/third_party%2Fxla%2Fxla%2Fffi%2Fexecution_state.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/813110d67c9fa5dc4124a55fdc62214e6ff71fea/third_party%2Fxla%2Fxla%2Fffi%2Fexecution_state.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fffi%2Fexecution_state.h?ref=813110d67c9fa5dc4124a55fdc62214e6ff71fea",
+            "patch": "@@ -20,6 +20,7 @@ limitations under the License.\n \n #include \"absl/status/status.h\"\n #include \"absl/status/statusor.h\"\n+#include \"xla/ffi/execution_state.pb.h\"\n #include \"xla/ffi/type_registry.h\"\n #include \"xla/tsl/platform/statusor.h\"\n #include \"xla/tsl/util/safe_reinterpret_cast.h\"\n@@ -50,6 +51,23 @@ class ExecutionState {\n   ExecutionState(const ExecutionState&) = delete;\n   ExecutionState& operator=(const ExecutionState&) = delete;\n \n+  ExecutionState(ExecutionState&& other) { *this = std::move(other); }\n+  ExecutionState& operator=(ExecutionState&& other) {\n+    if (this != &other) {\n+      if (type_info_.deleter) {\n+        type_info_.deleter(state_);\n+      }\n+      type_id_ = other.type_id_;\n+      type_info_ = other.type_info_;\n+      state_ = other.state_;\n+\n+      other.type_id_ = TypeRegistry::kUnknownTypeId;\n+      other.type_info_ = {};\n+      other.state_ = nullptr;\n+    }\n+    return *this;\n+  }\n+\n   // Sets opaque state with a given type id. Returns an error if state is\n   // already set, or if type id is not supported as a state.\n   absl::Status Set(TypeId type_id, void* state);\n@@ -58,6 +76,10 @@ class ExecutionState {\n   // match the requested one, returns an error.\n   absl::StatusOr<void*> Get(TypeId type_id) const;\n \n+  absl::StatusOr<ExecutionStateProto> ToProto() const;\n+  static absl::StatusOr<ExecutionState> FromProto(\n+      const ExecutionStateProto& proto);\n+\n   // Sets typed state of type `T` and optional deleter. Returns an\n   // error if state is already set.\n   template <typename T>"
+        },
+        {
+            "sha": "f1104efa45f7f0f6918ee45b93ca42258ec77116",
+            "filename": "third_party/xla/xla/ffi/execution_state.proto",
+            "status": "added",
+            "additions": 11,
+            "deletions": 0,
+            "changes": 11,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/813110d67c9fa5dc4124a55fdc62214e6ff71fea/third_party%2Fxla%2Fxla%2Fffi%2Fexecution_state.proto",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/813110d67c9fa5dc4124a55fdc62214e6ff71fea/third_party%2Fxla%2Fxla%2Fffi%2Fexecution_state.proto",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fffi%2Fexecution_state.proto?ref=813110d67c9fa5dc4124a55fdc62214e6ff71fea",
+            "patch": "@@ -0,0 +1,11 @@\n+syntax = \"proto3\";\n+\n+package xla.ffi;\n+\n+option java_multiple_files = true;\n+option java_outer_classname = \"ExecutionState\";\n+\n+message ExecutionStateProto {\n+  string type_name = 1;\n+  bytes state = 2;\n+}"
+        },
+        {
+            "sha": "e5ca8c3bb108e70bc3e1bc577b5b239543091725",
+            "filename": "third_party/xla/xla/ffi/execution_state_test.cc",
+            "status": "modified",
+            "additions": 33,
+            "deletions": 0,
+            "changes": 33,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/813110d67c9fa5dc4124a55fdc62214e6ff71fea/third_party%2Fxla%2Fxla%2Fffi%2Fexecution_state_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/813110d67c9fa5dc4124a55fdc62214e6ff71fea/third_party%2Fxla%2Fxla%2Fffi%2Fexecution_state_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fffi%2Fexecution_state_test.cc?ref=813110d67c9fa5dc4124a55fdc62214e6ff71fea",
+            "patch": "@@ -17,9 +17,11 @@ limitations under the License.\n \n #include <cstdint>\n #include <memory>\n+#include <string>\n \n #include <gmock/gmock.h>\n #include <gtest/gtest.h>\n+#include \"absl/status/statusor.h\"\n #include \"xla/ffi/type_registry.h\"\n #include \"xla/tsl/lib/core/status_test_util.h\"\n #include \"xla/tsl/platform/statusor.h\"\n@@ -83,4 +85,35 @@ TEST(ExecutionStateTest, SetAndGetForExternalType) {\n   EXPECT_EQ(data, value);\n }\n \n+TEST(ExecutionStateTest, Serialization) {\n+  struct MyState {\n+    std::string value;\n+  };\n+\n+  TypeRegistry::TypeInfo type_info = {\n+      /*deleter=*/\n+      [](void* ptr) { delete static_cast<MyState*>(ptr); },\n+      /*serializer=*/\n+      [](const void* ptr) -> absl::StatusOr<std::string> {\n+        return static_cast<const MyState*>(ptr)->value;\n+      },\n+      /*deserializer=*/\n+      [](absl::string_view state) -> absl::StatusOr<void*> {\n+        return new MyState{std::string(state)};\n+      }};\n+  TF_ASSERT_OK_AND_ASSIGN(\n+      TypeRegistry::TypeId type_id,\n+      TypeRegistry::AssignExternalTypeId(\"my_state_type\", type_info));\n+\n+  ExecutionState state;\n+  TF_ASSERT_OK(state.Set(type_id, new MyState{\"some_state_data\"}));\n+\n+  TF_ASSERT_OK_AND_ASSIGN(ExecutionStateProto proto, state.ToProto());\n+\n+  TF_ASSERT_OK_AND_ASSIGN(ExecutionState round_trip,\n+                          ExecutionState::FromProto(proto))\n+  TF_ASSERT_OK_AND_ASSIGN(void* round_trip_data, round_trip.Get(type_id));\n+  EXPECT_EQ(static_cast<MyState*>(round_trip_data)->value, \"some_state_data\");\n+}\n+\n }  // namespace xla::ffi"
+        },
+        {
+            "sha": "9036f58a334eb10c3072e8cbfd4d11a062fe3074",
+            "filename": "third_party/xla/xla/ffi/type_registry.cc",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 0,
+            "changes": 15,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/813110d67c9fa5dc4124a55fdc62214e6ff71fea/third_party%2Fxla%2Fxla%2Fffi%2Ftype_registry.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/813110d67c9fa5dc4124a55fdc62214e6ff71fea/third_party%2Fxla%2Fxla%2Fffi%2Ftype_registry.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fffi%2Ftype_registry.cc?ref=813110d67c9fa5dc4124a55fdc62214e6ff71fea",
+            "patch": "@@ -108,6 +108,21 @@ absl::Status TypeRegistry::RegisterExternalTypeId(absl::string_view name,\n   return absl::OkStatus();\n }\n \n+absl::StatusOr<absl::string_view> TypeRegistry::GetTypeName(TypeId type_id) {\n+  absl::MutexLock lock(type_registry_mutex);\n+  auto& registry = StaticTypeRegistryMap();\n+\n+  auto it = absl::c_find_if(\n+      registry, [&](const auto& kv) { return kv.second.type_id == type_id; });\n+\n+  if (it == registry.end()) {\n+    return Internal(\"Type id %d is not registered with a static registry\",\n+                    type_id.value());\n+  }\n+\n+  return it->first;\n+}\n+\n absl::StatusOr<TypeRegistry::TypeId> TypeRegistry::GetTypeId(\n     absl::string_view name) {\n   absl::MutexLock lock(type_registry_mutex);"
+        },
+        {
+            "sha": "d08ad80f015f5951fb1a7c2a7d8b9f56ceb16b1c",
+            "filename": "third_party/xla/xla/ffi/type_registry.h",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/813110d67c9fa5dc4124a55fdc62214e6ff71fea/third_party%2Fxla%2Fxla%2Fffi%2Ftype_registry.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/813110d67c9fa5dc4124a55fdc62214e6ff71fea/third_party%2Fxla%2Fxla%2Fffi%2Ftype_registry.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fffi%2Ftype_registry.h?ref=813110d67c9fa5dc4124a55fdc62214e6ff71fea",
+            "patch": "@@ -17,6 +17,7 @@ limitations under the License.\n #define XLA_FFI_TYPE_REGISTRY_H_\n \n #include <cstdint>\n+#include <string>\n \n #include \"absl/base/no_destructor.h\"\n #include \"absl/status/status.h\"\n@@ -61,10 +62,18 @@ class TypeRegistry {\n   // Pointers to functions that allow XLA runtime to manipulate external types.\n   struct TypeInfo {\n     using Deleter = void (*)(void*);\n+    using Serializer = absl::StatusOr<std::string> (*)(const void*);\n+    using Deserializer = absl::StatusOr<void*> (*)(absl::string_view);\n \n     Deleter deleter = nullptr;\n+    Serializer serializer = nullptr;\n+    Deserializer deserializer = nullptr;\n   };\n \n+  // Returns type name for a given type id. Returns an error if type id is not\n+  // registered. Works for both external and internal type ids.\n+  static absl::StatusOr<absl::string_view> GetTypeName(TypeId type_id);\n+\n   // Returns type id for a given type name. Returns an error if type is\n   // not registered. Works for both external and internal type ids.\n   static absl::StatusOr<TypeId> GetTypeId(absl::string_view name);"
+        }
+    ],
+    "stats": {
+        "total": 148,
+        "additions": 147,
+        "deletions": 1
+    }
+}

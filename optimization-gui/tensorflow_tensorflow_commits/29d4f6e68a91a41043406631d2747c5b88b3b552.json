@@ -1,0 +1,36 @@
+{
+    "author": "serach24",
+    "message": "PR #31063: Fix a shifting issue in scatter determinism expander\n\nImported from GitHub PR https://github.com/openxla/xla/pull/31063\n\n📝 Summary of Changes\nThis change fixes a bug in the scatter_determinism_expander pass that produced incorrect results for scatter_set operations when the scatter indices contained the value 0. The issue was caused by an interaction between the prefix scan's zero-padding and an index of 0, leading to an incorrect internal mask. The fix explicitly sets the first element of this mask to False, ensuring the correct value is written to index 0.\n\n🎯 Justification\nThis change is crucial for correctness. The bug (reported in [jax-ml/jax#27796](https://github.com/jax-ml/jax/issues/27796)) causes silent data corruption in deterministic scatter operations when index 0 is used. Any workload relying on scatter_set with deterministic ordering will benefit from this fix, as it guarantees the integrity of the output.\n\n🚀 Kind of Contribution\n🐛 Bug Fix\n\n📊 Benchmark (for Performance Improvements)\nN/A - This is a correctness bug fix, not a performance improvement.\n\n🧪 Unit Tests\nThis change fixes existing unit tests that were previously failing due to this bug. The tests that now pass correctly cover scatter_set operations where the scatter indices include 0, validating that the transformation in scatter_determinism_expander produces the correct HLO and final result.\n\n🧪 Execution Tests\nNo new end-to-end execution tests were added. The correctness of the fix is sufficiently verified by the updated unit tests, which now pass and specifically target the failing case.\nCopybara import of the project:\n\n--\n8c0625d0dff76058b693b99297925dc49d19eddb by Chenhao Jiang <chenhaoj@nvidia.com>:\n\nFix a shifting issue in scatter determinism expander\n\nMerging this change closes #31063\n\nPiperOrigin-RevId: 804794064",
+    "sha": "29d4f6e68a91a41043406631d2747c5b88b3b552",
+    "files": [
+        {
+            "sha": "b14e20fb27a7444e18f25f2b742803dc6d2b0c7e",
+            "filename": "third_party/xla/xla/service/scatter_determinism_expander.cc",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/29d4f6e68a91a41043406631d2747c5b88b3b552/third_party%2Fxla%2Fxla%2Fservice%2Fscatter_determinism_expander.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/29d4f6e68a91a41043406631d2747c5b88b3b552/third_party%2Fxla%2Fxla%2Fservice%2Fscatter_determinism_expander.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fscatter_determinism_expander.cc?ref=29d4f6e68a91a41043406631d2747c5b88b3b552",
+            "patch": "@@ -368,6 +368,15 @@ static absl::StatusOr<HloInstruction*> CreateScanWithIndices(\n     auto* indices_mask = parent->AddInstruction(HloInstruction::CreateCompare(\n         ShapeUtil::MakeShape(PRED, {num_updates}), indices,\n         concatenated_indices, ComparisonDirection::kEq));\n+    auto* first_element_false = parent->AddInstruction(\n+        HloInstruction::CreateConstant(LiteralUtil::CreateR1<bool>({false})));\n+    auto* remaining_mask = parent->AddInstruction(HloInstruction::CreateSlice(\n+        ShapeUtil::MakeShape(PRED, {num_updates - 1}), indices_mask, {1},\n+        {num_updates}, {1}));\n+    indices_mask = parent->AddInstruction(HloInstruction::CreateConcatenate(\n+        ShapeUtil::MakeShape(PRED, {num_updates}),\n+        {first_element_false, remaining_mask}, 0));\n+\n     std::vector<HloInstruction*> map_operands = {current_updates,\n                                                  concatenated_updates};\n     TF_ASSIGN_OR_RETURN(HloInstruction * reduced_updates,"
+        },
+        {
+            "sha": "9ceb46b89a084f48dab48cb58f0bf2d6124be694",
+            "filename": "third_party/xla/xla/service/scatter_determinism_expander_test.cc",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 1,
+            "changes": 5,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/29d4f6e68a91a41043406631d2747c5b88b3b552/third_party%2Fxla%2Fxla%2Fservice%2Fscatter_determinism_expander_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/29d4f6e68a91a41043406631d2747c5b88b3b552/third_party%2Fxla%2Fxla%2Fservice%2Fscatter_determinism_expander_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fscatter_determinism_expander_test.cc?ref=29d4f6e68a91a41043406631d2747c5b88b3b552",
+            "patch": "@@ -883,18 +883,21 @@ TEST_F(ScatterDeterminismExpanderTest, ScatterAddHloVerificationTest) {\n     CHECK-DAG:   %[[CONSTANT:.*]] = s32[1]{0} constant({2})\n     CHECK-DAG:   %[[BROADCAST0:.*]] = s32[2,1]{1,0} broadcast(%[[CONSTANT]]), dimensions={1}\n     CHECK-DAG:   %[[SELECT1:.*]] = s32[2,1]{1,0} select(%[[BROADCAST3]], %[[RESHAPE5]], %[[BROADCAST0]])\n+    CHECK-DAG:   %[[FALSE:.*]] = pred[1]{0} constant({0})\n     CHECK-DAG:   %[[CONSTANT2:.*]] = s32[] constant(0)\n     CHECK-DAG:   %[[BROADCAST1:.*]] = s32[1]{0} broadcast(%[[CONSTANT2]]), dimensions={}\n     CHECK-DAG:   %[[SLICE1:.*]] = s32[1]{0} slice(%[[GET_TUPLE_ELEMENT]]), slice={[0:1]}\n     CHECK-DAG:   %[[CONCATENATE1:.*]] = s32[2]{0} concatenate(%[[BROADCAST1]], %[[SLICE1]]), dimensions={0}\n     CHECK-DAG:   %[[COMPARE1:.*]] = pred[2]{0} compare(%[[GET_TUPLE_ELEMENT]], %[[CONCATENATE1]]), direction=EQ\n+    CHECK-DAG:   %[[SLICE2:.*]] = pred[1]{0} slice(%[[COMPARE1]]), slice={[1:2]}\n+    CHECK-DAG:   %[[CONCATENATE3:.*]] = pred[2]{0} concatenate(%[[FALSE]], %[[SLICE2]]), dimensions={0}\n     CHECK-DAG:   %[[GET_TUPLE_ELEMENT1:.*]] = f32[2]{0} get-tuple-element(%[[SORT]]), index=1\n     CHECK-DAG:   %[[CONSTANT1:.*]] = f32[] constant(0)\n     CHECK-DAG:   %[[BROADCAST:.*]] = f32[1]{0} broadcast(%[[CONSTANT1]]), dimensions={}\n     CHECK-DAG:   %[[SLICE:.*]] = f32[1]{0} slice(%[[GET_TUPLE_ELEMENT1]]), slice={[0:1]}\n     CHECK-DAG:   %[[CONCATENATE:.*]] = f32[2]{0} concatenate(%[[BROADCAST]], %[[SLICE]]), dimensions={0}\n     CHECK-DAG:   %[[MAP:.*]] = f32[2]{0} map(%[[GET_TUPLE_ELEMENT1]], %[[CONCATENATE]]), dimensions={0}, to_apply=%scatter_computation\n-    CHECK-DAG:   %[[SELECT:.*]] = f32[2]{0} select(%[[COMPARE1]], %[[MAP]], %[[GET_TUPLE_ELEMENT1]])\n+    CHECK-DAG:   %[[SELECT:.*]] = f32[2]{0} select(%[[CONCATENATE3]], %[[MAP]], %[[GET_TUPLE_ELEMENT1]])\n     CHECK-DAG:  ROOT %[[SCATTER:.*]] = f32[2]{0} scatter(%[[OPERAND]], %[[SELECT1]], %[[SELECT]]),\n     CHECK-SAME:   update_window_dims={},\n     CHECK-SAME:   inserted_window_dims={0},"
+        }
+    ],
+    "stats": {
+        "total": 14,
+        "additions": 13,
+        "deletions": 1
+    }
+}

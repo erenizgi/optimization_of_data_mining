@@ -1,0 +1,36 @@
+{
+    "author": "gspschmid",
+    "message": "PR #34110: [pjrt] Add cuda_version attribute to GPU plugin\n\nImported from GitHub PR https://github.com/openxla/xla/pull/34110\n\n📝 Summary of Changes\nAdds a C API plugin attribute `cuda_version` that's set to the cuda runtime version the plugin was compiled against. The verison may be queried from JAX, e.g.,\n```bash\n$ python3 -c \"import jax.extend; print(jax.extend.backend.get_backend().cuda_version)\"\n13000\n```\n\n🎯 Justification\nThis allows CUDA-version-specific packages to detect the CUDA version present in JAX. See also https://github.com/jax-ml/jax/issues/32729\n\n🚀 Kind of Contribution\nNew Feature\n\n📊 Benchmark (for Performance Improvements)\nN/A\n\n🧪 Unit Tests:\nNone\n\n🧪 Execution Tests:\nNone\n\ncc @skye\nCopybara import of the project:\n\n--\nc8b9097739f4416a6e5939ae8102d7141ecc03a2 by Georg Stefan Schmid <gschmid@nvidia.com>:\n\n[pjrt] Add cuda_version attribute to GPU plugin\n\nMerging this change closes #34110\n\nPiperOrigin-RevId: 842948422",
+    "sha": "a44a6d3d75c4b8ee48ce8d165efd40f5a51cddba",
+    "files": [
+        {
+            "sha": "203269226200e86411152a7fbea282eedb24d662",
+            "filename": "third_party/xla/xla/pjrt/c/BUILD",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 2,
+            "changes": 10,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a44a6d3d75c4b8ee48ce8d165efd40f5a51cddba/third_party%2Fxla%2Fxla%2Fpjrt%2Fc%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a44a6d3d75c4b8ee48ce8d165efd40f5a51cddba/third_party%2Fxla%2Fxla%2Fpjrt%2Fc%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fc%2FBUILD?ref=a44a6d3d75c4b8ee48ce8d165efd40f5a51cddba",
+            "patch": "@@ -417,7 +417,11 @@ cc_library(\n     name = \"pjrt_c_api_gpu_internal\",\n     srcs = [\"pjrt_c_api_gpu_internal.cc\"],\n     hdrs = [\"pjrt_c_api_gpu_internal.h\"],\n-    local_defines = if_rocm_is_configured([\"TENSORFLOW_USE_ROCM=1\"]),\n+    local_defines = (\n+        if_cuda_is_configured([\"GOOGLE_CUDA=1\"]) + if_rocm_is_configured([\n+            \"TENSORFLOW_USE_ROCM=1\",\n+        ])\n+    ),\n     visibility = [\"//visibility:public\"],\n     deps = [\n         \":pjrt_c_api_custom_partitioner_extension_hdrs\",\n@@ -462,7 +466,9 @@ cc_library(\n         \"@com_google_absl//absl/container:flat_hash_map\",\n         \"@com_google_absl//absl/status\",\n         \"@com_google_absl//absl/strings:str_format\",\n-    ],\n+    ] + if_cuda_is_configured([\n+        \"@local_config_cuda//cuda:cuda_headers\",\n+    ]),\n )\n \n cc_library("
+        },
+        {
+            "sha": "dd5fa7400a7ccb7caea1f2adc16d5d11fcff0370",
+            "filename": "third_party/xla/xla/pjrt/c/pjrt_c_api_gpu_internal.cc",
+            "status": "modified",
+            "additions": 49,
+            "deletions": 1,
+            "changes": 50,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a44a6d3d75c4b8ee48ce8d165efd40f5a51cddba/third_party%2Fxla%2Fxla%2Fpjrt%2Fc%2Fpjrt_c_api_gpu_internal.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a44a6d3d75c4b8ee48ce8d165efd40f5a51cddba/third_party%2Fxla%2Fxla%2Fpjrt%2Fc%2Fpjrt_c_api_gpu_internal.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fc%2Fpjrt_c_api_gpu_internal.cc?ref=a44a6d3d75c4b8ee48ce8d165efd40f5a51cddba",
+            "patch": "@@ -59,6 +59,10 @@ limitations under the License.\n #include \"xla/service/compiler.h\"\n #include \"xla/service/custom_call_target_registry.h\"\n \n+#if GOOGLE_CUDA\n+#include \"third_party/gpus/cuda/include/cuda_runtime_api.h\"\n+#endif  // GOOGLE_CUDA\n+\n namespace pjrt {\n namespace gpu_plugin {\n \n@@ -322,6 +326,50 @@ PJRT_Error* PJRT_GpuDeviceTopology_Create(\n   return nullptr;\n }\n \n+#if GOOGLE_CUDA && defined(CUDART_VERSION)  // cuda\n+namespace {\n+\n+const std::vector<PJRT_NamedValue>* MakeCudaPluginCAttributes() {\n+  std::vector<PJRT_NamedValue>* attributes = new std::vector<PJRT_NamedValue>();\n+  const std::vector<PJRT_NamedValue>& base_attributes =\n+      pjrt::GetXlaPluginCAttributes();\n+  attributes->reserve(base_attributes.size() + 1);\n+  attributes->assign(base_attributes.begin(), base_attributes.end());\n+  {\n+    // Include the cuda_version attribute.\n+    PJRT_NamedValue c_value;\n+    c_value.struct_size = PJRT_NamedValue_STRUCT_SIZE;\n+    c_value.extension_start = nullptr;\n+    absl::string_view name = \"cuda_version\";\n+    c_value.name = name.data();\n+    c_value.name_size = name.size();\n+    c_value.type = PJRT_NamedValue_Type::PJRT_NamedValue_kInt64;\n+    c_value.int64_value = CUDART_VERSION;\n+    c_value.value_size = 1;\n+    attributes->push_back(c_value);\n+  }\n+  return attributes;\n+}\n+\n+}  // namespace\n+#endif\n+\n+PJRT_Error* PJRT_Plugin_Attributes_Gpu(PJRT_Plugin_Attributes_Args* args) {\n+  PJRT_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(\n+      \"PJRT_Plugin_Attributes_Args\", PJRT_Plugin_Attributes_Args_STRUCT_SIZE,\n+      args->struct_size));\n+#if GOOGLE_CUDA && defined(CUDART_VERSION)  // cuda\n+  static const std::vector<PJRT_NamedValue>* attributes =\n+      MakeCudaPluginCAttributes();\n+#else\n+  const std::vector<PJRT_NamedValue>* attributes =\n+      &pjrt::GetXlaPluginCAttributes();\n+#endif\n+  args->num_attributes = attributes->size();\n+  args->attributes = attributes->data();\n+  return nullptr;\n+}\n+\n PLUGIN_Profiler_Api profiler_api{\n     /*struct_size=*/PLUGIN_Profiler_Api_STRUCT_SIZE,\n     /*priv=*/nullptr,\n@@ -470,7 +518,7 @@ const PJRT_Api* GetGpuPjrtApi() {\n       pjrt::gpu_plugin::PJRT_ExecuteContext_Create,\n       pjrt::gpu_plugin::PJRT_GpuDeviceTopology_Create,\n       pjrt::PJRT_Plugin_Initialize_NoOp, &cross_host_transfers_extension.base,\n-      pjrt::PJRT_Plugin_Attributes_Xla);\n+      pjrt::gpu_plugin::PJRT_Plugin_Attributes_Gpu);\n \n   return &pjrt_api;\n }"
+        }
+    ],
+    "stats": {
+        "total": 60,
+        "additions": 57,
+        "deletions": 3
+    }
+}

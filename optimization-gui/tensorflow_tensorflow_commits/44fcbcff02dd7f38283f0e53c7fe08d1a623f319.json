@@ -1,0 +1,48 @@
+{
+    "author": "liepieshov",
+    "message": "Convert FuncResultSharding for nested functions to ShardingConstraint with open dimensions.\n\nRight now if FuncResultSharding is set to sharding of function result (return) the propagation propagates factors without pushing any closed dimensions on the operand.\n\nHowever when FuncResultSharding for nested functions is converted to ShardingConstraint, this ShardingConstraint pushes it's sharding to the operand closing its dimensions.\n\nWith this change we make this ShardingConstraint be more similar in terms of propagation logic to what happens with main function result sharding.\n\nPiperOrigin-RevId: 817127465",
+    "sha": "44fcbcff02dd7f38283f0e53c7fe08d1a623f319",
+    "files": [
+        {
+            "sha": "219dc65be09e5ccaa473aeb81f5819502433a506",
+            "filename": "third_party/xla/xla/service/spmd/shardy/sdy_round_trip/import_shardy_attrs.cc",
+            "status": "modified",
+            "additions": 20,
+            "deletions": 4,
+            "changes": 24,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/44fcbcff02dd7f38283f0e53c7fe08d1a623f319/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Fsdy_round_trip%2Fimport_shardy_attrs.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/44fcbcff02dd7f38283f0e53c7fe08d1a623f319/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Fsdy_round_trip%2Fimport_shardy_attrs.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Fsdy_round_trip%2Fimport_shardy_attrs.cc?ref=44fcbcff02dd7f38283f0e53c7fe08d1a623f319",
+            "patch": "@@ -19,12 +19,11 @@ limitations under the License.\n #include <cstdint>\n #include <memory>\n #include <optional>\n-#include <string_view>\n \n #include \"absl/functional/any_invocable.h\"\n #include \"absl/log/check.h\"\n-#include \"absl/log/log.h\"\n #include \"llvm/ADT/STLExtras.h\"\n+#include \"llvm/ADT/SmallVector.h\"\n #include \"llvm/ADT/StringRef.h\"\n #include \"llvm/Support/LogicalResult.h\"\n #include \"mlir/AsmParser/AsmParser.h\"\n@@ -107,6 +106,21 @@ CustomCallOp getX64CombineOnFuncResultSharding(\n   return dynCastX64CombineCustomCall(lhsUser);\n }\n \n+// TODO(kostiantynl): b/448858211 when API is fixed, use\n+// sharding.openShardingDims() instead.\n+TensorShardingAttr openShardingDims(TensorShardingAttr sharding) {\n+  llvm::SmallVector<mlir::sdy::DimensionShardingAttr> dimShardings(\n+      sharding.getDimShardings().begin(), sharding.getDimShardings().end());\n+  for (auto& dimSharding : dimShardings) {\n+    dimSharding = mlir::sdy::DimensionShardingAttr::get(\n+        sharding.getContext(), dimSharding.getAxes(), /*isClosed=*/false,\n+        /*priority=*/dimSharding.getPriority());\n+  }\n+  return TensorShardingAttr::get(sharding.getContext(), sharding.getMeshOrRef(),\n+                                 dimShardings, sharding.getReplicatedAxes(),\n+                                 sharding.getUnreducedAxes());\n+}\n+\n void handleFuncResultSharding(CustomCallOp funcResultSharding, FuncOp funcOp,\n                               DictionaryAttr dictAttr, IRRewriter& rewriter) {\n   // This is a temporary CustomCallOp that holds the sharding from a\n@@ -147,11 +161,13 @@ void handleFuncResultSharding(CustomCallOp funcResultSharding, FuncOp funcOp,\n     // If there are users that are not the func return op, which might happen\n     // due to inlined func ops that originally had result shardings, we replace\n     // the `xla.sdy.FuncResultSharding` with a `ShardingConstraintOp` to\n-    // preserve the original func result sharding.\n+    // preserve the original func result sharding, but open all sharding\n+    // dimensions.\n     rewriter.setInsertionPoint(funcResultSharding);\n     CHECK_EQ(funcResultSharding.getNumOperands(), 1);\n     rewriter.replaceOpWithNewOp<mlir::sdy::ShardingConstraintOp>(\n-        funcResultSharding, funcResultSharding.getOperand(0), sharding);\n+        funcResultSharding, funcResultSharding.getOperand(0),\n+        openShardingDims(sharding));\n   } else {\n     rewriter.replaceOp(funcResultSharding, funcResultSharding.getOperands());\n   }"
+        },
+        {
+            "sha": "2981bb1c0c3574afdae2ab5a25787a3e11564447",
+            "filename": "third_party/xla/xla/service/spmd/shardy/test/sdy_round_trip_export_inline_round_trip.mlir",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/44fcbcff02dd7f38283f0e53c7fe08d1a623f319/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Ftest%2Fsdy_round_trip_export_inline_round_trip.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/44fcbcff02dd7f38283f0e53c7fe08d1a623f319/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Ftest%2Fsdy_round_trip_export_inline_round_trip.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Ftest%2Fsdy_round_trip_export_inline_round_trip.mlir?ref=44fcbcff02dd7f38283f0e53c7fe08d1a623f319",
+            "patch": "@@ -15,7 +15,7 @@ func.func @main(%arg0: tensor<8x16xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"\n     -> (tensor<8x16xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"c\"}, {}]>}) {\n   // CHECK-NEXT: %[[ADD_0:.*]] = stablehlo.add %arg0, %arg0 : tensor<8x16xf32>\n   // CHECK-NEXT: %[[MUL:.*]] = stablehlo.multiply %[[ADD_0]], %[[ADD_0]] : tensor<8x16xf32>\n-  // CHECK-NEXT: %[[SC:.*]] = sdy.sharding_constraint %[[MUL]] <@mesh, [{}, {\"b\"}]> : tensor<8x16xf32>\n+  // CHECK-NEXT: %[[SC:.*]] = sdy.sharding_constraint %[[MUL]] <@mesh, [{?}, {\"b\", ?}]> : tensor<8x16xf32>\n   // CHECK-NEXT: %[[ADD_1:.*]] = stablehlo.add %[[SC]], %[[SC]] : tensor<8x16xf32>\n   // CHECK-NEXT: return %[[ADD_1]] : tensor<8x16xf32>\n   %0 = stablehlo.add %arg0, %arg0 : tensor<8x16xf32>"
+        },
+        {
+            "sha": "5f71f60e88fe5a5f50d9b4fa196eaf4786d6fdd2",
+            "filename": "third_party/xla/xla/service/spmd/shardy/test/sdy_round_trip_import_pipeline.mlir",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 3,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/44fcbcff02dd7f38283f0e53c7fe08d1a623f319/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Ftest%2Fsdy_round_trip_import_pipeline.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/44fcbcff02dd7f38283f0e53c7fe08d1a623f319/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Ftest%2Fsdy_round_trip_import_pipeline.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Ftest%2Fsdy_round_trip_import_pipeline.mlir?ref=44fcbcff02dd7f38283f0e53c7fe08d1a623f319",
+            "patch": "@@ -77,9 +77,9 @@ module @multiple_func_result_shardings attributes {mhlo.frontend_attributes = {x\n   func.func @func_result_shardings_used_by_other_ops(\n     %arg0: tensor<32xi32>, %arg1: tensor<32xi32>\n   ) -> (tensor<32xi32>, tensor<32xi32>) {\n-    // CHECK-NEXT: %[[SC0:.*]] = sdy.sharding_constraint %arg0 <@mesh, [{\"a\"}p0]>\n-    // CHECK-NEXT: %[[SC1:.*]] = sdy.sharding_constraint %[[SC0]] <@mesh, [{\"b\"}p2]>\n-    // CHECK-NEXT: %[[SC2:.*]] = sdy.sharding_constraint %arg1 <@mesh, [{\"a\"}p3]>\n+    // CHECK-NEXT: %[[SC0:.*]] = sdy.sharding_constraint %arg0 <@mesh, [{\"a\", ?}p0]>\n+    // CHECK-NEXT: %[[SC1:.*]] = sdy.sharding_constraint %[[SC0]] <@mesh, [{\"b\", ?}p2]>\n+    // CHECK-NEXT: %[[SC2:.*]] = sdy.sharding_constraint %arg1 <@mesh, [{\"a\", ?}p3]>\n     // CHECK-NEXT: %[[ADD:.*]] = stablehlo.add %[[SC1]], %[[SC2]]\n     // CHECK-NEXT: return %[[SC1]], %[[ADD]]\n     %0 = stablehlo.custom_call @local_xla.sdy.FuncResultSharding(%arg0) {mhlo.frontend_attributes = {xla.sdy.sharding = \"#sdy.sharding_per_value<[<@mesh, [{\\\"a\\\"}p0]>]>\"}} : (tensor<32xi32>) -> tensor<32xi32>"
+        }
+    ],
+    "stats": {
+        "total": 32,
+        "additions": 24,
+        "deletions": 8
+    }
+}

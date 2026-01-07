@@ -1,0 +1,60 @@
+{
+    "author": "deqiangc",
+    "message": "Make AsyncHandle register persistent within scope of function\n\nPiperOrigin-RevId: 834619932",
+    "sha": "f81fa58e777cd919da88ec140a894179051e59f7",
+    "files": [
+        {
+            "sha": "527a724c491b968d76708f0522614eb5fec2ae3e",
+            "filename": "tensorflow/compiler/mlir/tfrt/translate/mlrt/BUILD",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f81fa58e777cd919da88ec140a894179051e59f7/tensorflow%2Fcompiler%2Fmlir%2Ftfrt%2Ftranslate%2Fmlrt%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f81fa58e777cd919da88ec140a894179051e59f7/tensorflow%2Fcompiler%2Fmlir%2Ftfrt%2Ftranslate%2Fmlrt%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcompiler%2Fmlir%2Ftfrt%2Ftranslate%2Fmlrt%2FBUILD?ref=f81fa58e777cd919da88ec140a894179051e59f7",
+            "patch": "@@ -19,6 +19,7 @@ cc_library(\n     srcs = [\"mlir_to_bytecode.cc\"],\n     hdrs = [\"mlir_to_bytecode.h\"],\n     deps = [\n+        \"//tensorflow/compiler/mlir/tfrt/ir/mlrt:mlrt_ops\",\n         \"//tensorflow/core/tfrt/mlrt/bytecode\",\n         \"//tensorflow/core/tfrt/mlrt/bytecode:executable\",\n         \"//tensorflow/core/tfrt/mlrt/bytecode:function\",\n@@ -43,6 +44,7 @@ tf_cc_test(\n     data = glob([\"testdata/**\"]),\n     deps = [\n         \":mlir_to_bytecode\",\n+        \"//tensorflow/compiler/mlir/tfrt/ir/mlrt:mlrt_ops\",\n         \"//tensorflow/core/tfrt/mlrt/bytecode\",\n         \"//tensorflow/core/tfrt/mlrt/bytecode:executable\",\n         \"//tensorflow/core/tfrt/mlrt/interpreter:attribute_span\","
+        },
+        {
+            "sha": "9d44a96e180fe149362abecfe8e973446050e8e0",
+            "filename": "tensorflow/compiler/mlir/tfrt/translate/mlrt/mlir_to_bytecode.cc",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 6,
+            "changes": 22,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f81fa58e777cd919da88ec140a894179051e59f7/tensorflow%2Fcompiler%2Fmlir%2Ftfrt%2Ftranslate%2Fmlrt%2Fmlir_to_bytecode.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f81fa58e777cd919da88ec140a894179051e59f7/tensorflow%2Fcompiler%2Fmlir%2Ftfrt%2Ftranslate%2Fmlrt%2Fmlir_to_bytecode.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcompiler%2Fmlir%2Ftfrt%2Ftranslate%2Fmlrt%2Fmlir_to_bytecode.cc?ref=f81fa58e777cd919da88ec140a894179051e59f7",
+            "patch": "@@ -41,6 +41,7 @@ limitations under the License.\n #include \"mlir/IR/Types.h\"  // from @llvm-project\n #include \"mlir/IR/Value.h\"  // from @llvm-project\n #include \"mlir/Support/LLVM.h\"  // from @llvm-project\n+#include \"tensorflow/compiler/mlir/tfrt/ir/mlrt/mlrt_dialect.h\"\n #include \"tensorflow/core/tfrt/mlrt/bytecode/bytecode.h\"\n #include \"tensorflow/core/tfrt/mlrt/bytecode/executable.h\"\n #include \"tensorflow/core/tfrt/mlrt/bytecode/function.h\"\n@@ -169,6 +170,7 @@ struct FunctionEmitterContext {\n   struct RegInfo {\n     int num_uses = 0;\n     int id = -1;\n+    bool persistent = false;  // True if the register should not be freed\n   };\n \n   int next_reg_id = 0;\n@@ -218,9 +220,12 @@ void EmitKernel(FunctionEmitterContext& function_context,\n     int id = iter->second.id;\n     CHECK_NE(id, -1);  // Crash Ok\n     last_uses.push_back(0);\n-    if (--iter->second.num_uses == 0) {\n-      function_context.FreeRegId(id);\n-      last_uses.back() = 1;\n+    auto& reg_info = iter->second;\n+    if (!reg_info.persistent) {\n+      if (--reg_info.num_uses == 0) {\n+        function_context.FreeRegId(id);\n+        last_uses.back() = 1;\n+      }\n     }\n     arguments.push_back(id);\n   }\n@@ -284,16 +289,21 @@ void EmitFunction(const ModuleEmitterContext& module_context,\n   for (auto arg : block.getArguments()) {\n     int id = function_context.AssignRegId();\n     input_regs.push_back(id);\n+    bool persistent = mlir::isa<mlrt::compiler::AsyncHandleType>(arg.getType());\n     register_table[arg] = {static_cast<int>(std::distance(arg.getUses().begin(),\n                                                           arg.getUses().end())),\n-                           id};\n+                           id, persistent};\n   }\n   constructor.construct_input_regs(input_regs);\n \n   for (auto& op : block) {\n     for (auto result : op.getResults()) {\n-      register_table[result] = {static_cast<int>(\n-          std::distance(result.getUses().begin(), result.getUses().end()))};\n+      bool persistent =\n+          mlir::isa<mlrt::compiler::AsyncHandleType>(result.getType());\n+      register_table[result] = {\n+          static_cast<int>(\n+              std::distance(result.getUses().begin(), result.getUses().end())),\n+          -1, persistent};\n     }\n   }\n "
+        },
+        {
+            "sha": "28d27649821f2e5bd2398ad5472a72a4c326cec6",
+            "filename": "tensorflow/compiler/mlir/tfrt/translate/mlrt/mlir_to_bytecode_test.cc",
+            "status": "modified",
+            "additions": 62,
+            "deletions": 0,
+            "changes": 62,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f81fa58e777cd919da88ec140a894179051e59f7/tensorflow%2Fcompiler%2Fmlir%2Ftfrt%2Ftranslate%2Fmlrt%2Fmlir_to_bytecode_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f81fa58e777cd919da88ec140a894179051e59f7/tensorflow%2Fcompiler%2Fmlir%2Ftfrt%2Ftranslate%2Fmlrt%2Fmlir_to_bytecode_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcompiler%2Fmlir%2Ftfrt%2Ftranslate%2Fmlrt%2Fmlir_to_bytecode_test.cc?ref=f81fa58e777cd919da88ec140a894179051e59f7",
+            "patch": "@@ -33,6 +33,7 @@ limitations under the License.\n #include \"mlir/IR/MLIRContext.h\"  // from @llvm-project\n #include \"mlir/Parser/Parser.h\"  // from @llvm-project\n #include \"mlir/Support/LLVM.h\"  // from @llvm-project\n+#include \"tensorflow/compiler/mlir/tfrt/ir/mlrt/mlrt_dialect.h\"\n #include \"xla/tsl/platform/resource_loader.h\"\n #include \"xla/tsl/platform/status_matchers.h\"\n #include \"tensorflow/core/tfrt/mlrt/bytecode/bytecode.h\"\n@@ -382,5 +383,66 @@ TEST(MlirToByteCodeTest, CustomDense) {\n   }\n }\n \n+TEST(MlirToByteCodeTest, Async) {\n+  constexpr char kAsyncMlir[] =\n+      \"tensorflow/compiler/mlir/tfrt/translate/mlrt/testdata/async.mlir\";\n+\n+  mlir::DialectRegistry registry;\n+  registry.insert<mlir::func::FuncDialect, mlrt::compiler::MlrtDialect>();\n+  mlir::MLIRContext mlir_context(registry);\n+  mlir_context.allowUnregisteredDialects();\n+  auto mlir_module = mlir::parseSourceFile<mlir::ModuleOp>(\n+      tsl::GetDataDependencyFilepath(kAsyncMlir), &mlir_context);\n+\n+  AttributeEncoderRegistry attribute_encoder_registry;\n+  bc::Buffer buffer =\n+      EmitExecutable(attribute_encoder_registry, mlir_module.get()).value();\n+\n+  bc::Executable executable(buffer.data());\n+\n+  auto kernel_names = executable.kernel_names();\n+  EXPECT_THAT(kernel_names,\n+              ElementsAreArray({\"test_mlbc.add.i32\", \"return\", \"mlrt.async\",\n+                                \"mlrt.await_handle\"}));\n+\n+  auto functions = executable.functions();\n+  ASSERT_EQ(functions.size(), 2);\n+\n+  auto function = functions[1];\n+  EXPECT_EQ(function.name().str(), \"main\");\n+  EXPECT_EQ(function.num_regs(), 4);\n+  EXPECT_THAT(function.input_regs(), ElementsAreArray({0, 1}));\n+  EXPECT_THAT(function.output_regs(), ElementsAreArray({1}));\n+  EXPECT_THAT(function.output_last_uses(), ElementsAreArray({true}));\n+\n+  auto kernels = function.kernels();\n+  ASSERT_EQ(kernels.size(), 5);\n+\n+  EXPECT_EQ(kernels[0].code(), 2);  // mlrt.async\n+  EXPECT_THAT(kernels[0].arguments(), ElementsAreArray({0, 1}));\n+  // The returned handle is in register 2, which is never used by other kernels.\n+  EXPECT_THAT(kernels[0].results(), ElementsAreArray({2}));\n+  EXPECT_THAT(kernels[0].last_uses(), ElementsAreArray({false, false}));\n+\n+  EXPECT_EQ(kernels[1].code(), 3);  // mlrt.await_handle\n+  EXPECT_THAT(kernels[1].arguments(), ElementsAreArray({2}));\n+  EXPECT_THAT(kernels[1].results(), IsEmpty());\n+\n+  EXPECT_EQ(kernels[2].code(), 0);  // test_mlbc.add.i32\n+  EXPECT_THAT(kernels[2].arguments(), ElementsAreArray({0, 1}));\n+  EXPECT_THAT(kernels[2].results(), ElementsAreArray({3}));\n+  EXPECT_THAT(kernels[2].last_uses(), ElementsAreArray({true, true}));\n+\n+  EXPECT_EQ(kernels[3].code(), 0);  // test_mlbc.add.i32\n+  EXPECT_THAT(kernels[3].arguments(), ElementsAreArray({3, 3}));\n+  EXPECT_THAT(kernels[3].results(), ElementsAreArray({1}));\n+  EXPECT_THAT(kernels[3].last_uses(), ElementsAreArray({false, true}));\n+\n+  EXPECT_EQ(kernels[4].code(), 1);  // return\n+  EXPECT_THAT(kernels[4].arguments(), ElementsAreArray({1}));\n+  EXPECT_THAT(kernels[4].results(), IsEmpty());\n+  EXPECT_THAT(kernels[4].last_uses(), ElementsAreArray({true}));\n+}\n+\n }  // namespace\n }  // namespace mlrt"
+        },
+        {
+            "sha": "f3816531218c815e47459a83f6cecfea8557bc3d",
+            "filename": "tensorflow/compiler/mlir/tfrt/translate/mlrt/testdata/async.mlir",
+            "status": "added",
+            "additions": 15,
+            "deletions": 0,
+            "changes": 15,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f81fa58e777cd919da88ec140a894179051e59f7/tensorflow%2Fcompiler%2Fmlir%2Ftfrt%2Ftranslate%2Fmlrt%2Ftestdata%2Fasync.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f81fa58e777cd919da88ec140a894179051e59f7/tensorflow%2Fcompiler%2Fmlir%2Ftfrt%2Ftranslate%2Fmlrt%2Ftestdata%2Fasync.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcompiler%2Fmlir%2Ftfrt%2Ftranslate%2Fmlrt%2Ftestdata%2Fasync.mlir?ref=f81fa58e777cd919da88ec140a894179051e59f7",
+            "patch": "@@ -0,0 +1,15 @@\n+func.func @add_i32(%arg0: i32, %arg1: i32) -> i32 {\n+  %0 = \"test_mlbc.add.i32\"(%arg0, %arg1) : (i32, i32) -> i32\n+  func.return %0 : i32\n+}\n+\n+func.func @main(%arg0: i32, %arg1: i32) -> i32 {\n+  %handle = \"mlrt.async\"(%arg0, %arg1) {callee = @add_i32} : (i32, i32) -> !mlrt.async_handle\n+\n+  \"mlrt.await_handle\"(%handle) : (!mlrt.async_handle) -> () \n+\n+  %c1 = \"test_mlbc.add.i32\"(%arg0, %arg1) : (i32, i32) -> i32\n+  %c2 = \"test_mlbc.add.i32\"(%c1, %c1) : (i32, i32) -> i32\n+\n+  func.return %c2 : i32\n+}\n\\ No newline at end of file"
+        }
+    ],
+    "stats": {
+        "total": 101,
+        "additions": 95,
+        "deletions": 6
+    }
+}

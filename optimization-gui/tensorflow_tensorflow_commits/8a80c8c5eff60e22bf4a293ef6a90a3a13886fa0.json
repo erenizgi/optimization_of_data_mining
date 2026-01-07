@@ -1,0 +1,60 @@
+{
+    "author": "loislo",
+    "message": "[XLA:GPU] Add handling for `scaled-dot` to `GemmFusion`.\n\nIt is a simplest possible rewriter that just extracts scaled-dot instruction to a fusion.\n\nPiperOrigin-RevId: 800379691",
+    "sha": "8a80c8c5eff60e22bf4a293ef6a90a3a13886fa0",
+    "files": [
+        {
+            "sha": "3f574a8dac1adacd526e080e821998b371f03c88",
+            "filename": "third_party/xla/xla/service/gpu/ir_emission_utils.h",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/8a80c8c5eff60e22bf4a293ef6a90a3a13886fa0/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fir_emission_utils.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/8a80c8c5eff60e22bf4a293ef6a90a3a13886fa0/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fir_emission_utils.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fir_emission_utils.h?ref=8a80c8c5eff60e22bf4a293ef6a90a3a13886fa0",
+            "patch": "@@ -94,6 +94,11 @@ inline constexpr absl::string_view kTritonGemmFusionKind = \"__triton_gemm\";\n inline constexpr absl::string_view kTritonNestedGemmFusionKind =\n     \"__triton_nested_gemm_fusion\";\n \n+// Fusions that use Triton have FusionBackendConfig.kind equal to this string.\n+// Used for fusions that implement a scaled dot.\n+inline constexpr absl::string_view kTritonScaledDotFusionKind =\n+    \"__triton_scaled_dot_fusion\";\n+\n inline constexpr absl::string_view kCuDnnFusionKind = \"__cudnn$fusion\";\n \n // Fusions that can be emitted using a dynamic memcpy. A dynamic memcpy depends"
+        },
+        {
+            "sha": "98e5ec9572fd3f9ca4f099ff6ebd39a3e7d27459",
+            "filename": "third_party/xla/xla/service/gpu/transforms/BUILD",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/8a80c8c5eff60e22bf4a293ef6a90a3a13886fa0/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/8a80c8c5eff60e22bf4a293ef6a90a3a13886fa0/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2FBUILD?ref=8a80c8c5eff60e22bf4a293ef6a90a3a13886fa0",
+            "patch": "@@ -1518,6 +1518,8 @@ cc_library(\n         \"//xla/service/gpu:triton_fusion_analysis\",\n         \"//xla/service/gpu:triton_tiling_propagation\",\n         \"//xla/stream_executor:device_description\",\n+        \"//xla/tsl/platform:errors\",\n+        \"//xla/tsl/platform:statusor\",\n         \"@com_google_absl//absl/algorithm:container\",\n         \"@com_google_absl//absl/container:flat_hash_map\",\n         \"@com_google_absl//absl/container:flat_hash_set\","
+        },
+        {
+            "sha": "e078b6cf816b4d98f04a3021b267b41fc4ed9a72",
+            "filename": "third_party/xla/xla/service/gpu/transforms/gemm_fusion.cc",
+            "status": "modified",
+            "additions": 42,
+            "deletions": 0,
+            "changes": 42,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/8a80c8c5eff60e22bf4a293ef6a90a3a13886fa0/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fgemm_fusion.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/8a80c8c5eff60e22bf4a293ef6a90a3a13886fa0/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fgemm_fusion.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fgemm_fusion.cc?ref=8a80c8c5eff60e22bf4a293ef6a90a3a13886fa0",
+            "patch": "@@ -52,6 +52,8 @@ limitations under the License.\n #include \"xla/service/instruction_fusion.h\"\n #include \"xla/shape_util.h\"\n #include \"xla/stream_executor/device_description.h\"\n+#include \"xla/tsl/platform/errors.h\"\n+#include \"xla/tsl/platform/statusor.h\"\n #include \"xla/util.h\"\n #include \"xla/xla_data.pb.h\"\n #include \"tsl/platform/errors.h\"\n@@ -854,6 +856,46 @@ class GemmFusionVisitor : public DfsHloRewriteVisitor {\n     return absl::OkStatus();\n   }\n \n+  absl::Status HandleScaledDot(HloInstruction* scaled_dot) override {\n+    CHECK_EQ(scaled_dot->opcode(), HloOpcode::kScaledDot);\n+    HloComputation::Builder builder(\n+        absl::StrCat(\"fusion_\", scaled_dot->name()));\n+\n+    auto create_parameter = [&](int64_t parameter_number,\n+                                absl::string_view name) {\n+      return builder.AddInstruction(HloInstruction::CreateParameter(\n+          parameter_number, scaled_dot->operand(parameter_number)->shape(),\n+          name));\n+    };\n+    std::vector<HloInstruction*> new_operands{\n+        create_parameter(0, \"lhs\"),\n+        create_parameter(1, \"lhs_scale\"),\n+        create_parameter(2, \"rhs\"),\n+        create_parameter(3, \"rhs_scale\"),\n+    };\n+    builder.AddInstruction(\n+        scaled_dot->CloneWithNewOperands(scaled_dot->shape(), new_operands));\n+\n+    HloComputation* computation =\n+        scaled_dot->GetModule()->AddComputationAndUnifyNamesAndIds(\n+            builder.Build(),\n+            /*is_entry=*/false);\n+    HloInstruction* fusion = scaled_dot->parent()->AddInstruction(\n+        HloInstruction::CreateFusion(computation->root_instruction()->shape(),\n+                                     HloInstruction::FusionKind::kCustom,\n+                                     scaled_dot->operands(), computation));\n+\n+    TF_ASSIGN_OR_RETURN(auto gpu_config,\n+                        fusion->backend_config<GpuBackendConfig>());\n+    FusionBackendConfig& backend_config =\n+        *gpu_config.mutable_fusion_backend_config();\n+    backend_config.set_kind(kTritonScaledDotFusionKind);\n+    TF_RETURN_IF_ERROR(fusion->set_backend_config(gpu_config));\n+    TF_RETURN_IF_ERROR(ReplaceInstruction(scaled_dot, fusion));\n+    MarkAsChanged();\n+    return absl::OkStatus();\n+  }\n+\n  private:\n   se::GpuComputeCapability gpu_version_;\n };"
+        },
+        {
+            "sha": "71a6c028350900461221bf7a89703a50057f56a3",
+            "filename": "third_party/xla/xla/service/gpu/transforms/gemm_fusion_test.cc",
+            "status": "modified",
+            "additions": 42,
+            "deletions": 0,
+            "changes": 42,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/8a80c8c5eff60e22bf4a293ef6a90a3a13886fa0/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fgemm_fusion_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/8a80c8c5eff60e22bf4a293ef6a90a3a13886fa0/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fgemm_fusion_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fgemm_fusion_test.cc?ref=8a80c8c5eff60e22bf4a293ef6a90a3a13886fa0",
+            "patch": "@@ -1455,6 +1455,48 @@ TEST_F(SmallDotGemmFusionTest, Int4WithMinorBatchDimIsNotRewritten) {\n   EXPECT_FALSE(result);\n }\n \n+TEST_F(GemmFusionTest, ScaledDotIsFused) {\n+  constexpr absl::string_view kHloText = R\"(\n+    HloModule ScaledDotIsFused\n+\n+    ENTRY entry {\n+     lhs = bf16[4,4] parameter(0)\n+     lhs_scale = bf16[1,1] parameter(1)\n+     rhs = bf16[4,4] parameter(2)\n+     rhs_scale = bf16[1,1] parameter(3)\n+     ROOT dot = bf16[4,4] scaled-dot(lhs, lhs_scale, rhs, rhs_scale),\n+         lhs_contracting_dims={1},\n+         rhs_contracting_dims={1},\n+         metadata={op_name=\"foo\"}\n+    }\n+  )\";\n+\n+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(kHloText));\n+  TF_ASSERT_OK_AND_ASSIGN(auto result,\n+                          GemmFusion(gpu_version_).Run(module.get()));\n+  EXPECT_TRUE(result);\n+\n+  constexpr absl::string_view kExpectedHloText = R\"(\n+    CHECK: %[[FUSION_DOT:.*]] (\n+    CHECK:   %[[LHS:.*]] = bf16[4,4]{1,0} parameter(0)\n+    CHECK:   %[[LHS_SCALE:.*]] = bf16[1,1]{1,0} parameter(1)\n+    CHECK:   %[[RHS:.*]] = bf16[4,4]{1,0} parameter(2)\n+    CHECK:   %[[RHS_SCALE:.*]] = bf16[1,1]{1,0} parameter(3)\n+    CHECK:   ROOT %dot.1 = bf16[4,4]{1,0} scaled-dot(\n+    CHECK:       %[[LHS]], %[[LHS_SCALE]], %[[RHS]], %[[RHS_SCALE]]),\n+    CHECK:     lhs_contracting_dims={1},\n+    CHECK:     rhs_contracting_dims={1},\n+    CHECK:     metadata={op_name=\"foo\"}\n+    CHECK: }\n+    CHECK: ENTRY\n+    CHECK:   ROOT %[[FUSION:.*]] = bf16[4,4]{1,0} fusion(\n+    CHECK:     kind=kCustom,\n+    CHECK:     calls=%[[FUSION_DOT]]\n+    CHECK:     {\"kind\":\"__triton_scaled_dot_fusion\"}\n+  )\";\n+  MatchHloModule(*module, kExpectedHloText);\n+}\n+\n }  // namespace\n }  // namespace gpu\n }  // namespace xla"
+        }
+    ],
+    "stats": {
+        "total": 91,
+        "additions": 91,
+        "deletions": 0
+    }
+}

@@ -1,0 +1,36 @@
+{
+    "author": "ezhulenev",
+    "message": "[xla] Add convertion from PjRtFuture<T> to PjRtFuture<>\n\nAdd PjRtFuture<T>::GetReadyFuture() API to get a stateless future that will signal when the payload becomes available.\n\nPiperOrigin-RevId: 802729853",
+    "sha": "299c451a980967ba8aae1a410420286ee1bc1ca9",
+    "files": [
+        {
+            "sha": "5797049d686009d436b569c639b9dc979476c992",
+            "filename": "third_party/xla/xla/pjrt/pjrt_future.h",
+            "status": "modified",
+            "additions": 33,
+            "deletions": 0,
+            "changes": 33,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/299c451a980967ba8aae1a410420286ee1bc1ca9/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_future.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/299c451a980967ba8aae1a410420286ee1bc1ca9/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_future.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_future.h?ref=299c451a980967ba8aae1a410420286ee1bc1ca9",
+            "patch": "@@ -320,6 +320,13 @@ class PjRtFutureBase : public PjRtFutureMoveControl<is_move_only> {\n     }\n   }\n \n+  // Returns a PjRtFuture<> that becomes ready when *this is ready. If *this\n+  // completes with an error, the returned future will also be an error.\n+  //\n+  // These APIs defined out of line as they require PjRtFuture<> definition.\n+  PjRtFuture<> GetReadyFuture() const&;\n+  PjRtFuture<> GetReadyFuture() &&;\n+\n   // Registers callback to be called once the promise is ready, with the final\n   // value.\n   //\n@@ -465,6 +472,7 @@ class PjRtFuture : public internal::PjRtFutureBase<absl::StatusOr<T>> {\n   }\n \n   using Base::Await;\n+  using Base::GetReadyFuture;\n   using Base::OnReady;\n \n   // Returns an PjRtFuture<R> that is constructed from the result of invoking\n@@ -806,6 +814,31 @@ class PjRtFuture<void> : public internal::PjRtFutureBase<absl::Status> {\n       ready_promise_;\n };\n \n+//===----------------------------------------------------------------------===//\n+// internal::PjRtFutureBase<T> implementation.\n+//===----------------------------------------------------------------------===//\n+\n+namespace internal {\n+\n+template <typename T, bool is_move_only>\n+PjRtFuture<> PjRtFutureBase<T, is_move_only>::GetReadyFuture() const& {\n+  PjRtFuture<>::Promise promise = PjRtFuture<>::CreatePromise();\n+  promise_.AndThen([p = promise_.AsPtr(), promise]() mutable {\n+    if constexpr (std::is_same_v<T, absl::Status>) {\n+      promise.Set(*p);\n+    } else {\n+      promise.Set(p->status());\n+    }\n+  });\n+  return PjRtFuture<>(promise);\n+}\n+\n+template <typename T, bool is_move_only>\n+PjRtFuture<> PjRtFutureBase<T, is_move_only>::GetReadyFuture() && {\n+  return this->OnReady();\n+}\n+\n+}  // namespace internal\n }  // namespace xla\n \n #endif  // XLA_PJRT_PJRT_FUTURE_H_"
+        },
+        {
+            "sha": "6680d5af6f26c2ca190c43eda57e96c4a60f6df2",
+            "filename": "third_party/xla/xla/pjrt/pjrt_future_test.cc",
+            "status": "modified",
+            "additions": 44,
+            "deletions": 0,
+            "changes": 44,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/299c451a980967ba8aae1a410420286ee1bc1ca9/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_future_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/299c451a980967ba8aae1a410420286ee1bc1ca9/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_future_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_future_test.cc?ref=299c451a980967ba8aae1a410420286ee1bc1ca9",
+            "patch": "@@ -53,6 +53,50 @@ TEST(PjRtFutureTest, StatelessFuture) {\n       [](absl::Status status) { EXPECT_EQ(status, absl::OkStatus()); });\n }\n \n+TEST(PjRtFutureTest, StatefulFutureToStateless) {\n+  auto promise = PjRtFuture<int32_t>::CreatePromise();\n+  PjRtFuture<int32_t> future(promise);\n+  PjRtFuture<> on_ready_future = future.GetReadyFuture();\n+\n+  EXPECT_FALSE(on_ready_future.IsReady());\n+  promise.Set(42);\n+  EXPECT_EQ(on_ready_future.Await(), absl::OkStatus());\n+}\n+\n+TEST(PjRtFutureTest, StatefulFutureToStatelessError) {\n+  auto promise = PjRtFuture<int32_t>::CreatePromise();\n+  PjRtFuture<int32_t> future(promise);\n+  PjRtFuture<> on_ready_future = future.GetReadyFuture();\n+\n+  EXPECT_FALSE(on_ready_future.IsReady());\n+  promise.Set(absl::InternalError(\"test\"));\n+  EXPECT_EQ(on_ready_future.Await(), absl::InternalError(\"test\"));\n+}\n+\n+TEST(PjRtFutureTest, MoveOnlyFutureToStateless) {\n+  auto promise = PjRtFuture<std::unique_ptr<int32_t>>::CreatePromise();\n+  PjRtFuture<std::unique_ptr<int32_t>> future(promise);\n+  PjRtFuture<> on_ready_future = future.GetReadyFuture();\n+\n+  EXPECT_FALSE(future.IsReady());\n+  EXPECT_FALSE(on_ready_future.IsReady());\n+\n+  promise.Set(std::make_unique<int32_t>(42));\n+  EXPECT_EQ(on_ready_future.Await(), absl::OkStatus());\n+}\n+\n+TEST(PjRtFutureTest, MoveOnlyFutureToStatelessError) {\n+  auto promise = PjRtFuture<std::unique_ptr<int32_t>>::CreatePromise();\n+  PjRtFuture<std::unique_ptr<int32_t>> future(promise);\n+  PjRtFuture<> on_ready_future = future.GetReadyFuture();\n+\n+  EXPECT_FALSE(future.IsReady());\n+  EXPECT_FALSE(on_ready_future.IsReady());\n+\n+  promise.Set(absl::InternalError(\"test\"));\n+  EXPECT_EQ(on_ready_future.Await(), absl::InternalError(\"test\"));\n+}\n+\n TEST(PjRtFutureTest, CopyableFuture) {\n   auto promise = PjRtFuture<int32_t>::CreatePromise();\n   PjRtFuture<int32_t> future(promise);"
+        }
+    ],
+    "stats": {
+        "total": 77,
+        "additions": 77,
+        "deletions": 0
+    }
+}

@@ -1,0 +1,60 @@
+{
+    "author": "nputikhin",
+    "message": "[XLA:GPU] Fuse more slices into GeMMs with K<1024\n\nFusing slices with the consumer is potentially beneficial. However split-K GeMM rewriter does not support sliced contracting dimension, so we restrict the fusion to cases where we have small K.\n\nPiperOrigin-RevId: 844859324",
+    "sha": "deb256b360c624f8d476d888eb5dc1f902210fac",
+    "files": [
+        {
+            "sha": "8036bc09ab2ce63d55af27d8b0cbe0d7e6f31f9d",
+            "filename": "third_party/xla/xla/service/gpu/transforms/gemm_fusion_test.cc",
+            "status": "modified",
+            "additions": 52,
+            "deletions": 0,
+            "changes": 52,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/deb256b360c624f8d476d888eb5dc1f902210fac/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fgemm_fusion_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/deb256b360c624f8d476d888eb5dc1f902210fac/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fgemm_fusion_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fgemm_fusion_test.cc?ref=deb256b360c624f8d476d888eb5dc1f902210fac",
+            "patch": "@@ -227,6 +227,58 @@ ENTRY e {\n   EXPECT_TRUE(GemmFusion(cc).Run(module.get()).value());\n }\n \n+TEST_F(GemmFusionTest, FuseSliceWithOtherUsersWhenDotHasSmallK) {\n+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,\n+                          ParseAndReturnVerifiedModule(R\"(\n+ENTRY e {\n+  p0 = bf16[512,3584]{1,0} parameter(0)\n+  p1 = bf16[3584,14400]{0,1} parameter(1)\n+  p2 = bf16[64,14336]{1,0} parameter(2)\n+\n+  d0 = bf16[512,14400]{1,0} dot(p0, p1), lhs_contracting_dims={1}, rhs_contracting_dims={0}\n+  sl0 = bf16[512,14336]{1,0} slice(d0), slice={[0:512], [0:14336]}\n+\n+  sl1 = bf16[512,64]{1,0} slice(d0), slice={[0:512], [14336:14400]}\n+  d1 = bf16[512,14336]{1,0} dot(sl1, p2), lhs_contracting_dims={1}, rhs_contracting_dims={0}\n+  ROOT a0 = bf16[512,14336]{1,0} add(sl0, d1)\n+})\"));\n+\n+  const se::CudaComputeCapability cc{se::CudaComputeCapability::kHopper, 0};\n+  EXPECT_TRUE(GemmFusion(cc).Run(module.get()).value());\n+\n+  // Check that the second dot is fused and the fusion contains sl1.\n+  // We make no assumptions about other fusions.\n+  constexpr absl::string_view kExpectedHloText = R\"(\n+    CHECK: %[[FUSION_DOT:.*]] (\n+    CHECK:   %[[SLICE:.*]] = bf16[512,64]{1,0} slice(%parameter_0), slice={[0:512], [14336:14400]}\n+    CHECK:   ROOT {{.*}} = bf16[512,14336]{1,0} dot(%[[SLICE]], %parameter_1), lhs_contracting_dims={1}, rhs_contracting_dims={0}\n+    CHECK: ENTRY\n+    CHECK-DAG: %[[FUSION_D1:.*]] = bf16[512,14336]{1,0} fusion({{.*}}, {{.*}}), kind=kCustom, calls=%[[FUSION_DOT]]\n+    CHECK-DAG: ROOT %a0 = bf16[512,14336]{1,0} add({{.*}}, %[[FUSION_D1]])\n+  )\";\n+  MatchHloModule(*module, kExpectedHloText);\n+}\n+\n+TEST_F(GemmFusionTest, DoNotFuseSliceWithOtherUsersWhenDotHasLargeK) {\n+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,\n+                          ParseAndReturnVerifiedModule(R\"(\n+ENTRY e {\n+  p0 = bf16[512,3584]{1,0} parameter(0)\n+  p1 = bf16[3584,14400]{0,1} parameter(1)\n+  p2 = bf16[1400,14336]{1,0} parameter(2)\n+\n+  d0 = bf16[512,14400]{1,0} dot(p0, p1), lhs_contracting_dims={1}, rhs_contracting_dims={0}\n+  sl0 = bf16[512,14336]{1,0} slice(d0), slice={[0:512], [0:14336]}\n+  sl1 = bf16[512,1400]{1,0} slice(d0), slice={[0:512], [13000:14400]}\n+\n+  d1 = bf16[512,14336]{1,0} dot(sl1, p2), lhs_contracting_dims={1}, rhs_contracting_dims={0}\n+  ROOT a0 = bf16[512,14336]{1,0} add(sl0, d1)\n+})\"));\n+\n+  const se::CudaComputeCapability cc{se::CudaComputeCapability::kHopper, 0};\n+  EXPECT_FALSE(GemmFusion(cc).Run(module.get()).value());\n+}\n+\n TEST_F(GemmFusionTest, DoNotFuseSliceOfMixedDimensions) {\n   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,\n                           ParseAndReturnVerifiedModule(R\"("
+        },
+        {
+            "sha": "9f7fbcba0aa98b0e5c4c598a5dd90000565b9159",
+            "filename": "third_party/xla/xla/service/gpu/triton_fusion_analysis.cc",
+            "status": "modified",
+            "additions": 24,
+            "deletions": 6,
+            "changes": 30,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/deb256b360c624f8d476d888eb5dc1f902210fac/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftriton_fusion_analysis.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/deb256b360c624f8d476d888eb5dc1f902210fac/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftriton_fusion_analysis.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftriton_fusion_analysis.cc?ref=deb256b360c624f8d476d888eb5dc1f902210fac",
+            "patch": "@@ -57,6 +57,16 @@ using triton_fusion::GetPropagatedDimOrdersAndRequirements;\n using triton_fusion::kNoSplitRequirement;\n using triton_fusion::TransformDirection;\n \n+int64_t GetContractingDimSize(const HloInstruction& dot) {\n+  const auto& contracting_dims =\n+      ContractingDimensionsForOperand(dot, /*operand_number=*/0);\n+  int64_t contracting_dim_size = 1;\n+  for (int64_t dim : contracting_dims) {\n+    contracting_dim_size *= dot.operand(0)->shape().dimensions(dim);\n+  }\n+  return contracting_dim_size;\n+}\n+\n }  // namespace\n \n namespace triton_fusion {\n@@ -81,9 +91,13 @@ namespace triton_fusion {\n           0) {\n     splittable_dimension_index = non_contracting_dimension_index;\n   }\n-  FusionContext context(DotProperties{non_contracting_dimension_index,\n-                                      splittable_dimension_index},\n-                        DotRequirements(kNoSplitRequirement));\n+\n+  int64_t contracting_size = GetContractingDimSize(dot);\n+\n+  FusionContext context(\n+      DotProperties{non_contracting_dimension_index, splittable_dimension_index,\n+                    contracting_size},\n+      DotRequirements(kNoSplitRequirement));\n   context.dim_orders_[dot.operand(operand_number)] =\n       DimensionOrder::FromDotOperandOrOutput(*dot.operand(operand_number),\n                                              split_k_dimension_index);\n@@ -102,9 +116,13 @@ namespace triton_fusion {\n     // LHS non-contracting follows (batch is absent in this case).\n     splittable_dimension_index = (split_k > 1) ? 1 : 0;\n   }\n-  FusionContext context(DotProperties{/*noncontracting_dimension=*/-1,\n-                                      splittable_dimension_index},\n-                        std::move(requirements));\n+\n+  int64_t contracting_size = GetContractingDimSize(dot);\n+\n+  FusionContext context(\n+      DotProperties{/*noncontracting_dimension=*/-1, splittable_dimension_index,\n+                    contracting_size},\n+      std::move(requirements));\n   context.dim_orders_[&dot] = DimensionOrder::FromDotOperandOrOutput(dot);\n   return context;\n }"
+        },
+        {
+            "sha": "24b5e4879240c4629a5fe93368d8e33f8530c69f",
+            "filename": "third_party/xla/xla/service/gpu/triton_tiling_propagation.cc",
+            "status": "modified",
+            "additions": 24,
+            "deletions": 4,
+            "changes": 28,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/deb256b360c624f8d476d888eb5dc1f902210fac/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftriton_tiling_propagation.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/deb256b360c624f8d476d888eb5dc1f902210fac/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftriton_tiling_propagation.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftriton_tiling_propagation.cc?ref=deb256b360c624f8d476d888eb5dc1f902210fac",
+            "patch": "@@ -992,11 +992,16 @@ bool CanNotBeFusedIntoAUser(const HloInstruction& hlo) {\n                           hlo.users()[0]->opcode() == HloOpcode::kTuple);\n }\n \n+// Maximum contracting dimension size for which slice fusion is allowed when\n+// the operand has multiple users.\n+constexpr int kMaxContractingDimSizeForSliceFusion = 1024;\n+\n // Let input and output data volumes of a fusion grow by small amounts.\n constexpr int kIoToleranceBytes = 1024;\n \n // Tells that fusing an instruction as an input is efficient.\n-bool IsInputWorthFusing(const HloInstruction& hlo) {\n+bool IsInputWorthFusing(const HloInstruction& hlo,\n+                        const DotProperties& properties) {\n   std::optional<int64_t> input_minus_output_bytes = InputMinusOutputBytes(hlo);\n   if (!input_minus_output_bytes.has_value()) {\n     return false;\n@@ -1011,15 +1016,30 @@ bool IsInputWorthFusing(const HloInstruction& hlo) {\n       hlo_query::AllOperandsAreParametersOrConstants(hlo)) {\n     return true;\n   }\n+  // Explanation:\n+  // * Operand user count > 1 - if the producer of the slice has a single user\n+  //   the slice can be fused into the producer instead of here.\n+  // * contracting_dim_size < 1024 - fusing slices disables split-K rewriter,\n+  //   which may outweigh the benefit of fusing it in the first place. Small\n+  //   contracting dimension almost never benefits from splitting it, so we\n+  //   allow the fusion.\n+\n+  // TODO: b/393299275 - Remove the contracting dim size restriction once the\n+  // new emitter lands and we can support slices in contracting dimension with\n+  // splits.\n+  if (hlo.opcode() == HloOpcode::kSlice && hlo.operand(0)->user_count() > 1 &&\n+      properties.contracting_dim_size <= kMaxContractingDimSizeForSliceFusion) {\n+    return true;\n+  }\n   const bool enable_subchannel_dequantisation_fusion =\n       hlo.GetModule()\n           ->config()\n           .debug_options()\n           .xla_gpu_experimental_enable_subchannel_dequantisation_fusion();\n   if (hlo.opcode() == HloOpcode::kMultiply) {\n     return enable_subchannel_dequantisation_fusion &&\n-           IsInputWorthFusing(*hlo.operand(0)) &&\n-           IsInputWorthFusing(*hlo.operand(1));\n+           IsInputWorthFusing(*hlo.operand(0), properties) &&\n+           IsInputWorthFusing(*hlo.operand(1), properties);\n   }\n   return hlo_query::AllOperandsAreParametersOrConstantsWithSingleUser(hlo);\n }\n@@ -1139,7 +1159,7 @@ GetPropagatedDimOrdersAndRequirementsIfProfitablyFusible(\n         }\n       }\n     }\n-    if (!accepted && !IsInputWorthFusing(hlo)) {\n+    if (!accepted && !IsInputWorthFusing(hlo, properties)) {\n       return FusionDecision::Forbid(\n           \"Not obviously profitable to fuse as input.\");\n     }"
+        },
+        {
+            "sha": "df09b35a1f0ffcf3b35916a4c866046508301d64",
+            "filename": "third_party/xla/xla/service/gpu/triton_tiling_propagation.h",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/deb256b360c624f8d476d888eb5dc1f902210fac/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftriton_tiling_propagation.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/deb256b360c624f8d476d888eb5dc1f902210fac/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftriton_tiling_propagation.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftriton_tiling_propagation.h?ref=deb256b360c624f8d476d888eb5dc1f902210fac",
+            "patch": "@@ -249,6 +249,8 @@ struct DotProperties {\n   // Index of dot dimension that can be split.\n   // Currently typically LHS non-contracting one.\n   const int splittable_dimension_index;\n+  // Size of the contracting dimension (K).\n+  const int64_t contracting_dim_size;\n };\n \n // A special value for splittable_dimension_major_part_size."
+        }
+    ],
+    "stats": {
+        "total": 112,
+        "additions": 102,
+        "deletions": 10
+    }
+}

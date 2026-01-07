@@ -1,0 +1,60 @@
+{
+    "author": "akuegel",
+    "message": "Fix a layout bug in HloEvaluator.\n\nWe should not use linear indexing if the operand layout differs from the result\nlayout.\n\nPiperOrigin-RevId: 836170200",
+    "sha": "297973b6da3264a881450501d5a1fc32a1da4ca5",
+    "files": [
+        {
+            "sha": "affbb8154eb75abf89b339dd677a07e64902e9a1",
+            "filename": "third_party/xla/xla/hlo/evaluator/hlo_evaluator.cc",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/297973b6da3264a881450501d5a1fc32a1da4ca5/third_party%2Fxla%2Fxla%2Fhlo%2Fevaluator%2Fhlo_evaluator.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/297973b6da3264a881450501d5a1fc32a1da4ca5/third_party%2Fxla%2Fxla%2Fhlo%2Fevaluator%2Fhlo_evaluator.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fevaluator%2Fhlo_evaluator.cc?ref=297973b6da3264a881450501d5a1fc32a1da4ca5",
+            "patch": "@@ -111,7 +111,8 @@ absl::StatusOr<Literal> Compare(const Shape& shape, Comparison comparison,\n     // If layout is the same, we can use linear indexing into the literals.\n     const Layout& lhs_layout = lhs_literal.shape().layout();\n     const Layout& rhs_layout = rhs_literal.shape().layout();\n-    bool same_layout = LayoutUtil::Equal(lhs_layout, rhs_layout);\n+    bool same_layout = LayoutUtil::Equal(lhs_layout, rhs_layout) &&\n+                       LayoutUtil::Equal(lhs_layout, shape.layout());\n \n     if (same_layout) {\n       TF_RETURN_IF_ERROR(result.PopulateLinearParallel<bool>("
+        },
+        {
+            "sha": "4e2715ed65e756b932f75529cc9fd9a39b1378cf",
+            "filename": "third_party/xla/xla/hlo/evaluator/hlo_evaluator.h",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 4,
+            "changes": 17,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/297973b6da3264a881450501d5a1fc32a1da4ca5/third_party%2Fxla%2Fxla%2Fhlo%2Fevaluator%2Fhlo_evaluator.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/297973b6da3264a881450501d5a1fc32a1da4ca5/third_party%2Fxla%2Fxla%2Fhlo%2Fevaluator%2Fhlo_evaluator.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fevaluator%2Fhlo_evaluator.h?ref=297973b6da3264a881450501d5a1fc32a1da4ca5",
+            "patch": "@@ -567,10 +567,19 @@ class HloEvaluator : public ConstDfsHloVisitorWithDefault,\n     TF_RET_CHECK(ShapeUtil::SameDimensions(shape, operand->shape()));\n \n     Literal result(shape);\n-    TF_RETURN_IF_ERROR(\n-        result.PopulateLinearParallel<ReturnT>([&](int64_t linear_index, int) {\n-          return unary_op(operand_literal.GetLinear<NativeT>(linear_index));\n-        }));\n+    bool same_layout =\n+        LayoutUtil::Equal(operand->shape().layout(), shape.layout());\n+    if (same_layout) {\n+      TF_RETURN_IF_ERROR(result.PopulateLinearParallel<ReturnT>(\n+          [&](int64_t linear_index, int /*thread_id*/) {\n+            return unary_op(operand_literal.GetLinear<NativeT>(linear_index));\n+          }));\n+    } else {\n+      TF_RETURN_IF_ERROR(result.PopulateParallel<ReturnT>(\n+          [&](absl::Span<const int64_t> multi_index, int /*thread_id*/) {\n+            return unary_op(operand_literal.Get<NativeT>(multi_index));\n+          }));\n+    }\n     return result;\n   }\n "
+        },
+        {
+            "sha": "69b0462f04b0419709d494673e98eab631308f92",
+            "filename": "third_party/xla/xla/hlo/evaluator/hlo_evaluator_test.cc",
+            "status": "modified",
+            "additions": 39,
+            "deletions": 0,
+            "changes": 39,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/297973b6da3264a881450501d5a1fc32a1da4ca5/third_party%2Fxla%2Fxla%2Fhlo%2Fevaluator%2Fhlo_evaluator_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/297973b6da3264a881450501d5a1fc32a1da4ca5/third_party%2Fxla%2Fxla%2Fhlo%2Fevaluator%2Fhlo_evaluator_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fevaluator%2Fhlo_evaluator_test.cc?ref=297973b6da3264a881450501d5a1fc32a1da4ca5",
+            "patch": "@@ -50,6 +50,7 @@ limitations under the License.\n #include \"xla/hlo/testlib/hlo_hardware_independent_test_base.h\"\n #include \"xla/hlo/testlib/test.h\"\n #include \"xla/hlo/transforms/simplifiers/hlo_element_type_converter.h\"\n+#include \"xla/layout.h\"\n #include \"xla/layout_util.h\"\n #include \"xla/literal.h\"\n #include \"xla/literal_util.h\"\n@@ -376,6 +377,17 @@ TEST_F(HloEvaluatorTest, DoesAdd) {\n                std::move(rhs));\n }\n // Verifies that HloEvaluator evaluates a HLO instruction that performs\n+// element-wise addition with 2 operands and a different result layout.\n+TEST_F(HloEvaluatorTest, DoesAddDifferentResultLayout) {\n+  auto lhs = LiteralUtil::CreateR2<int64_t>({{1, 0}, {-100, 4}});\n+  auto rhs = LiteralUtil::CreateR2<int64_t>({{2, 4}, {4, 4}});\n+  Layout layout({0, 1});\n+  auto expected =\n+      LiteralUtil::CreateR2WithLayout<int64_t>({{3, 4}, {-96, 8}}, layout);\n+  TestBinaryOp(HloOpcode::kAdd, std::move(expected), std::move(lhs),\n+               std::move(rhs));\n+}\n+// Verifies that HloEvaluator evaluates a HLO instruction that performs\n // element-wise and with 2 operands.\n TEST_P(HloEvaluatorBf16Test, DoesAnd) {\n   auto lhs = LiteralUtil::CreateR2<int64_t>({{1, 0}, {-100, 4}});\n@@ -436,6 +448,25 @@ TEST_F(HloEvaluatorTest, DoesClampS64) {\n                 std::move(value), std::move(high));\n }\n \n+TEST_F(HloEvaluatorTest, DoesClampS64DifferentResultLayout) {\n+  auto low = LiteralUtil::CreateR2<int64_t>(\n+      {{-8616761059752331528LL, 6780561065411491190LL},\n+       {-8616761059752331528LL, 0LL}});\n+  auto value = LiteralUtil::CreateR2<int64_t>(\n+      {{-6780561065411491190LL, 6780561065411491180LL},\n+       {4241131823772864090LL, -1LL}});\n+  auto high = LiteralUtil::CreateR2<int64_t>(\n+      {{-6780561065411491180LL, 8616761059752331528LL},\n+       {3832151243857508051LL, 1LL}});\n+  Layout layout({0, 1});\n+  auto expected = LiteralUtil::CreateR2WithLayout<int64_t>(\n+      {{-6780561065411491190LL, 6780561065411491190LL},\n+       {3832151243857508051LL, 0}},\n+      layout);\n+  TestTernaryOp(HloOpcode::kClamp, std::move(expected), std::move(low),\n+                std::move(value), std::move(high));\n+}\n+\n TEST_P(HloEvaluatorBf16Test, DoesDivideDouble) {\n   auto lhs = LiteralUtil::CreateR2<double>({{1.0, 0.0}, {-100.0, 4.0}});\n   auto rhs = LiteralUtil::CreateR2<double>({{2.2, 4.0}, {4.0, 4.0}});\n@@ -476,6 +507,14 @@ TEST_F(HloEvaluatorTest, DoesNegateR2) {\n       {{0, std::numeric_limits<int>::min()}, {1, -4}});\n   TestUnaryOp(HloOpcode::kNegate, std::move(expected), std::move(operand));\n }\n+TEST_F(HloEvaluatorTest, DoesNegateR2DifferentResultLayout) {\n+  auto operand = LiteralUtil::CreateR2<int32_t>(\n+      {{0, std::numeric_limits<int32_t>::min()}, {-1, 4}});\n+  Layout layout({0, 1});\n+  auto expected = LiteralUtil::CreateR2WithLayout<int32_t>(\n+      {{0, std::numeric_limits<int>::min()}, {1, -4}}, layout);\n+  TestUnaryOp(HloOpcode::kNegate, std::move(expected), std::move(operand));\n+}\n TEST_P(HloEvaluatorBf16Test, DoesCosR2) {\n   auto operand = LiteralUtil::CreateR2<float>({{0, M_PI}, {-M_PI, 2 * M_PI}});\n   auto expected = LiteralUtil::CreateR2<float>({{1, -1}, {-1, 1}});"
+        },
+        {
+            "sha": "e01b810a95fa52bae23107e404a4ae9d8414c7ff",
+            "filename": "third_party/xla/xla/hlo/evaluator/hlo_evaluator_typed_visitor.h",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 2,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/297973b6da3264a881450501d5a1fc32a1da4ca5/third_party%2Fxla%2Fxla%2Fhlo%2Fevaluator%2Fhlo_evaluator_typed_visitor.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/297973b6da3264a881450501d5a1fc32a1da4ca5/third_party%2Fxla%2Fxla%2Fhlo%2Fevaluator%2Fhlo_evaluator_typed_visitor.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fevaluator%2Fhlo_evaluator_typed_visitor.h?ref=297973b6da3264a881450501d5a1fc32a1da4ca5",
+            "patch": "@@ -2376,7 +2376,8 @@ class HloEvaluatorTypedVisitor : public ConstDfsHloVisitorWithDefault {\n     // If layout is the same, we can use linear indexing into the literals.\n     const Layout& lhs_layout = lhs_literal.shape().layout();\n     const Layout& rhs_layout = rhs_literal.shape().layout();\n-    bool same_layout = LayoutUtil::Equal(lhs_layout, rhs_layout);\n+    bool same_layout = LayoutUtil::Equal(lhs_layout, rhs_layout) &&\n+                       LayoutUtil::Equal(lhs_layout, shape.layout());\n \n     if (same_layout) {\n       TF_RETURN_IF_ERROR(result.PopulateLinearParallel<ReturnT>(\n@@ -2424,7 +2425,8 @@ class HloEvaluatorTypedVisitor : public ConstDfsHloVisitorWithDefault {\n     const Layout& rhs_layout = rhs_literal.shape().layout();\n     const Layout& ehs_layout = ehs_literal.shape().layout();\n     bool same_layout = LayoutUtil::Equal(lhs_layout, rhs_layout) &&\n-                       LayoutUtil::Equal(rhs_layout, ehs_layout);\n+                       LayoutUtil::Equal(rhs_layout, ehs_layout) &&\n+                       LayoutUtil::Equal(lhs_layout, shape.layout());\n \n     if (same_layout) {\n       TF_RETURN_IF_ERROR(result.PopulateLinearParallel<ReturnT>("
+        }
+    ],
+    "stats": {
+        "total": 65,
+        "additions": 58,
+        "deletions": 7
+    }
+}

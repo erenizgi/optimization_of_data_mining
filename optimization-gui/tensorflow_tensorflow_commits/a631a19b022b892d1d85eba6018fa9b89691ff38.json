@@ -1,0 +1,48 @@
+{
+    "author": "pschuh",
+    "message": "Simplify how device events are handled. Because definition_stream() is always\nprovided and only used if the stream is defined, we can avoid tracking\nusage_stream separately.\n\nPiperOrigin-RevId: 814765407",
+    "sha": "a631a19b022b892d1d85eba6018fa9b89691ff38",
+    "files": [
+        {
+            "sha": "89ed6733603933590e3332b12b83afe0fa60d223",
+            "filename": "third_party/xla/xla/pjrt/pjrt_stream_executor_client.cc",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 2,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a631a19b022b892d1d85eba6018fa9b89691ff38/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_stream_executor_client.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a631a19b022b892d1d85eba6018fa9b89691ff38/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_stream_executor_client.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_stream_executor_client.cc?ref=a631a19b022b892d1d85eba6018fa9b89691ff38",
+            "patch": "@@ -1420,7 +1420,9 @@ PjRtStreamExecutorBuffer::Release(bool wait_for_operations_to_complete) {\n       for (const auto& stream_and_event : events) {\n         VLOG(4)\n             << \"Checking whether need to wait for stream_and_event: stream: \"\n-            << stream_and_event.stream\n+            << (stream_and_event.event->IsDefined()\n+                    ? stream_and_event.event->definition_stream()\n+                    : nullptr)\n             << \"; event: \" << &*stream_and_event.event\n             << \"; reference_held: \" << stream_and_event.reference_held\n             << \"; is_predetermined_error: \"\n@@ -1494,7 +1496,7 @@ void PjRtStreamExecutorBuffer::ConvertUsageHold(TrackedDeviceBuffer* buffer,\n                                                 bool reference_held) {\n   absl::MutexLock lock(&mu_);\n   CHECK(device_buffer() == buffer || device_buffer() == nullptr);\n-  buffer->AddUsageEvent(usage_stream, std::move(event), reference_held);\n+  buffer->AddUsageEvent(std::move(event), reference_held);\n   DecrementUsage();\n }\n "
+        },
+        {
+            "sha": "08b3cbbf5e3d8704b8c39362fde593d40b7f0cdf",
+            "filename": "third_party/xla/xla/pjrt/tracked_device_buffer.cc",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 5,
+            "changes": 21,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a631a19b022b892d1d85eba6018fa9b89691ff38/third_party%2Fxla%2Fxla%2Fpjrt%2Ftracked_device_buffer.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a631a19b022b892d1d85eba6018fa9b89691ff38/third_party%2Fxla%2Fxla%2Fpjrt%2Ftracked_device_buffer.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Ftracked_device_buffer.cc?ref=a631a19b022b892d1d85eba6018fa9b89691ff38",
+            "patch": "@@ -32,6 +32,7 @@ limitations under the License.\n #include \"absl/status/status.h\"\n #include \"absl/synchronization/mutex.h\"\n #include \"absl/types/span.h\"\n+#include \"xla/pjrt/device_event.h\"\n #include \"xla/pjrt/event_pool.h\"\n #include \"xla/pjrt/pjrt_client.h\"\n #include \"xla/pjrt/pjrt_common.h\"\n@@ -257,31 +258,31 @@ void TrackedDeviceBuffer::ConfirmDonation() {\n   ReleaseDeviceMemory();\n }\n \n-void TrackedDeviceBuffer::AddUsageEvent(se::Stream* usage_stream,\n-                                        BufferSequencingEventRef event,\n+void TrackedDeviceBuffer::AddUsageEvent(BufferSequencingEventRef event,\n                                         bool reference_held) {\n   CHECK(in_use_);\n \n   // If the event is 0, it means that the event is not recorded yet and the task\n   // related to this event is deferred, so just add it.\n   if (!event->IsDefined()) {\n-    usage_events_.push_back({usage_stream, event, reference_held});\n+    usage_events_.push_back({event, reference_held});\n     return;\n   }\n+  auto* usage_stream = event->definition_stream();\n \n   for (auto& existing : usage_events_) {\n     // If the existing event is 0, it means that the event is not recorded yet\n     // and the task related to this event is deferred, so don't replace it.\n     if (!existing.event->IsDefined()) continue;\n-    if (existing.stream == usage_stream) {\n+    if (existing.event->definition_stream() == usage_stream) {\n       if (*existing.event < *event) {\n         existing.event = event;\n         existing.reference_held = reference_held;\n       }\n       return;\n     }\n   }\n-  usage_events_.push_back({usage_stream, event, reference_held});\n+  usage_events_.push_back({event, reference_held});\n }\n \n TrackedDeviceBuffer::StreamAndEventContainer\n@@ -312,6 +313,16 @@ tsl::RCReference<CommonPjRtRawBuffer> TrackedDeviceBuffer::GetRawBuffer(\n       device_memory_);\n }\n \n+void TrackedDeviceBuffer::AddUsageEvent(\n+    tsl::RCReference<PjRtDeviceEvent> event) {\n+  if (event) {\n+    AddUsageEvent(\n+        tensorflow::down_cast<PjRtStreamExecutorDeviceEvent*>(event.get())\n+            ->event(),\n+        true);\n+  }\n+}\n+\n void GetDeviceBufferEvents(\n     const TrackedDeviceBuffer& buffer, bool get_usage_events,\n     absl::flat_hash_set<BufferSequencingEvent*>* events) {"
+        },
+        {
+            "sha": "9bd1a8542cc0dc73ae0d9b8236a76e2c5ba59499",
+            "filename": "third_party/xla/xla/pjrt/tracked_device_buffer.h",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 7,
+            "changes": 11,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a631a19b022b892d1d85eba6018fa9b89691ff38/third_party%2Fxla%2Fxla%2Fpjrt%2Ftracked_device_buffer.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a631a19b022b892d1d85eba6018fa9b89691ff38/third_party%2Fxla%2Fxla%2Fpjrt%2Ftracked_device_buffer.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Ftracked_device_buffer.h?ref=a631a19b022b892d1d85eba6018fa9b89691ff38",
+            "patch": "@@ -163,6 +163,8 @@ class BufferSequencingEvent : tsl::AsyncPayload::KeepOnError {\n     se::Stream* definition_stream;\n   };\n \n+  se::Stream* definition_stream() const { return event_->definition_stream; }\n+\n  private:\n   uint64_t sequence_number() const;\n \n@@ -218,8 +220,6 @@ class TrackedDeviceBuffer : public AbstractTrackedDeviceBuffer {\n  public:\n   // Helper object to keep track of usage of the buffer on streams.\n   struct StreamAndEvent {\n-    // A stream the buffer has been used on.\n-    se::Stream* stream;\n     // An event that is later than the most recent usage of the buffer on\n     // stream.\n     BufferSequencingEventRef event;\n@@ -282,8 +282,7 @@ class TrackedDeviceBuffer : public AbstractTrackedDeviceBuffer {\n   //                   reference to *this to stay live until after the host\n   //                   is sure that the usage (transfer or execution) has\n   //                   completed.\n-  void AddUsageEvent(se::Stream* usage_stream, BufferSequencingEventRef event,\n-                     bool reference_held);\n+  void AddUsageEvent(BufferSequencingEventRef event, bool reference_held);\n \n   using StreamAndEventContainer = absl::InlinedVector<StreamAndEvent, 3>;\n   // Returns the set of streams that the buffer was used on, and for each stream\n@@ -303,9 +302,7 @@ class TrackedDeviceBuffer : public AbstractTrackedDeviceBuffer {\n   tsl::RCReference<CommonPjRtRawBuffer> GetRawBuffer(\n       PjRtMemorySpace* memory_space) override;\n \n-  void AddUsageEvent(tsl::RCReference<PjRtDeviceEvent> event) override {\n-    LOG(FATAL) << \"Implement\";\n-  }\n+  void AddUsageEvent(tsl::RCReference<PjRtDeviceEvent> event) override;\n \n   void Delete(PjRtMemorySpace* memory_space) override {\n     LOG(FATAL) << \"Implement\";"
+        }
+    ],
+    "stats": {
+        "total": 38,
+        "additions": 24,
+        "deletions": 14
+    }
+}

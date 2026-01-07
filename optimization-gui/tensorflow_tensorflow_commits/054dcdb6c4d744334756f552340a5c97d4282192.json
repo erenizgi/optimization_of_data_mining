@@ -1,0 +1,48 @@
+{
+    "author": "thomasjoerg",
+    "message": "[XLA:GPU] Preserve reduce+convert idioms in `ReduceDecomposer`.\n\n`reduce` followed by `convert` is the idiomatic way of specifying different dtypes for accumulation and output for HLO reductions. The two ops thus logically belong together and will typically be fused for codegen. Prior to this change, the ReduceDecomposer pass injected transposing `copy` ops in-between `reduce` and `convert`. Breaking the reduce+convert apart confused some downstream passes.\n\nAlso make `ReduceDecomposer` preserve op metadata.\n\nPiperOrigin-RevId: 840182238",
+    "sha": "054dcdb6c4d744334756f552340a5c97d4282192",
+    "files": [
+        {
+            "sha": "bf6f0ff59e21b97f9c76177bb4322cb9da79e56a",
+            "filename": "third_party/xla/xla/hlo/transforms/expanders/BUILD",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 2,
+            "changes": 8,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/054dcdb6c4d744334756f552340a5c97d4282192/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fexpanders%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/054dcdb6c4d744334756f552340a5c97d4282192/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fexpanders%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fexpanders%2FBUILD?ref=054dcdb6c4d744334756f552340a5c97d4282192",
+            "patch": "@@ -433,9 +433,14 @@ cc_library(\n     srcs = [\"reduce_decomposer.cc\"],\n     hdrs = [\"reduce_decomposer.h\"],\n     deps = [\n+        \"//xla:shape_util\",\n+        \"//xla:status_macros\",\n+        \"//xla:util\",\n         \"//xla/hlo/ir:hlo\",\n         \"//xla/hlo/pass:hlo_pass\",\n         \"//xla/service:hlo_creation_utils\",\n+        \"//xla/tsl/platform:errors\",\n+        \"//xla/tsl/platform:statusor\",\n         \"@com_google_absl//absl/container:flat_hash_set\",\n         \"@com_google_absl//absl/status\",\n         \"@com_google_absl//absl/status:statusor\",\n@@ -448,10 +453,9 @@ xla_cc_test(\n     srcs = [\"reduce_decomposer_test.cc\"],\n     deps = [\n         \":reduce_decomposer\",\n-        \"//xla/hlo/parser:hlo_parser\",\n+        \"//xla/hlo/ir:hlo\",\n         \"//xla/hlo/testlib:hlo_hardware_independent_test_base\",\n         \"//xla/hlo/testlib:test\",\n-        \"//xla/hlo/testlib:test_helpers\",\n         \"@com_google_googletest//:gtest\",\n         \"@com_google_googletest//:gtest_main\",\n     ],"
+        },
+        {
+            "sha": "53582d360b5e43585ac9bc07447305e07c8d0c81",
+            "filename": "third_party/xla/xla/hlo/transforms/expanders/reduce_decomposer.cc",
+            "status": "modified",
+            "additions": 24,
+            "deletions": 4,
+            "changes": 28,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/054dcdb6c4d744334756f552340a5c97d4282192/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fexpanders%2Freduce_decomposer.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/054dcdb6c4d744334756f552340a5c97d4282192/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fexpanders%2Freduce_decomposer.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fexpanders%2Freduce_decomposer.cc?ref=054dcdb6c4d744334756f552340a5c97d4282192",
+            "patch": "@@ -26,8 +26,15 @@ limitations under the License.\n #include \"absl/strings/string_view.h\"\n #include \"xla/hlo/ir/dfs_hlo_visitor_with_default.h\"\n #include \"xla/hlo/ir/hlo_casting_utils.h\"\n+#include \"xla/hlo/ir/hlo_instruction.h\"\n #include \"xla/hlo/ir/hlo_instructions.h\"\n+#include \"xla/hlo/ir/hlo_opcode.h\"\n #include \"xla/service/hlo_creation_utils.h\"\n+#include \"xla/shape.h\"\n+#include \"xla/status_macros.h\"\n+#include \"xla/tsl/platform/errors.h\"\n+#include \"xla/tsl/platform/statusor.h\"\n+#include \"xla/util.h\"\n \n namespace xla {\n \n@@ -104,21 +111,34 @@ class ReduceDecomposerVisitor : public DfsHloRewriteVisitor {\n     TF_ASSIGN_OR_RETURN(auto expected_output_shape,\n                         ShapeUtil::MakeValidatedMaybeTupleShape(output_shapes));\n     if (expected_tuple_shape == expected_output_shape) {\n-      return absl::OkStatus();\n+      return absl::OkStatus();  // Nothing to do here.\n     }\n \n     TF_ASSIGN_OR_RETURN(\n         auto r_prime,\n         MakeReduceHlo(reduce->inputs(), reduce->init_values(),\n-                      reduce->dimensions(), reduce->called_computations()[0]));\n+                      reduce->dimensions(), reduce->called_computations()[0],\n+                      &reduce->metadata()));\n     TF_RET_CHECK(r_prime->shape() == expected_tuple_shape);\n \n+    // Handle non-variadic reductions.\n     if (!shape.IsTuple()) {\n-      auto copy = MakeCopyHlo(r_prime, shape);\n-      TF_RETURN_IF_ERROR(ReplaceInstruction(reduce, copy));\n+      HloInstruction* to_replace = reduce;\n+      HloInstruction* to_copy = r_prime;\n+      if (reduce->users().size() == 1 &&\n+          reduce->users()[0]->opcode() == HloOpcode::kConvert) {\n+        // Keep reduction+convert ops adjacent and insert the copy after them.\n+        to_replace = reduce->users()[0];\n+        to_copy = MakeConvertToHlo(r_prime, to_replace->shape().element_type(),\n+                                   &to_replace->metadata());\n+        shape.set_element_type(to_replace->shape().element_type());\n+      }\n+      auto copy = MakeCopyHlo(to_copy, shape);\n+      TF_RETURN_IF_ERROR(ReplaceInstruction(to_replace, copy));\n       return absl::OkStatus();\n     }\n \n+    // Handle variadic reductions.\n     std::vector<HloInstruction*> copies;\n     for (int i = 0; i < reduce->input_count(); i++) {\n       TF_ASSIGN_OR_RETURN(auto from, GetOutput(r_prime, i));"
+        },
+        {
+            "sha": "fdc0e2acc291bd1ae3537b448261992fb1bb41c7",
+            "filename": "third_party/xla/xla/hlo/transforms/expanders/reduce_decomposer_test.cc",
+            "status": "modified",
+            "additions": 33,
+            "deletions": 4,
+            "changes": 37,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/054dcdb6c4d744334756f552340a5c97d4282192/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fexpanders%2Freduce_decomposer_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/054dcdb6c4d744334756f552340a5c97d4282192/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fexpanders%2Freduce_decomposer_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fexpanders%2Freduce_decomposer_test.cc?ref=054dcdb6c4d744334756f552340a5c97d4282192",
+            "patch": "@@ -17,10 +17,9 @@ limitations under the License.\n #include <optional>\n \n #include <gtest/gtest.h>\n-#include \"xla/hlo/parser/hlo_parser.h\"\n+#include \"xla/hlo/ir/hlo_instruction.h\"\n #include \"xla/hlo/testlib/hlo_hardware_independent_test_base.h\"\n #include \"xla/hlo/testlib/test.h\"\n-#include \"xla/hlo/testlib/test_helpers.h\"\n \n namespace xla {\n namespace {\n@@ -41,7 +40,7 @@ add {\n ENTRY c {\n     p = f32[5,3,4]{2,1,0} parameter(0)\n     z = f32[] constant(0)\n-    ROOT r = f32[5,4]{0,1} reduce(p, z), dimensions={1}, to_apply=add\n+    ROOT r = f32[5,4]{0,1} reduce(p, z), dimensions={1}, to_apply=add, metadata={op_name=\"reduce\"}\n }\n )\";\n \n@@ -54,11 +53,41 @@ ENTRY c {\n \n   RunAndFilecheckHloRewrite(hlo, ReduceDecomposer{},\n                             R\"(\n-// CHECK: [[reduce_0:%[^ ]+]] = f32[5,4]{1,0} reduce([[p_1:%[^ ]+]], [[z_2:%[^ ]+]]), dimensions={1}, to_apply=[[add_3:%[^ ]+]]\n+// CHECK: [[reduce_0:%[^ ]+]] = f32[5,4]{1,0} reduce([[p_1:%[^ ]+]], [[z_2:%[^ ]+]]), dimensions={1}, to_apply=[[add_3:%[^ ]+]], metadata={op_name=\"reduce\"}\n // CHECK-NEXT: ROOT [[copy_4:%[^ ]+]] = f32[5,4]{0,1} copy([[reduce_0]])\n       )\");\n }\n \n+TEST_F(ReduceDecomposerTest, ReducePerformsTranspositionAfterConvert) {\n+  const char* hlo = R\"(\n+add {\n+    a = f32[] parameter(0)\n+    b = f32[] parameter(1)\n+    ROOT out = add(a, b)\n+}\n+\n+ENTRY c {\n+    p = f32[5,3,4]{2,1,0} parameter(0)\n+    z = f32[] constant(0)\n+    r = f32[5,4]{0,1} reduce(p, z), dimensions={1}, to_apply=add, metadata={op_name=\"reduce\"}\n+    ROOT c = bf16[5,4]{0,1} convert(r), metadata={op_name=\"convert\"}\n+})\";\n+\n+  RunAndFilecheckHloRewrite(\n+      hlo,\n+      ReduceDecomposer{/*custom_layout_allowed=*/[&](const HloInstruction*) {\n+        return true;\n+      }},\n+      std::nullopt);\n+\n+  RunAndFilecheckHloRewrite(hlo, ReduceDecomposer{},\n+                            R\"(\n+// CHECK: [[reduce:%[^ ]+]] = f32[5,4]{1,0} reduce([[p_1:%[^ ]+]], [[z_2:%[^ ]+]]), dimensions={1}, to_apply=[[add:%[^ ]+]], metadata={op_name=\"reduce\"}\n+// CHECK-NEXT: [[convert:%[^ ]+]] = bf16[5,4]{1,0} convert([[reduce]]), metadata={op_name=\"convert\"}\n+// CHECK-NEXT: ROOT [[copy:%[^ ]+]] = bf16[5,4]{0,1} copy([[convert]])\n+      )\");\n+}\n+\n TEST_F(ReduceDecomposerTest, ReduceNaturalLayout) {\n   // Reshape is already a bitcast, nothing should be changed.\n   const char* hlo = R\"("
+        }
+    ],
+    "stats": {
+        "total": 73,
+        "additions": 63,
+        "deletions": 10
+    }
+}

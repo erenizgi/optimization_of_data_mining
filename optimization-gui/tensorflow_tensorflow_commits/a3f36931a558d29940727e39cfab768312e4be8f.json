@@ -1,0 +1,48 @@
+{
+    "author": "tensorflower-gardener",
+    "message": "[XLA:Original Value] Fix original value tracking in multi_output_fusion\n\nCurrently the fused operation has incorrect original value that doesn't match the tuple structure. This CL fixes that and added a test covering this case.\n\nPiperOrigin-RevId: 805113270",
+    "sha": "a3f36931a558d29940727e39cfab768312e4be8f",
+    "files": [
+        {
+            "sha": "2b682a4992bc13e6ae1b109a656b4f406bbc212a",
+            "filename": "third_party/xla/xla/hlo/ir/hlo_original_value.h",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a3f36931a558d29940727e39cfab768312e4be8f/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_original_value.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a3f36931a558d29940727e39cfab768312e4be8f/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_original_value.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_original_value.h?ref=a3f36931a558d29940727e39cfab768312e4be8f",
+            "patch": "@@ -23,6 +23,7 @@ limitations under the License.\n #include <utility>\n \n #include \"absl/strings/string_view.h\"\n+#include \"xla/shape.h\"\n #include \"xla/shape_util.h\"\n #include \"xla/tuple_tree.h\"\n #include \"xla/util.h\"\n@@ -68,6 +69,7 @@ class OriginalValue {\n       : tree_(std::move(root_node)) {}\n   explicit OriginalValue(TupleTree<std::optional<OriginalArray>>&& tree)\n       : tree_(std::move(tree)) {}\n+  explicit OriginalValue(const Shape& shape) : tree_(shape) {}\n   std::string ToString() const;\n   OriginalValueProto ToProto() const;\n   static std::shared_ptr<OriginalValue> FromProto("
+        },
+        {
+            "sha": "ca7cc69ad01e2a96c75bd7ace8832cc4bf6dec7f",
+            "filename": "third_party/xla/xla/service/BUILD",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a3f36931a558d29940727e39cfab768312e4be8f/third_party%2Fxla%2Fxla%2Fservice%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a3f36931a558d29940727e39cfab768312e4be8f/third_party%2Fxla%2Fxla%2Fservice%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2FBUILD?ref=a3f36931a558d29940727e39cfab768312e4be8f",
+            "patch": "@@ -2050,12 +2050,17 @@ cc_library(\n         \"//xla/hlo/ir:hlo\",\n         \"//xla/hlo/pass:hlo_pass\",\n         \"//xla/hlo/transforms/simplifiers:hlo_dce\",\n+        \"//xla/tsl/platform:errors\",\n+        \"//xla/tsl/platform:status\",\n         \"@com_google_absl//absl/container:flat_hash_map\",\n         \"@com_google_absl//absl/container:flat_hash_set\",\n+        \"@com_google_absl//absl/functional:function_ref\",\n         \"@com_google_absl//absl/log\",\n         \"@com_google_absl//absl/log:check\",\n         \"@com_google_absl//absl/status:statusor\",\n         \"@com_google_absl//absl/strings\",\n+        \"@com_google_absl//absl/strings:str_format\",\n+        \"@com_google_absl//absl/types:span\",\n     ],\n )\n "
+        },
+        {
+            "sha": "36d529330d5c2964ab35e06ebfb1268ff1693839",
+            "filename": "third_party/xla/xla/service/multi_output_fusion.cc",
+            "status": "modified",
+            "additions": 47,
+            "deletions": 0,
+            "changes": 47,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a3f36931a558d29940727e39cfab768312e4be8f/third_party%2Fxla%2Fxla%2Fservice%2Fmulti_output_fusion.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a3f36931a558d29940727e39cfab768312e4be8f/third_party%2Fxla%2Fxla%2Fservice%2Fmulti_output_fusion.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fmulti_output_fusion.cc?ref=a3f36931a558d29940727e39cfab768312e4be8f",
+            "patch": "@@ -17,21 +17,31 @@ limitations under the License.\n \n #include <algorithm>\n #include <cstdint>\n+#include <memory>\n #include <optional>\n+#include <utility>\n #include <vector>\n \n #include \"absl/container/flat_hash_set.h\"\n+#include \"absl/functional/function_ref.h\"\n #include \"absl/log/check.h\"\n #include \"absl/log/log.h\"\n+#include \"absl/strings/str_format.h\"\n #include \"absl/strings/string_view.h\"\n+#include \"absl/types/span.h\"\n #include \"xla/debug_options_flags.h\"\n #include \"xla/hlo/analysis/hlo_dataflow_analysis.h\"\n #include \"xla/hlo/analysis/hlo_reachability.h\"\n #include \"xla/hlo/ir/hlo_instruction.h\"\n #include \"xla/hlo/ir/hlo_opcode.h\"\n+#include \"xla/hlo/ir/hlo_original_value.h\"\n+#include \"xla/hlo/ir/hlo_print_options.h\"\n #include \"xla/hlo/transforms/simplifiers/hlo_dce.h\"\n #include \"xla/map_util.h\"\n+#include \"xla/shape.h\"\n #include \"xla/shape_util.h\"\n+#include \"xla/tsl/platform/errors.h\"\n+#include \"xla/tsl/platform/status.h\"\n #include \"xla/util.h\"\n \n namespace xla {\n@@ -76,10 +86,45 @@ absl::StatusOr<bool> MultiOutputFusion::Run(\n   return changed;\n }\n \n+namespace {\n+void SetOriginalValue(HloInstruction* remaining, HloInstruction* fused,\n+                      const Shape& remaining_shape, const Shape& fused_shape) {\n+  auto remaining_ov = remaining->original_value();\n+  auto fused_ov = fused->original_value();\n+  if (remaining_ov == nullptr && fused_ov == nullptr) {\n+    return;\n+  }\n+\n+  if (!remaining_ov) {\n+    remaining_ov = std::make_shared<OriginalValue>(remaining_shape);\n+  }\n+  if (!fused_ov) {\n+    fused_ov = std::make_shared<OriginalValue>(fused_shape);\n+  }\n+  std::vector<std::optional<OriginalArray>> new_leaves;\n+  for (const auto& [index, value] : remaining_ov->original_arrays()) {\n+    new_leaves.push_back(value);\n+  }\n+  for (const auto& [index, value] : fused_ov->original_arrays()) {\n+    new_leaves.push_back(value);\n+  }\n+\n+  auto new_ov = std::make_shared<OriginalValue>(remaining->shape());\n+  int64_t leaf_index = 0;\n+  for (auto& [index, value] : new_ov->mutable_original_arrays()) {\n+    value = new_leaves[leaf_index++];\n+  }\n+  remaining->set_original_value(new_ov);\n+}\n+}  // namespace\n+\n HloInstruction* MultiOutputFusion::Fuse(HloInstruction* instr1,\n                                         HloInstruction* instr2) {\n   HloInstruction* remaining = instr1;\n   HloInstruction* fused = instr2;\n+  const Shape& remaining_shape = remaining->shape();\n+  const Shape& fused_shape = fused->shape();\n+\n   // Make sure that if only one of the instructions is a fusion, or if only one\n   // of the instructions is a multi-output fusion, it's what will be fused into.\n   if (!remaining->IsMultiOutputFusion() && fused->IsMultiOutputFusion()) {\n@@ -93,6 +138,8 @@ HloInstruction* MultiOutputFusion::Fuse(HloInstruction* instr1,\n   } else {\n     remaining->FuseInstructionIntoMultiOutput(fused);\n   }\n+\n+  SetOriginalValue(remaining, fused, remaining_shape, fused_shape);\n   return remaining;\n }\n "
+        }
+    ],
+    "stats": {
+        "total": 54,
+        "additions": 54,
+        "deletions": 0
+    }
+}

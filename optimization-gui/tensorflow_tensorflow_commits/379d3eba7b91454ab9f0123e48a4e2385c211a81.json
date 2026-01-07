@@ -1,0 +1,84 @@
+{
+    "author": "tensorflower-gardener",
+    "message": "Set call result shardings to the out shardings of func that is created or found from cache.\n\nIt is a no op for `dedupFunctionsFully` is false which is also the default.\n\noutShardings is the the output shardings of the named computation at hand. However, if dedupFunctionsFully true, the func we pick from `createFuncOpOrGetFromCache`, which is the func the call will actually be calling, may have a different output sharding than the named computation, and call result sharding should be set to the output sharding it calls. For example,\n\nnamedComputation1(foo): insharding={\"x\"} outsharding={\"y\"}\nnamedComputation2(foo): insharding={\"x\"} outsharding={\"z\"}\n\ncall1 to namedComputation1\ncall2 to namedComputation2\n\nWhen dedupFunctionsFully is false, we have separate instances of foo as their outshardings are different.\n\nfunc foo1 insharding={\"x\"} outsharding={\"y\"} {...}\nfunc foo2 insharding={\"x\"} outsharding={\"z\"} {...}\ncall1 to foo_1 resultsharding={\"y\"}\ncall2 to foo_2 resultsharding={\"z\"}\n\nWhen dedupFunctionsFully is true, we do not have separate instance of foo, we need to pick either namedComputation1 or namedComputation2, say we pick namedComputation1, hence it becomes:\n\nfunc foo insharding={\"x\"} outsharding={\"y\"} {...}\ncall1 to foo resultsharding={\"y\"}\ncall2 to foo resultsharding={\"y\"}\n\nAs a result, call2 should have a resultsharding={\"y\"} since it is calling foo, instead of the out sharding of namedComputation2 which is {\"z\"}.\n\nPiperOrigin-RevId: 820139879",
+    "sha": "379d3eba7b91454ab9f0123e48a4e2385c211a81",
+    "files": [
+        {
+            "sha": "27fc5795529149bc8e13c4cd7927574145154101",
+            "filename": "third_party/xla/xla/service/spmd/shardy/round_trip_common/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/379d3eba7b91454ab9f0123e48a4e2385c211a81/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Fround_trip_common%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/379d3eba7b91454ab9f0123e48a4e2385c211a81/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Fround_trip_common%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Fround_trip_common%2FBUILD?ref=379d3eba7b91454ab9f0123e48a4e2385c211a81",
+            "patch": "@@ -40,6 +40,7 @@ cc_library(\n     hdrs = [\"export_named_computations.h\"],\n     deps = [\n         \"//xla/service/spmd/shardy:constants\",\n+        \"//xla/service/spmd/shardy:utils\",\n         \"@com_google_absl//absl/log:check\",\n         \"@llvm-project//llvm:Support\",\n         \"@llvm-project//mlir:FuncDialect\","
+        },
+        {
+            "sha": "4bcfd3cecbb23de9d9e61c2e190a0ef3117ee64e",
+            "filename": "third_party/xla/xla/service/spmd/shardy/round_trip_common/export_named_computations.cc",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 3,
+            "changes": 12,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/379d3eba7b91454ab9f0123e48a4e2385c211a81/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Fround_trip_common%2Fexport_named_computations.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/379d3eba7b91454ab9f0123e48a4e2385c211a81/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Fround_trip_common%2Fexport_named_computations.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Fround_trip_common%2Fexport_named_computations.cc?ref=379d3eba7b91454ab9f0123e48a4e2385c211a81",
+            "patch": "@@ -40,6 +40,7 @@ limitations under the License.\n #include \"shardy/dialect/sdy/ir/dialect.h\"\n #include \"shardy/dialect/sdy/ir/utils.h\"\n #include \"xla/service/spmd/shardy/constants.h\"\n+#include \"xla/service/spmd/shardy/utils.h\"\n \n namespace xla {\n namespace sdy {\n@@ -180,9 +181,14 @@ class ExportNamedComputationsPass\n           namedComputationOp.getOperands());\n       callOp->setAttrs(callOpAttrs);\n \n-      // Copy the output shardings to the call op.\n-      if (outShardings.has_value()) {\n-        mlir::sdy::setShardings(callOp, *outShardings);\n+      // Copy the func output shardings to the call op.\n+      // TODO(enver): Add explicit reshard if callOp and funcOp result shardings\n+      // mismatch.\n+      FuncOp funcOp = symbolTable.lookup<FuncOp>(funcSymName);\n+      if (TensorShardingPerValueAttr funcResultShardings =\n+              getFuncResultShardings(callOp, funcOp, symbolTable);\n+          funcResultShardings) {\n+        mlir::sdy::setShardings(callOp, funcResultShardings);\n         if (manualAxesAttr) {\n           callOp->setAttr(kManualAxes, manualAxesAttr);\n         }"
+        },
+        {
+            "sha": "621b1294ece1affb3e69a9496cf781a5695bf222",
+            "filename": "third_party/xla/xla/service/spmd/shardy/round_trip_common/import_func_calls.cc",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 38,
+            "changes": 38,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/379d3eba7b91454ab9f0123e48a4e2385c211a81/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Fround_trip_common%2Fimport_func_calls.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/379d3eba7b91454ab9f0123e48a4e2385c211a81/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Fround_trip_common%2Fimport_func_calls.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Fround_trip_common%2Fimport_func_calls.cc?ref=379d3eba7b91454ab9f0123e48a4e2385c211a81",
+            "patch": "@@ -112,44 +112,6 @@ TensorShardingPerValueAttr getFuncArgShardings(CallOp callOp, FuncOp funcOp,\n   return TensorShardingPerValueAttr::get(funcOp.getContext(), argShardings);\n }\n \n-// Returns the first non-maximal mesh on the result shardings, if there is\n-// one. Otherwise returns `std::nullopt`.\n-// TODO(enver): Move to utils and potentially with a common helper that takes an\n-// std::function to get the sharding given an index.\n-std::optional<mlir::Attribute> getMeshOrRefOnResults(\n-    FuncOp funcOp, const SymbolTable& symbolTable) {\n-  for (int64_t resultNum = 0; resultNum < funcOp.getNumResults(); ++resultNum) {\n-    if (TensorShardingAttr sdySharding =\n-            mlir::sdy::getFuncResultSharding(funcOp, resultNum);\n-        sdySharding && !sdySharding.getMesh(symbolTable).isMaximal()) {\n-      return std::make_optional(sdySharding.getMeshOrRef());\n-    }\n-  }\n-  return std::nullopt;\n-}\n-\n-TensorShardingPerValueAttr getFuncResultShardings(\n-    CallOp callOp, FuncOp funcOp, const SymbolTable& symbolTable) {\n-  std::optional<mlir::Attribute> meshOrRef =\n-      getMeshOrRefOnResults(funcOp, symbolTable);\n-  if (!meshOrRef) {\n-    return nullptr;\n-  }\n-  mlir::SmallVector<TensorShardingAttr> resultShardings;\n-  resultShardings.reserve(funcOp.getNumResults());\n-  for (int64_t resultNum = 0; resultNum < funcOp.getNumResults(); ++resultNum) {\n-    TensorShardingAttr sdySharding =\n-        mlir::sdy::getFuncResultSharding(funcOp, resultNum);\n-    resultShardings.push_back(\n-        sdySharding\n-            ? sdySharding\n-            : TensorShardingAttr::getFullyOpen(\n-                  funcOp.getContext(),\n-                  getTensorRank(callOp.getResult(resultNum)), *meshOrRef));\n-  }\n-  return TensorShardingPerValueAttr::get(funcOp.getContext(), resultShardings);\n-}\n-\n void importCallOp(\n     CallOp callOp,\n     llvm::SmallDenseMap<StringRef, mlir::Region*>& calleeNameToMovedRegion,"
+        },
+        {
+            "sha": "a028966dcaab3b8355545ab8121887db0263d7a4",
+            "filename": "third_party/xla/xla/service/spmd/shardy/test/export_named_computations_deduplicate_functions_fully.mlir",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/379d3eba7b91454ab9f0123e48a4e2385c211a81/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Ftest%2Fexport_named_computations_deduplicate_functions_fully.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/379d3eba7b91454ab9f0123e48a4e2385c211a81/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Ftest%2Fexport_named_computations_deduplicate_functions_fully.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Ftest%2Fexport_named_computations_deduplicate_functions_fully.mlir?ref=379d3eba7b91454ab9f0123e48a4e2385c211a81",
+            "patch": "@@ -5,7 +5,7 @@ sdy.mesh @mesh = <[\"x\"=2, \"y\"=2]>\n // CHECK-LABEL: func @multiple_same_named_computations_different_shardings(\n func.func @multiple_same_named_computations_different_shardings(%arg0: tensor<8x2xi32> {sdy.sharding = #sdy.sharding<@mesh, [{\"y\"}, {\"x\"}]>}) -> (tensor<8x2xi32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}, {\"y\"}]>}) {\n   // CHECK-NEXT: %0 = call @baz(%arg0) {sdy.sharding = #sdy.sharding_per_value<[<@mesh, [{\"x\"}, {}]>]>} : (tensor<8x2xi32>) -> tensor<8x2xi32>\n-  // CHECK-NEXT: %1 = call @baz(%arg0) {sdy.sharding = #sdy.sharding_per_value<[<@mesh, [{\"x\"}, {\"y\"}]>]>} : (tensor<8x2xi32>) -> tensor<8x2xi32>\n+  // CHECK-NEXT: %1 = call @baz(%arg0) {sdy.sharding = #sdy.sharding_per_value<[<@mesh, [{\"x\"}, {}]>]>} : (tensor<8x2xi32>) -> tensor<8x2xi32>\n   // CHECK-NEXT: return %1 : tensor<8x2xi32>\n   %0 = sdy.named_computation<\"baz\">(%arg0) in_shardings=[<@mesh, [{}, {\"y\"}]>] out_shardings=[<@mesh, [{\"x\"}, {}]>] (%arg1: tensor<8x2xi32>) {\n     %2 = stablehlo.multiply %arg1, %arg1 {mhlo.frontend_attributes = {_xla_compute_type = \"host\"}, sdy.sharding = #sdy.sharding_per_value<[<@mesh, [{\"x\", ?}, {\"y\", ?}]>]>} : tensor<8x2xi32>\n@@ -31,7 +31,7 @@ sdy.mesh @mesh = <[\"x\"=2, \"y\"=2]>\n // CHECK-SAME:      -> (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\", \"y\"}]>}) {\n // CHECK:       %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{\"x\", \"y\"}]>] out_shardings=[<@mesh, [{\"x\", \"y\"}]>] manual_axes={\"x\"} (%arg1: tensor<4xf32>) {\n // CHECK-NEXT:    %2 = func.call @foo(%arg1) {sdy.sharding = #sdy.sharding_per_value<[<@mesh, [{\"y\"}]>]>, xla.sdy.manual_axes = #sdy<manual_axes{\"x\"}>} : (tensor<4xf32>) -> tensor<4xf32>\n-// CHECK-NEXT:    %3 = func.call @foo(%2) {sdy.sharding = #sdy.sharding_per_value<[<@mesh, [{}]>]>, xla.sdy.manual_axes = #sdy<manual_axes{\"x\"}>} : (tensor<4xf32>) -> tensor<4xf32>\n+// CHECK-NEXT:    %3 = func.call @foo(%2) {sdy.sharding = #sdy.sharding_per_value<[<@mesh, [{\"y\"}]>]>, xla.sdy.manual_axes = #sdy<manual_axes{\"x\"}>} : (tensor<4xf32>) -> tensor<4xf32>\n // CHECK-NEXT:    sdy.return %3 : tensor<4xf32>\n // CHECK-NEXT:  } : (tensor<8xf32>) -> tensor<8xf32>\n // CHECK-NEXT:  %1 = call @foo_0(%0) {sdy.sharding = #sdy.sharding_per_value<[<@mesh, [{\"y\"}]>]>} : (tensor<8xf32>) -> tensor<8xf32>"
+        },
+        {
+            "sha": "d3a4bd26971cef3e91486c7659f69a262cf28c5e",
+            "filename": "third_party/xla/xla/service/spmd/shardy/utils.cc",
+            "status": "modified",
+            "additions": 43,
+            "deletions": 0,
+            "changes": 43,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/379d3eba7b91454ab9f0123e48a4e2385c211a81/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Futils.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/379d3eba7b91454ab9f0123e48a4e2385c211a81/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Futils.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Futils.cc?ref=379d3eba7b91454ab9f0123e48a4e2385c211a81",
+            "patch": "@@ -40,6 +40,7 @@ limitations under the License.\n #include \"mlir/IR/MLIRContext.h\"\n #include \"mlir/IR/Operation.h\"\n #include \"mlir/IR/PatternMatch.h\"\n+#include \"mlir/IR/SymbolTable.h\"\n #include \"mlir/IR/TypeRange.h\"\n #include \"mlir/IR/Visitors.h\"\n #include \"mlir/Support/LLVM.h\"\n@@ -439,5 +440,47 @@ bool hasShardyMesh(mlir::ModuleOp module) {\n   return !module.getOps<mlir::sdy::MeshOp>().empty();\n }\n \n+namespace {\n+// Returns the first non-maximal mesh on the result shardings, if there is\n+// one. Otherwise returns `std::nullopt`.\n+// TODO(enver): Use a common helper that takes an std::function to get the\n+// sharding given an index.\n+std::optional<Attribute> getMeshOrRefOnResults(\n+    mlir::func::FuncOp funcOp, const mlir::SymbolTable& symbolTable) {\n+  for (int64_t resultNum = 0; resultNum < funcOp.getNumResults(); ++resultNum) {\n+    if (mlir::sdy::TensorShardingAttr sdySharding =\n+            mlir::sdy::getFuncResultSharding(funcOp, resultNum);\n+        sdySharding && !sdySharding.getMesh(symbolTable).isMaximal()) {\n+      return std::make_optional(sdySharding.getMeshOrRef());\n+    }\n+  }\n+  return std::nullopt;\n+}\n+}  // namespace\n+\n+mlir::sdy::TensorShardingPerValueAttr getFuncResultShardings(\n+    mlir::func::CallOp callOp, mlir::func::FuncOp funcOp,\n+    const mlir::SymbolTable& symbolTable) {\n+  std::optional<mlir::Attribute> meshOrRef =\n+      getMeshOrRefOnResults(funcOp, symbolTable);\n+  if (!meshOrRef) {\n+    return nullptr;\n+  }\n+  SmallVector<mlir::sdy::TensorShardingAttr> resultShardings;\n+  resultShardings.reserve(funcOp.getNumResults());\n+  for (int64_t resultNum = 0; resultNum < funcOp.getNumResults(); ++resultNum) {\n+    mlir::sdy::TensorShardingAttr sdySharding =\n+        mlir::sdy::getFuncResultSharding(funcOp, resultNum);\n+    resultShardings.push_back(\n+        sdySharding ? sdySharding\n+                    : mlir::sdy::TensorShardingAttr::getFullyOpen(\n+                          funcOp.getContext(),\n+                          mlir::sdy::getTensorRank(callOp.getResult(resultNum)),\n+                          *meshOrRef));\n+  }\n+  return mlir::sdy::TensorShardingPerValueAttr::get(funcOp.getContext(),\n+                                                    resultShardings);\n+}\n+\n }  // namespace sdy\n }  // namespace xla"
+        },
+        {
+            "sha": "362ac8768795125a4d8fe1447a82e6efddddb954",
+            "filename": "third_party/xla/xla/service/spmd/shardy/utils.h",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/379d3eba7b91454ab9f0123e48a4e2385c211a81/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Futils.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/379d3eba7b91454ab9f0123e48a4e2385c211a81/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Futils.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Futils.h?ref=379d3eba7b91454ab9f0123e48a4e2385c211a81",
+            "patch": "@@ -166,6 +166,12 @@ bool hasGspmdAttrsOrOps(mlir::ModuleOp module);\n // TODO(b/420837831): delete this once we don't fall back to GSPMD.\n bool hasShardyMesh(mlir::ModuleOp module);\n \n+// Returns the func result shardings of `funcOp`, with fully-replicated\n+// shardings for empty shardings on `funcOp`, by using the ranks from `callOp`.\n+mlir::sdy::TensorShardingPerValueAttr getFuncResultShardings(\n+    mlir::func::CallOp callOp, mlir::func::FuncOp funcOp,\n+    const mlir::SymbolTable& symbolTable);\n+\n }  // namespace sdy\n }  // namespace xla\n "
+        }
+    ],
+    "stats": {
+        "total": 104,
+        "additions": 61,
+        "deletions": 43
+    }
+}

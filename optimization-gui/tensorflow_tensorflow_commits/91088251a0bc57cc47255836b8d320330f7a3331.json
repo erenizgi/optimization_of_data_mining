@@ -1,0 +1,24 @@
+{
+    "author": "ezhulenev",
+    "message": "PR #35463: [xla:gpu] Support ncclAlltoall directly for contiguous send/recv buffers\n\nImported from GitHub PR https://github.com/openxla/xla/pull/35463\n\nWith latest NCCL we can use `ncclAlltoall` API directly without having to launch grouped send and recv operations.\nCopybara import of the project:\n\n--\n0630f4d48049b211442dcb1754e521a4b1f37f7b by Eugene Zhulenev <ezv@amazon.com>:\n\n[xla:gpu] Support ncclAlltoall directly for contiguous send/recv buffers\n\nMerging this change closes #35463\n\nPiperOrigin-RevId: 846277559",
+    "sha": "91088251a0bc57cc47255836b8d320330f7a3331",
+    "files": [
+        {
+            "sha": "1924b34a02320b22f6f67540b98e4ec5bae84b4f",
+            "filename": "third_party/xla/xla/backends/gpu/collectives/nccl_communicator.cc",
+            "status": "modified",
+            "additions": 44,
+            "deletions": 1,
+            "changes": 45,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/91088251a0bc57cc47255836b8d320330f7a3331/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcollectives%2Fnccl_communicator.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/91088251a0bc57cc47255836b8d320330f7a3331/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcollectives%2Fnccl_communicator.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcollectives%2Fnccl_communicator.cc?ref=91088251a0bc57cc47255836b8d320330f7a3331",
+            "patch": "@@ -640,6 +640,32 @@ absl::Status NcclCommunicator::LaunchAllGather(\n   return absl::OkStatus();\n }\n \n+// If all buffers are contiguous returns a device address range that covers all\n+// of them, otherwise returns an empty optional.\n+static std::optional<se::DeviceAddressBase> IsContinguous(\n+    absl::Span<const se::DeviceAddressBase> buffers) {\n+  if (buffers.empty()) {\n+    return std::nullopt;\n+  }\n+\n+  if (buffers.size() == 1) {\n+    return buffers[0];\n+  }\n+\n+  size_t total_size = buffers[0].size();\n+  for (size_t i = 1; i < buffers.size(); ++i) {\n+    se::DeviceAddress<uint8_t> a(buffers[i - 1]);\n+    se::DeviceAddress<uint8_t> b(buffers[i]);\n+    total_size += b.size();\n+\n+    if (a.base() + a.size() != b.base()) {\n+      return std::nullopt;\n+    }\n+  }\n+\n+  return se::DeviceAddressBase(buffers[0].opaque(), total_size);\n+}\n+\n absl::Status NcclCommunicator::LaunchAllToAll(\n     absl::InlinedVector<se::DeviceAddressBase, 4> send_buffers,\n     absl::InlinedVector<se::DeviceAddressBase, 4> recv_buffers,\n@@ -653,12 +679,18 @@ absl::Status NcclCommunicator::LaunchAllToAll(\n     absl::StrAppendFormat(out, \"%p\", buffer.opaque());\n   };\n \n+  auto send_contiguous = IsContinguous(send_buffers);\n+  auto recv_contiguous = IsContinguous(recv_buffers);\n+\n   VLOG(3) << absl::StreamFormat(\n       \"[%d] Launch NCCL AllToAll operation; send_buffers=[%s]; \"\n-      \"recv_buffers=[%s]; dtype=%s; count=%d; comm=%p; stream=%p\",\n+      \"send_contiguous=%v; recv_buffers=[%s]; recv_contiguous=%v; dtype=%s; \"\n+      \"count=%d; comm=%p; stream=%p\",\n       stream->parent()->device_ordinal(),\n       absl::StrJoin(send_buffers, \", \", buffer_formatter),\n+      send_contiguous.has_value(),\n       absl::StrJoin(recv_buffers, \", \", buffer_formatter),\n+      recv_contiguous.has_value(),\n       primitive_util::LowercasePrimitiveTypeName(dtype), count, comm_, stream);\n \n   if (send_buffers.size() != recv_buffers.size()) {\n@@ -678,6 +710,17 @@ absl::Status NcclCommunicator::LaunchAllToAll(\n \n   TF_ASSIGN_OR_RETURN(ncclDataType_t nccl_dtype, ToNcclDataType(dtype, false));\n \n+#if NCCL_VERSION_CODE >= 22800\n+  // If send and receive buffers are contiguous we can use all-to-all API from\n+  // NCCL directly without launching individual send/recv operations.\n+  if (send_contiguous && recv_contiguous) {\n+    XLA_NCCL_RETURN_IF_ERROR(ncclAlltoAll(\n+        send_contiguous->opaque(), recv_contiguous->opaque(),\n+        ToNcclCount(dtype, count), nccl_dtype, comm_, AsCudaStream(stream)));\n+    return absl::OkStatus();\n+  }\n+#endif\n+\n   TF_RETURN_IF_ERROR(GroupStart());\n   for (size_t i = 0; i < send_buffers.size(); ++i) {\n     se::DeviceAddressBase send_buffer = send_buffers[i];"
+        }
+    ],
+    "stats": {
+        "total": 45,
+        "additions": 44,
+        "deletions": 1
+    }
+}

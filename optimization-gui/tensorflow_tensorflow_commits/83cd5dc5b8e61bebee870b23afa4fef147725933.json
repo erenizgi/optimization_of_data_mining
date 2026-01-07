@@ -1,0 +1,24 @@
+{
+    "author": "zacmustin",
+    "message": "Optimize MakePromiseTrackEvent if event is ready.\n\n**Description**\n\nPreviously, `MakePromiseTrackEvent` *always* called `PJRT_Event_OnReady` to register an **asynchronous** callback for when execution finished. This registration happens even if the `Event` has already completed by the time `MakePromiseTrackEvent` is called, incurring unnecessary overhead.\n\nThis change optimizes this path by first checking `PJRT_Event_IsReady()`. If the event has already completed, we skip `PJRT_Event_OnReady` entirely and instead **synchronously** fetch the event's status via `PJRT_Event_Error()` and fulfill the future's promise immediately.\n\n**Performance:**\n\n* **Small computations** (device execution completes BEFORE `MakePromiseTrackEvent()`) get **much faster** since we skip the `PJRT_Event_OnReady` overhead.\n* **Large computations** (device execution completes AFTER `MakePromiseTrackEvent()`) get **negligibly slower**: `PJRT_Event_IsReady()` just checks a `bool` and should be extremely quick, adding negligible overhead.\n\nPiperOrigin-RevId: 814387687",
+    "sha": "83cd5dc5b8e61bebee870b23afa4fef147725933",
+    "files": [
+        {
+            "sha": "3af9a6d89981ef20ccd5ab1fc3382efdcfaa856b",
+            "filename": "third_party/xla/xla/pjrt/pjrt_c_api_client.cc",
+            "status": "modified",
+            "additions": 27,
+            "deletions": 0,
+            "changes": 27,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/83cd5dc5b8e61bebee870b23afa4fef147725933/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_c_api_client.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/83cd5dc5b8e61bebee870b23afa4fef147725933/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_c_api_client.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_c_api_client.cc?ref=83cd5dc5b8e61bebee870b23afa4fef147725933",
+            "patch": "@@ -2839,6 +2839,33 @@ PJRT_Event* PjRtCApiBuffer::GetReadyEvent() {\n void PjRtCApiBuffer::MakePromiseTrackEvent() {\n   CHECK(readiness_promise_ != nullptr);\n   const PJRT_Api* api = pjrt_c_api();\n+\n+  // Check if device execution has finished via `PJRT_Event_IsReady`. If true,\n+  // fetch the status with `PJRT_Event_Error()` and fulfill the promise\n+  // immediately. This avoids unnecessary overhead for already completed events.\n+  // Otherwise, register an asynchronous callback with\n+  // `PJRT_Event_OnReady` to be notified when the event is ready.\n+  PJRT_Event_IsReady_Args is_ready_args;\n+  is_ready_args.struct_size = PJRT_Event_IsReady_Args_STRUCT_SIZE;\n+  is_ready_args.extension_start = nullptr;\n+  is_ready_args.event = GetReadyEvent();\n+  std::unique_ptr<PJRT_Error, pjrt::PJRT_ErrorDeleter> is_ready_error{\n+      api->PJRT_Event_IsReady(&is_ready_args), pjrt::MakeErrorDeleter(api)};\n+  if (is_ready_error != nullptr) {\n+    readiness_promise_->Set(pjrt::PjrtErrorToStatus(is_ready_error.get(), api));\n+    return;\n+  }\n+  if (is_ready_args.is_ready) {\n+    PJRT_Event_Error_Args error_args;\n+    error_args.struct_size = PJRT_Event_Error_Args_STRUCT_SIZE;\n+    error_args.extension_start = nullptr;\n+    error_args.event = is_ready_args.event;\n+    PJRT_Error* error = api->PJRT_Event_Error(&error_args);\n+    readiness_promise_->Set(pjrt::PjrtErrorToStatus(error, api));\n+    pjrt::MakeErrorDeleter(api)(error);\n+    return;\n+  }\n+\n   PJRT_Event_OnReady_Args args;\n   args.struct_size = PJRT_Event_OnReady_Args_STRUCT_SIZE;\n   args.extension_start = nullptr;"
+        }
+    ],
+    "stats": {
+        "total": 27,
+        "additions": 27,
+        "deletions": 0
+    }
+}

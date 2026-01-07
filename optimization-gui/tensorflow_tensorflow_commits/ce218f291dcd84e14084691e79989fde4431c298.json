@@ -1,0 +1,84 @@
+{
+    "author": "junwhanahn",
+    "message": "Add a variant of `Shape:ToProto`/`Layout::ToProto` that takes a proto to be serialized into\n\nThis is useful when `ShapeProto` or `LayoutProto` is part of a bigger proto message that is arena allocated. Without this, the caller has to pay for the copy overhead when assigning the proto returned by `ToProto()` into a submessage field on an arena.\n\nPiperOrigin-RevId: 839558669",
+    "sha": "ce218f291dcd84e14084691e79989fde4431c298",
+    "files": [
+        {
+            "sha": "7688fe1f7a5b0970ab875448bdd1380be024d712",
+            "filename": "third_party/xla/xla/layout.cc",
+            "status": "modified",
+            "additions": 67,
+            "deletions": 32,
+            "changes": 99,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ce218f291dcd84e14084691e79989fde4431c298/third_party%2Fxla%2Fxla%2Flayout.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ce218f291dcd84e14084691e79989fde4431c298/third_party%2Fxla%2Fxla%2Flayout.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Flayout.cc?ref=ce218f291dcd84e14084691e79989fde4431c298",
+            "patch": "@@ -36,12 +36,61 @@ limitations under the License.\n \n namespace xla {\n \n-TileProto Tile::ToProto() const {\n-  TileProto tile_proto;\n-  for (int64_t i : dimensions()) {\n+namespace {\n+\n+// Populates `tile` to `tile_proto`. `tile_proto` must be an empty message.\n+void SaveTileToEmptyProto(const Tile& tile, TileProto& tile_proto) {\n+  for (int64_t i : tile.dimensions()) {\n     tile_proto.add_dimensions(i);\n   }\n-  return tile_proto;\n+}\n+\n+// Populates `split_config` to `split_config_proto`. `split_config_proto` must\n+// be an empty message.\n+void SaveSplitConfigToEmptyProto(const SplitConfig& split_config,\n+                                 SplitConfigProto& split_config_proto) {\n+  split_config_proto.set_dimension(split_config.dimension());\n+  for (int64_t i : split_config.split_indices()) {\n+    split_config_proto.add_split_indices(i);\n+  }\n+}\n+\n+// Populates `layout` to `proto`. `proto` must be an empty message.\n+void SaveLayoutToEmptyProto(const Layout& layout, LayoutProto& proto) {\n+  proto.mutable_minor_to_major()->Reserve(layout.minor_to_major().size());\n+  for (const int64_t dimension : layout.minor_to_major()) {\n+    proto.add_minor_to_major(dimension);\n+  }\n+  for (const Tile& tile : layout.tiles()) {\n+    SaveTileToEmptyProto(tile, *proto.add_tiles());\n+  }\n+  proto.set_tail_padding_alignment_in_elements(\n+      layout.tail_padding_alignment_in_elements());\n+  proto.set_index_primitive_type(layout.index_primitive_type());\n+  proto.set_pointer_primitive_type(layout.pointer_primitive_type());\n+  proto.set_element_size_in_bits(layout.element_size_in_bits());\n+  proto.set_memory_space(layout.memory_space());\n+  for (const SplitConfig& split_config : layout.split_configs()) {\n+    SaveSplitConfigToEmptyProto(split_config, *proto.add_split_configs());\n+  }\n+  if (layout.has_physical_shape()) {\n+    layout.physical_shape().ToProto(*proto.mutable_physical_shape());\n+  }\n+  proto.set_dynamic_shape_metadata_prefix_bytes(\n+      layout.dynamic_shape_metadata_prefix_bytes());\n+}\n+\n+}  // namespace\n+\n+void Tile::ToProto(TileProto& tile_proto) const {\n+  tile_proto.Clear();\n+  SaveTileToEmptyProto(*this, tile_proto);\n+}\n+\n+TileProto Tile::ToProto() const {\n+  TileProto proto;\n+  SaveTileToEmptyProto(*this, proto);\n+  return proto;\n }\n \n void Tile::Print(Printer* printer) const {\n@@ -71,13 +120,15 @@ Layout::Layout()\n     : index_primitive_type_(PRIMITIVE_TYPE_INVALID),\n       pointer_primitive_type_(PRIMITIVE_TYPE_INVALID) {}\n \n+void SplitConfig::ToProto(SplitConfigProto& split_config_proto) const {\n+  split_config_proto.Clear();\n+  SaveSplitConfigToEmptyProto(*this, split_config_proto);\n+}\n+\n SplitConfigProto SplitConfig::ToProto() const {\n-  SplitConfigProto split_config_proto;\n-  split_config_proto.set_dimension(dimension_);\n-  for (int64_t i : split_indices_) {\n-    split_config_proto.add_split_indices(i);\n-  }\n-  return split_config_proto;\n+  SplitConfigProto proto;\n+  SaveSplitConfigToEmptyProto(*this, proto);\n+  return proto;\n }\n \n std::string SplitConfig::ToString() const {\n@@ -192,30 +243,14 @@ Layout& Layout::operator=(Layout&& other) = default;\n   return layout;\n }\n \n+void Layout::ToProto(LayoutProto& proto) const {\n+  proto.Clear();\n+  SaveLayoutToEmptyProto(*this, proto);\n+}\n+\n LayoutProto Layout::ToProto() const {\n   LayoutProto proto;\n-  proto.Clear();\n-  proto.mutable_minor_to_major()->Reserve(minor_to_major().size());\n-  for (const int64_t dimension : minor_to_major()) {\n-    proto.add_minor_to_major(dimension);\n-  }\n-  for (const Tile& tile : tiles()) {\n-    *proto.add_tiles() = tile.ToProto();\n-  }\n-  proto.set_tail_padding_alignment_in_elements(\n-      tail_padding_alignment_in_elements());\n-  proto.set_index_primitive_type(index_primitive_type());\n-  proto.set_pointer_primitive_type(pointer_primitive_type());\n-  proto.set_element_size_in_bits(element_size_in_bits_);\n-  proto.set_memory_space(memory_space_);\n-  for (const SplitConfig& split_config : split_configs()) {\n-    *proto.add_split_configs() = split_config.ToProto();\n-  }\n-  if (has_physical_shape()) {\n-    *proto.mutable_physical_shape() = physical_shape_->ToProto();\n-  }\n-  proto.set_dynamic_shape_metadata_prefix_bytes(\n-      dynamic_shape_metadata_prefix_bytes_);\n+  SaveLayoutToEmptyProto(*this, proto);\n   return proto;\n }\n "
+        },
+        {
+            "sha": "ee701a2bc6755f96c63ec990ab62cc658b083c6e",
+            "filename": "third_party/xla/xla/layout.h",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 1,
+            "changes": 17,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ce218f291dcd84e14084691e79989fde4431c298/third_party%2Fxla%2Fxla%2Flayout.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ce218f291dcd84e14084691e79989fde4431c298/third_party%2Fxla%2Fxla%2Flayout.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Flayout.h?ref=ce218f291dcd84e14084691e79989fde4431c298",
+            "patch": "@@ -47,7 +47,7 @@ class Tile {\n   explicit Tile(absl::Span<const int64_t> dimensions)\n       : dimensions_(dimensions.begin(), dimensions.end()) {}\n \n-  // De/Serialize a Tile to and from a TileProto.\n+  // Creates a Tile from a TileProto.\n   static absl::StatusOr<Tile> FromProto(const TileProto& tile_proto) {\n     Tile tile;\n     tile.dimensions_.reserve(tile_proto.dimensions_size());\n@@ -57,6 +57,11 @@ class Tile {\n     }\n     return tile;\n   }\n+\n+  // Converts the Tile to a TileProto. Clears `tile_proto` first.\n+  void ToProto(TileProto& tile_proto) const;\n+\n+  // Returns a TileProto representation of the Tile.\n   TileProto ToProto() const;\n \n   bool operator==(const Tile& other) const {\n@@ -120,11 +125,18 @@ class SplitConfig {\n       : dimension_(dimension),\n         split_indices_(split_indices.begin(), split_indices.end()) {}\n \n+  // Creates a SplitConfig from a SplitConfigProto.\n   static SplitConfig CreateFromProto(\n       const SplitConfigProto& split_config_proto) {\n     return SplitConfig(split_config_proto.dimension(),\n                        split_config_proto.split_indices());\n   }\n+\n+  // Converts the SplitConfig to a SplitConfigProto. Clears `split_config_proto`\n+  // first.\n+  void ToProto(SplitConfigProto& split_config_proto) const;\n+\n+  // Returns a SplitConfigProto representation of the SplitConfig.\n   SplitConfigProto ToProto() const;\n \n   bool operator==(const SplitConfig& other) const {\n@@ -202,6 +214,9 @@ class Layout {\n     return FromProto(proto).value();\n   }\n \n+  // Converts the Layout to a LayoutProto. Clears `proto` first.\n+  void ToProto(LayoutProto& proto) const;\n+\n   // Returns a LayoutProto representation of the Layout.\n   LayoutProto ToProto() const;\n "
+        },
+        {
+            "sha": "11da7790cbb9c70c0147ead9f4c9b495b68f3af0",
+            "filename": "third_party/xla/xla/layout_test.cc",
+            "status": "modified",
+            "additions": 25,
+            "deletions": 0,
+            "changes": 25,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ce218f291dcd84e14084691e79989fde4431c298/third_party%2Fxla%2Fxla%2Flayout_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ce218f291dcd84e14084691e79989fde4431c298/third_party%2Fxla%2Fxla%2Flayout_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Flayout_test.cc?ref=ce218f291dcd84e14084691e79989fde4431c298",
+            "patch": "@@ -195,6 +195,31 @@ TEST(Layout, LayoutToFromProto) {\n                        .add_split_configs(SplitConfig(1, {0, 4})));\n }\n \n+TEST(Layout, LayoutToFromProtoInplace) {\n+  // Round-trips a Layout through proto de/serialization. Start from a\n+  // non-empty proto to verify that `ToProto` clears the given proto first.\n+  auto expect_unchanged = [](const Layout& layout) {\n+    LayoutProto layout_proto;\n+    layout_proto.add_tiles();\n+    layout.ToProto(layout_proto);\n+    const auto from_proto_result = Layout::FromProto(layout_proto);\n+    TF_ASSERT_OK(from_proto_result);\n+    EXPECT_EQ(layout, *from_proto_result) << layout_proto.DebugString();\n+  };\n+\n+  expect_unchanged(Layout());\n+  expect_unchanged(Layout({1, 3, 2, 0}));\n+  expect_unchanged(Layout({0, 1}).set_element_size_in_bits(42));\n+  expect_unchanged(Layout({3, 2, 1, 0}, {Tile({42, 123}), Tile({4, 5})}));\n+  expect_unchanged(Layout({1, 0}, {}));\n+  expect_unchanged(Layout(\n+      {1, 0}, {}, PRIMITIVE_TYPE_INVALID, PRIMITIVE_TYPE_INVALID, 1, 0, 0, {},\n+      std::make_unique<Shape>(ShapeUtil::MakeShape(S32, {10, 10}))));\n+  expect_unchanged(Layout({0, 1}, {Tile({123})})\n+                       .add_split_configs(SplitConfig(0, {3}))\n+                       .add_split_configs(SplitConfig(1, {0, 4})));\n+}\n+\n TEST(Layout, DeleteDimensionWorksForDeletingLastDimFromDenseLayout) {\n   Layout layout({0, 1});\n   ASSERT_EQ(layout.minor_to_major().size(), 2);"
+        },
+        {
+            "sha": "5d51b66cc6fb640fade2e875b2ac85df9f775958",
+            "filename": "third_party/xla/xla/shape.cc",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 4,
+            "changes": 17,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ce218f291dcd84e14084691e79989fde4431c298/third_party%2Fxla%2Fxla%2Fshape.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ce218f291dcd84e14084691e79989fde4431c298/third_party%2Fxla%2Fxla%2Fshape.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fshape.cc?ref=ce218f291dcd84e14084691e79989fde4431c298",
+            "patch": "@@ -137,8 +137,18 @@ absl::StatusOr<Shape> Shape::FromProto(const ShapeProto& shape_proto) {\n   return shape;\n }\n \n+void Shape::ToProto(ShapeProto& proto) const {\n+  proto.Clear();\n+  SaveToEmptyProto(proto);\n+}\n+\n ShapeProto Shape::ToProto() const {\n   ShapeProto proto;\n+  SaveToEmptyProto(proto);\n+  return proto;\n+}\n+\n+void Shape::SaveToEmptyProto(ShapeProto& proto) const {\n   proto.set_element_type(element_type_);\n \n   if (const auto* const state = if_array_state()) {\n@@ -150,17 +160,16 @@ ShapeProto Shape::ToProto() const {\n       proto.add_is_dynamic_dimension(dynamic);\n     }\n     if (state->layout.has_value()) {\n-      *proto.mutable_layout() = state->layout->ToProto();\n+      state->layout->ToProto(*proto.mutable_layout());\n     }\n   } else if (const auto* const state = if_tuple_state()) {\n     proto.mutable_tuple_shapes()->Reserve(state->tuple_shapes.size());\n     for (const Shape& shape : state->tuple_shapes) {\n-      *proto.add_tuple_shapes() = shape.ToProto();\n+      shape.ToProto(*proto.add_tuple_shapes());\n     }\n   } else if (const auto* const state = if_buffer_state()) {\n-    *proto.add_tuple_shapes() = state->buffer_shape->ToProto();\n+    state->buffer_shape->ToProto(*proto.add_tuple_shapes());\n   }\n-  return proto;\n }\n \n Shape::BufferState::BufferState() : buffer_shape(std::make_unique<Shape>()) {}"
+        },
+        {
+            "sha": "c848eed4bf8818e465813b46dccf6dba4b0c25dc",
+            "filename": "third_party/xla/xla/shape.h",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ce218f291dcd84e14084691e79989fde4431c298/third_party%2Fxla%2Fxla%2Fshape.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ce218f291dcd84e14084691e79989fde4431c298/third_party%2Fxla%2Fxla%2Fshape.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fshape.h?ref=ce218f291dcd84e14084691e79989fde4431c298",
+            "patch": "@@ -101,6 +101,9 @@ class Shape {\n   // opposed to crashing) if the proto has logically invalid fields.\n   static absl::StatusOr<Shape> FromProto(const ShapeProto& shape_proto);\n \n+  // Converts the Shape to a ShapeProto. Clears `proto` first.\n+  void ToProto(ShapeProto& proto) const;\n+\n   // Returns a ShapeProto representation of the Shape.\n   ShapeProto ToProto() const;\n \n@@ -667,6 +670,9 @@ class Shape {\n   // CHECK-fails if this shape's state is not empty.\n   void CheckStateIsEmpty() const;\n \n+  // Converts this shape to a proto. `proto` must be an empty message.\n+  void SaveToEmptyProto(ShapeProto& proto) const;\n+\n   // The element type of this shape (tuple, array, etc).\n   PrimitiveType element_type_ = PRIMITIVE_TYPE_INVALID;\n "
+        },
+        {
+            "sha": "08df2b0114a10b34a0ef1e8dde9cf310ef9e246a",
+            "filename": "third_party/xla/xla/shape_test.cc",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 0,
+            "changes": 16,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ce218f291dcd84e14084691e79989fde4431c298/third_party%2Fxla%2Fxla%2Fshape_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ce218f291dcd84e14084691e79989fde4431c298/third_party%2Fxla%2Fxla%2Fshape_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fshape_test.cc?ref=ce218f291dcd84e14084691e79989fde4431c298",
+            "patch": "@@ -86,6 +86,22 @@ TEST_F(ShapeTest, ShapeToFromProto) {\n   }\n }\n \n+TEST_F(ShapeTest, ShapeToFromProtoInplace) {\n+  for (const Shape& shape :\n+       {opaque_, token_, scalar_, matrix_, matrix2_, matrix_buffer_, tuple_,\n+        nested_tuple_, dynamic_matrix_, unbounded_}) {\n+    //  Start from a non-empty proto to verify that `ToProto` clears the given\n+    //  proto first.\n+    ShapeProto shape_proto;\n+    shape_proto.set_element_type(F32);\n+    shape.ToProto(shape_proto);\n+    auto shape_copy = Shape::FromProto(shape_proto);\n+    TF_ASSERT_OK(shape_copy);\n+    EXPECT_TRUE(ShapeUtil::Equal(shape, *shape_copy))\n+        << shape_proto.DebugString();\n+  }\n+}\n+\n TEST_F(ShapeTest, ShapeToString) {\n   EXPECT_EQ(\"opaque[]\", opaque_.ToString());\n   EXPECT_EQ(\"token[]\", token_.ToString());"
+        }
+    ],
+    "stats": {
+        "total": 180,
+        "additions": 143,
+        "deletions": 37
+    }
+}

@@ -1,0 +1,48 @@
+{
+    "author": "WillFroom",
+    "message": "[XLA:CPU][XTile] Use bufferization to lower stablehlo reshape & iota.\n\nRather than using vector ops before bufferization just rely directly on bufferization as both of these are pure in-memory operations.\n\nPiperOrigin-RevId: 834222545",
+    "sha": "23fb5293543bdceff78ce9541a8dcb6e038d78c2",
+    "files": [
+        {
+            "sha": "8c65a0877be1cb3e52da6c1751499c00cc521013",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/fusion_compiler.cc",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/23fb5293543bdceff78ce9541a8dcb6e038d78c2/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ffusion_compiler.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/23fb5293543bdceff78ce9541a8dcb6e038d78c2/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ffusion_compiler.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ffusion_compiler.cc?ref=23fb5293543bdceff78ce9541a8dcb6e038d78c2",
+            "patch": "@@ -319,6 +319,12 @@ static void AddTiledOptimizationPasses(mlir::OpPassManager& pm) {\n           mlir::vector::VectorMultiReductionLowering::InnerParallel));\n   pm.addPass(CreateTensorOpsToBufferizablePass());\n \n+  mlir::stablehlo::StablehloLegalizeToLinalgPassOptions\n+      stablehlo_to_linalg_options;\n+  stablehlo_to_linalg_options.enablePrimitiveOps = true;\n+  pm.addPass(mlir::stablehlo::createStablehloLegalizeToLinalgPass());\n+  pm.addPass(xtile::createConvertElementwise0DTensorToScalarPass());\n+\n   pm.addPass(mlir::createConvertElementwiseToLinalgPass());\n   pm.addPass(CreateFuseElementwisePass());\n "
+        },
+        {
+            "sha": "4949d2e4edd1cc67156ce3743abc229115427a1b",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/tiled/transforms/shlo_to_vector.cc",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 23,
+            "changes": 29,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/23fb5293543bdceff78ce9541a8dcb6e038d78c2/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Fshlo_to_vector.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/23fb5293543bdceff78ce9541a8dcb6e038d78c2/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Fshlo_to_vector.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Fshlo_to_vector.cc?ref=23fb5293543bdceff78ce9541a8dcb6e038d78c2",
+            "patch": "@@ -296,23 +296,6 @@ struct LowerBroadcastInDim\n   }\n };\n \n-struct LowerReshape : mlir::OpRewritePattern<mlir::stablehlo::ReshapeOp> {\n-  using OpRewritePattern::OpRewritePattern;\n-\n-  mlir::LogicalResult matchAndRewrite(\n-      mlir::stablehlo::ReshapeOp op,\n-      mlir::PatternRewriter& rewriter) const override {\n-    auto source_vector = ReadTensorToVector(rewriter, op.getOperand());\n-    auto result_vector_type = GetVectorType(op.getType());\n-\n-    mlir::Value reshaped_vector = mlir::vector::ShapeCastOp::create(\n-        rewriter, op->getLoc(), result_vector_type, source_vector);\n-\n-    rewriter.replaceOp(op, WriteVectorToTensor(rewriter, reshaped_vector));\n-    return mlir::success();\n-  }\n-};\n-\n struct LowerIota : mlir::OpRewritePattern<mlir::stablehlo::IotaOp> {\n   using OpRewritePattern::OpRewritePattern;\n \n@@ -324,9 +307,9 @@ struct LowerIota : mlir::OpRewritePattern<mlir::stablehlo::IotaOp> {\n           op, \"iota op with rank != 1 is not supported\");\n     }\n \n-    auto result_vector_type = GetVectorType(op.getType());\n-    auto element_type = result_vector_type.getElementType();\n-    int64_t iota_size = result_vector_type.getNumElements();\n+    auto result_type = op.getType();\n+    auto element_type = result_type.getElementType();\n+    int64_t iota_size = result_type.getNumElements();\n \n     llvm::SmallVector<mlir::Attribute> iota_values(iota_size);\n     for (int idx = 0; idx != iota_size; ++idx) {\n@@ -335,9 +318,9 @@ struct LowerIota : mlir::OpRewritePattern<mlir::stablehlo::IotaOp> {\n \n     mlir::Value iota_const = mlir::arith::ConstantOp::create(\n         rewriter, op->getLoc(),\n-        mlir::DenseElementsAttr::get(result_vector_type, iota_values));\n+        mlir::DenseElementsAttr::get(result_type, iota_values));\n \n-    rewriter.replaceOp(op, WriteVectorToTensor(rewriter, iota_const));\n+    rewriter.replaceOp(op, iota_const);\n     return mlir::success();\n   }\n };\n@@ -350,7 +333,7 @@ class ShloToVectorPass : public impl::ShloToVectorPassBase<ShloToVectorPass> {\n     mlir::MLIRContext* context = &getContext();\n     mlir::RewritePatternSet patterns(context);\n     patterns.add<LowerTranspose, LowerDotGeneral, LowerReduce,\n-                 LowerBroadcastInDim, LowerReshape, LowerIota>(context);\n+                 LowerBroadcastInDim, LowerIota>(context);\n     if (mlir::failed(\n             mlir::applyPatternsGreedily(getOperation(), std::move(patterns)))) {\n       signalPassFailure();"
+        },
+        {
+            "sha": "8dd5709c7fead921510bb7342f63127603d016c4",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/tiled/transforms/tests/shlo_to_vector.mlir",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 11,
+            "changes": 12,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/23fb5293543bdceff78ce9541a8dcb6e038d78c2/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Fshlo_to_vector.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/23fb5293543bdceff78ce9541a8dcb6e038d78c2/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Fshlo_to_vector.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Fshlo_to_vector.mlir?ref=23fb5293543bdceff78ce9541a8dcb6e038d78c2",
+            "patch": "@@ -164,21 +164,11 @@ func.func @broadcast_2D_tensor_outer(%input : tensor<4xf32>) -> tensor<4x32xf32>\n \n // -----\n \n-func.func @reshape(%input : tensor<4xf32>) -> tensor<2x1x2xf32> {\n-  %result = stablehlo.reshape %input : (tensor<4xf32>) -> tensor<2x1x2xf32>\n-  return %result : tensor<2x1x2xf32>\n-}\n-\n-// CHECK-LABEL: @reshape\n-// CHECK:vector.shape_cast {{.*}} : vector<4xf32> to vector<2x1x2xf32>\n-\n-// -----\n-\n func.func @iota() -> tensor<4xi32> {\n   %result = stablehlo.iota dim = 0 : tensor<4xi32>\n   return %result : tensor<4xi32>\n }\n \n // CHECK-LABEL: @iota\n-// CHECK: arith.constant dense<[0, 1, 2, 3]> : vector<4xi32>\n+// CHECK: arith.constant dense<[0, 1, 2, 3]> : tensor<4xi32>\n "
+        }
+    ],
+    "stats": {
+        "total": 47,
+        "additions": 13,
+        "deletions": 34
+    }
+}

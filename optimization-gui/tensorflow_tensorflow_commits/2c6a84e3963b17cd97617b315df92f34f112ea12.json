@@ -1,0 +1,36 @@
+{
+    "author": "tensorflower-gardener",
+    "message": "[Autotuner] Extend with missing features.\n\n- Doesn't autotune is there is a config already assigned\n- Add CustomKernel auotuning support\n- Enable cubLASLt fallback for cublas backend.\n\nPiperOrigin-RevId: 839315624",
+    "sha": "2c6a84e3963b17cd97617b315df92f34f112ea12",
+    "files": [
+        {
+            "sha": "0a4cb1d780d61322f52985204b1b7dd44736aab9",
+            "filename": "third_party/xla/xla/service/gpu/autotuning/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/2c6a84e3963b17cd97617b315df92f34f112ea12/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/2c6a84e3963b17cd97617b315df92f34f112ea12/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2FBUILD?ref=2c6a84e3963b17cd97617b315df92f34f112ea12",
+            "patch": "@@ -142,6 +142,7 @@ cc_library(\n         \"//xla:xla_proto_cc\",\n         \"//xla/backends/autotuner:codegen_backend\",\n         \"//xla/backends/gpu/autotuner:cublas\",\n+        \"//xla/backends/gpu/autotuner:custom_kernel\",\n         \"//xla/backends/gpu/autotuner:fission_backend\",\n         \"//xla/backends/gpu/autotuner:triton\",\n         \"//xla/backends/gpu/codegen/triton:tma_utils\","
+        },
+        {
+            "sha": "7710404a765736e1edba7ab9c04999a688356ef7",
+            "filename": "third_party/xla/xla/service/gpu/autotuning/gemm_fusion_autotuner.cc",
+            "status": "modified",
+            "additions": 28,
+            "deletions": 7,
+            "changes": 35,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/2c6a84e3963b17cd97617b315df92f34f112ea12/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fgemm_fusion_autotuner.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/2c6a84e3963b17cd97617b315df92f34f112ea12/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fgemm_fusion_autotuner.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fgemm_fusion_autotuner.cc?ref=2c6a84e3963b17cd97617b315df92f34f112ea12",
+            "patch": "@@ -47,6 +47,7 @@ limitations under the License.\n #include \"xla/autotuning.pb.h\"\n #include \"xla/backends/autotuner/codegen_backend.h\"\n #include \"xla/backends/gpu/autotuner/cublas.h\"\n+#include \"xla/backends/gpu/autotuner/custom_kernel.h\"\n #include \"xla/backends/gpu/autotuner/fission_backend.h\"\n #include \"xla/backends/gpu/autotuner/triton.h\"\n #include \"xla/backends/gpu/runtime/buffer_comparator.h\"\n@@ -141,20 +142,29 @@ using ProfilingOutput = AutotunerCompileUtil::ProfilingOutput;\n namespace {\n \n std::unique_ptr<HloPassPipeline> GetCublasRewriterPipeline(\n-    const se::DeviceDescription& device_description) {\n+    const se::DeviceDescription* device_description) {\n   auto pipeline = std::make_unique<HloPassPipeline>(\"cublas_rewriter_pipeline\");\n   pipeline->AddPass(std::make_unique<DotAlgorithmRewriter>());\n   for (GemmRewriterOptions::DType dtype :\n        {GemmRewriterOptions::DType::kFp8Only,\n         GemmRewriterOptions::DType::kNonFp8Only}) {\n     auto gemm_rewriter = std::make_unique<GemmRewriter>(\n-        device_description.gpu_compute_capability(),\n-        device_description.runtime_version(), GemmRewriterOptions{dtype});\n+        device_description->gpu_compute_capability(),\n+        device_description->runtime_version(), GemmRewriterOptions{dtype});\n     pipeline->AddPass(std::move(gemm_rewriter));\n   }\n   return pipeline;\n }\n \n+std::unique_ptr<HloPassPipeline> GetCustomKernelRewriterPipeline(\n+    const se::DeviceDescription* device_description) {\n+  auto pipeline =\n+      std::make_unique<HloPassPipeline>(\"custom_kernel_rewriter_pipeline\");\n+  pipeline->AddPass(\n+      std::make_unique<CustomKernelFusionRewriter>(device_description));\n+  return pipeline;\n+}\n+\n using AutoTuneCacheKeyCount = absl::flat_hash_map<AutotuneCacheKey, uint64_t>;\n \n using KeysAndInstructions =\n@@ -1698,8 +1708,15 @@ absl::StatusOr<bool> GemmFusionAutotuner::RunViaNewInfra(\n   backends.push_back(std::make_unique<FissionBackend>(\n       &debug_options, compiler.get(), target_config.get(),\n       std::make_unique<CublasBackend>(stream_exec, &debug_options,\n-                                      compiler.get(), target_config.get()),\n-      GetCublasRewriterPipeline(target_config->device_description),\n+                                      compiler.get(), target_config.get(),\n+                                      /*fp8_lt_fallback=*/true),\n+      GetCublasRewriterPipeline(&target_config->device_description),\n+      mlir_context_));\n+  backends.push_back(std::make_unique<FissionBackend>(\n+      &debug_options, compiler.get(), target_config.get(),\n+      std::make_unique<CustomKernelBackend>(\n+          stream_exec, &debug_options, compiler.get(), target_config.get()),\n+      GetCustomKernelRewriterPipeline(&target_config->device_description),\n       mlir_context_));\n   auto should_autotune = [](const HloInstruction& instruction) -> bool {\n     if (instruction.opcode() != HloOpcode::kFusion) {\n@@ -1708,8 +1725,12 @@ absl::StatusOr<bool> GemmFusionAutotuner::RunViaNewInfra(\n     auto gpu_config = instruction.backend_config<GpuBackendConfig>();\n     const FusionBackendConfig& backend_config =\n         gpu_config->fusion_backend_config();\n-    if (backend_config.kind() == kTritonGemmFusionKind ||\n-        backend_config.kind() == kCuDnnFusionKind) {\n+    bool is_unassigned_triton =\n+        backend_config.kind() == kTritonGemmFusionKind &&\n+        !backend_config.has_triton_gemm_config();\n+    bool is_unassigned_custom = backend_config.kind() == kCustomFusionKind &&\n+                                !backend_config.has_custom_fusion_config();\n+    if (is_unassigned_triton || is_unassigned_custom) {\n       return true;\n     }\n     return false;"
+        }
+    ],
+    "stats": {
+        "total": 36,
+        "additions": 29,
+        "deletions": 7
+    }
+}

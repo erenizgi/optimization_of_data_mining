@@ -1,0 +1,36 @@
+{
+    "author": "chsigg",
+    "message": "[xla:gpu] Add pattern to hoist `tt.trans` up from `scf.if` so that it can be CSE'd.\n\nThis avoids duplicated code in the two branches of the `scf.if` which is not cleaned up because there is no LICM for `scf.if`.\n\nPiperOrigin-RevId: 807677006",
+    "sha": "1471d1cdda0e5165fdea030ddbbfbd2b1a659308",
+    "files": [
+        {
+            "sha": "8bc1f58ca8cf6453577e03743adee8deafe477ec",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/transforms/tests/triton_xla_fold_transpose.mlir",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 4,
+            "changes": 10,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/1471d1cdda0e5165fdea030ddbbfbd2b1a659308/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftests%2Ftriton_xla_fold_transpose.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/1471d1cdda0e5165fdea030ddbbfbd2b1a659308/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftests%2Ftriton_xla_fold_transpose.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftests%2Ftriton_xla_fold_transpose.mlir?ref=1471d1cdda0e5165fdea030ddbbfbd2b1a659308",
+            "patch": "@@ -39,13 +39,15 @@ func.func @push_transpose_up_through_elementwise(%arg0: tensor<4x8xf32>) -> tens\n   return %1 : tensor<8x4xf32>\n }\n \n-// CHECK-LABEL: func @push_transpose_up_into_if\n-func.func @push_transpose_up_into_if(%arg0: tensor<4x8xf32>, %arg1: tensor<4x8xf32>, %cond: i1) -> tensor<8x4xf32> {\n+// CHECK-LABEL: func @push_transpose_up_through_if\n+func.func @push_transpose_up_through_if(%arg0: tensor<4x8xf32>, %arg1: tensor<4x8xf32>, %cond: i1) -> tensor<8x4xf32> {\n+  // CHECK-DAG: %[[TRANS0:.*]] = tt.trans %arg0 {order = array<i32: 1, 0>} : tensor<4x8xf32> -> tensor<8x4xf32>\n+  // CHECK-DAG: %[[TRANS1:.*]] = tt.trans %arg1 {order = array<i32: 1, 0>} : tensor<4x8xf32> -> tensor<8x4xf32>\n   %0 = scf.if %cond -> tensor<4x8xf32> {\n-    // CHECK: tt.trans %arg0 {order = array<i32: 1, 0>} : tensor<4x8xf32> -> tensor<8x4xf32>\n+    // CHECK: scf.yield %[[TRANS0]] : tensor<8x4xf32>\n     scf.yield %arg0 : tensor<4x8xf32>\n   } else {\n-    // CHECK: tt.trans %arg1 {order = array<i32: 1, 0>} : tensor<4x8xf32> -> tensor<8x4xf32>\n+    // CHECK: scf.yield %[[TRANS1]] : tensor<8x4xf32>\n     scf.yield %arg1 : tensor<4x8xf32>\n   }\n   // CHECK-NOT: tt.trans"
+        },
+        {
+            "sha": "0a3c351da1c663c9c08835fdd3256ab55b168447",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/transforms/triton_xla_fold_transpose_pass.cc",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 1,
+            "changes": 16,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/1471d1cdda0e5165fdea030ddbbfbd2b1a659308/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftriton_xla_fold_transpose_pass.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/1471d1cdda0e5165fdea030ddbbfbd2b1a659308/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftriton_xla_fold_transpose_pass.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftriton_xla_fold_transpose_pass.cc?ref=1471d1cdda0e5165fdea030ddbbfbd2b1a659308",
+            "patch": "@@ -226,7 +226,7 @@ LogicalResult PushTransposeUpIntoIf(TransOp op, PatternRewriter& rewriter) {\n   }\n \n   // Compute the new types for the if op.\n-  unsigned result_number = cast<OpResult>(op.getSrc()).getResultNumber();\n+  unsigned result_number = cast<OpResult>(src).getResultNumber();\n   auto new_types = llvm::to_vector(if_op.getResultTypes());\n   new_types[result_number] = op.getType();\n \n@@ -253,6 +253,19 @@ LogicalResult PushTransposeUpIntoIf(TransOp op, PatternRewriter& rewriter) {\n   return success();\n }\n \n+LogicalResult HoistTransposeUpFromIf(TransOp op, PatternRewriter& rewriter) {\n+  scf::IfOp if_op = dyn_cast<scf::IfOp>(op->getParentOp());\n+  if (!if_op) {\n+    return rewriter.notifyMatchFailure(op, \"Not a child of scf.if.\");\n+  }\n+  if (!op.getSrc().getParentRegion()->isAncestor(if_op->getParentRegion())) {\n+    return rewriter.notifyMatchFailure(op, \"Operand defined inside scf.if.\");\n+  }\n+\n+  op->moveBefore(if_op);\n+  return success();\n+}\n+\n SmallVector<int32_t> GetInversePermutation(ArrayRef<int32_t> permutation) {\n   SmallVector<int32_t> result(permutation.size());\n   for (int32_t i = 0; i < permutation.size(); ++i) {\n@@ -321,6 +334,7 @@ class TritonXLAFoldTransposePass\n     RewritePatternSet patterns(&getContext());\n     patterns.add(FoldTransposeOfExtract);\n     patterns.add(PushTransposeUpIntoIf);\n+    patterns.add(HoistTransposeUpFromIf, /*benefit=*/2);\n     patterns.add(PushTransposeUpThroughBroadcast);\n     patterns.add(PushTransposeUpThroughElementwise);\n     patterns.add(PushTransposeUpThroughExpandDims);"
+        }
+    ],
+    "stats": {
+        "total": 26,
+        "additions": 21,
+        "deletions": 5
+    }
+}

@@ -1,0 +1,96 @@
+{
+    "author": "beckerhe",
+    "message": "Remove dependency on HloInstruction from CustomKernelThunk\n\nCustomKernelThunk's constructor used to take a pointer to an HloInstruction for the sole purpose to extract the computation name (for debugging purposes).\n\nSince Thunks should not depend on HLO if avoidable this change moves the creation of ThunkInfo to where the CustomKernelThunk gets constructed. This removes the dependency on HloInstruction, makes it easier to construct instances of CustomKernelThunk for testing, and makes it consistent with the construction of all other thunks.\n\nPiperOrigin-RevId: 833241677",
+    "sha": "caddf5796c909951b3816028dc51c783e1921bc1",
+    "files": [
+        {
+            "sha": "b9803de2b58d428f8dd94f33db3d35f32393080f",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/custom.cc",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 3,
+            "changes": 8,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/caddf5796c909951b3816028dc51c783e1921bc1/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Fcustom.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/caddf5796c909951b3816028dc51c783e1921bc1/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Fcustom.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Fcustom.cc?ref=caddf5796c909951b3816028dc51c783e1921bc1",
+            "patch": "@@ -101,9 +101,11 @@ absl::StatusOr<std::unique_ptr<Thunk>> BuildCustomKernelThunkForFusion(\n       emitters::KernelArguments::Create(ir_emitter_context.buffer_assignment(),\n                                         GetDefaultBufferAlignment(), &fusion));\n \n-  return std::make_unique<CustomKernelThunk>(\n-      &fusion, std::move(custom_kernel), std::move(kernel_arguments),\n-      ir_emitter_context.GetNextThunkId());\n+  Thunk::ThunkInfo thunk_info = Thunk::ThunkInfo::WithProfileAnnotation(\n+      &fusion, ir_emitter_context.GetNextThunkId());\n+  return std::make_unique<CustomKernelThunk>(std::move(thunk_info),\n+                                             std::move(custom_kernel),\n+                                             std::move(kernel_arguments));\n }\n \n absl::StatusOr<BufferAllocation::Slice> GetOperandSlice("
+        },
+        {
+            "sha": "3b8bd20722ee7bd441a76015470fcc87fd355e60",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/BUILD",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 3,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/caddf5796c909951b3816028dc51c783e1921bc1/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/caddf5796c909951b3816028dc51c783e1921bc1/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2FBUILD?ref=caddf5796c909951b3816028dc51c783e1921bc1",
+            "patch": "@@ -3348,11 +3348,8 @@ xla_cc_test(\n     deps = [\n         \":custom_kernel_thunk\",\n         \":thunk\",\n-        \":thunk_id\",\n-        \"//xla:literal\",\n         \"//xla:shape_util\",\n         \"//xla/codegen/emitters:kernel_arguments\",\n-        \"//xla/hlo/ir:hlo\",\n         \"//xla/runtime:buffer_use\",\n         \"//xla/service:buffer_assignment\",\n         \"//xla/service/gpu/kernels:custom_kernel\","
+        },
+        {
+            "sha": "f3b70b2ee25b3a9c30f671343f6f3f6e72c1ef6a",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/custom_kernel_thunk.cc",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 7,
+            "changes": 10,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/caddf5796c909951b3816028dc51c783e1921bc1/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fcustom_kernel_thunk.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/caddf5796c909951b3816028dc51c783e1921bc1/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fcustom_kernel_thunk.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fcustom_kernel_thunk.cc?ref=caddf5796c909951b3816028dc51c783e1921bc1",
+            "patch": "@@ -28,9 +28,7 @@ limitations under the License.\n #include \"absl/types/span.h\"\n #include \"xla/backends/gpu/runtime/print_buffer_contents.h\"\n #include \"xla/backends/gpu/runtime/thunk.h\"\n-#include \"xla/backends/gpu/runtime/thunk_id.h\"\n #include \"xla/codegen/emitters/kernel_arguments.h\"\n-#include \"xla/hlo/ir/hlo_instruction.h\"\n #include \"xla/runtime/buffer_use.h\"\n #include \"xla/service/buffer_assignment.h\"\n #include \"xla/service/gpu/kernels/custom_kernel.h\"\n@@ -44,12 +42,10 @@ limitations under the License.\n namespace xla {\n namespace gpu {\n \n-\n CustomKernelThunk::CustomKernelThunk(\n-    const HloInstruction* instr, CustomKernel custom_kernel,\n-    const emitters::KernelArguments& kernel_arguments, ThunkId thunk_id)\n-    : Thunk(Kind::kCustomKernel,\n-            Thunk::ThunkInfo::WithProfileAnnotation(instr, thunk_id)),\n+    Thunk::ThunkInfo thunk_info, CustomKernel custom_kernel,\n+    const emitters::KernelArguments& kernel_arguments)\n+    : Thunk(Kind::kCustomKernel, std::move(thunk_info)),\n       args_(kernel_arguments.GetArgumentBufferSlices()),\n       written_(kernel_arguments.GetArgumentOutputFlags()),\n       custom_kernel_(std::move(custom_kernel)) {}"
+        },
+        {
+            "sha": "e7970dca487cb73beee46f135f99ff17c9fcf7d1",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/custom_kernel_thunk.h",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 5,
+            "changes": 7,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/caddf5796c909951b3816028dc51c783e1921bc1/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fcustom_kernel_thunk.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/caddf5796c909951b3816028dc51c783e1921bc1/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fcustom_kernel_thunk.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fcustom_kernel_thunk.h?ref=caddf5796c909951b3816028dc51c783e1921bc1",
+            "patch": "@@ -27,9 +27,7 @@ limitations under the License.\n #include \"absl/strings/string_view.h\"\n #include \"absl/synchronization/mutex.h\"\n #include \"xla/backends/gpu/runtime/thunk.h\"\n-#include \"xla/backends/gpu/runtime/thunk_id.h\"\n #include \"xla/codegen/emitters/kernel_arguments.h\"\n-#include \"xla/hlo/ir/hlo_instruction.h\"\n #include \"xla/service/buffer_assignment.h\"\n #include \"xla/service/gpu/kernels/custom_kernel.h\"\n #include \"xla/service/gpu/launch_dimensions.h\"\n@@ -45,9 +43,8 @@ namespace gpu {\n // compiled by XLA and loaded from an executable source.\n class CustomKernelThunk : public Thunk {\n  public:\n-  CustomKernelThunk(const HloInstruction* inst, CustomKernel custom_kernel,\n-                    const emitters::KernelArguments& kernel_arguments,\n-                    ThunkId thunk_id);\n+  CustomKernelThunk(Thunk::ThunkInfo thunk_info, CustomKernel custom_kernel,\n+                    const emitters::KernelArguments& kernel_arguments);\n \n   std::string ToString(int indent) const override;\n "
+        },
+        {
+            "sha": "9bd6f99f41469c305be2a86f6c240e2f6b9bdb92",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/custom_kernel_thunk_test.cc",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 7,
+            "changes": 9,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/caddf5796c909951b3816028dc51c783e1921bc1/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fcustom_kernel_thunk_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/caddf5796c909951b3816028dc51c783e1921bc1/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fcustom_kernel_thunk_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fcustom_kernel_thunk_test.cc?ref=caddf5796c909951b3816028dc51c783e1921bc1",
+            "patch": "@@ -18,10 +18,7 @@ limitations under the License.\n #include <gmock/gmock.h>\n #include <gtest/gtest.h>\n #include \"xla/backends/gpu/runtime/thunk.h\"\n-#include \"xla/backends/gpu/runtime/thunk_id.h\"\n #include \"xla/codegen/emitters/kernel_arguments.h\"\n-#include \"xla/hlo/ir/hlo_instruction.h\"\n-#include \"xla/literal.h\"\n #include \"xla/runtime/buffer_use.h\"\n #include \"xla/service/buffer_assignment.h\"\n #include \"xla/service/gpu/kernels/custom_kernel.h\"\n@@ -46,8 +43,7 @@ TEST(CustomKernelThunkTest, BufferUsesReturnsCorrectBuffers) {\n   arg0.set_written(false);\n   arg1.set_written(true);\n   emitters::KernelArguments kernel_arguments({arg0, arg1});\n-  auto hlo = HloInstruction::CreateConstant(Literal());\n-  CustomKernelThunk thunk(hlo.get(), kernel, kernel_arguments, ThunkId{0});\n+  CustomKernelThunk thunk(Thunk::ThunkInfo{}, kernel, kernel_arguments);\n \n   Thunk::BufferUses buffers = thunk.buffer_uses();\n \n@@ -69,8 +65,7 @@ TEST(CustomKernelThunkTest, BufferUsesReturnsBuffersInConsistentOrder) {\n   arg0.set_written(false);\n   arg1.set_written(true);\n   emitters::KernelArguments kernel_arguments({arg0, arg1});\n-  auto hlo = HloInstruction::CreateConstant(Literal());\n-  CustomKernelThunk thunk(hlo.get(), kernel, kernel_arguments, ThunkId{0});\n+  CustomKernelThunk thunk(Thunk::ThunkInfo{}, kernel, kernel_arguments);\n \n   Thunk::BufferUses buffers1 = thunk.buffer_uses();\n   Thunk::BufferUses buffers2 = thunk.buffer_uses();"
+        },
+        {
+            "sha": "6470fd52b8ef158b5ff78be099bd50a687d6a222",
+            "filename": "third_party/xla/xla/service/gpu/custom_kernel_emitter_cuda.cc",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 2,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/caddf5796c909951b3816028dc51c783e1921bc1/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fcustom_kernel_emitter_cuda.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/caddf5796c909951b3816028dc51c783e1921bc1/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fcustom_kernel_emitter_cuda.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fcustom_kernel_emitter_cuda.cc?ref=caddf5796c909951b3816028dc51c783e1921bc1",
+            "patch": "@@ -14,12 +14,12 @@ limitations under the License.\n ==============================================================================*/\n \n #include <memory>\n+#include <utility>\n \n #include \"absl/status/status.h\"\n #include \"absl/status/statusor.h\"\n #include \"absl/strings/string_view.h\"\n #include \"xla/backends/gpu/runtime/custom_kernel_thunk.h\"\n-#include \"xla/backends/gpu/runtime/kernel_thunk.h\"\n #include \"xla/codegen/emitters/kernel_arguments.h\"\n #include \"xla/hlo/ir/hlo_instructions.h\"\n #include \"xla/service/gpu/custom_kernel_emitter.h\"\n@@ -62,8 +62,10 @@ absl::StatusOr<std::unique_ptr<Thunk>> EmitPtxCustomKernelThunk(\n           call.name, call.kernel_data, kernel_arguments.args().size(),\n           call.block_dim, call.thread_dim, call.shared_mem));\n \n+  Thunk::ThunkInfo thunk_info =\n+      Thunk::ThunkInfo::WithProfileAnnotation(instr, context->GetNextThunkId());\n   return std::make_unique<CustomKernelThunk>(\n-      instr, ptx_custom_kernel, kernel_arguments, context->GetNextThunkId());\n+      std::move(thunk_info), ptx_custom_kernel, kernel_arguments);\n }\n \n }  // namespace gpu"
+        },
+        {
+            "sha": "62fe6b5680feecf2ec0f9dc1a56cfefeb867f716",
+            "filename": "third_party/xla/xla/service/gpu/ir_emitter_unnested.cc",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 6,
+            "changes": 9,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/caddf5796c909951b3816028dc51c783e1921bc1/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fir_emitter_unnested.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/caddf5796c909951b3816028dc51c783e1921bc1/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fir_emitter_unnested.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fir_emitter_unnested.cc?ref=caddf5796c909951b3816028dc51c783e1921bc1",
+            "patch": "@@ -164,17 +164,13 @@ limitations under the License.\n #include \"xla/service/llvm_ir/loop_emitter.h\"\n #include \"xla/service/llvm_ir/sort_util.h\"\n #include \"xla/service/name_uniquer.h\"\n-#include \"xla/service/platform_util.h\"\n #include \"xla/shape.h\"\n #include \"xla/shape_util.h\"\n #include \"xla/status_macros.h\"\n #include \"xla/stream_executor/device_description.h\"\n #include \"xla/stream_executor/gpu/gpu_blas_lt.h\"\n #include \"xla/stream_executor/gpu/tma_metadata.h\"\n-#include \"xla/stream_executor/gpu_solver_context.h\"\n #include \"xla/stream_executor/launch_dim.h\"\n-#include \"xla/stream_executor/platform.h\"\n-#include \"xla/stream_executor/platform/platform_object_registry.h\"\n #include \"xla/stream_executor/stream_executor.h\"\n #include \"xla/tools/hlo_decomposer.h\"\n #include \"xla/tsl/platform/errors.h\"\n@@ -1376,9 +1372,10 @@ absl::Status IrEmitterUnnested::EmitTopKCustomCall(\n       kernel::topk::GetTopKKernel(\"topk\", dtype, n, k, batch_size,\n                                   platform_name(), wavefront_size));\n \n+  Thunk::ThunkInfo thunk_info = Thunk::ThunkInfo::WithProfileAnnotation(\n+      instr, ir_emitter_context_->GetNextThunkId());\n   AddThunkToThunkSequence(std::make_unique<CustomKernelThunk>(\n-      instr, std::move(kernel), kernel_arguments,\n-      ir_emitter_context_->GetNextThunkId()));\n+      std::move(thunk_info), std::move(kernel), kernel_arguments));\n   return absl::OkStatus();\n }\n "
+        }
+    ],
+    "stats": {
+        "total": 52,
+        "additions": 19,
+        "deletions": 33
+    }
+}

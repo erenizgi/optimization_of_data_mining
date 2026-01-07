@@ -1,0 +1,60 @@
+{
+    "author": "fengwuyao",
+    "message": "Update to use half data type in Cast kernel.\n\nPiperOrigin-RevId: 845989438",
+    "sha": "39d92388316cbd73786efceb69e17a5ea4eaf1a4",
+    "files": [
+        {
+            "sha": "5a47ace22d912bd1a71c5f4e1d18f0c929ffc640",
+            "filename": "tensorflow/lite/kernels/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/39d92388316cbd73786efceb69e17a5ea4eaf1a4/tensorflow%2Flite%2Fkernels%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/39d92388316cbd73786efceb69e17a5ea4eaf1a4/tensorflow%2Flite%2Fkernels%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Flite%2Fkernels%2FBUILD?ref=39d92388316cbd73786efceb69e17a5ea4eaf1a4",
+            "patch": "@@ -834,6 +834,7 @@ cc_library(\n         \"@ruy//ruy/profiler:instrumentation\",\n         \"//tensorflow/lite/c:c_api_types\",\n         \"//tensorflow/lite/c:common\",\n+        \"//tensorflow/lite/types:half\",\n         \"//tensorflow/lite:array\",\n         \"//tensorflow/lite:builtin_ops\",\n         \"//tensorflow/lite:cc_api_stable\","
+        },
+        {
+            "sha": "3560c21e5d498a4979752606c156b5a4735ceb0c",
+            "filename": "tensorflow/lite/kernels/cast.cc",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 26,
+            "changes": 39,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/39d92388316cbd73786efceb69e17a5ea4eaf1a4/tensorflow%2Flite%2Fkernels%2Fcast.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/39d92388316cbd73786efceb69e17a5ea4eaf1a4/tensorflow%2Flite%2Fkernels%2Fcast.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Flite%2Fkernels%2Fcast.cc?ref=39d92388316cbd73786efceb69e17a5ea4eaf1a4",
+            "patch": "@@ -29,6 +29,8 @@ limitations under the License.\n #include \"tensorflow/lite/kernels/internal/tensor_ctypes.h\"\n #include \"tensorflow/lite/kernels/kernel_util.h\"\n #include \"tensorflow/lite/kernels/op_macros.h\"\n+#include \"tensorflow/lite/types/fp16.h\"\n+#include \"tensorflow/lite/types/half.h\"\n \n #ifdef __ARM_NEON\n #include <arm_neon.h>\n@@ -99,17 +101,9 @@ void copyCast(const std::complex<float>* in, std::complex<float>* out,\n }\n \n template <typename ToT>\n-void copyCast(const Eigen::half* in, ToT* out, int num_elements) {\n-  std::transform(in, in + num_elements, out, [](Eigen::half a) {\n-    return static_cast<ToT>(Eigen::half_impl::half_to_float(a));\n-  });\n-}\n-\n-template <>\n-void copyCast(const Eigen::half* in, std::complex<float>* out,\n-              int num_elements) {\n-  std::transform(in, in + num_elements, out, [](Eigen::half a) {\n-    return std::complex<float>(Eigen::half_impl::half_to_float(a));\n+void copyCast(const half* in, ToT* out, int num_elements) {\n+  std::transform(in, in + num_elements, out, [](half a) {\n+    return static_cast<ToT>(fp16_ieee_to_fp32_value(a));\n   });\n }\n \n@@ -122,33 +116,26 @@ void copyCast(const Eigen::bfloat16* in, std::complex<float>* out,\n }\n \n template <typename FromT>\n-void copyCastToFloat16(const FromT* in, Eigen::half* out, int num_elements) {\n+void copyCastToFloat16(const FromT* in, half* out, int num_elements) {\n   std::transform(in, in + num_elements, out, [](FromT a) {\n-    return Eigen::half_impl::float_to_half_rtne(static_cast<float>(a));\n+    return half::from_bits(fp16_ieee_from_fp32_value(static_cast<float>(a)));\n   });\n }\n \n template <>\n-void copyCastToFloat16(const std::complex<float>* in, Eigen::half* out,\n+void copyCastToFloat16(const std::complex<float>* in, half* out,\n                        int num_elements) {\n   std::transform(in, in + num_elements, out, [](std::complex<float> a) {\n-    return Eigen::half_impl::float_to_half_rtne(std::real(a));\n+    return half::from_bits(fp16_ieee_from_fp32_value(std::real(a)));\n   });\n }\n \n template <>\n-void copyCastToFloat16(const Eigen::half* in, Eigen::half* out,\n-                       int num_elements) {\n-  std::transform(in, in + num_elements, out, [](Eigen::half a) { return a; });\n-}\n-\n-template <>\n-void copyCastToFloat16(const Eigen::bfloat16* in, Eigen::half* out,\n-                       int num_elements) {\n+void copyCastToFloat16(const Eigen::bfloat16* in, half* out, int num_elements) {\n   // bfloat16 -> float -> half (fp16)\n   std::transform(in, in + num_elements, out, [](Eigen::bfloat16 a) {\n-    return Eigen::half_impl::float_to_half_rtne(\n-        Eigen::bfloat16_impl::bfloat16_to_float(a));\n+    return half::from_bits(\n+        fp16_ieee_from_fp32_value(Eigen::bfloat16_impl::bfloat16_to_float(a)));\n   });\n }\n \n@@ -310,7 +297,7 @@ TfLiteStatus copyToTensor(TfLiteContext* context, const FromT* in,\n       copyCast(in, out->data.int8, num_elements);\n       break;\n     case kTfLiteFloat16:\n-      copyCastToFloat16(in, reinterpret_cast<Eigen::half*>(out->data.f16),\n+      copyCastToFloat16(in, reinterpret_cast<half*>(out->data.f16),\n                         num_elements);\n       break;\n     case kTfLiteBFloat16:"
+        },
+        {
+            "sha": "09cc8fbfbda37caff2d1747ca40f08a2896b51a9",
+            "filename": "tensorflow/lite/kernels/cast_test.cc",
+            "status": "modified",
+            "additions": 55,
+            "deletions": 1,
+            "changes": 56,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/39d92388316cbd73786efceb69e17a5ea4eaf1a4/tensorflow%2Flite%2Fkernels%2Fcast_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/39d92388316cbd73786efceb69e17a5ea4eaf1a4/tensorflow%2Flite%2Fkernels%2Fcast_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Flite%2Fkernels%2Fcast_test.cc?ref=39d92388316cbd73786efceb69e17a5ea4eaf1a4",
+            "patch": "@@ -23,7 +23,6 @@ limitations under the License.\n #include <gtest/gtest.h>\n #include \"absl/random/random.h\"\n #include \"absl/types/span.h\"\n-#include \"Eigen/Core\"  // from @eigen_archive\n #include \"tensorflow/lite/c/common.h\"\n #include \"tensorflow/lite/core/c/c_api_types.h\"\n #include \"tensorflow/lite/kernels/cast_test_common.h\"\n@@ -461,6 +460,61 @@ TEST(CastOpModel, CastBFloat16ToFloat) {\n                   /*max_abs_err=*/0.05f)));\n }\n \n+TEST(CastOpModel, CastFloat16ToInt32) {\n+  CastOpModel m({TensorType_FLOAT16, {1, 6}}, {TensorType_INT32, {1, 6}});\n+  m.PopulateTensor<half>(m.input(),\n+                         {static_cast<half>(100.f), static_cast<half>(20.f),\n+                          static_cast<half>(3.f), static_cast<half>(0.4f),\n+                          static_cast<half>(0.999f), static_cast<half>(1.1f)});\n+  ASSERT_EQ(m.Invoke(), kTfLiteOk);\n+  EXPECT_THAT(m.ExtractVector<int32_t>(m.output()),\n+              ElementsAreArray({100, 20, 3, 0, 0, 1}));\n+}\n+\n+TEST(CastOpModel, CastInt32ToFloat16) {\n+  CastOpModel m({TensorType_INT32, {1, 6}}, {TensorType_FLOAT16, {1, 6}});\n+  m.PopulateTensor<int32_t>(m.input(), {100, 20, 3, 0, 1, -1});\n+  ASSERT_EQ(m.Invoke(), kTfLiteOk);\n+  EXPECT_THAT(\n+      m.ExtractVector<half>(m.output()),\n+      ElementsAreArray({static_cast<half>(100.f), static_cast<half>(20.f),\n+                        static_cast<half>(3.f), static_cast<half>(0.f),\n+                        static_cast<half>(1.f), static_cast<half>(-1.f)}));\n+}\n+\n+TEST(CastOpModel, CastFloat16ToBFloat16) {\n+  CastOpModel m({TensorType_FLOAT16, {1, 6}}, {TensorType_BFLOAT16, {1, 6}});\n+  m.PopulateTensor<half>(m.input(),\n+                         {static_cast<half>(100.f), static_cast<half>(20.f),\n+                          static_cast<half>(3.f), static_cast<half>(0.4f),\n+                          static_cast<half>(0.999f), static_cast<half>(1.1f)});\n+  ASSERT_EQ(m.Invoke(), kTfLiteOk);\n+  EXPECT_THAT(m.ExtractVector<Eigen::bfloat16>(m.output()),\n+              ElementsAreArray({static_cast<Eigen::bfloat16>(100.f),\n+                                static_cast<Eigen::bfloat16>(20.f),\n+                                static_cast<Eigen::bfloat16>(3.f),\n+                                static_cast<Eigen::bfloat16>(0.4f),\n+                                static_cast<Eigen::bfloat16>(0.999f),\n+                                static_cast<Eigen::bfloat16>(1.1f)}));\n+}\n+\n+TEST(CastOpModel, CastBFloat16ToFloat16) {\n+  CastOpModel m({TensorType_BFLOAT16, {1, 6}}, {TensorType_FLOAT16, {1, 6}});\n+  m.PopulateTensor<Eigen::bfloat16>(\n+      m.input(),\n+      {static_cast<Eigen::bfloat16>(100.f), static_cast<Eigen::bfloat16>(20.f),\n+       static_cast<Eigen::bfloat16>(3.f), static_cast<Eigen::bfloat16>(0.4f),\n+       static_cast<Eigen::bfloat16>(0.999f),\n+       static_cast<Eigen::bfloat16>(1.1f)});\n+  ASSERT_EQ(m.Invoke(), kTfLiteOk);\n+  EXPECT_THAT(m.ExtractVector<half>(m.output()),\n+              ElementsAreArray(ArrayFloatNear(\n+                  {static_cast<half>(100.f), static_cast<half>(20.f),\n+                   static_cast<half>(3.f), static_cast<half>(0.4f),\n+                   static_cast<half>(0.999f), static_cast<half>(1.1f)},\n+                  /*max_abs_err=*/0.05f)));\n+}\n+\n TEST(CastOpModel, CastConstInputCachingWorks) {\n   // This tests the implementation of a performance optimization. If that\n   // optimization is changed, this test will likely break/need to be updated."
+        },
+        {
+            "sha": "0bc596f7782e2aba828ff69ad83495aaebd1e027",
+            "filename": "tensorflow/lite/types/BUILD",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/39d92388316cbd73786efceb69e17a5ea4eaf1a4/tensorflow%2Flite%2Ftypes%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/39d92388316cbd73786efceb69e17a5ea4eaf1a4/tensorflow%2Flite%2Ftypes%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Flite%2Ftypes%2FBUILD?ref=39d92388316cbd73786efceb69e17a5ea4eaf1a4",
+            "patch": "@@ -28,4 +28,8 @@ cc_library(\n         \"fp16.h\",\n         \"half.h\",\n     ],\n+    # copybara:uncomment_begin(google-only)\n+    # compatible_with = [\"//buildenv/target:non_prod\"],\n+    # copybara:uncomment_end\n+    deps = [\"@FP16\"],\n )"
+        }
+    ],
+    "stats": {
+        "total": 100,
+        "additions": 73,
+        "deletions": 27
+    }
+}

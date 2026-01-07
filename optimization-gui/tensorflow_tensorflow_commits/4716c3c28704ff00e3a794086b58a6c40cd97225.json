@@ -1,0 +1,48 @@
+{
+    "author": "chsigg",
+    "message": "Add verification for `NVMMASharedEncodingAttr` during reshape inference.\n\nImplement `verifyNVMMASharedEncoding` to check compatibility with TMA block shapes and tile dimensions. Integrate this verification into `inferMemDescReshapeOpEncoding` to ensure that reshapes involving `nvmma_shared` layouts result in valid encodings. Add a test case to catch issues with invalid reshape outcomes.\n\nPiperOrigin-RevId: 804487400",
+    "sha": "4716c3c28704ff00e3a794086b58a6c40cd97225",
+    "files": [
+        {
+            "sha": "57edc26f9bc9acac58f788eea5ee061ff54b0749",
+            "filename": "third_party/xla/third_party/triton/temporary/series.bzl",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4716c3c28704ff00e3a794086b58a6c40cd97225/third_party%2Fxla%2Fthird_party%2Ftriton%2Ftemporary%2Fseries.bzl",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4716c3c28704ff00e3a794086b58a6c40cd97225/third_party%2Fxla%2Fthird_party%2Ftriton%2Ftemporary%2Fseries.bzl",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fthird_party%2Ftriton%2Ftemporary%2Fseries.bzl?ref=4716c3c28704ff00e3a794086b58a6c40cd97225",
+            "patch": "@@ -15,4 +15,5 @@ those to this list.\n \n temporary_patch_list = [\n     # Add new patches just above this line\n+    \"//third_party/triton:temporary/verify_nvmma_encoding.patch\",\n ]"
+        },
+        {
+            "sha": "02a1bc0612b0b60fb1b6d8184d090200020a9150",
+            "filename": "third_party/xla/third_party/triton/temporary/verify_nvmma_encoding.patch",
+            "status": "added",
+            "additions": 93,
+            "deletions": 0,
+            "changes": 93,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4716c3c28704ff00e3a794086b58a6c40cd97225/third_party%2Fxla%2Fthird_party%2Ftriton%2Ftemporary%2Fverify_nvmma_encoding.patch",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4716c3c28704ff00e3a794086b58a6c40cd97225/third_party%2Fxla%2Fthird_party%2Ftriton%2Ftemporary%2Fverify_nvmma_encoding.patch",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fthird_party%2Ftriton%2Ftemporary%2Fverify_nvmma_encoding.patch?ref=4716c3c28704ff00e3a794086b58a6c40cd97225",
+            "patch": "@@ -0,0 +1,93 @@\n+\n+--- a/lib/Dialect/TritonGPU/IR/Ops.cpp\t2025-08-22 04:02:56.000000000 -0700\n++++ b/lib/Dialect/TritonGPU/IR/Ops.cpp\t2025-09-08 07:22:55.000000000 -0700\n+@@ -1,3 +1,5 @@\n++#include \"llvm/Support/Casting.h\"\n++#include \"llvm/Support/LogicalResult.h\"\n+ #include \"mlir/IR/BuiltinTypes.h\"\n+ #include \"mlir/IR/Diagnostics.h\"\n+ #include \"mlir/Support/DebugStringHelper.h\"\n+@@ -9,9 +11,8 @@\n+ #include \"triton/Dialect/TritonGPU/IR/Types.h\"\n+ #include \"triton/Dialect/TritonGPU/Transforms/Utility.h\"\n+ #include \"triton/Dialect/TritonNvidiaGPU/IR/Dialect.h\"\n++#include \"triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h\"\n+ #include \"triton/Tools/LayoutUtils.h\"\n+-#include \"llvm/Support/Casting.h\"\n+-#include \"llvm/Support/LogicalResult.h\"\n+ \n+ // Provide custom directive handlers for declarative assemblyFormat.\n+ // They must be visible before including the generated op classes.\n+@@ -517,10 +518,47 @@\n+   return success();\n+ }\n+ \n+-static LogicalResult inferMemDescReshapeOpEncoding(ArrayRef<int64_t> srcShape,\n++// Verification copied from nvmmaSharedToLinearLayout().\n++LogicalResult verifyNVMMASharedEncoding(std::optional<Location> loc,\n++                                        NVMMASharedEncodingAttr attr,\n++                                        ArrayRef<int64_t> shape,\n++                                        int elementBitWidth) {\n++  if (attr.getSwizzlingByteWidth() == 0) return success();\n++  if (shape.size() < 2)\n++    return emitOptionalError(loc, \"nvmma_shared encoding requires rank >= 2\");\n++\n++  auto shapePerCTA = getShapePerCTA(attr, shape);\n++  auto tmaShape = triton::nvidia_gpu::getTMABlockShape(attr, shapePerCTA,\n++                                                       /*packedSize=*/true);\n++  std::array<int64_t, 2> collapsedTmaShape{1, tmaShape.back()};\n++  for (int i = 0; i + 1 < shape.size(); i++)\n++    collapsedTmaShape[0] *= tmaShape[i];\n++  if (attr.getTransposed()) {\n++    std::swap(collapsedTmaShape[0], collapsedTmaShape[1]);\n++  }\n++\n++  int tileRows = 8;\n++  int tileCols = 8 * attr.getSwizzlingByteWidth() / elementBitWidth;\n++  if (attr.getFp4Padded()) tileCols /= 2;\n++\n++  int packingFactor = attr.getFp4Padded() ? 2 : 1;\n++  if (collapsedTmaShape[1] * packingFactor < tileCols ||\n++      collapsedTmaShape[0] < tileRows) {\n++    return emitOptionalError(\n++        loc,\n++        \"Illegal shared layout; expected collapsed shapePerCTA to \"\n++        \"be at least [\",\n++        tileRows, \", \", (tileCols / packingFactor), \"], collapsedTmaShape: [\",\n++        collapsedTmaShape[0], \", \", collapsedTmaShape[1], \"]\");\n++  }\n++  return success();\n++}\n++\n++static LogicalResult inferMemDescReshapeOpEncoding(std::optional<Location> loc,\n++                                                   ArrayRef<int64_t> srcShape,\n+                                                    Attribute srcEnc,\n+                                                    ArrayRef<int64_t> dstShape,\n+-                                                   Attribute &dstEnc) {\n++                                                   Attribute& dstEnc) {\n+   if (auto mmaEncoding = dyn_cast<NVMMASharedEncodingAttr>(srcEnc)) {\n+     // TODO: supporting reshape of CTA layouts is non-trivial.\n+     if (getNumCTAs(mmaEncoding) > 1)\n+@@ -544,6 +582,11 @@\n+         ctx, mmaEncoding.getSwizzlingByteWidth(), mmaEncoding.getTransposed(),\n+         mmaEncoding.getElementBitWidth(), mmaEncoding.getFp4Padded(),\n+         CTALayout);\n++    if (failed(verifyNVMMASharedEncoding(\n++            loc, cast<NVMMASharedEncodingAttr>(dstEnc), dstShape,\n++            mmaEncoding.getElementBitWidth()))) {\n++      return failure();\n++    }\n+     // Big guns, check linear layouts are equivalent\n+     // We disallow reshaping memdesc_subslice in the verifier\n+     auto srcLL = toLinearLayout(srcShape, srcEnc, srcShape);\n+@@ -565,8 +608,8 @@\n+ \n+   Attribute dstEncoding;\n+   if (Attribute srcEnc = srcTy.getEncoding()) {\n+-    if (failed(inferMemDescReshapeOpEncoding(srcTy.getShape(), srcEnc, dstShape,\n+-                                             dstEncoding)))\n++    if (failed(inferMemDescReshapeOpEncoding(loc, srcTy.getShape(), srcEnc,\n++                                             dstShape, dstEncoding)))\n+       return failure();\n+   }\n+ "
+        },
+        {
+            "sha": "1fb71abe3ba8b0a08f2fe792e0ba754e73135dda",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/transforms/tests/optimize_dot_operands.mlir",
+            "status": "added",
+            "additions": 20,
+            "deletions": 0,
+            "changes": 20,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4716c3c28704ff00e3a794086b58a6c40cd97225/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftests%2Foptimize_dot_operands.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4716c3c28704ff00e3a794086b58a6c40cd97225/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftests%2Foptimize_dot_operands.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftests%2Foptimize_dot_operands.mlir?ref=4716c3c28704ff00e3a794086b58a6c40cd97225",
+            "patch": "@@ -0,0 +1,20 @@\n+// RUN: xla-opt %s --tritongpu-optimize-dot-operands\n+\n+// Verify fix for b/439549903.\n+\n+!tensor1 = tensor<128x16x2xbf16, #ttg.blocked<{sizePerThread = [1, 16, 2], threadsPerWarp = [32, 1, 1], warpsPerCTA = [4, 1, 1], order = [2, 1, 0]}>>\n+!tensor2 = tensor<128x32xbf16, #ttg.blocked<{sizePerThread = [1, 32], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>>\n+!memdesc = !ttg.memdesc<128x32xbf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>, #ttg.shared_memory>\n+\n+module attributes {\n+  \"ttg.num-ctas\" = 1 : i32,\n+  \"ttg.num-warps\" = 4 : i32,\n+  \"ttg.target\" = \"cuda:100\",\n+  \"ttg.threads-per-warp\" = 32 : i32\n+} {\n+  tt.func @reshape_crash(%arg0: !tensor1) -> !memdesc {\n+    %0 = tt.reshape %arg0 : !tensor1 -> !tensor2\n+    %1 = ttg.local_alloc %0 : (!tensor2) -> !memdesc\n+    tt.return %1 : !memdesc\n+  }\n+}"
+        }
+    ],
+    "stats": {
+        "total": 114,
+        "additions": 114,
+        "deletions": 0
+    }
+}

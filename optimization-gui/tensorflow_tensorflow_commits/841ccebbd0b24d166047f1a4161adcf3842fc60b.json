@@ -1,0 +1,60 @@
+{
+    "author": "EusebioDM",
+    "message": "Refactor `ConvolutionReorderThunk` member fields\n\nIn practice the thunk always has:\n* an input and output filter\n* either:\n  * no biases\n  * both an input and output bias\n\nSo specify this invariant into the data structure, to make this more readable and to make it harder to create an invalid thunk.\n\nPiperOrigin-RevId: 819099118",
+    "sha": "841ccebbd0b24d166047f1a4161adcf3842fc60b",
+    "files": [
+        {
+            "sha": "f24b098e1641210cf29ba2701a5cdbdebc012748",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/BUILD",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 1,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/841ccebbd0b24d166047f1a4161adcf3842fc60b/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/841ccebbd0b24d166047f1a4161adcf3842fc60b/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2FBUILD?ref=841ccebbd0b24d166047f1a4161adcf3842fc60b",
+            "patch": "@@ -560,7 +560,6 @@ cc_library(\n         \"//xla/stream_executor:device_memory\",\n         \"//xla/stream_executor:dnn\",\n         \"//xla/stream_executor:stream_executor_h\",\n-        \"@com_google_absl//absl/container:inlined_vector\",\n         \"@com_google_absl//absl/log:check\",\n         \"@com_google_absl//absl/status\",\n     ],"
+        },
+        {
+            "sha": "558b0778438b9c1d45ecc19711e11782b6b5afe2",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/convolution_reorder_thunk.cc",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 18,
+            "changes": 34,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/841ccebbd0b24d166047f1a4161adcf3842fc60b/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fconvolution_reorder_thunk.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/841ccebbd0b24d166047f1a4161adcf3842fc60b/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fconvolution_reorder_thunk.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fconvolution_reorder_thunk.cc?ref=841ccebbd0b24d166047f1a4161adcf3842fc60b",
+            "patch": "@@ -19,7 +19,6 @@ limitations under the License.\n #include <optional>\n #include <utility>\n \n-#include \"absl/container/inlined_vector.h\"\n #include \"absl/log/check.h\"\n #include \"absl/status/status.h\"\n #include \"xla/backends/gpu/runtime/convolution_filter_thunk.pb.h\"\n@@ -47,32 +46,31 @@ static se::dnn::FilterDescriptor CreateFilterDescriptor(\n \n ConvolutionReorderThunk::ConvolutionReorderThunk(\n     ThunkInfo thunk_info, ConvolutionFilterDimensions filter_dimensions,\n-    absl::InlinedVector<BufferAllocation::Slice, 2> operand_slices,\n-    absl::InlinedVector<BufferAllocation::Slice, 2> result_slices)\n+    BufferAllocation::Slice filter_input, BufferAllocation::Slice filter_output,\n+    std::optional<BiasBuffers> biases)\n     : Thunk(Kind::kConvolutionReorder, thunk_info),\n       filter_descriptor_(CreateFilterDescriptor(filter_dimensions)),\n-      operand_buffers_(operand_slices),\n-      result_buffers_(result_slices) {}\n+      filter_input_(filter_input),\n+      filter_output_(filter_output),\n+      biases_(biases) {}\n \n absl::Status ConvolutionReorderThunk::ExecuteOnStream(\n     const ExecuteParams& params) {\n-  bool has_bias = operand_buffers_.size() > 1;\n-  CHECK_EQ(operand_buffers_.size(), result_buffers_.size());\n-\n   const auto& buffer_allocations = *params.buffer_allocations;\n \n   auto filter_input = se::DeviceMemory<int8_t>(\n-      buffer_allocations.GetDeviceAddress(operand_buffers_[0]));\n+      buffer_allocations.GetDeviceAddress(filter_input_));\n   auto filter_output = se::DeviceMemory<int8_t>(\n-      buffer_allocations.GetDeviceAddress(result_buffers_[0]));\n-  auto bias_input =\n-      has_bias ? std::make_optional(se::DeviceMemory<float>(\n-                     buffer_allocations.GetDeviceAddress(operand_buffers_[1])))\n-               : std::nullopt;\n-  auto bias_output =\n-      has_bias ? std::make_optional(se::DeviceMemory<float>(\n-                     buffer_allocations.GetDeviceAddress(result_buffers_[1])))\n-               : std::nullopt;\n+      buffer_allocations.GetDeviceAddress(filter_output_));\n+\n+  std::optional<se::DeviceMemory<float>> bias_input;\n+  std::optional<se::DeviceMemory<float>> bias_output;\n+  if (biases_.has_value()) {\n+    bias_input = se::DeviceMemory<float>(\n+        buffer_allocations.GetDeviceAddress(biases_->bias_input));\n+    bias_output = se::DeviceMemory<float>(\n+        buffer_allocations.GetDeviceAddress(biases_->bias_output));\n+  }\n \n   auto dnn = params.stream->parent()->AsDnn();\n   if (dnn == nullptr) {"
+        },
+        {
+            "sha": "16b1b25f8157166174abcc3d5921efd505818f39",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/convolution_reorder_thunk.h",
+            "status": "modified",
+            "additions": 14,
+            "deletions": 7,
+            "changes": 21,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/841ccebbd0b24d166047f1a4161adcf3842fc60b/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fconvolution_reorder_thunk.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/841ccebbd0b24d166047f1a4161adcf3842fc60b/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fconvolution_reorder_thunk.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fconvolution_reorder_thunk.h?ref=841ccebbd0b24d166047f1a4161adcf3842fc60b",
+            "patch": "@@ -16,8 +16,8 @@ limitations under the License.\n #ifndef XLA_BACKENDS_GPU_RUNTIME_CONVOLUTION_REORDER_THUNK_H_\n #define XLA_BACKENDS_GPU_RUNTIME_CONVOLUTION_REORDER_THUNK_H_\n \n+#include <optional>\n \n-#include \"absl/container/inlined_vector.h\"\n #include \"absl/status/status.h\"\n #include \"xla/backends/gpu/runtime/convolution_filter_thunk.pb.h\"\n #include \"xla/backends/gpu/runtime/thunk.h\"\n@@ -30,10 +30,16 @@ namespace gpu {\n // Launches the kernel that reorders input data for int8x32 convolutions.\n class ConvolutionReorderThunk : public Thunk {\n  public:\n-  ConvolutionReorderThunk(\n-      ThunkInfo thunk_info, ConvolutionFilterDimensions filter_dimensions,\n-      absl::InlinedVector<BufferAllocation::Slice, 2> operand_slices,\n-      absl::InlinedVector<BufferAllocation::Slice, 2> result_slices);\n+  struct BiasBuffers {\n+    BufferAllocation::Slice bias_input;\n+    BufferAllocation::Slice bias_output;\n+  };\n+\n+  ConvolutionReorderThunk(ThunkInfo thunk_info,\n+                          ConvolutionFilterDimensions filter_dimensions,\n+                          BufferAllocation::Slice filter_input,\n+                          BufferAllocation::Slice filter_output,\n+                          std::optional<BiasBuffers> biases);\n \n   ConvolutionReorderThunk(const ConvolutionReorderThunk&) = delete;\n   ConvolutionReorderThunk& operator=(const ConvolutionReorderThunk&) = delete;\n@@ -43,8 +49,9 @@ class ConvolutionReorderThunk : public Thunk {\n  private:\n   // TODO: b/431980836 - Store the filter dimensions to use for serialization.\n   const se::dnn::FilterDescriptor filter_descriptor_;\n-  absl::InlinedVector<BufferAllocation::Slice, 2> operand_buffers_;\n-  absl::InlinedVector<BufferAllocation::Slice, 2> result_buffers_;\n+  BufferAllocation::Slice filter_input_;\n+  BufferAllocation::Slice filter_output_;\n+  std::optional<BiasBuffers> biases_;\n };\n \n }  // namespace gpu"
+        },
+        {
+            "sha": "914fdfdb3e74da1b3bed39e9d18a615a65d46a18",
+            "filename": "third_party/xla/xla/service/gpu/ir_emitter_unnested.cc",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 15,
+            "changes": 23,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/841ccebbd0b24d166047f1a4161adcf3842fc60b/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fir_emitter_unnested.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/841ccebbd0b24d166047f1a4161adcf3842fc60b/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fir_emitter_unnested.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fir_emitter_unnested.cc?ref=841ccebbd0b24d166047f1a4161adcf3842fc60b",
+            "patch": "@@ -897,34 +897,27 @@ absl::Status IrEmitterUnnested::EmitConvolutionReorderThunk(\n   filter_dimensions.set_input_filter_height(shape.dimensions(2));\n   filter_dimensions.set_input_filter_width(shape.dimensions(3));\n \n-  absl::InlinedVector<BufferAllocation::Slice, 2> operand_slices;\n   TF_ASSIGN_OR_RETURN(BufferAllocation::Slice filter_input,\n                       GetAllocationSliceForHlo(instr->operand(0)));\n-  operand_slices.push_back(filter_input);\n+\n+  BufferAllocation::Slice filter_output;\n+  std::optional<ConvolutionReorderThunk::BiasBuffers> biases;\n   if (has_bias) {\n+    TF_ASSIGN_OR_RETURN(filter_output, GetAllocationSliceForHlo(instr, {0}));\n+\n     TF_ASSIGN_OR_RETURN(BufferAllocation::Slice bias_input,\n                         GetAllocationSliceForHlo(instr->operand(1)));\n-    operand_slices.push_back(bias_input);\n-  }\n-\n-  absl::InlinedVector<BufferAllocation::Slice, 2> result_slices;\n-  if (has_bias) {\n-    TF_ASSIGN_OR_RETURN(BufferAllocation::Slice filter_output,\n-                        GetAllocationSliceForHlo(instr, {0}));\n-    result_slices.push_back(filter_output);\n     TF_ASSIGN_OR_RETURN(BufferAllocation::Slice bias_output,\n                         GetAllocationSliceForHlo(instr, {1}));\n-    result_slices.push_back(bias_output);\n+    biases = {{bias_input, bias_output}};\n   } else {\n-    TF_ASSIGN_OR_RETURN(BufferAllocation::Slice filter_output,\n-                        GetAllocationSliceForHlo(instr));\n-    result_slices.push_back(filter_output);\n+    TF_ASSIGN_OR_RETURN(filter_output, GetAllocationSliceForHlo(instr));\n   }\n \n   auto thunk = std::make_unique<ConvolutionReorderThunk>(\n       Thunk::ThunkInfo::WithProfileAnnotation(\n           instr, ir_emitter_context_->GetNextThunkId()),\n-      std::move(filter_dimensions), operand_slices, result_slices);\n+      std::move(filter_dimensions), filter_input, filter_output, biases);\n   AddThunkToThunkSequence(std::move(thunk));\n   return absl::OkStatus();\n }"
+        }
+    ],
+    "stats": {
+        "total": 79,
+        "additions": 38,
+        "deletions": 41
+    }
+}

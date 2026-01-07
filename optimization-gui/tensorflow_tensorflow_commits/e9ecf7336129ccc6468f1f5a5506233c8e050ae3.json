@@ -1,0 +1,48 @@
+{
+    "author": "shawnwang18",
+    "message": "PR #34499: Fix cublasLT bug when swap operands\n\nImported from GitHub PR https://github.com/openxla/xla/pull/34499\n\n🎯 Justification\nThis pull request introduces support for FP8 matmul operations with swapped operands in the GPU autotuner and ensures correct handling of scaling factors when operands are swapped. The main changes include updates to the autotuner test suite, the CUDA BLAS Lt matmul implementation, and build dependencies.\n\n🚀 Kind of Contribution\n🐛 Bug Fix,\n\n🧪 Unit Tests:\nCublasLtBackendTest.CompileFp8SwapOperands\n\nCopybara import of the project:\n\n--\nfc091ad5fadd9ede2f93296e1e999eaa105b6c77 by Shawn Wang <shawnw@nvidia.com>:\n\nFix cublasLT bug when swap operands\n\nMerging this change closes #34499\n\nPiperOrigin-RevId: 840213993",
+    "sha": "e9ecf7336129ccc6468f1f5a5506233c8e050ae3",
+    "files": [
+        {
+            "sha": "4ee9bca34cf29c858acfc41db7ee3152f8ec06e7",
+            "filename": "third_party/xla/xla/backends/gpu/autotuner/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e9ecf7336129ccc6468f1f5a5506233c8e050ae3/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e9ecf7336129ccc6468f1f5a5506233c8e050ae3/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2FBUILD?ref=e9ecf7336129ccc6468f1f5a5506233c8e050ae3",
+            "patch": "@@ -257,6 +257,7 @@ xla_test(\n         \"//xla/hlo/testlib:filecheck\",\n         \"//xla/hlo/testlib:hlo_hardware_independent_test_base\",\n         \"//xla/service:compiler\",\n+        \"//xla/service:executable\",\n         \"//xla/service:platform_util\",\n         \"//xla/service/gpu:nvptx_compiler_impl\",\n         \"//xla/stream_executor:blas\","
+        },
+        {
+            "sha": "1e165611fe590c2484a952ca7ab83735fac4dae0",
+            "filename": "third_party/xla/xla/backends/gpu/autotuner/cublaslt_test.cc",
+            "status": "modified",
+            "additions": 46,
+            "deletions": 0,
+            "changes": 46,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e9ecf7336129ccc6468f1f5a5506233c8e050ae3/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Fcublaslt_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e9ecf7336129ccc6468f1f5a5506233c8e050ae3/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Fcublaslt_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Fcublaslt_test.cc?ref=e9ecf7336129ccc6468f1f5a5506233c8e050ae3",
+            "patch": "@@ -30,6 +30,7 @@ limitations under the License.\n #include \"xla/hlo/testlib/filecheck.h\"\n #include \"xla/hlo/testlib/hlo_hardware_independent_test_base.h\"\n #include \"xla/service/compiler.h\"\n+#include \"xla/service/executable.h\"\n #include \"xla/service/gpu/nvptx_compiler.h\"\n #include \"xla/service/platform_util.h\"\n #include \"xla/stream_executor/blas.h\"\n@@ -196,5 +197,50 @@ TEST_F(CublasLtBackendTest, ApplyConfig) {\n               absl_testing::IsOkAndHolds(true));\n }\n \n+TEST_F(CublasLtBackendTest, CompileFp8SwapOperands) {\n+  if (!stream_executor_->GetDeviceDescription()\n+           .cuda_compute_capability()\n+           .IsAtLeast(8, 9)) {\n+    GTEST_SKIP() << \"FP8 requires compute capability 8.9 or higher\";\n+  }\n+  // CuBLASLt requires the operands to be in a specific layout (transposed /\n+  // non-transposed) for FP8 matrix multiplication. This HLO defines a\n+  // row-major output which forces the backend to swap operands, implicitly\n+  // satisfying the layout requirements.\n+  const char kFp8MatmulWithSwapHlo[] = R\"(\n+  HloModule module\n+\n+  ENTRY %main (lhs: f8e4m3fn[16,16], rhs: f8e4m3fn[16,16], lhs_scale: f32[], rhs_scale: f32[]) -> f32[16,16] {\n+    %lhs = f8e4m3fn[16,16]{1,0} parameter(0)\n+    %rhs = f8e4m3fn[16,16]{1,0} parameter(1)\n+    %lhs_scale = f32[] parameter(2)\n+    %rhs_scale = f32[] parameter(3)\n+\n+    %custom-call = (f32[16,16]{1,0}, s8[100]{0}) custom-call(%lhs, %rhs, %lhs_scale, %rhs_scale),\n+      custom_call_target=\"__cublas$lt$matmul$f8\",\n+      backend_config={\"gemm_backend_config\":{\n+        \"dot_dimension_numbers\":{\n+          \"lhs_contracting_dimensions\":[\"1\"],\n+          \"rhs_contracting_dimensions\":[\"0\"],\n+          \"lhs_batch_dimensions\":[],\n+          \"rhs_batch_dimensions\":[]\n+        },\n+        \"alpha_real\": 1,\n+        \"beta\": 0\n+      }}\n+    ROOT %get-tuple-element = f32[16,16]{1,0} get-tuple-element(%custom-call), index=0\n+  })\";\n+\n+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,\n+                          ParseAndReturnVerifiedModule(kFp8MatmulWithSwapHlo));\n+  TF_ASSERT_OK_AND_ASSIGN(\n+      std::unique_ptr<BackendConfig> config,\n+      backend_.GetDefaultConfig(\n+          *(module->entry_computation()->root_instruction()->operand(0))));\n+  absl::StatusOr<std::unique_ptr<Executable>> executable = backend_.Compile(\n+      *(module->entry_computation()->root_instruction()->operand(0)), *config);\n+  EXPECT_THAT(executable, absl_testing::IsOk());\n+}\n+\n }  // namespace gpu\n }  // namespace xla"
+        },
+        {
+            "sha": "fcc6d497a380086a127db18f913bd9e89797965b",
+            "filename": "third_party/xla/xla/stream_executor/cuda/cuda_blas_lt.cc",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 10,
+            "changes": 25,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e9ecf7336129ccc6468f1f5a5506233c8e050ae3/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_blas_lt.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e9ecf7336129ccc6468f1f5a5506233c8e050ae3/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_blas_lt.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_blas_lt.cc?ref=e9ecf7336129ccc6468f1f5a5506233c8e050ae3",
+            "patch": "@@ -357,8 +357,10 @@ absl::Status BlasLt::MatmulPlan::DoMatmul(\n         \"Algorithm must be set before calling DoMatMul!\");\n   }\n   DeviceMemoryBase a = args.a, b = args.b;\n+  DeviceMemoryBase a_scale = args.a_scale, b_scale = args.b_scale;\n   if (must_swap_operands_) {\n     std::swap(a, b);\n+    std::swap(a_scale, b_scale);\n   }\n \n   auto blas_lt = static_cast<BlasLt*>(gpu::BlasLt::Get(stream));\n@@ -398,15 +400,15 @@ absl::Status BlasLt::MatmulPlan::DoMatmul(\n                                  args.bias.opaque()));\n     }\n #if CUDA_VERSION >= 11080\n-    if (args.a_scale != nullptr) {\n+    if (a_scale != nullptr) {\n       TF_RETURN_IF_ERROR(SetAttr(op_desc_.get(),\n                                  CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,\n-                                 args.a_scale.opaque()));\n+                                 a_scale.opaque()));\n     }\n-    if (args.b_scale != nullptr) {\n+    if (b_scale != nullptr) {\n       TF_RETURN_IF_ERROR(SetAttr(op_desc_.get(),\n                                  CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,\n-                                 args.b_scale.opaque()));\n+                                 b_scale.opaque()));\n     }\n     if (args.c_scale != nullptr) {\n       TF_RETURN_IF_ERROR(SetAttr(op_desc_.get(),\n@@ -424,9 +426,8 @@ absl::Status BlasLt::MatmulPlan::DoMatmul(\n                                  args.d_amax.opaque()));\n     }\n #else\n-    if (!(args.a_scale == nullptr && args.b_scale == nullptr &&\n-          args.c_scale == nullptr && args.d_scale == nullptr &&\n-          args.d_amax == nullptr)) {\n+    if (!(a_scale == nullptr && b_scale == nullptr && args.c_scale == nullptr &&\n+          args.d_scale == nullptr && args.d_amax == nullptr)) {\n       return absl::InternalError(\n           \"A/B/C/D scales and amax require cublasLt >= 11.8\");\n     }\n@@ -464,12 +465,16 @@ absl::Status BlasLt::MatmulPlan::DoMatmul(\n \n     std::unique_ptr<ActivateContext> activation = blas_lt->parent_->Activate();\n \n+    void* c_ptr = args.c.opaque();\n+    if (beta_ == 0.0) {\n+      c_ptr = nullptr;\n+    }\n+\n     if (palgo != nullptr) {\n       SE_CUBLAS_RETURN_IF_ERROR(cublasLtMatmul(\n           blas_lt->blas_lt_.get(), op_desc_.get(), alpha, a.opaque(),\n-          a_desc_.get(), b.opaque(), b_desc_.get(), beta, args.c.opaque(),\n-          c_desc_.get(), args.d.opaque(), d_desc_.get(), palgo, workspace_addr,\n-          workspace_size,\n+          a_desc_.get(), b.opaque(), b_desc_.get(), beta, c_ptr, c_desc_.get(),\n+          args.d.opaque(), d_desc_.get(), palgo, workspace_addr, workspace_size,\n           absl::bit_cast<CUstream>(stream->platform_specific_handle().stream)));\n     } else {\n       return absl::InternalError(\"cublaslt: Invalid algorithm type\");"
+        }
+    ],
+    "stats": {
+        "total": 72,
+        "additions": 62,
+        "deletions": 10
+    }
+}

@@ -1,0 +1,48 @@
+{
+    "author": "pschuh",
+    "message": "Protect filling out GetReadyFuture with a mutex.\n\nPiperOrigin-RevId: 827724780",
+    "sha": "fab82cc24890717891b67627a91533aed640359b",
+    "files": [
+        {
+            "sha": "ad0d6328a8cf2f0c42deff7e8e970d090e93160a",
+            "filename": "third_party/xla/xla/pjrt/c_api_client/BUILD",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/fab82cc24890717891b67627a91533aed640359b/third_party%2Fxla%2Fxla%2Fpjrt%2Fc_api_client%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/fab82cc24890717891b67627a91533aed640359b/third_party%2Fxla%2Fxla%2Fpjrt%2Fc_api_client%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fc_api_client%2FBUILD?ref=fab82cc24890717891b67627a91533aed640359b",
+            "patch": "@@ -129,10 +129,12 @@ xla_cc_test(\n         \"//xla/service:computation_placer_hdr\",\n         \"//xla/tests:literal_test_util\",\n         \"//xla/tsl/lib/core:status_test_util\",\n+        \"//xla/tsl/platform:env\",\n         \"//xla/tsl/platform:statusor\",\n         \"//xla/tsl/platform:test\",\n         \"@com_google_absl//absl/status\",\n         \"@com_google_absl//absl/strings:str_format\",\n+        \"@com_google_absl//absl/synchronization\",\n         \"@com_google_absl//absl/types:span\",\n         \"@com_google_googletest//:gtest_main\",\n         \"@llvm-project//mlir:IR\","
+        },
+        {
+            "sha": "7308cc99fdedb5a54181bcb8ba91c489b722cafc",
+            "filename": "third_party/xla/xla/pjrt/c_api_client/pjrt_c_api_client.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/fab82cc24890717891b67627a91533aed640359b/third_party%2Fxla%2Fxla%2Fpjrt%2Fc_api_client%2Fpjrt_c_api_client.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/fab82cc24890717891b67627a91533aed640359b/third_party%2Fxla%2Fxla%2Fpjrt%2Fc_api_client%2Fpjrt_c_api_client.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fc_api_client%2Fpjrt_c_api_client.cc?ref=fab82cc24890717891b67627a91533aed640359b",
+            "patch": "@@ -2958,6 +2958,7 @@ void PjRtCApiBuffer::MakePromiseTrackEvent() {\n }\n \n Future<> PjRtCApiBuffer::GetReadyFuture() {\n+  absl::MutexLock l(mu_);\n   if (readiness_promise_ == nullptr) {\n     auto [promise, future] = Future<>::MakePromise();\n     readiness_promise_ = std::move(promise).ToShared();"
+        },
+        {
+            "sha": "74e0bba0921a8f9892f1770bab501c300e9bebaa",
+            "filename": "third_party/xla/xla/pjrt/c_api_client/pjrt_c_api_client_test.cc",
+            "status": "modified",
+            "additions": 52,
+            "deletions": 0,
+            "changes": 52,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/fab82cc24890717891b67627a91533aed640359b/third_party%2Fxla%2Fxla%2Fpjrt%2Fc_api_client%2Fpjrt_c_api_client_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/fab82cc24890717891b67627a91533aed640359b/third_party%2Fxla%2Fxla%2Fpjrt%2Fc_api_client%2Fpjrt_c_api_client_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fc_api_client%2Fpjrt_c_api_client_test.cc?ref=fab82cc24890717891b67627a91533aed640359b",
+            "patch": "@@ -29,6 +29,7 @@ limitations under the License.\n #include <gtest/gtest.h>\n #include \"absl/status/status.h\"\n #include \"absl/strings/str_format.h\"\n+#include \"absl/synchronization/blocking_counter.h\"\n #include \"absl/types/span.h\"\n #include \"mlir/IR/BuiltinOps.h\"\n #include \"mlir/IR/MLIRContext.h\"\n@@ -57,8 +58,10 @@ limitations under the License.\n #include \"xla/shape_util.h\"\n #include \"xla/tests/literal_test_util.h\"\n #include \"xla/tsl/lib/core/status_test_util.h\"\n+#include \"xla/tsl/platform/env.h\"\n #include \"xla/tsl/platform/statusor.h\"\n #include \"xla/tsl/platform/test.h\"\n+#include \"xla/tsl/platform/threadpool.h\"\n \n namespace xla {\n namespace {\n@@ -126,6 +129,55 @@ TEST(PjRtCApiClientTest, FulfillAliasBuffer) {\n       LiteralUtil::CreateR2<int32_t>({{2, 3, 4}, {5, 6, 7}}), *alias_literal));\n }\n \n+TEST(PjRtCApiClientTest, ConcurrentGetReadyFuture) {\n+  const PJRT_Api* c_api = ::pjrt::cpu_plugin::GetCpuPjrtApi();\n+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<PjRtClient> client,\n+                          WrapClientAroundCApi(c_api));\n+\n+  constexpr int kNumThreads = 4;\n+  tsl::thread::ThreadPool thread_pool(\n+      tsl::Env::Default(), \"GetReadyWithConcurrentUsage\", kNumThreads);\n+\n+  std::vector<int32_t> data{1, 2, 3, 4, 5, 6};\n+  Shape shape = ShapeUtil::MakeShape(S32, {2, 3});\n+\n+  // Create a buffer from host data.\n+  TF_ASSERT_OK_AND_ASSIGN(\n+      auto param,\n+      client->BufferFromHostBuffer(\n+          data.data(), shape.element_type(), shape.dimensions(),\n+          /*byte_strides=*/std::nullopt,\n+          PjRtClient::HostBufferSemantics::kImmutableOnlyDuringCall, nullptr,\n+          client->memory_spaces()[0], /*device_layout=*/nullptr));\n+\n+  // Define a simple \"add one\" kernel.\n+  XlaBuilder builder(\"add_one\");\n+  auto input = Parameter(&builder, 0, shape, \"input\");\n+  auto one = ConstantR0<int32_t>(&builder, 1);\n+  auto add = Add(input, one);\n+  auto computation = builder.Build(add).value();\n+\n+  // Compile and load the executable.\n+  TF_ASSERT_OK_AND_ASSIGN(\n+      std::unique_ptr<PjRtLoadedExecutable> executable,\n+      client->CompileAndLoad(computation, CompileOptions()));\n+  for (size_t i = 0; i < 100; ++i) {\n+    TF_ASSERT_OK_AND_ASSIGN(\n+        std::vector<std::vector<std::unique_ptr<PjRtBuffer>>> results,\n+        executable->Execute({{param.get()}}, ExecuteOptions()));\n+    auto buffer = std::move(results[0][0]);\n+\n+    absl::BlockingCounter blocking_counter(kNumThreads);\n+    for (size_t j = 0; j < kNumThreads; ++j) {\n+      thread_pool.Schedule([&, buffer = buffer.get()]() {\n+        TF_EXPECT_OK(buffer->GetReadyFuture().Await());\n+        blocking_counter.DecrementCount();\n+      });\n+    }\n+    blocking_counter.Wait();\n+  }\n+}\n+\n TEST(PjRtCApiClientTest, IsDynamicDimension) {\n   SetUpCpuPjRtApi();\n   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<PjRtClient> client,"
+        }
+    ],
+    "stats": {
+        "total": 55,
+        "additions": 55,
+        "deletions": 0
+    }
+}

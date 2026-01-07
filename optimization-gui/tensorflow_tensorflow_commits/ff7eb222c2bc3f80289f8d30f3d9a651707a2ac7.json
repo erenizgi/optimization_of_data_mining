@@ -1,0 +1,144 @@
+{
+    "author": "unknown",
+    "message": "Refactor XLA Profiler State Check to Use Low-Overhead C API\n\nThis CL refactors the XLA profiler's state-checking mechanism to resolve GIL deadlocks and improve performance.\n\nPreviously, the C++ profiler context would import a Python module to update the profiler's state. This operation, performed while holding the GIL, could cause deadlocks if the import failed (e.g., in a JAX-only environment).\n\nThis change replaces the fragile cross-language import with a shared C++ std::atomic<bool>. Python code now queries this state via a new, low-overhead C function (is_traceme_enabled_raw) instead of ctypes.\n\nThis approach eliminates the deadlocks, decouples the C++ profiler from Python modules, and maintains high performance for the state check. The internal C++ API was also updated to use a safer reference instead of a raw pointer.\n\nPiperOrigin-RevId: 847261952",
+    "sha": "ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7",
+    "files": [
+        {
+            "sha": "9c2de5b39016e79b0ae4aca1008c2d250b60aa83",
+            "filename": "tensorflow/compiler/jit/BUILD",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 1,
+            "changes": 5,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7/tensorflow%2Fcompiler%2Fjit%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7/tensorflow%2Fcompiler%2Fjit%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcompiler%2Fjit%2FBUILD?ref=ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7",
+            "patch": "@@ -65,7 +65,10 @@ filegroup(\n # Please use the individual targets in the deps list as needed. See b/336889334.\n cc_library(\n     name = \"jit\",\n-    visibility = internal_visibility([\":legacy_jit_users\"]),\n+    visibility = internal_visibility([\n+        \":legacy_jit_users\",\n+        \"//tensorflow/python/profiler:__pkg__\",\n+    ]),\n     deps = [\n         \":xla_cpu_device\",\n         \":xla_cpu_jit\","
+        },
+        {
+            "sha": "bcf9a42a941023b70807482a2af8c976f050c047",
+            "filename": "tensorflow/python/profiler/internal/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7/tensorflow%2Fpython%2Fprofiler%2Finternal%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7/tensorflow%2Fpython%2Fprofiler%2Finternal%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fpython%2Fprofiler%2Finternal%2FBUILD?ref=ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7",
+            "patch": "@@ -108,6 +108,7 @@ tf_python_pybind_extension(\n         \"//tensorflow/tools/pip_package:__subpackages__\",\n     ],\n     deps = [\n+        \"@local_xla//xla/python/profiler/internal:traceme_state\",\n         \"@local_xla//xla/python/profiler/internal:traceme_wrapper\",\n         \"@pybind11\",\n     ],"
+        },
+        {
+            "sha": "47b8b56c94a26991eb44d4d251a6addd1d6f180f",
+            "filename": "tensorflow/python/profiler/internal/_pywrap_traceme.pyi",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7/tensorflow%2Fpython%2Fprofiler%2Finternal%2F_pywrap_traceme.pyi",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7/tensorflow%2Fpython%2Fprofiler%2Finternal%2F_pywrap_traceme.pyi",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fpython%2Fprofiler%2Finternal%2F_pywrap_traceme.pyi?ref=ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7",
+            "patch": "@@ -17,3 +17,5 @@ class TraceMe:\n     def __init__(self, arg0: str, **kwargs) -> None: ...\n     def SetMetadata(self, **kwargs) -> None: ...\n     def Stop(self) -> None: ...\n+\n+def traceme_enabled(*args, **kwargs): ..."
+        },
+        {
+            "sha": "9397eb18134cf3ee2e46bf49a4e2c43aa83e4c19",
+            "filename": "tensorflow/python/profiler/internal/traceme_wrapper.cc",
+            "status": "modified",
+            "additions": 19,
+            "deletions": 0,
+            "changes": 19,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7/tensorflow%2Fpython%2Fprofiler%2Finternal%2Ftraceme_wrapper.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7/tensorflow%2Fpython%2Fprofiler%2Finternal%2Ftraceme_wrapper.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fpython%2Fprofiler%2Finternal%2Ftraceme_wrapper.cc?ref=ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7",
+            "patch": "@@ -17,14 +17,33 @@ limitations under the License.\n \n #include \"pybind11/attr.h\"  // from @pybind11\n #include \"pybind11/pybind11.h\"  // from @pybind11\n+#include \"xla/python/profiler/internal/traceme_state.h\"\n \n namespace py = ::pybind11;\n \n using ::xla::profiler::TraceMeWrapper;\n \n+// Returns true if TraceMe is enabled.\n+// This is a low-overhead function that can be called frequently.\n+static PyObject* traceme_enabled(PyObject* self, PyObject* args) {\n+  if (xla::profiler::traceme_enabled) {\n+    Py_RETURN_TRUE;\n+  }\n+  Py_RETURN_FALSE;\n+}\n+\n+static PyMethodDef traceme_method_def = {\"traceme_enabled\", traceme_enabled,\n+                                         METH_NOARGS,\n+                                         \"Returns true if TraceMe is enabled.\"};\n+\n PYBIND11_MODULE(_pywrap_traceme, m) {\n   py::class_<TraceMeWrapper>(m, \"TraceMe\", py::module_local())\n       .def(py::init<const py::str&, const py::kwargs&>())\n       .def(\"SetMetadata\", &TraceMeWrapper::SetMetadata)\n       .def(\"Stop\", &TraceMeWrapper::Stop);\n+\n+  py::object module_name = m.attr(\"__name__\");\n+  m.attr(\"traceme_enabled\") =\n+      py::reinterpret_steal<py::object>(PyCFunction_NewEx(\n+          &traceme_method_def, /*self=*/nullptr, module_name.ptr()));\n };"
+        },
+        {
+            "sha": "bec85cdc60bba8d5d8731fadd08096eb1fad2620",
+            "filename": "tensorflow/python/profiler/profiler_v2_test.py",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 0,
+            "changes": 8,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7/tensorflow%2Fpython%2Fprofiler%2Fprofiler_v2_test.py",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7/tensorflow%2Fpython%2Fprofiler%2Fprofiler_v2_test.py",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fpython%2Fprofiler%2Fprofiler_v2_test.py?ref=ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7",
+            "patch": "@@ -98,6 +98,14 @@ def test_context_manager_with_options(self):\n     file_list = gfile.ListDirectory(logdir)\n     self.assertEqual(len(file_list), 1)\n \n+  def test_callback(self):\n+    logdir = self.get_temp_dir()\n+    self.assertFalse(trace.enabled())\n+    profiler.start(logdir)\n+    self.assertTrue(trace.enabled())\n+    profiler.stop()\n+    self.assertFalse(trace.enabled())\n+\n \n if __name__ == '__main__':\n   test.main()"
+        },
+        {
+            "sha": "4c877803ef76236ef1f48afda9a649eaf8056d32",
+            "filename": "tensorflow/python/profiler/trace.py",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 5,
+            "changes": 10,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7/tensorflow%2Fpython%2Fprofiler%2Ftrace.py",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7/tensorflow%2Fpython%2Fprofiler%2Ftrace.py",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fpython%2Fprofiler%2Ftrace.py?ref=ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7",
+            "patch": "@@ -19,9 +19,9 @@\n from tensorflow.python.profiler.internal import _pywrap_traceme\n from tensorflow.python.util.tf_export import tf_export\n \n-# This variable is modified by PythonHooks::Start/Stop() in C++. Such\n-# arrangement will reduce the number of calls through pybind11.\n-enabled = False\n+# This is a low-overhead function that directly calls C++ to check if the\n+# profiler is enabled.\n+enabled = _pywrap_traceme.traceme_enabled\n \n \n @tf_export('profiler.experimental.Trace', v1=[])\n@@ -74,7 +74,7 @@ def __init__(self, name, **kwargs):\n       The example above uses the keyword argument \"step_num\" to specify the\n       training step being traced.\n     \"\"\"\n-    if enabled:\n+    if enabled():\n       # Creating _pywrap_traceme.TraceMe starts the clock.\n       self._traceme = _pywrap_traceme.TraceMe(name, **kwargs)\n     else:\n@@ -177,7 +177,7 @@ def inner_wrapper(func):\n \n     @functools.wraps(func)\n     def wrapped(*args, **kwargs):\n-      if enabled:\n+      if enabled():\n         with Trace(trace_name, **trace_kwargs):\n           return func(*args, **kwargs)\n       return func(*args, **kwargs)"
+        },
+        {
+            "sha": "08d97088e51d8d9f680c0a8c1b3e8c3f3f2592a2",
+            "filename": "third_party/xla/xla/python/profiler/internal/BUILD",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 1,
+            "changes": 16,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7/third_party%2Fxla%2Fxla%2Fpython%2Fprofiler%2Finternal%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7/third_party%2Fxla%2Fxla%2Fpython%2Fprofiler%2Finternal%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpython%2Fprofiler%2Finternal%2FBUILD?ref=ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7",
+            "patch": "@@ -1,4 +1,4 @@\n-load(\"//xla/tsl:tsl.bzl\", \"internal_visibility\")\n+load(\"//xla/tsl:tsl.bzl\", \"if_windows\", \"internal_visibility\")\n load(\"//xla/tsl:tsl.default.bzl\", \"get_compatible_with_portable\")\n load(\"//xla/tsl/platform:rules_cc.bzl\", \"cc_library\")\n load(\"//xla/tsl/profiler/builds:build_config.bzl\", \"tf_profiler_copts\")\n@@ -21,6 +21,7 @@ cc_library(\n         \"//tensorflow/python/profiler/internal:__subpackages__\",\n     ]),\n     deps = [\n+        \":traceme_state\",\n         \"//xla/tsl/platform:env\",\n         \"//xla/tsl/platform:macros\",\n         \"//xla/tsl/profiler/utils:time_utils\",\n@@ -40,6 +41,19 @@ cc_library(\n     alwayslink = True,\n )\n \n+cc_library(\n+    name = \"traceme_state\",\n+    srcs = [\"traceme_state.cc\"],\n+    hdrs = [\"traceme_state.h\"],\n+    copts = tf_profiler_copts() + if_windows([\"/DTF_COMPILE_LIBRARY\"]),\n+    visibility = internal_visibility([\n+        \"//tensorflow/python/profiler/internal:__pkg__\",\n+    ]),\n+    deps = [\n+        \"//xla/tsl/platform:macros\",\n+    ],\n+)\n+\n cc_library(\n     name = \"traceme_wrapper\",\n     hdrs = [\"traceme_wrapper.h\"],"
+        },
+        {
+            "sha": "fbe1afabf26270149d37344c48f5a3689c96e30c",
+            "filename": "third_party/xla/xla/python/profiler/internal/python_hooks.cc",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 13,
+            "changes": 16,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7/third_party%2Fxla%2Fxla%2Fpython%2Fprofiler%2Finternal%2Fpython_hooks.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7/third_party%2Fxla%2Fxla%2Fpython%2Fprofiler%2Finternal%2Fpython_hooks.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpython%2Fprofiler%2Finternal%2Fpython_hooks.cc?ref=ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7",
+            "patch": "@@ -23,6 +23,7 @@ limitations under the License.\n #include \"absl/strings/str_cat.h\"\n #include \"absl/strings/string_view.h\"\n #include \"absl/strings/strip.h\"\n+#include \"xla/python/profiler/internal/traceme_state.h\"\n #include \"xla/tsl/platform/env.h\"\n #include \"xla/tsl/profiler/utils/time_utils.h\"\n #include \"xla/tsl/profiler/utils/xplane_builder.h\"\n@@ -148,7 +149,7 @@ void PythonHookContext::Start(const PythonHooksOptions& options) {\n   if (options_.enable_python_traceme || options_.enable_trace_python_function) {\n     PyGILState_STATE gil_state = PyGILState_Ensure();\n     if (options_.enable_python_traceme) {\n-      EnableTraceMe(true);\n+      traceme_enabled = true;\n     }\n     if (options_.enable_trace_python_function) {\n       SetProfilerInAllThreads();\n@@ -187,7 +188,7 @@ void PythonHookContext::Stop() {\n       ClearProfilerInAllThreads();\n     }\n     if (options_.enable_python_traceme) {\n-      EnableTraceMe(false);\n+      traceme_enabled = false;\n     }\n     PyGILState_Release(gil_state);\n   }\n@@ -408,16 +409,5 @@ void PythonHookContext::ProfileFast(PyFrameObject* frame, int what,\n   ThreadingSetProfile(py::none());\n }\n \n-/*static*/ void PythonHookContext::EnableTraceMe(bool enable) {\n-  const char* kModuleName =\n-      \"tensorflow.python.profiler.trace\";\n-  try {\n-    auto trace_module = py::module::import(kModuleName);\n-    trace_module.attr(\"enabled\") = py::bool_(enable);\n-  } catch (const py::error_already_set& e) {\n-    LOG(INFO) << \"Can't import \" << kModuleName;\n-  }\n-}\n-\n }  // namespace profiler\n }  // namespace xla"
+        },
+        {
+            "sha": "623df122ed1cd976125a8d528d953cd26a40135c",
+            "filename": "third_party/xla/xla/python/profiler/internal/python_hooks.h",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 1,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7/third_party%2Fxla%2Fxla%2Fpython%2Fprofiler%2Finternal%2Fpython_hooks.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7/third_party%2Fxla%2Fxla%2Fpython%2Fprofiler%2Finternal%2Fpython_hooks.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpython%2Fprofiler%2Finternal%2Fpython_hooks.h?ref=ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7",
+            "patch": "@@ -135,7 +135,6 @@ class PythonHookContext {\n   void Stop();\n   void ProfileFast(PyFrameObject* frame, int what, PyObject* arg);\n   void CollectData(tensorflow::profiler::XPlane* raw_plane);\n-  static void EnableTraceMe(bool enable);\n \n   static void SetProfilerInAllThreads();\n   static void ClearProfilerInAllThreads();"
+        },
+        {
+            "sha": "b4959e725ab372188c83c50de28addf036c1dc77",
+            "filename": "third_party/xla/xla/python/profiler/internal/traceme_state.cc",
+            "status": "added",
+            "additions": 25,
+            "deletions": 0,
+            "changes": 25,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7/third_party%2Fxla%2Fxla%2Fpython%2Fprofiler%2Finternal%2Ftraceme_state.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7/third_party%2Fxla%2Fxla%2Fpython%2Fprofiler%2Finternal%2Ftraceme_state.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpython%2Fprofiler%2Finternal%2Ftraceme_state.cc?ref=ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7",
+            "patch": "@@ -0,0 +1,25 @@\n+/* Copyright 2024 The OpenXLA Authors.\n+\n+Licensed under the Apache License, Version 2.0 (the \"License\");\n+you may not use this file except in compliance with the License.\n+You may obtain a copy of the License at\n+\n+    http://www.apache.org/licenses/LICENSE-2.0\n+\n+Unless required by applicable law or agreed to in writing, software\n+distributed under the License is distributed on an \"AS IS\" BASIS,\n+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+See the License for the specific language governing permissions and\n+limitations under the License.\n+==============================================================================*/\n+#include \"xla/python/profiler/internal/traceme_state.h\"\n+\n+#include <atomic>\n+\n+namespace xla {\n+namespace profiler {\n+\n+std::atomic<bool> traceme_enabled{false};\n+\n+}  // namespace profiler\n+}  // namespace xla"
+        },
+        {
+            "sha": "937321772507a5da160419d1059cfaf6fce563a6",
+            "filename": "third_party/xla/xla/python/profiler/internal/traceme_state.h",
+            "status": "added",
+            "additions": 29,
+            "deletions": 0,
+            "changes": 29,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7/third_party%2Fxla%2Fxla%2Fpython%2Fprofiler%2Finternal%2Ftraceme_state.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7/third_party%2Fxla%2Fxla%2Fpython%2Fprofiler%2Finternal%2Ftraceme_state.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpython%2Fprofiler%2Finternal%2Ftraceme_state.h?ref=ff7eb222c2bc3f80289f8d30f3d9a651707a2ac7",
+            "patch": "@@ -0,0 +1,29 @@\n+/* Copyright 2024 The OpenXLA Authors.\n+\n+Licensed under the Apache License, Version 2.0 (the \"License\");\n+you may not use this file except in compliance with the License.\n+You may obtain a copy of the License at\n+\n+    http://www.apache.org/licenses/LICENSE-2.0\n+\n+Unless required by applicable law or agreed to in writing, software\n+distributed under the License is distributed on an \"AS IS\" BASIS,\n+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+See the License for the specific language governing permissions and\n+limitations under the License.\n+==============================================================================*/\n+#ifndef XLA_PYTHON_PROFILER_INTERNAL_TRACEME_STATE_H_\n+#define XLA_PYTHON_PROFILER_INTERNAL_TRACEME_STATE_H_\n+\n+#include <atomic>\n+\n+#include \"xla/tsl/platform/macros.h\"\n+namespace xla {\n+namespace profiler {\n+\n+// Indicates whether TraceMe is enabled.\n+TF_EXPORT extern std::atomic<bool> traceme_enabled;\n+}  // namespace profiler\n+}  // namespace xla\n+\n+#endif  // XLA_PYTHON_PROFILER_INTERNAL_TRACEME_STATE_H_"
+        }
+    ],
+    "stats": {
+        "total": 132,
+        "additions": 111,
+        "deletions": 21
+    }
+}

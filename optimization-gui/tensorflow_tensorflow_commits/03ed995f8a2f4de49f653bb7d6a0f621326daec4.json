@@ -1,0 +1,60 @@
+{
+    "author": "akuegel",
+    "message": "[XLA:GPU] Allow unrolling for ReduceWindow with small window.\n\nExperiments show that this performs still better than not unrolling.\nAlso rename the method MayPreventVectorization as the naming is misleading. The\nother logic makes sure that we can at least vectorize the stores, so this\nfunction should check whether there is an expected performance drop due to\nunrolling, not whether we may be able to vectorize loads.\n\nPiperOrigin-RevId: 817621544",
+    "sha": "03ed995f8a2f4de49f653bb7d6a0f621326daec4",
+    "files": [
+        {
+            "sha": "4ffaaa9c280efbbaf0792660646104f85e89b3d3",
+            "filename": "third_party/xla/xla/service/gpu/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/03ed995f8a2f4de49f653bb7d6a0f621326daec4/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/03ed995f8a2f4de49f653bb7d6a0f621326daec4/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2FBUILD?ref=03ed995f8a2f4de49f653bb7d6a0f621326daec4",
+            "patch": "@@ -2778,6 +2778,7 @@ xla_cc_test(\n         \"//xla/hlo/ir:hlo\",\n         \"//xla/hlo/parser:hlo_parser\",\n         \"//xla/hlo/testlib:hlo_hardware_independent_test_base\",\n+        \"//xla/hlo/utils:hlo_traversal\",\n         \"//xla/service:instruction_fusion\",\n         \"//xla/stream_executor:device_description\",\n         \"//xla/tests:xla_internal_test_main\","
+        },
+        {
+            "sha": "2ed3aa4a31655f7b9efc18b17355a4a2166941c9",
+            "filename": "third_party/xla/xla/service/gpu/gpu_fusible.cc",
+            "status": "modified",
+            "additions": 22,
+            "deletions": 6,
+            "changes": 28,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/03ed995f8a2f4de49f653bb7d6a0f621326daec4/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_fusible.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/03ed995f8a2f4de49f653bb7d6a0f621326daec4/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_fusible.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_fusible.cc?ref=03ed995f8a2f4de49f653bb7d6a0f621326daec4",
+            "patch": "@@ -31,9 +31,11 @@ limitations under the License.\n #include \"absl/strings/string_view.h\"\n #include \"absl/synchronization/mutex.h\"\n #include \"xla/hlo/analysis/hlo_dataflow_analysis.h\"\n+#include \"xla/hlo/ir/hlo_casting_utils.h\"\n #include \"xla/hlo/ir/hlo_computation.h\"\n #include \"xla/hlo/ir/hlo_instruction.h\"\n #include \"xla/hlo/ir/hlo_instruction_utils.h\"\n+#include \"xla/hlo/ir/hlo_instructions.h\"\n #include \"xla/hlo/ir/hlo_opcode.h\"\n #include \"xla/hlo/utils/hlo_traversal.h\"\n #include \"xla/permutation_util.h\"\n@@ -850,13 +852,27 @@ bool IsGenericTritonFusion(const HloInstruction& instr) {\n                  .kind() == kTritonFusionKind;\n }\n \n-bool MayPreventVectorization(const HloFusionAdaptor& fusion) {\n+bool MayCausePerformanceDropIfUnrolled(const HloFusionAdaptor& fusion) {\n   // An empirically chosen constant: unrolling concat with a large amount of\n   // arguments causes excessive register spilling.\n   static constexpr int kMaxConcatArgumentsForUnrolling = 10;\n+  // An empirically chosen constant: One thread handles a full window of\n+  // ReduceWindow, so if we unroll it might make parallelism even worse. For\n+  // small window sizes this is still ok.\n+  static constexpr int kMaxReduceWindowSize = 8;\n   return HloAnyOf(fusion, [&](auto node) {\n     switch (node.opcode()) {\n-      case HloOpcode::kReduceWindow:\n+      case HloOpcode::kReduceWindow: {\n+        auto window_dims = Cast<HloReduceWindowInstruction>(&node.instruction())\n+                               ->window()\n+                               .dimensions();\n+        std::vector<int64_t> window_sizes;\n+        window_sizes.reserve(window_dims.size());\n+        for (const auto& window_dim : window_dims) {\n+          window_sizes.push_back(window_dim.size());\n+        }\n+        return Product(window_sizes) > kMaxReduceWindowSize;\n+      }\n       case HloOpcode::kSort:\n       case HloOpcode::kDot:\n         return true;\n@@ -927,7 +943,7 @@ LaunchDimensionsConfig ComputeLoopFusionConfig(\n   int64_t n_threads_max = analysis.device_info().threads_per_core_limit() *\n                           analysis.device_info().core_count();\n   if (num_elements >= n_threads_max &&\n-      !MayPreventVectorization(analysis.fusion())) {\n+      !MayCausePerformanceDropIfUnrolled(analysis.fusion())) {\n     unroll_factor = ComputeMaxUnrollFactor(num_elements);\n   }\n   // CHECK that unroll_factor is a power-of-2, as needed by the logic below.\n@@ -937,9 +953,9 @@ LaunchDimensionsConfig ComputeLoopFusionConfig(\n   // safe even if the new unroll_factor doesn't divide the number of elements,\n   // as the parallel loop emitter will insert a bounds check in this case to\n   // ensure the out-of-bounds element is not computed and written. Setting\n-  // unroll_factor is safe even if MayPreventVectorization returns false, as\n-  // the MayPreventVectorization check is an optimization, not a correctness\n-  // requirement.\n+  // unroll_factor is safe even if MayCausePerformanceDropIfUnrolled returns\n+  // true, as the MayCausePerformanceDropIfUnrolled check is an optimization,\n+  // not a correctness requirement.\n   unroll_factor = std::max(\n       unroll_factor,\n       CeilOfRatio(8, analysis.input_output_info().smallest_output_dtype_bits));"
+        },
+        {
+            "sha": "7a6c5529b7f33e41da8afb1335a0de50fad41d2a",
+            "filename": "third_party/xla/xla/service/gpu/gpu_fusible.h",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 3,
+            "changes": 7,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/03ed995f8a2f4de49f653bb7d6a0f621326daec4/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_fusible.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/03ed995f8a2f4de49f653bb7d6a0f621326daec4/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_fusible.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_fusible.h?ref=03ed995f8a2f4de49f653bb7d6a0f621326daec4",
+            "patch": "@@ -228,9 +228,10 @@ std::vector<const HloInstruction*> GetFusionRoots(\n // Whether the instruction is a generic Triton fusion.\n bool IsGenericTritonFusion(const HloInstruction& instr);\n \n-// Whether the fusion will likely behave poorly with vectorization due to the\n-// instructions it contains.\n-bool MayPreventVectorization(const HloFusionAdaptor& fusion);\n+// Whether there is an expected performance drop when unrolling due to the\n+// instructions contained in the fusion, e.g. potential register spilling or not\n+// enough parallelism.\n+bool MayCausePerformanceDropIfUnrolled(const HloFusionAdaptor& fusion);\n \n // Returns the max loop unroll factor.\n inline constexpr int64_t MaxUnrollFactor() { return 4; }"
+        },
+        {
+            "sha": "6f601d8620b68c0b0084be6e46e176405838f639",
+            "filename": "third_party/xla/xla/service/gpu/gpu_fusible_test.cc",
+            "status": "modified",
+            "additions": 44,
+            "deletions": 0,
+            "changes": 44,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/03ed995f8a2f4de49f653bb7d6a0f621326daec4/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_fusible_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/03ed995f8a2f4de49f653bb7d6a0f621326daec4/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_fusible_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_fusible_test.cc?ref=03ed995f8a2f4de49f653bb7d6a0f621326daec4",
+            "patch": "@@ -24,6 +24,7 @@ limitations under the License.\n #include \"xla/hlo/ir/hlo_opcode.h\"\n #include \"xla/hlo/parser/hlo_parser.h\"\n #include \"xla/hlo/testlib/hlo_hardware_independent_test_base.h\"\n+#include \"xla/hlo/utils/hlo_traversal.h\"\n #include \"xla/service/instruction_fusion.h\"\n #include \"xla/stream_executor/device_description.h\"\n #include \"xla/tsl/platform/statusor.h\"\n@@ -1624,6 +1625,49 @@ e {\n   EXPECT_TRUE(IsConsumerTheOnlyNonRootUser(p, n));\n }\n \n+TEST_F(GpuFusibleTest, MayCausePerformanceDropIfUnrolledSmallReduceWindowIsOk) {\n+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(R\"(\n+HloModule m\n+\n+add {\n+  lhs = f16[] parameter(0)\n+  rhs = f16[] parameter(1)\n+  ROOT result = f16[] add(lhs, rhs)\n+}\n+\n+ENTRY main {\n+  p0 = f16[2048,5,40,2048]{3,2,1,0} parameter(0)\n+  constant_0 = f16[] constant(0)\n+  ROOT reduce_window_sum = f16[2048,5,5,2048]{3,2,1,0} reduce-window(p0, constant_0), window={size=1x1x8x1 stride=1x1x8x1}, to_apply=add\n+}\n+)\"));\n+  const HloInstruction* root = module->entry_computation()->root_instruction();\n+  auto fusion_adaptor = HloFusionAdaptor::ForInstruction(root);\n+  EXPECT_FALSE(MayCausePerformanceDropIfUnrolled(*fusion_adaptor));\n+}\n+\n+TEST_F(GpuFusibleTest,\n+       MayCausePerformanceDropIfUnrolledLargerReduceWindowIsNotOk) {\n+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(R\"(\n+HloModule m\n+\n+add {\n+  lhs = f16[] parameter(0)\n+  rhs = f16[] parameter(1)\n+  ROOT result = f16[] add(lhs, rhs)\n+}\n+\n+ENTRY main {\n+  p0 = f16[2048,10,40,2048]{3,2,1,0} parameter(0)\n+  constant_0 = f16[] constant(0)\n+  ROOT reduce_window_sum = f16[2048,5,5,2048]{3,2,1,0} reduce-window(p0, constant_0), window={size=1x2x8x1 stride=1x2x8x1}, to_apply=add\n+}\n+)\"));\n+  const HloInstruction* root = module->entry_computation()->root_instruction();\n+  auto fusion_adaptor = HloFusionAdaptor::ForInstruction(root);\n+  EXPECT_TRUE(MayCausePerformanceDropIfUnrolled(*fusion_adaptor));\n+}\n+\n }  // namespace\n }  // namespace gpu\n }  // namespace xla"
+        }
+    ],
+    "stats": {
+        "total": 80,
+        "additions": 71,
+        "deletions": 9
+    }
+}

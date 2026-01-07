@@ -1,0 +1,48 @@
+{
+    "author": "tensorflower-gardener",
+    "message": "Update Triton backend to reflect the latest changes in gemm_fusion_autotuner.\n\n- default config also as per the instruction and is taken from dot search space.\n\nPiperOrigin-RevId: 833776305",
+    "sha": "8551579c51601f7509e9a1e41bbbaa15fa3d6632",
+    "files": [
+        {
+            "sha": "9a7880fc6220c860f7042b05dde7e3123e51ccab",
+            "filename": "third_party/xla/xla/backends/gpu/autotuner/BUILD",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/8551579c51601f7509e9a1e41bbbaa15fa3d6632/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/8551579c51601f7509e9a1e41bbbaa15fa3d6632/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2FBUILD?ref=8551579c51601f7509e9a1e41bbbaa15fa3d6632",
+            "patch": "@@ -514,6 +514,7 @@ cc_library(\n         \"//xla/service:hlo_cost_analysis\",\n         \"//xla/service/gpu:backend_configs_cc\",\n         \"//xla/service/gpu:gpu_float_support\",\n+        \"//xla/service/gpu:hlo_fusion_analysis\",\n         \"//xla/service/gpu:ir_emission_utils\",\n         \"//xla/service/gpu:matmul_utils\",\n         \"//xla/service/gpu:split_k_gemm_rewriter\",\n@@ -528,10 +529,12 @@ cc_library(\n         \"//xla/stream_executor/gpu:tma_metadata\",\n         \"//xla/tsl/platform:errors\",\n         \"//xla/tsl/platform:statusor\",\n+        \"@com_google_absl//absl/algorithm:container\",\n         \"@com_google_absl//absl/log\",\n         \"@com_google_absl//absl/log:check\",\n         \"@com_google_absl//absl/status\",\n         \"@com_google_absl//absl/status:statusor\",\n+        \"@com_google_absl//absl/strings\",\n     ],\n )\n "
+        },
+        {
+            "sha": "efde8de4a5aea1f23609d600c5daad8f8b8e93cd",
+            "filename": "third_party/xla/xla/backends/gpu/autotuner/triton.cc",
+            "status": "modified",
+            "additions": 20,
+            "deletions": 5,
+            "changes": 25,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/8551579c51601f7509e9a1e41bbbaa15fa3d6632/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Ftriton.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/8551579c51601f7509e9a1e41bbbaa15fa3d6632/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Ftriton.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Ftriton.cc?ref=8551579c51601f7509e9a1e41bbbaa15fa3d6632",
+            "patch": "@@ -18,12 +18,13 @@ limitations under the License.\n #include <memory>\n #include <optional>\n #include <utility>\n-#include <variant>\n #include <vector>\n \n+#include \"absl/algorithm/container.h\"\n #include \"absl/log/check.h\"\n #include \"absl/log/log.h\"\n #include \"absl/status/status.h\"\n+#include \"absl/strings/str_cat.h\"\n #include \"xla/autotuning.pb.h\"\n #include \"xla/backends/autotuner/codegen_backend.h\"\n #include \"xla/hlo/ir/hlo_casting_utils.h\"\n@@ -38,6 +39,7 @@ limitations under the License.\n #include \"xla/service/gpu/autotuning/triton_configs.h\"\n #include \"xla/service/gpu/backend_configs.pb.h\"\n #include \"xla/service/gpu/gpu_float_support.h\"\n+#include \"xla/service/gpu/hlo_fusion_analysis.h\"\n #include \"xla/service/gpu/ir_emission_utils.h\"\n #include \"xla/service/gpu/matmul_utils.h\"\n #include \"xla/service/gpu/split_k_gemm_rewriter.h\"\n@@ -147,13 +149,13 @@ TritonBackend::GetSupportedConfigs(const HloInstruction& instr) {\n \n absl::StatusOr<std::unique_ptr<BackendConfig>> TritonBackend::GetDefaultConfig(\n     const HloInstruction& instr) {\n-  if (!IsSupported(instr)) {\n+  TF_ASSIGN_OR_RETURN(std::vector<std::unique_ptr<BackendConfig>> configs,\n+                      GetSupportedConfigs(instr));\n+  if (configs.empty()) {\n     return absl::InvalidArgumentError(\n         \"TritonBackend does not support this instruction.\");\n   }\n-  auto any = std::make_unique<google::protobuf::Any>();\n-  any->PackFrom(TritonGemmConfig(64, 64, 64, 1, 1, 2, 1, false).ToProto());\n-  return any;\n+  return std::move(configs[0]);\n }\n \n absl::Status TritonBackend::ApplyConfig(HloInstruction& instr,\n@@ -173,6 +175,7 @@ absl::Status TritonBackend::ApplyConfig(HloInstruction& instr,\n   FusionBackendConfig& backend_config =\n       *gpu_config.mutable_fusion_backend_config();\n \n+  backend_config.set_kind(kTritonGemmFusionKind);\n   *backend_config.mutable_triton_gemm_config() = triton_config_proto;\n   TF_RETURN_IF_ERROR(instr.set_backend_config(gpu_config));\n \n@@ -210,6 +213,18 @@ absl::StatusOr<std::unique_ptr<HloModule>> TritonBackend::RunHloPasses(\n \n   NestGemmFusion nest_gemm_fusion(gpu_device_info, symbolic_expr_context_);\n   TF_RETURN_IF_ERROR(nest_gemm_fusion.Run(hlo_module.get()).status());\n+\n+  bool is_legacy_gemm_disabled = absl::c_contains(\n+      debug_options().xla_gpu_unsupported_generic_triton_emitter_features(),\n+      DebugOptions::GENERIC_TRITON_EMITTER_DISABLE_LEGACY_GEMM);\n+  bool is_triton_gemm_fusion =\n+      IsGpuFusionKind(*hlo_module->entry_computation()->root_instruction(),\n+                      kTritonGemmFusionKind);\n+  if (is_legacy_gemm_disabled && is_triton_gemm_fusion) {\n+    return absl::InternalError(\n+        absl::StrCat(\"Unexpected \", kTritonGemmFusionKind,\n+                     \" fusion: \", hlo_module->ToString()));\n+  }\n   return hlo_module;\n }\n "
+        },
+        {
+            "sha": "5c20f23cc5531652ca2e5db9f270093a207cb14e",
+            "filename": "third_party/xla/xla/backends/gpu/autotuner/triton_test.cc",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 6,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/8551579c51601f7509e9a1e41bbbaa15fa3d6632/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Ftriton_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/8551579c51601f7509e9a1e41bbbaa15fa3d6632/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Ftriton_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Ftriton_test.cc?ref=8551579c51601f7509e9a1e41bbbaa15fa3d6632",
+            "patch": "@@ -156,17 +156,11 @@ TEST_F(TritonBackendTest, GetSupportedConfigsForUnsupportedInstruction) {\n TEST_F(TritonBackendTest, GetDefaultConfig) {\n   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,\n                           ParseAndReturnVerifiedModule(kHlo));\n-  TritonBackendConfig expected_config =\n-      TritonGemmConfig(64, 64, 64, 1, 1, 2, 1, false).ToProto();\n-\n   absl::StatusOr<std::unique_ptr<BackendConfig>> config =\n       backend_.GetDefaultConfig(\n           *(module->entry_computation()->root_instruction()));\n \n   EXPECT_THAT(config, absl_testing::IsOk());\n-  TritonBackendConfig actual_config;\n-  ASSERT_TRUE(config.value()->UnpackTo(&actual_config));\n-  EXPECT_THAT(actual_config, EqualsProto(expected_config));\n }\n \n TEST_F(TritonBackendTest, GetDefaultConfigForUnsupportedInstruction) {"
+        }
+    ],
+    "stats": {
+        "total": 34,
+        "additions": 23,
+        "deletions": 11
+    }
+}

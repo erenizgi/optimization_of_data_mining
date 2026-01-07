@@ -1,0 +1,60 @@
+{
+    "author": "WillFroom",
+    "message": "[XLA:CPU][XTile] Handle vector types in math.erf lowering.\n\nPiperOrigin-RevId: 834193967",
+    "sha": "29a99a6bdc00f94c5f6d0d3e4638a8f04840fd9e",
+    "files": [
+        {
+            "sha": "52c4a044c61f6d71dd67a46f154c039ac8db25ec",
+            "filename": "third_party/xla/xla/codegen/emitters/transforms/BUILD",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/29a99a6bdc00f94c5f6d0d3e4638a8f04840fd9e/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftransforms%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/29a99a6bdc00f94c5f6d0d3e4638a8f04840fd9e/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftransforms%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftransforms%2FBUILD?ref=29a99a6bdc00f94c5f6d0d3e4638a8f04840fd9e",
+            "patch": "@@ -73,13 +73,13 @@ cc_library(\n         \"//xla/codegen/emitters:elemental_hlo_to_mlir\",\n         \"//xla/codegen/emitters:implicit_arith_op_builder\",\n         \"//xla/codegen/emitters/ir:xla\",\n-        \"//xla/codegen/intrinsic\",\n         \"//xla/codegen/intrinsic:erf\",\n         \"//xla/codegen/intrinsic:exp\",\n         \"//xla/codegen/intrinsic:fptrunc\",\n         \"//xla/codegen/intrinsic:log1p\",\n         \"//xla/codegen/intrinsic:rsqrt\",\n         \"//xla/codegen/intrinsic:tanh\",\n+        \"//xla/codegen/intrinsic:type\",\n         \"//xla/hlo/analysis:indexing_analysis\",\n         \"//xla/hlo/analysis:symbolic_expr\",\n         \"//xla/mlir_hlo\",\n@@ -133,6 +133,7 @@ cc_library(\n         \"@llvm-project//mlir:VectorDialect\",\n         \"@llvm-project//mlir:VectorToLLVM\",\n         \"@llvm-project//mlir:VectorTransforms\",\n+        \"@llvm-project//mlir:VectorUtils\",\n         \"@local_tsl//tsl/platform:protobuf\",\n     ],\n )"
+        },
+        {
+            "sha": "95b6fe5737f916bb280f6e54a74b896d32dbd4eb",
+            "filename": "third_party/xla/xla/codegen/emitters/transforms/lower_xla_intrinsic_lib.cc",
+            "status": "modified",
+            "additions": 40,
+            "deletions": 8,
+            "changes": 48,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/29a99a6bdc00f94c5f6d0d3e4638a8f04840fd9e/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftransforms%2Flower_xla_intrinsic_lib.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/29a99a6bdc00f94c5f6d0d3e4638a8f04840fd9e/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftransforms%2Flower_xla_intrinsic_lib.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftransforms%2Flower_xla_intrinsic_lib.cc?ref=29a99a6bdc00f94c5f6d0d3e4638a8f04840fd9e",
+            "patch": "@@ -11,6 +11,7 @@ See the License for the specific language governing permissions and\n limitations under the License.\n ==============================================================================*/\n \n+#include <cstdint>\n #include <memory>\n #include <string>\n #include <utility>\n@@ -20,12 +21,13 @@ limitations under the License.\n #include \"mlir/Dialect/Arith/IR/Arith.h\"\n #include \"mlir/Dialect/Func/IR/FuncOps.h\"\n #include \"mlir/Dialect/Math/IR/Math.h\"\n+#include \"mlir/Dialect/Vector/IR/VectorOps.h\"\n+#include \"mlir/Dialect/Vector/Utils/VectorUtils.h\"\n #include \"mlir/IR/Builders.h\"\n #include \"mlir/IR/BuiltinAttributes.h\"\n #include \"mlir/IR/BuiltinOps.h\"\n #include \"mlir/IR/BuiltinTypeInterfaces.h\"\n #include \"mlir/IR/BuiltinTypes.h\"\n-#include \"mlir/IR/ImplicitLocOpBuilder.h\"\n #include \"mlir/IR/PatternMatch.h\"\n #include \"mlir/IR/TypeUtilities.h\"\n #include \"mlir/IR/Types.h\"\n@@ -39,10 +41,10 @@ limitations under the License.\n #include \"xla/codegen/intrinsic/erf.h\"\n #include \"xla/codegen/intrinsic/exp.h\"\n #include \"xla/codegen/intrinsic/fptrunc.h\"\n-#include \"xla/codegen/intrinsic/intrinsic.h\"\n #include \"xla/codegen/intrinsic/log1p.h\"\n #include \"xla/codegen/intrinsic/rsqrt.h\"\n #include \"xla/codegen/intrinsic/tanh.h\"\n+#include \"xla/codegen/intrinsic/type.h\"\n \n namespace xla {\n namespace emitters {\n@@ -84,13 +86,28 @@ class LowerErfPattern : public mlir::OpRewritePattern<mlir::math::ErfOp> {\n \n   mlir::LogicalResult matchAndRewrite(\n       mlir::math::ErfOp op, mlir::PatternRewriter& rewriter) const override {\n-    mlir::Type type = op.getType();\n+    auto type = op.getType();\n+    mlir::Type element_type = mlir::getElementTypeOrSelf(op.getType());\n+    auto maybe_vector_type = mlir::dyn_cast<mlir::VectorType>(type);\n+\n+    if (maybe_vector_type && maybe_vector_type.getRank() != 1) {\n+      return rewriter.notifyMatchFailure(op, \"Vector rank is not 1.\");\n+    }\n+\n+    // Get the vectorized version of the given type if op has a vector type,\n+    // else just return the given type.\n+    auto get_vector_type = [&maybe_vector_type](mlir::Type type) -> mlir::Type {\n+      if (maybe_vector_type) {\n+        return maybe_vector_type.clone(type);\n+      }\n+      return type;\n+    };\n \n     // Extend the argument to f32 and truncate the result back unconditionally\n     // as these will be cleaned up later if they are already f32.\n-    if (type.isF16() || type.isF32()) {\n+    if (element_type.isF16() || element_type.isF32()) {\n       mlir::ImplicitLocOpBuilder b(op.getLoc(), rewriter);\n-      mlir::Type f32_type = b.getF32Type();\n+      mlir::Type f32_type = get_vector_type(b.getF32Type());\n \n       mlir::Value input_value =\n           b.create<mlir::arith::ExtFOp>(f32_type, op.getOperand());\n@@ -106,12 +123,27 @@ class LowerErfPattern : public mlir::OpRewritePattern<mlir::math::ErfOp> {\n       return mlir::success();\n     }\n \n-    if (type.isF64()) {\n+    if (element_type.isF64()) {\n       mlir::ImplicitLocOpBuilder b(op.getLoc(), rewriter);\n \n       auto erf_decl = GetErf64Declaration(rewriter);\n-      auto call_op = b.create<mlir::func::CallOp>(erf_decl, op.getOperand());\n-      rewriter.replaceOp(op, call_op->getResults());\n+\n+      if (!maybe_vector_type) {\n+        auto call_op = b.create<mlir::func::CallOp>(erf_decl, op.getOperand());\n+        rewriter.replaceOp(op, call_op->getResults());\n+        return mlir::success();\n+      }\n+\n+      llvm::SmallVector<mlir::Value> scalar_erf_results;\n+      for (int64_t idx = 0; idx < maybe_vector_type.getNumElements(); ++idx) {\n+        mlir::Value extracted = mlir::vector::ExtractOp::create(\n+            rewriter, op.getLoc(), op.getOperand(), idx);\n+        mlir::Value scalar_erf =\n+            b.create<mlir::func::CallOp>(erf_decl, extracted).getResult(0);\n+        scalar_erf_results.push_back(scalar_erf);\n+      }\n+      rewriter.replaceOpWithNewOp<mlir::vector::FromElementsOp>(\n+          op, type, scalar_erf_results);\n       return mlir::success();\n     }\n "
+        },
+        {
+            "sha": "166db94363035d26d4f315df17d33a960db2020f",
+            "filename": "third_party/xla/xla/codegen/emitters/transforms/passes.td",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/29a99a6bdc00f94c5f6d0d3e4638a8f04840fd9e/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftransforms%2Fpasses.td",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/29a99a6bdc00f94c5f6d0d3e4638a8f04840fd9e/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftransforms%2Fpasses.td",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftransforms%2Fpasses.td?ref=29a99a6bdc00f94c5f6d0d3e4638a8f04840fd9e",
+            "patch": "@@ -27,6 +27,7 @@ def LowerXlaIntrinsicLibPass : Pass<\"xla-lower-xla-intrinsic-lib\", \"mlir::Module\n   }];\n   let dependentDialects = [\n     \"mlir::func::FuncDialect\",\n+    \"mlir::vector::VectorDialect\",\n   ];\n   let constructor = \"CreateLowerXlaIntrinsicLibPass()\";\n }"
+        },
+        {
+            "sha": "24a772c5580f12a07ad01eeab8f413d71ed9a1ff",
+            "filename": "third_party/xla/xla/codegen/emitters/transforms/tests/lower_xla_intrinsic_lib.mlir",
+            "status": "modified",
+            "additions": 27,
+            "deletions": 0,
+            "changes": 27,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/29a99a6bdc00f94c5f6d0d3e4638a8f04840fd9e/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftransforms%2Ftests%2Flower_xla_intrinsic_lib.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/29a99a6bdc00f94c5f6d0d3e4638a8f04840fd9e/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftransforms%2Ftests%2Flower_xla_intrinsic_lib.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftransforms%2Ftests%2Flower_xla_intrinsic_lib.mlir?ref=29a99a6bdc00f94c5f6d0d3e4638a8f04840fd9e",
+            "patch": "@@ -80,6 +80,20 @@ module {\n \n // -----\n \n+module {\n+  func.func @erf32_vector(%arg0: vector<4xf32>) -> vector<4xf32> {\n+    %ret = math.erf %arg0 : vector<4xf32>\n+    return %ret : vector<4xf32>\n+  }\n+}\n+\n+// CHECK-LABEL: @erf32_vector\n+// CHECK-NOT: math.erf\n+// CHECK: %[[ERF_CALL:.*]] = call @local_xla.erf.v4f32\n+// CHECK: return %[[ERF_CALL]]\n+\n+// -----\n+\n module {\n   func.func @erf64(%arg0: f64) -> f64 {\n     %ret = math.erf %arg0 : f64\n@@ -93,6 +107,19 @@ module {\n // CHECK: return %[[ERF_CALL]]\n \n \n+// -----\n+\n+module {\n+  func.func @erf64_vector(%arg0: vector<4xf64>) -> vector<4xf64> {\n+    %ret = math.erf %arg0 : vector<4xf64>\n+    return %ret : vector<4xf64>\n+  }\n+}\n+\n+// CHECK-LABEL: @erf64_vector\n+// CHECK-NOT: math.erf\n+// CHECK-COUNT-4: call @erf\n+\n // -----\n \n module {"
+        }
+    ],
+    "stats": {
+        "total": 79,
+        "additions": 70,
+        "deletions": 9
+    }
+}

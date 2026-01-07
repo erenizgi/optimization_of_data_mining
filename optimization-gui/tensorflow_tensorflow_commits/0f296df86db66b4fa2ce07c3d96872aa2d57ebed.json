@@ -1,0 +1,36 @@
+{
+    "author": "tensorflower-gardener",
+    "message": "Add device time measurement to TFRT GPU executable.\n\nPiperOrigin-RevId: 834079409",
+    "sha": "0f296df86db66b4fa2ce07c3d96872aa2d57ebed",
+    "files": [
+        {
+            "sha": "881765fcabd4d64e949041a15ddd25472b80739f",
+            "filename": "third_party/xla/xla/pjrt/gpu/tfrt/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/0f296df86db66b4fa2ce07c3d96872aa2d57ebed/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Ftfrt%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/0f296df86db66b4fa2ce07c3d96872aa2d57ebed/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Ftfrt%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Ftfrt%2FBUILD?ref=0f296df86db66b4fa2ce07c3d96872aa2d57ebed",
+            "patch": "@@ -89,6 +89,7 @@ cc_library(\n         \"//xla/pjrt/gpu:se_gpu_topology_description\",\n         \"//xla/pjrt/plugin/xla_gpu:xla_gpu_allocator_config\",\n         \"//xla/pjrt/plugin/xla_gpu:xla_gpu_client_options\",\n+        \"//xla/pjrt/profiling:device_time_measurement\",\n         \"//xla/pjrt/proto:compile_options_proto_cc\",\n         \"//xla/runtime:device_id\",\n         \"//xla/service:buffer_assignment\","
+        },
+        {
+            "sha": "9989d50916cfdddf3a359f3bd2fe2e1e2e6a9d5d",
+            "filename": "third_party/xla/xla/pjrt/gpu/tfrt/tfrt_gpu_executable.cc",
+            "status": "modified",
+            "additions": 48,
+            "deletions": 1,
+            "changes": 49,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/0f296df86db66b4fa2ce07c3d96872aa2d57ebed/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Ftfrt%2Ftfrt_gpu_executable.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/0f296df86db66b4fa2ce07c3d96872aa2d57ebed/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Ftfrt%2Ftfrt_gpu_executable.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Ftfrt%2Ftfrt_gpu_executable.cc?ref=0f296df86db66b4fa2ce07c3d96872aa2d57ebed",
+            "patch": "@@ -33,6 +33,8 @@ limitations under the License.\n #include \"absl/strings/str_format.h\"\n #include \"absl/strings/string_view.h\"\n #include \"absl/synchronization/mutex.h\"\n+#include \"absl/time/clock.h\"\n+#include \"absl/time/time.h\"\n #include \"absl/types/span.h\"\n #include \"unsupported/Eigen/CXX11/Tensor\"\n #include \"xla/backends/gpu/collectives/gpu_clique_key.h\"\n@@ -56,6 +58,7 @@ limitations under the License.\n #include \"xla/pjrt/pjrt_client.h\"\n #include \"xla/pjrt/pjrt_common.h\"\n #include \"xla/pjrt/pjrt_executable.h\"\n+#include \"xla/pjrt/profiling/device_time_measurement.h\"\n #include \"xla/pjrt/proto/compile_options.pb.h\"\n #include \"xla/pjrt/semaphore.h\"\n #include \"xla/pjrt/utils.h\"\n@@ -599,7 +602,8 @@ absl::StatusOr<PjRtLoadedExecutable::Result> TfrtGpuExecutable::ExecuteHelper(\n        recv_device_memory(std::move(recv_device_memory)),\n        output_cuda_execute_event(std::move(output_cuda_execute_event)),\n        compute_reservation(std::move(compute_reservation)), client = client_,\n-       task_incarnations = options.incarnations](\n+       task_incarnations = options.incarnations,\n+       time_measurement_key = xla::GetDeviceTimeMeasurementKey()](\n           std::vector<ExecutionInput> execution_inputs) mutable {\n         VLOG(1) << \"execute_fn for \" << executable_name\n                 << \", launch_id: \" << launch_id << \", replica: \" << replica\n@@ -678,6 +682,26 @@ absl::StatusOr<PjRtLoadedExecutable::Result> TfrtGpuExecutable::ExecuteHelper(\n           std::move(donation_transaction).Commit();\n         }\n \n+        ////////////////////////////////////////////////////////////////////////\n+        // Record the start time of the execution by placing a callback on the\n+        // stream directly before the execution. If this callback is added,\n+        // another callback will be added directly after the execution to record\n+        // the elapsed device time.\n+        ////////////////////////////////////////////////////////////////////////\n+        auto start_time = std::make_shared<absl::Time>();\n+        if (time_measurement_key.has_value()) {\n+          absl::Status host_callback_status = stream->DoHostCallback(\n+              [start_time]() mutable { *start_time = absl::Now(); });\n+\n+          if (!host_callback_status.ok()) {\n+            LOG(WARNING) << \"Failed to do host callback for to register device \"\n+                            \"start time\";\n+          }\n+        }\n+\n+        ////////////////////////////////////////////////////////////////////////\n+        // Start calling RunAsync for the executable.\n+        ////////////////////////////////////////////////////////////////////////\n         VLOG(1) << \"Start calling RunAsync for \" << executable_name\n                 << \", device=\" << device->DebugString()\n                 << \", launch_id=\" << launch_id << \", replica=\" << replica\n@@ -738,6 +762,29 @@ absl::StatusOr<PjRtLoadedExecutable::Result> TfrtGpuExecutable::ExecuteHelper(\n           return;\n         }\n \n+        ////////////////////////////////////////////////////////////////////////\n+        // Record the end time of the execution by placing a callback on the\n+        // stream directly after the execution. If this callback is added,\n+        // another callback will be added directly before the execution to\n+        // record the elapsed device time.\n+        ////////////////////////////////////////////////////////////////////////\n+        if (time_measurement_key.has_value()) {\n+          absl::Status host_callback_status = stream->DoHostCallback(\n+              [executable_name, time_measurement_key, start_time]() mutable {\n+                auto elapsed = absl::Now() - *start_time;\n+                VLOG(1) << \"Device execution time for \" << executable_name\n+                        << \" is \" << elapsed;\n+\n+                xla::RecordDeviceTimeMeasurement(\n+                    *time_measurement_key, elapsed,\n+                    DeviceTimeMeasurement::DeviceType::kGpu);\n+              });\n+          if (!host_callback_status.ok()) {\n+            LOG(WARNING) << \"Failed to do host callback for to register device \"\n+                            \"time measurement\";\n+          }\n+        }\n+\n         ExecutionOutput& execution_output = result_buffer_or_status.value();\n         ScopedShapedBuffer output = execution_output.ConsumeResult();\n         if (result_is_tuple) {"
+        }
+    ],
+    "stats": {
+        "total": 50,
+        "additions": 49,
+        "deletions": 1
+    }
+}

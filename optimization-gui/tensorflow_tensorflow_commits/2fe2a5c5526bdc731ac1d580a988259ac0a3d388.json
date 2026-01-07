@@ -1,0 +1,36 @@
+{
+    "author": "akuegel",
+    "message": "[XLA:GPU][XLA:CPU] Handle vector::FromElementsOp in FlattenTensors pass.\n\nAn upstream LLVM change adds a canonicalization pattern that turns some\n`vector::InsertOp`s into `vector::FromElementsOp`. Therefore FlattenTensors\nalso needs a conversion pattern for vector::FromElementsOp.\n\nPiperOrigin-RevId: 797669956",
+    "sha": "2fe2a5c5526bdc731ac1d580a988259ac0a3d388",
+    "files": [
+        {
+            "sha": "d9088aea2a4039dd86aa0244b42508dc8989bbfd",
+            "filename": "third_party/xla/xla/codegen/emitters/transforms/flatten_tensors.cc",
+            "status": "modified",
+            "additions": 22,
+            "deletions": 0,
+            "changes": 22,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/2fe2a5c5526bdc731ac1d580a988259ac0a3d388/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftransforms%2Fflatten_tensors.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/2fe2a5c5526bdc731ac1d580a988259ac0a3d388/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftransforms%2Fflatten_tensors.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftransforms%2Fflatten_tensors.cc?ref=2fe2a5c5526bdc731ac1d580a988259ac0a3d388",
+            "patch": "@@ -420,6 +420,27 @@ struct RewriteVectorInsert : OpRewritePattern<mv::InsertOp> {\n   }\n };\n \n+struct RewriteVectorFromElements : OpRewritePattern<mv::FromElementsOp> {\n+  using OpRewritePattern::OpRewritePattern;\n+\n+  LogicalResult matchAndRewrite(mv::FromElementsOp op,\n+                                PatternRewriter& rewriter) const override {\n+    auto vector = op.getDest();\n+    auto vector_type = vector.getType();\n+    if (vector_type.getRank() < 2) {\n+      return rewriter.notifyMatchFailure(op, \"the vector is already flat\");\n+    }\n+    auto loc = op.getLoc();\n+    mlir::ImplicitLocOpBuilder b(loc, rewriter);\n+    auto new_from_elements = b.create<mv::FromElementsOp>(\n+        GetFlattenedType(vector_type), op.getElements());\n+    auto cast_to_orig_type = b.create<UnrealizedConversionCastOp>(\n+        vector_type, new_from_elements.getResult());\n+    rewriter.replaceOp(op, cast_to_orig_type.getResult(0));\n+    return mlir::success();\n+  }\n+};\n+\n struct RewriteAtomicRMW : OpRewritePattern<AtomicRMWOp> {\n   using OpRewritePattern::OpRewritePattern;\n \n@@ -746,6 +767,7 @@ class FlattenTensorsPass\n         RewriteTensorExtract,\n         RewriteTensorInsert,\n         RewriteVectorExtract,\n+        RewriteVectorFromElements,\n         RewriteVectorInsert,\n         RewriteVectorTransferRead,\n         RewriteCpuLoad"
+        },
+        {
+            "sha": "07b0d3016661548fc19c36c13c2acc2f26ac7bf0",
+            "filename": "third_party/xla/xla/codegen/emitters/transforms/tests/flatten_tensors.mlir",
+            "status": "modified",
+            "additions": 17,
+            "deletions": 1,
+            "changes": 18,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/2fe2a5c5526bdc731ac1d580a988259ac0a3d388/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftransforms%2Ftests%2Fflatten_tensors.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/2fe2a5c5526bdc731ac1d580a988259ac0a3d388/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftransforms%2Ftests%2Fflatten_tensors.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftransforms%2Ftests%2Fflatten_tensors.mlir?ref=2fe2a5c5526bdc731ac1d580a988259ac0a3d388",
+            "patch": "@@ -261,7 +261,7 @@ func.func @vector_transfer_read(%arg0: tensor<64x66xbf16>, %i: index, %j: index)\n // -----\n \n func.func @vector_insert(%arg0: vector<10x24xf32>, %i: index)\n-  -> vector<10x24xf32> {\n+    -> vector<10x24xf32> {\n   %scalar = arith.constant 3.0 : f32\n   %out = vector.insert %scalar, %arg0 [1, %i] : f32 into vector<10x24xf32>\n   func.return %out : vector<10x24xf32>\n@@ -277,6 +277,22 @@ func.func @vector_insert(%arg0: vector<10x24xf32>, %i: index)\n \n // -----\n \n+func.func @vector_from_elements(%arg0: vector<2x2xf32>, %a: f32)\n+    -> vector<2x2xf32> {\n+  %b = arith.constant 2.0 : f32\n+  %c = arith.constant 3.0 : f32\n+  %d = arith.constant 4.0 : f32\n+  %out = vector.from_elements %a, %b, %c, %d : vector<2x2xf32>\n+  func.return %out : vector<2x2xf32>\n+}\n+// CHECK-LABEL: func.func @vector_from_elements(\n+// CHECK-SAME:      %[[VECTOR:.*]]: vector<4xf32>, %[[A:.*]]: f32)\n+// CHECK-SAME:      -> vector<4xf32> {\n+// CHECK:         vector.from_elements %[[A]],\n+// CHECK-SAME:      : vector<4xf32>\n+\n+// -----\n+\n func.func @update(%arg0: vector<10x24xf32>) -> vector<10x24xf32> {\n   %c1 = arith.constant 1 : index\n   %c42_f32 = arith.constant 42.0 : f32"
+        }
+    ],
+    "stats": {
+        "total": 40,
+        "additions": 39,
+        "deletions": 1
+    }
+}

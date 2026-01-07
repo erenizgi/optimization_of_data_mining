@@ -1,0 +1,48 @@
+{
+    "author": "WillFroom",
+    "message": "[XLA:CPU] Fix race condition when fast concat has no outer dimensions.\n\nPiperOrigin-RevId: 815617084",
+    "sha": "3371fcac99e65e561757ebe2239dedd66f0a5ee1",
+    "files": [
+        {
+            "sha": "85e2b4c90766b5a3e8f14253233c41777fd9de36",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/elemental/concatenate_kernel_emitter.cc",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 5,
+            "changes": 16,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/3371fcac99e65e561757ebe2239dedd66f0a5ee1/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Felemental%2Fconcatenate_kernel_emitter.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/3371fcac99e65e561757ebe2239dedd66f0a5ee1/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Felemental%2Fconcatenate_kernel_emitter.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Felemental%2Fconcatenate_kernel_emitter.cc?ref=3371fcac99e65e561757ebe2239dedd66f0a5ee1",
+            "patch": "@@ -106,13 +106,19 @@ ConcatenateKernelEmitter::EmitKernelDefinition() {\n       kernel_prototype.function->getEntryBlock().getTerminator());\n \n   llvm_ir::IrArray output_array = kernel_prototype.results[0];\n-  TF_RETURN_IF_ERROR(EmitFastConcatenate(\n-      instr_, kernel_prototype.arguments, output_array, llvm_module.get(),\n-      ir_builder, kernel_prototype.workgroup_id.x, total_workgroups));\n+  TF_ASSIGN_OR_RETURN(\n+      bool is_parallel,\n+      EmitFastConcatenate(instr_, kernel_prototype.arguments, output_array,\n+                          llvm_module.get(), ir_builder,\n+                          kernel_prototype.workgroup_id.x, total_workgroups));\n \n   LlvmIrKernelSource source(std::move(ctx), std::move(llvm_module));\n-  KernelSpec spec(kernel_prototype.function->getName(),\n-                  NumWorkGroups{static_cast<uint64_t>(total_workgroups)},\n+  NumWorkGroups num_workgroups;\n+  if (is_parallel) {\n+    num_workgroups.x = total_workgroups;\n+  }\n+\n+  KernelSpec spec(kernel_prototype.function->getName(), num_workgroups,\n                   std::move(kernel_prototype.argument_buffers),\n                   std::move(kernel_prototype.result_buffers),\n                   std::move(kernel_prototype.invariant_arguments));"
+        },
+        {
+            "sha": "07fa1bed46cb0a7c0578a0f3bbdded44ceab59b0",
+            "filename": "third_party/xla/xla/service/cpu/ir_emitter.cc",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 5,
+            "changes": 13,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/3371fcac99e65e561757ebe2239dedd66f0a5ee1/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fir_emitter.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/3371fcac99e65e561757ebe2239dedd66f0a5ee1/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fir_emitter.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fir_emitter.cc?ref=3371fcac99e65e561757ebe2239dedd66f0a5ee1",
+            "patch": "@@ -2937,10 +2937,11 @@ absl::Status IrEmitter::EmitFastConcatenate(\n     absl::Span<const llvm_ir::IrArray> source_arrays,\n     const llvm_ir::IrArray& target_array) {\n   return ::xla::cpu::EmitFastConcatenate(instr, source_arrays, target_array,\n-                                         module_, *b());\n+                                         module_, *b())\n+      .status();\n }\n \n-absl::Status EmitFastConcatenate(\n+absl::StatusOr<bool> EmitFastConcatenate(\n     const HloInstruction* instr,\n     absl::Span<const llvm_ir::IrArray> source_arrays,\n     const llvm_ir::IrArray& target_array, llvm::Module* module,\n@@ -3057,7 +3058,7 @@ absl::Status EmitFastConcatenate(\n   if (!outer_dims.empty()) {\n     SetToFirstInsertPoint(loops.GetOuterLoopExitBasicBlock(), &b);\n   }\n-  return absl::OkStatus();\n+  return is_parallel;\n }\n \n llvm::Value* IrEmitter::EmitPrintf(absl::string_view fmt,\n@@ -3337,8 +3338,10 @@ absl::Status IrEmitter::HandleConcatenate(HloInstruction* concatenate) {\n     for (HloInstruction* operand : concatenate->operands()) {\n       source_arrays.emplace_back(GetIrArrayFor(operand));\n     }\n-    TF_RETURN_IF_ERROR(::xla::cpu::EmitFastConcatenate(\n-        concatenate, source_arrays, target_array, module_, *b()));\n+    TF_RETURN_IF_ERROR(\n+        ::xla::cpu::EmitFastConcatenate(concatenate, source_arrays,\n+                                        target_array, module_, *b())\n+            .status());\n     VLOG(1) << \"Emitted fast concatenate for \" << concatenate->ToString();\n     return absl::OkStatus();\n   }"
+        },
+        {
+            "sha": "0932f7b6c7712318a8f5d093370455faeca8e7c2",
+            "filename": "third_party/xla/xla/service/cpu/ir_emitter.h",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/3371fcac99e65e561757ebe2239dedd66f0a5ee1/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fir_emitter.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/3371fcac99e65e561757ebe2239dedd66f0a5ee1/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fir_emitter.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fir_emitter.h?ref=3371fcac99e65e561757ebe2239dedd66f0a5ee1",
+            "patch": "@@ -864,7 +864,8 @@ void EmitTransferElements(llvm::Value* target, llvm::Value* source,\n                           llvm::Module* module, llvm::IRBuilderBase& b);\n \n // Decoupled implementation of IrEmitter::EmitFastConcatenate.\n-absl::Status EmitFastConcatenate(\n+// Returns true if the concatenate was parallelized.\n+absl::StatusOr<bool> EmitFastConcatenate(\n     const HloInstruction* instr,\n     absl::Span<const llvm_ir::IrArray> source_arrays,\n     const llvm_ir::IrArray& target_array, llvm::Module* module,"
+        }
+    ],
+    "stats": {
+        "total": 32,
+        "additions": 21,
+        "deletions": 11
+    }
+}

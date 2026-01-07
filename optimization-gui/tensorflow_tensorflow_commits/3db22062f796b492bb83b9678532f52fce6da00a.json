@@ -1,0 +1,36 @@
+{
+    "author": "majiddadashi",
+    "message": "Allow propagation of per-tensor quantization parameters across tfl.broadcast_to.\n\nThis enables the prepare-quantize pass to move Quantize/Dequantize operations (QDQs) through broadcast ops. This is valid for per-tensor quantization as broadcasting doesn't change the range of tensor values.\n\nA test case is added to verify the propagation.\n\nPiperOrigin-RevId: 798375402",
+    "sha": "3db22062f796b492bb83b9678532f52fce6da00a",
+    "files": [
+        {
+            "sha": "0fe2a4b9e59b0c67f0a127e0e4f9465b2f68f93c",
+            "filename": "tensorflow/compiler/mlir/lite/ir/tfl_ops.td",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/3db22062f796b492bb83b9678532f52fce6da00a/tensorflow%2Fcompiler%2Fmlir%2Flite%2Fir%2Ftfl_ops.td",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/3db22062f796b492bb83b9678532f52fce6da00a/tensorflow%2Fcompiler%2Fmlir%2Flite%2Fir%2Ftfl_ops.td",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcompiler%2Fmlir%2Flite%2Fir%2Ftfl_ops.td?ref=3db22062f796b492bb83b9678532f52fce6da00a",
+            "patch": "@@ -5528,6 +5528,7 @@ def TFL_BroadcastToOp : TFL_Op<\"broadcast_to\", [\n     PredOpTrait<\"input and output must have same element type\",\n       TFL_TCresVTEtIsSameAsOp<0, 0>>,\n     TFL_OperandHasRankAtMost<0, 8>,\n+    SameOperandsAndResultsScale,\n     TFL_OperandHasRank<1, 1>,\n     PredOpTrait<\"output dimension count must be at most 8\",\n       Or<[TFL_OperandIsUnrankedPred<1>,\n@@ -5575,6 +5576,11 @@ subsequent operation and then be optimized away, however.)\n     TFL_TensorOf<[F32, I32, I1, TFL_I4, I8, QI8, UI8, UI32, QUI8, I16, QI16, I64, Complex<F<32>>]>:$output\n   );\n \n+  let extraClassDeclaration = [{\n+    // Quantized axes are verified in the Verify function.\n+    bool RequiredSameQuantizedAxes() { return false; }\n+  }];\n+\n   let hasCanonicalizer = 1;\n }\n "
+        },
+        {
+            "sha": "f737e850d4836d1121135df21cd53b00052fb49b",
+            "filename": "tensorflow/compiler/mlir/lite/tests/prepare-quantize.mlir",
+            "status": "modified",
+            "additions": 21,
+            "deletions": 0,
+            "changes": 21,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/3db22062f796b492bb83b9678532f52fce6da00a/tensorflow%2Fcompiler%2Fmlir%2Flite%2Ftests%2Fprepare-quantize.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/3db22062f796b492bb83b9678532f52fce6da00a/tensorflow%2Fcompiler%2Fmlir%2Flite%2Ftests%2Fprepare-quantize.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcompiler%2Fmlir%2Flite%2Ftests%2Fprepare-quantize.mlir?ref=3db22062f796b492bb83b9678532f52fce6da00a",
+            "patch": "@@ -934,6 +934,27 @@ func.func @ReturnQuantizedResult(%arg0: tensor<1x224x224x3xf32>, %arg1: tensor<3\n \n // -----\n \n+// QDQ-LABEL: BroadcastToPerTensorQuantizationPropagation\n+func.func @BroadcastToPerTensorQuantizationPropagation() -> tensor<2x5xf32> {\n+  %shape = arith.constant dense<[2, 5]> : tensor<2xi32>\n+  %cst = arith.constant dense<1.0> : tensor<5xf32>\n+  %q = \"tfl.quantize\"(%cst) {qtype = tensor<5x!quant.uniform<i8<-127:127>:f32, 1.113490e-03>>} : (tensor<5xf32>) -> tensor<5x!quant.uniform<i8<-127:127>:f32, 1.113490e-03>>\n+  %dq = \"tfl.dequantize\"(%q) : (tensor<5x!quant.uniform<i8<-127:127>:f32, 1.113490e-03>>) -> tensor<5xf32>\n+  %t = \"tfl.broadcast_to\"(%dq, %shape) : (tensor<5xf32>, tensor<2xi32>) -> tensor<2x5xf32>\n+  func.return %t : tensor<2x5xf32>\n+\n+  // QDQ: %[[shape:.*]] = arith.constant dense<[2, 5]> : tensor<2xi32>\n+  // QDQ-NEXT: %[[w:.*]] = arith.constant dense<1.000000e+00> : tensor<5xf32>\n+  // QDQ-NEXT: %[[qw:.*]] = \"tfl.quantize\"(%[[w]]) <{qtype = tensor<5x!quant.uniform<i8<-127:127>:f32, 1.113490e-03>>}> : (tensor<5xf32>) -> tensor<5x!quant.uniform<i8<-127:127>:f32, 1.113490e-03>>\n+  // QDQ-NEXT: %[[dqw:.*]] = \"tfl.dequantize\"(%[[qw]]) : (tensor<5x!quant.uniform<i8<-127:127>:f32, 1.113490e-03>>) -> tensor<5xf32>\n+  // QDQ-NEXT: %[[bt:.*]] = \"tfl.broadcast_to\"(%[[dqw]], %[[shape]]) : (tensor<5xf32>, tensor<2xi32>) -> tensor<2x5xf32>\n+  // QDQ-NEXT: %[[qtw:.*]] = \"tfl.quantize\"(%[[bt]]) <{qtype = tensor<2x5x!quant.uniform<i8<-127:127>:f32, 1.113490e-03>>}> {volatile} : (tensor<2x5xf32>) -> tensor<2x5x!quant.uniform<i8<-127:127>:f32, 1.113490e-03>>\n+  // QDQ-NEXT: %[[dqtw:.*]] = \"tfl.dequantize\"(%[[qtw]]) : (tensor<2x5x!quant.uniform<i8<-127:127>:f32, 1.113490e-03>>) -> tensor<2x5xf32>\n+  // QDQ-NEXT: return %[[dqtw]] : tensor<2x5xf32>\n+}\n+\n+// -----\n+\n // QDQ-LABEL: TransposePerTensorQuantizationPropagation\n func.func @TransposePerTensorQuantizationPropagation() -> tensor<2x5xf32> {\n   %perm = arith.constant dense<[1, 0]> : tensor<2xi32>"
+        }
+    ],
+    "stats": {
+        "total": 27,
+        "additions": 27,
+        "deletions": 0
+    }
+}

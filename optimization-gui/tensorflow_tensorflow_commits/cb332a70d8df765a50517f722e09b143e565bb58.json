@@ -1,0 +1,36 @@
+{
+    "author": "vwbaker",
+    "message": "[XLA:GPU] Add support for complex scalar shapes in BufferComparator\n\nThis was previously crashing when calling dimensions(0). Added corresponding tests.\n\nPiperOrigin-RevId: 816692288",
+    "sha": "cb332a70d8df765a50517f722e09b143e565bb58",
+    "files": [
+        {
+            "sha": "fe59409a2fb7731f6165124f262b0c726f5c1a62",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/buffer_comparator.cc",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/cb332a70d8df765a50517f722e09b143e565bb58/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fbuffer_comparator.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/cb332a70d8df765a50517f722e09b143e565bb58/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fbuffer_comparator.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fbuffer_comparator.cc?ref=cb332a70d8df765a50517f722e09b143e565bb58",
+            "patch": "@@ -209,6 +209,10 @@ BufferComparator::BufferComparator(const Shape& shape, double tolerance,\n   // Normalize complex shapes: since we treat the passed array as a contiguous\n   // storage it does not matter which dimension are we doubling.\n   auto double_dim_size = [&]() {\n+    // A 0D tensor is equal to a 1D tensor of size 1 in a buffer.\n+    if (shape_.dimensions().empty()) {\n+      shape_.add_dimensions(1);\n+    }\n     int64_t prev_zero_dim_size = shape_.dimensions(0);\n     shape_.set_dimensions(0, prev_zero_dim_size * 2);\n   };"
+        },
+        {
+            "sha": "d0452885be4e67be953edadf25069a6d1682b01a",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/buffer_comparator_test.cc",
+            "status": "modified",
+            "additions": 46,
+            "deletions": 1,
+            "changes": 47,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/cb332a70d8df765a50517f722e09b143e565bb58/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fbuffer_comparator_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/cb332a70d8df765a50517f722e09b143e565bb58/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fbuffer_comparator_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fbuffer_comparator_test.cc?ref=cb332a70d8df765a50517f722e09b143e565bb58",
+            "patch": "@@ -53,7 +53,6 @@ class BufferComparatorTest : public testing::Test {\n     stream_exec_ = platform_->ExecutorForDevice(0).value();\n   }\n \n-  // Take floats only for convenience. Still uses ElementType internally.\n   template <typename ElementType>\n   bool CompareEqualBuffers(absl::Span<const ElementType> current,\n                            absl::Span<const ElementType> expected,\n@@ -100,6 +99,32 @@ class BufferComparatorTest : public testing::Test {\n                                                           kDefaultTolerance);\n   }\n \n+  template <typename ElementType>\n+  bool CompareEqualScalar(const ElementType& current,\n+                          const ElementType& expected,\n+                          double tolerance = kDefaultTolerance) {\n+    auto stream = stream_exec_->CreateStream().value();\n+    se::DeviceMemoryHandle current_buffer(\n+        stream_exec_, stream_exec_->AllocateScalar<ElementType>());\n+    se::DeviceMemoryHandle expected_buffer(\n+        stream_exec_, stream_exec_->AllocateScalar<ElementType>());\n+\n+    TF_CHECK_OK(stream->Memcpy(current_buffer.memory_ptr(), &current,\n+                               current_buffer.memory().size()));\n+    TF_CHECK_OK(stream->Memcpy(expected_buffer.memory_ptr(), &expected,\n+                               expected_buffer.memory().size()));\n+    TF_CHECK_OK(stream->BlockHostUntilDone());\n+\n+    BufferComparator comparator(\n+        ShapeUtil::MakeShape(\n+            primitive_util::NativeToPrimitiveType<ElementType>(), {}),\n+        kDefaultTolerance);\n+    return comparator\n+        .CompareEqual(stream.get(), current_buffer.memory(),\n+                      expected_buffer.memory())\n+        .value();\n+  }\n+\n   se::Platform* platform_;\n   se::StreamExecutor* stream_exec_;\n };\n@@ -126,6 +151,26 @@ TEST_F(BufferComparatorTest, TestComplex) {\n       CompareEqualComplex<double>({{0.1, 0.2}, {2, 3}}, {{0.1, 0.2}, {2, 7}}));\n }\n \n+TEST_F(BufferComparatorTest, TestScalar) {\n+  EXPECT_TRUE(CompareEqualScalar<std::complex<double>>({1, 1}, {1, 1}));\n+  EXPECT_FALSE(CompareEqualScalar<std::complex<double>>({1, 1}, {1, 2}));\n+  EXPECT_FALSE(CompareEqualScalar<std::complex<double>>({1, 1}, {2, 1}));\n+  EXPECT_TRUE(CompareEqualScalar<std::complex<float>>({1, 1}, {1, 1}));\n+  EXPECT_FALSE(CompareEqualScalar<std::complex<float>>({1, 1}, {1, 2}));\n+  EXPECT_FALSE(CompareEqualScalar<std::complex<float>>({1, 1}, {2, 1}));\n+  EXPECT_TRUE(CompareEqualScalar<float>(1, 1));\n+  EXPECT_FALSE(CompareEqualScalar<float>(1, 2));\n+  EXPECT_TRUE(CompareEqualScalar<double>(1, 1));\n+  EXPECT_FALSE(CompareEqualScalar<double>(1, 2));\n+  EXPECT_TRUE(CompareEqualScalar<bool>(true, true));\n+  EXPECT_TRUE(CompareEqualScalar<bool>(false, false));\n+  EXPECT_FALSE(CompareEqualScalar<bool>(true, false));\n+  EXPECT_TRUE(CompareEqualScalar<int8_t>(1, 1));\n+  EXPECT_FALSE(CompareEqualScalar<int8_t>(1, 2));\n+  EXPECT_TRUE(CompareEqualScalar<int32_t>(1, 1));\n+  EXPECT_FALSE(CompareEqualScalar<int32_t>(1, 2));\n+}\n+\n TEST_F(BufferComparatorTest, TestPred) {\n   EXPECT_TRUE(CompareEqualBuffers<bool>({false, true}, {false, true}, 0.0));\n   EXPECT_FALSE(CompareEqualBuffers<bool>({false, true}, {false, false}, 0.0));"
+        }
+    ],
+    "stats": {
+        "total": 51,
+        "additions": 50,
+        "deletions": 1
+    }
+}

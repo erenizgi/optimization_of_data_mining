@@ -1,0 +1,36 @@
+{
+    "author": "subhankarshah",
+    "message": "[XLA:MSA] When block prefetching, finalize the original value if a sliced value is prefetched successfully and the original value is not.\n\nWe already have a pinned allocation for the original value, it should be finalized to avoid re-allocation causing multiple pinned allocations for the same buffer.\n\nPiperOrigin-RevId: 820015337",
+    "sha": "4df1a3c67f15de4ce003c00b2e27b61e52380811",
+    "files": [
+        {
+            "sha": "35aef55589a2db1d5f45d6b51692985e29523bd0",
+            "filename": "third_party/xla/xla/service/memory_space_assignment/algorithm.cc",
+            "status": "modified",
+            "additions": 14,
+            "deletions": 0,
+            "changes": 14,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4df1a3c67f15de4ce003c00b2e27b61e52380811/third_party%2Fxla%2Fxla%2Fservice%2Fmemory_space_assignment%2Falgorithm.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4df1a3c67f15de4ce003c00b2e27b61e52380811/third_party%2Fxla%2Fxla%2Fservice%2Fmemory_space_assignment%2Falgorithm.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fmemory_space_assignment%2Falgorithm.cc?ref=4df1a3c67f15de4ce003c00b2e27b61e52380811",
+            "patch": "@@ -2338,6 +2338,20 @@ absl::Status MsaAlgorithm::ProcessBlockPrefetches() {\n     repack_allocation_blocks_.back().next_colocated =\n         &(repack_allocation_blocks_.back());\n   }\n+\n+  // Finalize the original values of the sliced values that are not finalized\n+  // yet to avoid being allocated twice.\n+  for (auto [_, original_value] : sliced_value_to_original_value) {\n+    if (finalized_values_.contains(original_value)) {\n+      continue;\n+    }\n+    Allocation* allocation = value_to_pinned_allocation[original_value];\n+    for (const HloUse& use : original_value->GetUses()) {\n+      allocation->AddUse(use);\n+    }\n+    finalized_values_.insert(original_value);\n+  }\n+\n   // Clear the pending chunks.\n   ClearPendingChunks();\n   return absl::OkStatus();"
+        },
+        {
+            "sha": "365e35e1548ef089379b1aa3dd11e379f7fb3edf",
+            "filename": "third_party/xla/xla/service/memory_space_assignment/memory_space_assignment_test.cc",
+            "status": "modified",
+            "additions": 56,
+            "deletions": 0,
+            "changes": 56,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4df1a3c67f15de4ce003c00b2e27b61e52380811/third_party%2Fxla%2Fxla%2Fservice%2Fmemory_space_assignment%2Fmemory_space_assignment_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4df1a3c67f15de4ce003c00b2e27b61e52380811/third_party%2Fxla%2Fxla%2Fservice%2Fmemory_space_assignment%2Fmemory_space_assignment_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fmemory_space_assignment%2Fmemory_space_assignment_test.cc?ref=4df1a3c67f15de4ce003c00b2e27b61e52380811",
+            "patch": "@@ -15381,6 +15381,62 @@ ENTRY entry {\n   EXPECT_EQ(num_prefetches, 6);\n }\n \n+TEST_F(SlicedPrefetchTest, TestMultiplePinnedAllocationsBug) {\n+  // When block prefetching, finalize the original value if a sliced value is\n+  // prefetched successfully and the original value is not, if not finalized it\n+  // can cause re-allocation causing multiple pinned allocations for the same\n+  // buffer.\n+  absl::string_view hlo_string = R\"(\n+HloModule module, is_scheduled=true\n+\n+ENTRY entry {\n+  p0 = f32[4,3]{1,0} parameter(0)\n+  slice0 = f32[2,3]{1,0} slice(p0), slice={[0:2], [0:3]}\n+  negate0 = f32[2,3]{1,0} negate(slice0)\n+  negate1 = f32[2,3]{1,0} negate(negate0)\n+  negate2 = f32[2,3]{1,0} negate(negate1)\n+  add2 = f32[2,3]{1,0} add(slice0, negate2)\n+  negate3 = f32[2,3]{1,0} negate(add2)\n+  negate4 = f32[2,3]{1,0} negate(negate3)\n+  negate5 = f32[2,3]{1,0} negate(negate4)\n+  negate6 = f32[4,3]{1,0} negate(p0)\n+  negate7 = f32[4,3]{1,0} negate(negate6)\n+  negate8 = f32[4,3]{1,0} negate(negate7)\n+  negate9 = f32[4,3]{1,0} negate(negate8)\n+  add10 = f32[4,3]{1,0} add(p0, negate9)\n+  ROOT tuple = (f32[2,3]{1,0}, f32[4,3]{1,0}) tuple(negate5, add10)\n+})\";\n+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,\n+                          ParseAndReturnVerifiedModule(hlo_string));\n+  Options memory_space_options = DefaultMemorySpaceOptions();\n+  memory_space_options.max_size_in_bytes = 256;\n+  memory_space_options.reserved_bytes_for_block_prefetches = 24;\n+  memory_space_options.max_outstanding_block_prefetches = 10;\n+  memory_space_options.max_outstanding_prefetches = 0;\n+  memory_space_options.block_prefetched_positions =\n+      GetHloPositions(module.get(), {\"p0\"});\n+  const std::string text_proto = R\"pb(\n+    overrides {\n+      hlo_position_matcher { instruction_name_regex: \"p0\" }\n+      override_options { assign_first: true }\n+    })pb\";\n+  TF_ASSERT_OK_AND_ASSIGN(auto msa_sort_order_overrides,\n+                          ParseTextProto<MsaSortOrderOverrides>(text_proto));\n+  memory_space_options.msa_sort_order_overrides =\n+      std::move(msa_sort_order_overrides);\n+\n+  XLA_VLOG_LINES(1, \"Before MSA: \\n\" + module->ToString());\n+  AssignMemorySpaceUsingCostAnalysis(module.get(),\n+                                     std::move(memory_space_options));\n+  XLA_VLOG_LINES(1, \"After MSA: \\n\" + module->ToString());\n+  std::vector<std::string> sliced_prefetch_uses = {\"negate0\", \"add2\"};\n+  CheckOperandOpcodeAndMemorySpaceForInstructionNames(\n+      /*module=*/module.get(), /*instruction_names=*/sliced_prefetch_uses,\n+      /*operand_index=*/0,\n+      /*operand_opcode=*/HloOpcode::kAsyncDone,\n+      /*operand_memory_space=*/kAlternateMemorySpace);\n+}\n+\n TEST_F(MemorySpaceAssignmentTest, NoPrefetchWithBandwidthLimitingAsyncStart) {\n   // The negate chain is long enough for asynchronous copy to be inserted\n   // between p1 and add. The prefetch will not happen because the bandwidth"
+        }
+    ],
+    "stats": {
+        "total": 70,
+        "additions": 70,
+        "deletions": 0
+    }
+}

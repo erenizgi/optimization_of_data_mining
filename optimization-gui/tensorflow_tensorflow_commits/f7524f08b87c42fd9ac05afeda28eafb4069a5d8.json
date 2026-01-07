@@ -1,0 +1,72 @@
+{
+    "author": "khasanovaa",
+    "message": "Add proto [de]serialization for `SelectKThunk`.\n\nPiperOrigin-RevId: 820210212",
+    "sha": "f7524f08b87c42fd9ac05afeda28eafb4069a5d8",
+    "files": [
+        {
+            "sha": "3c0b4cc3445e3c291a54b956b6a55b17b7eefc18",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/BUILD",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f7524f08b87c42fd9ac05afeda28eafb4069a5d8/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f7524f08b87c42fd9ac05afeda28eafb4069a5d8/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2FBUILD?ref=f7524f08b87c42fd9ac05afeda28eafb4069a5d8",
+            "patch": "@@ -1136,12 +1136,15 @@ cc_library(\n         \"//xla/stream_executor:device_memory\",\n         \"//xla/stream_executor:device_memory_allocator\",\n         \"//xla/stream_executor:stream\",\n+        \"//xla/tsl/platform:statusor\",\n         \"@com_google_absl//absl/container:inlined_vector\",\n         \"@com_google_absl//absl/log\",\n         \"@com_google_absl//absl/log:check\",\n         \"@com_google_absl//absl/status\",\n         \"@com_google_absl//absl/status:statusor\",\n         \"@com_google_absl//absl/strings\",\n+        \"@com_google_absl//absl/types:span\",\n+        \"@local_tsl//tsl/platform:statusor\",\n     ] + if_cuda_is_configured(\n         [\":select_k_exec_raft\"],\n         no_cuda = [\":select_k_exec_stub\"],\n@@ -1163,6 +1166,7 @@ xla_cc_test(\n         \"//xla/service:buffer_assignment\",\n         \"//xla/tsl/platform:statusor\",\n         \"//xla/tsl/util/proto:proto_matchers\",\n+        \"@com_google_absl//absl/status:status_matchers\",\n         \"@com_google_googletest//:gtest_main\",\n     ],\n )"
+        },
+        {
+            "sha": "77942bd6cd4e2318530ed23f1fdde98bf58df1b0",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/select_k_thunk.cc",
+            "status": "modified",
+            "additions": 34,
+            "deletions": 3,
+            "changes": 37,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f7524f08b87c42fd9ac05afeda28eafb4069a5d8/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fselect_k_thunk.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f7524f08b87c42fd9ac05afeda28eafb4069a5d8/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fselect_k_thunk.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fselect_k_thunk.cc?ref=f7524f08b87c42fd9ac05afeda28eafb4069a5d8",
+            "patch": "@@ -16,14 +16,18 @@ limitations under the License.\n #include \"xla/backends/gpu/runtime/select_k_thunk.h\"\n \n #include <cstdint>\n+#include <memory>\n #include <string>\n+#include <utility>\n+#include <vector>\n \n #include \"absl/container/inlined_vector.h\"\n #include \"absl/log/check.h\"\n #include \"absl/log/log.h\"\n #include \"absl/status/status.h\"\n #include \"absl/status/statusor.h\"\n #include \"absl/strings/str_cat.h\"\n+#include \"absl/types/span.h\"\n #include \"xla/backends/gpu/runtime/select_k_exec.h\"\n #include \"xla/backends/gpu/runtime/thunk.h\"\n #include \"xla/backends/gpu/runtime/thunk.pb.h\"\n@@ -32,9 +36,11 @@ limitations under the License.\n #include \"xla/hlo/ir/hlo_instruction.h\"\n #include \"xla/primitive_util.h\"\n #include \"xla/service/buffer_assignment.h\"\n+#include \"xla/shape.h\"\n #include \"xla/stream_executor/device_memory.h\"\n #include \"xla/stream_executor/device_memory_allocator.h\"\n #include \"xla/stream_executor/stream.h\"\n+#include \"xla/tsl/platform/statusor.h\"\n #include \"xla/types.h\"\n \n namespace xla::gpu {\n@@ -105,10 +111,35 @@ absl::Status SelectKThunk::ExecuteOnStream(const ExecuteParams& params) {\n absl::StatusOr<ThunkProto> SelectKThunk::ToProto() const {\n   ThunkProto proto;\n   *proto.mutable_thunk_info() = thunk_info().ToProto();\n+  SelectKThunkProto* select_k_proto = proto.mutable_select_k_thunk();\n \n-  SelectKThunkProto* select_k_thunk_proto = proto.mutable_select_k_thunk();\n-  (void)select_k_thunk_proto;\n-  // TODO(upwind): Add fields for SelectKThunkProto.\n+  select_k_proto->set_batch_size(batch_size_);\n+  select_k_proto->set_num_elements(num_elements_);\n+  select_k_proto->set_k(k_);\n+  select_k_proto->set_dtype(dtype_);\n+\n+  for (const BufferAllocation::Slice& arg : args_) {\n+    TF_ASSIGN_OR_RETURN(*select_k_proto->add_args(), arg.ToProto());\n+  }\n   return proto;\n }\n+\n+absl::StatusOr<std::unique_ptr<SelectKThunk>> SelectKThunk::FromProto(\n+    ThunkInfo thunk_info, const SelectKThunkProto& proto,\n+    absl::Span<const BufferAllocation> buffer_allocations) {\n+  std::vector<emitters::KernelArgument> arguments;\n+  arguments.reserve(proto.args().size());\n+  for (const xla::buffer_assignment::BufferAllocationSliceProto& arg :\n+       proto.args()) {\n+    TF_ASSIGN_OR_RETURN(\n+        BufferAllocation::Slice slice,\n+        BufferAllocation::Slice::FromProto(arg, buffer_allocations));\n+    emitters::KernelArgument argument{Shape{}, slice};\n+    arguments.push_back(std::move(argument));\n+  }\n+  return std::make_unique<SelectKThunk>(\n+      thunk_info, proto.batch_size(), proto.num_elements(), proto.k(),\n+      proto.dtype(), emitters::KernelArguments(std::move(arguments)));\n+}\n+\n }  // namespace xla::gpu"
+        },
+        {
+            "sha": "019b0a1ede0daca208652fc858a33cfd550ada7a",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/select_k_thunk.h",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f7524f08b87c42fd9ac05afeda28eafb4069a5d8/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fselect_k_thunk.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f7524f08b87c42fd9ac05afeda28eafb4069a5d8/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fselect_k_thunk.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fselect_k_thunk.h?ref=f7524f08b87c42fd9ac05afeda28eafb4069a5d8",
+            "patch": "@@ -17,6 +17,7 @@ limitations under the License.\n #define XLA_BACKENDS_GPU_RUNTIME_SELECT_K_THUNK_H_\n \n #include <cstdint>\n+#include <memory>\n #include <string>\n #include <vector>\n \n@@ -63,6 +64,10 @@ class SelectKThunk : public Thunk {\n \n   absl::StatusOr<ThunkProto> ToProto() const override;\n \n+  static absl::StatusOr<std::unique_ptr<SelectKThunk>> FromProto(\n+      ThunkInfo thunk_info, const SelectKThunkProto& proto,\n+      absl::Span<const BufferAllocation> buffer_allocations);\n+\n  private:\n   std::uint32_t batch_size_;\n   std::uint32_t num_elements_;"
+        },
+        {
+            "sha": "314a10ca3404e3238936d34fa06599a2e585a737",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/select_k_thunk_test.cc",
+            "status": "modified",
+            "additions": 28,
+            "deletions": 11,
+            "changes": 39,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f7524f08b87c42fd9ac05afeda28eafb4069a5d8/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fselect_k_thunk_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f7524f08b87c42fd9ac05afeda28eafb4069a5d8/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fselect_k_thunk_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fselect_k_thunk_test.cc?ref=f7524f08b87c42fd9ac05afeda28eafb4069a5d8",
+            "patch": "@@ -21,6 +21,7 @@ limitations under the License.\n \n #include <gmock/gmock.h>\n #include <gtest/gtest.h>\n+#include \"absl/status/status_matchers.h\"\n #include \"xla/backends/gpu/runtime/thunk.h\"\n #include \"xla/backends/gpu/runtime/thunk.pb.h\"\n #include \"xla/backends/gpu/runtime/thunk_id.h\"\n@@ -35,6 +36,7 @@ limitations under the License.\n namespace xla::gpu {\n namespace {\n \n+using ::absl_testing::IsOkAndHolds;\n using ::tsl::proto_testing::EqualsProto;\n \n TEST(SelectKThunkTest, ToProto) {\n@@ -46,30 +48,45 @@ TEST(SelectKThunkTest, ToProto) {\n   Thunk::ThunkInfo thunk_info =\n       Thunk::ThunkInfo::WithProfileAnnotation(topKInst.get(), ThunkId{456});\n \n-  BufferAllocation alloc0(/*index=*/0, /*size=*/20, /*color=*/0);\n-  BufferAllocation::Slice slice0(&alloc0, /*offset=*/0, /*size=*/20);\n+  std::vector<BufferAllocation> buffer_allocations = {\n+      {/*index=*/0, /*size=*/20, /*color=*/0},\n+      {/*index=*/1, /*size=*/12, /*color=*/0},\n+      {/*index=*/2, /*size=*/12, /*color=*/0}};\n \n-  BufferAllocation alloc1(/*index=*/1, /*size=*/12, /*color=*/0);\n-  BufferAllocation::Slice slice1(&alloc1, /*offset=*/0, /*size=*/12);\n-\n-  BufferAllocation alloc2(/*index=*/2, /*size=*/12, /*color=*/0);\n-  BufferAllocation::Slice slice2(&alloc2, /*offset=*/0, /*size=*/12);\n+  BufferAllocation::Slice slice0(&buffer_allocations[0], /*offset=*/0,\n+                                 /*size=*/20);\n+  BufferAllocation::Slice slice1(&buffer_allocations[1], /*offset=*/0,\n+                                 /*size=*/12);\n+  BufferAllocation::Slice slice2(&buffer_allocations[2], /*offset=*/0,\n+                                 /*size=*/12);\n \n   emitters::KernelArgument arg0(ShapeUtil::MakeShape(F32, {1, 5}), slice0);\n   emitters::KernelArgument arg1(ShapeUtil::MakeShape(F32, {1, 3}), slice1);\n   emitters::KernelArgument arg2(ShapeUtil::MakeShape(U32, {1, 3}), slice2);\n-  arg0.set_written(false);\n-  arg1.set_written(true);\n-  arg2.set_written(true);\n \n   emitters::KernelArguments kernel_arguments({arg0, arg1, arg2});\n \n   SelectKThunk thunk(std::move(thunk_info), 1, 5, 3, F32, kernel_arguments);\n+\n   TF_ASSERT_OK_AND_ASSIGN(ThunkProto proto, thunk.ToProto());\n   EXPECT_THAT(proto, EqualsProto(R\"pb(\n                 thunk_info { profile_annotation: \"custom-call\" thunk_id: 456 }\n-                select_k_thunk {}\n+                select_k_thunk {\n+                  args { buffer_allocation_index: 0 size: 20 }\n+                  args { buffer_allocation_index: 1 size: 12 }\n+                  args { buffer_allocation_index: 2 size: 12 }\n+                  batch_size: 1\n+                  num_elements: 5\n+                  k: 3\n+                  dtype: F32\n+                }\n               )pb\"));\n+\n+  TF_ASSERT_OK_AND_ASSIGN(\n+      std::unique_ptr<SelectKThunk> deserialized,\n+      SelectKThunk::FromProto(thunk.thunk_info(), proto.select_k_thunk(),\n+                              buffer_allocations));\n+  EXPECT_THAT(deserialized->ToProto(), IsOkAndHolds(EqualsProto(proto)));\n }\n \n }  // namespace"
+        },
+        {
+            "sha": "0b100285aeeb7022ae8f1839f5efefd88b4cb9b8",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/thunk.proto",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 1,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f7524f08b87c42fd9ac05afeda28eafb4069a5d8/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fthunk.proto",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f7524f08b87c42fd9ac05afeda28eafb4069a5d8/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fthunk.proto",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fthunk.proto?ref=f7524f08b87c42fd9ac05afeda28eafb4069a5d8",
+            "patch": "@@ -178,7 +178,11 @@ message OutfeedThunkProto {\n }\n \n message SelectKThunkProto {\n-  // TODO(upwind): Add fields for SelectKThunkProto.\n+  repeated xla.buffer_assignment.BufferAllocationSliceProto args = 1;\n+  uint32 batch_size = 3;\n+  uint32 num_elements = 4;\n+  uint32 k = 5;\n+  xla.PrimitiveType dtype = 6;\n }\n \n message CublasLtMatmulThunkProto {"
+        }
+    ],
+    "stats": {
+        "total": 91,
+        "additions": 76,
+        "deletions": 15
+    }
+}

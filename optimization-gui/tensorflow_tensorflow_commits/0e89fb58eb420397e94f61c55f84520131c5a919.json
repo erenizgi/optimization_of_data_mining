@@ -1,0 +1,36 @@
+{
+    "author": "basioli-k",
+    "message": "[XLA:GPU][host offloading] Make the host offloading threadpool a resource owned by the D2H stream executor.\n\nEnsures the lifetime of the threadpool is correctly tied to the stream executor.\n\nPiperOrigin-RevId: 816276753",
+    "sha": "0e89fb58eb420397e94f61c55f84520131c5a919",
+    "files": [
+        {
+            "sha": "6bb2d87cfe4f7c83bc782fd3b833108f30b45123",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/0e89fb58eb420397e94f61c55f84520131c5a919/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/0e89fb58eb420397e94f61c55f84520131c5a919/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2FBUILD?ref=0e89fb58eb420397e94f61c55f84520131c5a919",
+            "patch": "@@ -2525,6 +2525,7 @@ cc_library(\n         \"@com_google_absl//absl/memory\",\n         \"@com_google_absl//absl/status\",\n         \"@com_google_absl//absl/status:statusor\",\n+        \"@com_google_absl//absl/strings\",\n         \"@com_google_absl//absl/strings:str_format\",\n         \"@com_google_absl//absl/synchronization\",\n         \"@com_google_absl//absl/types:span\","
+        },
+        {
+            "sha": "f6215c5bd50113dbcf4164bb95b6a45035b998a8",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/host_execute_thunk.cc",
+            "status": "modified",
+            "additions": 35,
+            "deletions": 13,
+            "changes": 48,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/0e89fb58eb420397e94f61c55f84520131c5a919/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fhost_execute_thunk.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/0e89fb58eb420397e94f61c55f84520131c5a919/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fhost_execute_thunk.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fhost_execute_thunk.cc?ref=0e89fb58eb420397e94f61c55f84520131c5a919",
+            "patch": "@@ -31,6 +31,7 @@ limitations under the License.\n #include \"absl/memory/memory.h\"\n #include \"absl/status/status.h\"\n #include \"absl/status/statusor.h\"\n+#include \"absl/strings/str_cat.h\"\n #include \"absl/strings/str_format.h\"\n #include \"absl/synchronization/mutex.h\"\n #include \"absl/types/span.h\"\n@@ -65,24 +66,43 @@ namespace gpu {\n \n namespace {\n \n-tsl::thread::ThreadPool* GetHostExecuteThreadPool() {\n-  constexpr int kMaxNumHostExecuteThreads = 32;\n-  static tsl::thread::ThreadPool* host_offloading_thread_pool =\n-      new tsl::thread::ThreadPool(\n-          tsl::Env::Default(), \"host-offloading\",\n-          std::min(tsl::port::MaxParallelism(), kMaxNumHostExecuteThreads));\n-  return host_offloading_thread_pool;\n+class ThreadPoolResource : public se::StreamExecutor::Resource {\n+ public:\n+  explicit ThreadPoolResource(\n+      std::unique_ptr<tsl::thread::ThreadPool> thread_pool)\n+      : thread_pool_(std::move(thread_pool)) {}\n+\n+  tsl::thread::ThreadPool* thread_pool() const { return thread_pool_.get(); }\n+\n+ private:\n+  std::unique_ptr<tsl::thread::ThreadPool> thread_pool_;\n+};\n+\n+tsl::thread::ThreadPool* GetHostExecuteThreadPool(\n+    se::StreamExecutor* stream_executor) {\n+  return stream_executor\n+      ->GetOrCreateResource<ThreadPoolResource>([stream_executor]() {\n+        constexpr int kMaxNumHostExecuteThreads = 8;\n+        return std::make_unique<ThreadPoolResource>(\n+            std::make_unique<tsl::thread::ThreadPool>(\n+                tsl::Env::Default(),\n+                absl::StrCat(\"host-offloading-device-id-\",\n+                             stream_executor->device_ordinal()),\n+                std::min(tsl::port::MaxParallelism(),\n+                         kMaxNumHostExecuteThreads)));\n+      })\n+      ->thread_pool();\n }\n \n bool IsBufferOnDevice(se::Stream* stream, const void* ptr) {\n   auto memory_type = stream->parent()->GetPointerMemorySpace(ptr);\n   return memory_type.ok() && *memory_type == se::MemoryType::kDevice;\n }\n \n-// We ignore memory spaces in shape comparison since the memory can be on device\n-// or host, and both are valid for the host offloading case.\n-// If the memory is on device we copy it to host memory, and if it is on host\n-// memory we use it as is.\n+// We ignore memory spaces in shape comparison since the memory can be on\n+// device or host, and both are valid for the host offloading case. If the\n+// memory is on device we copy it to host memory, and if it is on host memory\n+// we use it as is.\n bool CompareShapesIgnoringMemorySpace(const Shape& shape1,\n                                       const Shape& shape2) {\n   auto eq = Shape::Equal().IgnoreMemorySpaceInLayout();\n@@ -526,8 +546,10 @@ absl::Status HostExecuteStartThunk::ExecuteOnStream(\n   };\n \n   TF_RETURN_IF_ERROR(device_to_host_stream->DoHostCallbackWithStatus(\n-      [execute = std::move(execute)] {\n-        GetHostExecuteThreadPool()->Schedule(std::move(execute));\n+      [execute = std::move(execute),\n+       d2h_stream_executor = device_to_host_stream->parent()] {\n+        GetHostExecuteThreadPool(d2h_stream_executor)\n+            ->Schedule(std::move(execute));\n         return absl::OkStatus();\n       }));\n "
+        }
+    ],
+    "stats": {
+        "total": 49,
+        "additions": 36,
+        "deletions": 13
+    }
+}

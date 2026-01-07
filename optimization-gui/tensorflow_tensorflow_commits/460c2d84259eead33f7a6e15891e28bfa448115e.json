@@ -1,0 +1,36 @@
+{
+    "author": "sergachev",
+    "message": "PR #34103: [GPU] Fix layout assignment of bitcast-converts.\n\nImported from GitHub PR https://github.com/openxla/xla/pull/34103\n\n📝 Summary of Changes\n\"mandatory\" compatible layouts have to be assigned to both operands and outputs simultaneously such that subsequent layout propagation does not alter one of them making the operation invalid.\n\n🚀 Kind of Contribution\n🐛 Bug Fix\n\n🧪 Unit Tests:\nyes\n\n🧪 Execution Tests:\nno\nCopybara import of the project:\n\n--\nf0ff62e4bf031a3aebf4cdadb66139b3b1120307 by Ilia Sergachev <isergachev@nvidia.com>:\n\n[GPU] Fix layout assignment of bitcast-converts.\n\n\"mandatory\" compatible layouts have to be assigned to both operands and\noutputs simultaneously such that subsequent layout propagation does not\nalter one of them making the operation invalid.\n\nMerging this change closes #34103\n\nPiperOrigin-RevId: 834676734",
+    "sha": "460c2d84259eead33f7a6e15891e28bfa448115e",
+    "files": [
+        {
+            "sha": "27ad756438a9b1bd274179f2f4971c6eb22057af",
+            "filename": "third_party/xla/xla/service/gpu/transforms/layout_assignment.cc",
+            "status": "modified",
+            "additions": 26,
+            "deletions": 8,
+            "changes": 34,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/460c2d84259eead33f7a6e15891e28bfa448115e/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Flayout_assignment.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/460c2d84259eead33f7a6e15891e28bfa448115e/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Flayout_assignment.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Flayout_assignment.cc?ref=460c2d84259eead33f7a6e15891e28bfa448115e",
+            "patch": "@@ -562,18 +562,36 @@ absl::Status GpuLayoutAssignment::AddBackendConstraints(\n     } else if (HloPredicateIsOp<HloOpcode::kBitcastConvert>(instruction)) {\n       Shape operand_shape = instruction->operand(0)->shape();\n       Shape output_shape = instruction->shape();\n-      // Make the added or removed dimension the minor most to give the\n-      // operation a chance to become a no-op (bitcast).\n+\n+      // Sets the layouts of the operand and output shapes to make the bitcast a\n+      // no-op. The changed dimension is moved to be the most minor one in the\n+      // layout of the larger shape, and the layout of the smaller shape is\n+      // derived from the larger one.\n+      auto assign_layouts = [](Shape* larger_shape, Shape* smaller_shape) {\n+        const int changed_dim = larger_shape->dimensions().size() - 1;\n+        *larger_shape->mutable_layout() =\n+            LayoutUtil::MoveDimToMinor(larger_shape->layout(), changed_dim);\n+        *smaller_shape->mutable_layout() =\n+            ShapeUtil::DeleteDimension(changed_dim, *larger_shape).layout();\n+      };\n+\n+      bool ranks_differ = true;\n       if (operand_shape.dimensions().size() >\n           output_shape.dimensions().size()) {\n-        *operand_shape.mutable_layout() = LayoutUtil::MoveDimToMinor(\n-            operand_shape.layout(), operand_shape.dimensions().size() - 1);\n-        TF_RETURN_IF_ERROR(SetOperandLayout(operand_shape, instruction, 0));\n+        assign_layouts(&operand_shape, &output_shape);\n       } else if (operand_shape.dimensions().size() <\n                  output_shape.dimensions().size()) {\n-        *output_shape.mutable_layout() = LayoutUtil::MoveDimToMinor(\n-            output_shape.layout(), output_shape.dimensions().size() - 1);\n-        TF_RETURN_IF_ERROR(SetInstructionLayout(output_shape, instruction));\n+        assign_layouts(&output_shape, &operand_shape);\n+      } else {\n+        ranks_differ = false;\n+      }\n+\n+      if (ranks_differ) {\n+        TF_RETURN_IF_ERROR(SetOperandLayout(operand_shape, instruction,\n+                                            /*operand_no=*/0,\n+                                            /*mandatory=*/true));\n+        TF_RETURN_IF_ERROR(SetInstructionLayout(output_shape, instruction,\n+                                                /*mandatory=*/true));\n       }\n     } else if (HloPredicateIsOp<HloOpcode::kTriangularSolve>(instruction)) {\n       // TODO(phawkins): Ideally we would relax this constraint. What we"
+        },
+        {
+            "sha": "161ac37dcc644a5afafc6d980235142f0d37484a",
+            "filename": "third_party/xla/xla/service/gpu/transforms/layout_assignment_test.cc",
+            "status": "modified",
+            "additions": 24,
+            "deletions": 0,
+            "changes": 24,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/460c2d84259eead33f7a6e15891e28bfa448115e/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Flayout_assignment_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/460c2d84259eead33f7a6e15891e28bfa448115e/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Flayout_assignment_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Flayout_assignment_test.cc?ref=460c2d84259eead33f7a6e15891e28bfa448115e",
+            "patch": "@@ -186,6 +186,30 @@ TEST_F(LayoutAssignmentTest, DotLayoutSetToDefaultIfDefaultValid) {\n                              .WithShape(F32, {5, 2, 4}, {2, 1, 0})));\n }\n \n+TEST_F(LayoutAssignmentTest, BitcastConvertKeepsCompatibleLayouts) {\n+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,\n+                          ParseAndReturnVerifiedModule(R\"(\n+e {\n+  a = u4[5,4,3,2]{3,2,1,0} parameter(0)\n+  b = u8[5,4,3]{2,1,0} bitcast-convert(a)\n+  c = u8[4,5,3]{2,1,0} transpose(b), dimensions={1,0,2}\n+})\"));\n+\n+  ComputationLayout computation_layout(\n+      module->entry_computation()->ComputeProgramShape());\n+  GpuLayoutAssignment layout_assignment(\n+      &computation_layout, GetGpuComputeCapability(), GetDnnVersion(),\n+      GetDeviceDescription());\n+  EXPECT_THAT(layout_assignment.Run(module.get()),\n+              absl_testing::IsOkAndHolds(true));\n+\n+  EXPECT_THAT(module->entry_computation()->root_instruction(),\n+              GmockMatch(m::Copy(m::Transpose(\n+                  m::BitcastConvert(\n+                      m::Parameter().WithShape(U4, {5, 4, 3, 2}, {3, 2, 1, 0}))\n+                      .WithShape(U8, {5, 4, 3}, {2, 1, 0})))));\n+}\n+\n TEST_F(LayoutAssignmentTest, DotOperandLayoutSetToBatchRowsColsOtherwise) {\n   const char* hlo_text = R\"(\n   HloModule DotLayout"
+        }
+    ],
+    "stats": {
+        "total": 58,
+        "additions": 50,
+        "deletions": 8
+    }
+}

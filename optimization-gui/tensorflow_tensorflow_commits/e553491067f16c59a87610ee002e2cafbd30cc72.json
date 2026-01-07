@@ -1,0 +1,120 @@
+{
+    "author": "basioli-k",
+    "message": "[XLA:GPU][codegen] Emit stablehlo for tiled transpose and implement lowering of transpose from stablehlo to triton.\n\nStart work on making fusion_emitter non dependant on triton.\n\nPiperOrigin-RevId: 816669341",
+    "sha": "e553491067f16c59a87610ee002e2cafbd30cc72",
+    "files": [
+        {
+            "sha": "79cf4df00975e2f36b77b0a292596e980b863b85",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e553491067f16c59a87610ee002e2cafbd30cc72/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e553491067f16c59a87610ee002e2cafbd30cc72/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2FBUILD?ref=e553491067f16c59a87610ee002e2cafbd30cc72",
+            "patch": "@@ -223,6 +223,7 @@ cc_library(\n         \"@llvm-project//llvm:ir_headers\",\n         \"@llvm-project//mlir:IR\",\n         \"@llvm-project//mlir:Pass\",\n+        \"@stablehlo//:stablehlo_ops\",\n         \"@triton//:TritonDialects\",\n     ] + if_cuda_or_rocm_is_configured([\n         \":compilation_pipeline\","
+        },
+        {
+            "sha": "275ab13232b6029e4764a82a4b7db2a88361aeee",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/fusion_emitter.cc",
+            "status": "modified",
+            "additions": 24,
+            "deletions": 8,
+            "changes": 32,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e553491067f16c59a87610ee002e2cafbd30cc72/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e553491067f16c59a87610ee002e2cafbd30cc72/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter.cc?ref=e553491067f16c59a87610ee002e2cafbd30cc72",
+            "patch": "@@ -88,6 +88,7 @@ limitations under the License.\n #include \"mlir/Target/LLVMIR/Dialect/ROCDL/ROCDLToLLVMIRTranslation.h\"\n #include \"mlir/Target/LLVMIR/Export.h\"\n #include \"mlir/Transforms/Passes.h\"\n+#include \"stablehlo/dialect/StablehloOps.h\"\n #include \"xla/backends/gpu/codegen/emitters/ir/xla_gpu_ops.h\"\n #include \"xla/backends/gpu/codegen/triton/compilation_pipeline.h\"\n #include \"xla/backends/gpu/codegen/triton/dot_algorithms.h\"\n@@ -99,6 +100,7 @@ limitations under the License.\n #include \"xla/backends/gpu/codegen/triton/transforms/passes.h\"\n #include \"xla/codegen/emitter_loc_op_builder.h\"\n #include \"xla/codegen/emitters/elemental_hlo_to_mlir.h\"\n+#include \"xla/codegen/emitters/ir/xla_dialect.h\"\n #include \"xla/codegen/emitters/ir/xla_ops.h\"\n #include \"xla/codegen/emitters/transforms/passes.h\"\n #include \"xla/codegen/tiling/symbolic_tile_analysis.h\"\n@@ -153,6 +155,7 @@ namespace gpu {\n namespace arith = ::mlir::arith;\n namespace ttir = ::mlir::triton;\n namespace mtx = ::mlir::triton::xla;\n+namespace stablehlo = ::mlir::stablehlo;\n \n using ::llvm::SmallVector;\n using ::mlir::AffineMap;\n@@ -659,9 +662,9 @@ Value EmitTiledTranspose(EmitterLocOpBuilder b, ArrayRef<int64_t> tile_sizes,\n   Type output_tensor_type =\n       mlir::RankedTensorType::get(padded_tile_sizes, input_element_type);\n \n-  SmallVector<int32_t> order = llvm::to_vector_of<int32_t>(dimensions);\n+  mlir::DenseI64ArrayAttr order = b.getDenseI64ArrayAttr(dimensions);\n \n-  return b.create<ttir::TransOp>(output_tensor_type, input, order);\n+  return b.create<stablehlo::TransposeOp>(output_tensor_type, input, order);\n }\n \n absl::StatusOr<ScalarOrTensor> EmitTiledBitcast(\n@@ -1838,12 +1841,12 @@ absl::Status EmitGeneric(mlir::OpBuilder builder,\n }  // namespace\n \n void LoadMlirDialectsForTriton(mlir::MLIRContext& mlir_context) {\n-  mlir_context\n-      .loadDialect<ttir::TritonDialect, ttir::gpu::TritonGPUDialect,\n-                   mlir::arith::ArithDialect, mlir::affine::AffineDialect,\n-                   mlir::LLVM::LLVMDialect, xla::XlaDialect,\n-                   xla::gpu::XlaGpuDialect, ttir::xla::XlaTritonDialect,\n-                   mlir::func::FuncDialect, mlir::tensor::TensorDialect>();\n+  mlir_context.loadDialect<\n+      ttir::TritonDialect, ttir::gpu::TritonGPUDialect,\n+      mlir::arith::ArithDialect, mlir::affine::AffineDialect,\n+      mlir::LLVM::LLVMDialect, xla::XlaDialect, xla::gpu::XlaGpuDialect,\n+      ttir::xla::XlaTritonDialect, mlir::func::FuncDialect,\n+      mlir::tensor::TensorDialect, stablehlo::StablehloDialect>();\n   mlir::DialectRegistry registry;\n   mlir::func::registerInlinerExtension(registry);\n   mlir::LLVM::registerInlinerInterface(registry);\n@@ -2048,6 +2051,19 @@ absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> CreateTritonModule(\n         ExtractInstructionIntoNewModule(*fusion)->ToString());\n   }\n \n+  {  // Convert xTile ops to Triton ops.\n+    mlir::PassManager pm(&mlir_context);\n+    // Disable verifier because the Triton code may be invalid due to the\n+    // unsupported types.\n+    pm.enableVerifier(/*enabled=*/false);\n+    pm.addPass(mlir::triton::xla::CreateStableHLOLowerToTritonPass());\n+    if (mlir::failed(pm.run(triton_module.get()))) {\n+      return CreateInternalError(\n+          \"Failed to convert xTile ops to Triton ops for fusion:\", fusion,\n+          *triton_module);\n+    }\n+  }\n+\n   if (debug_options.xla_gpu_experimental_scaled_dot_with_triton()) {\n     // Convert unsupported types before verification.\n     mlir::PassManager pm(&mlir_context);"
+        },
+        {
+            "sha": "1ba61058497d4fba0f950485ca241061fec087e8",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/transforms/BUILD",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e553491067f16c59a87610ee002e2cafbd30cc72/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e553491067f16c59a87610ee002e2cafbd30cc72/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2FBUILD?ref=e553491067f16c59a87610ee002e2cafbd30cc72",
+            "patch": "@@ -35,6 +35,7 @@ cc_library(\n         \"generalize_kernel_signature.cc\",\n         \"int4_passes.cc\",\n         \"round_f32_to_tf32_for_tf32_dot_pass.cc\",\n+        \"stablehlo_lower_to_triton.cc\",\n         \"triton_xla_convert_unsupported_types.cc\",\n         \"triton_xla_extract_insert_to_triton_pass.cc\",\n         \"triton_xla_fold_transpose_pass.cc\",\n@@ -78,6 +79,7 @@ cc_library(\n         \"@llvm-project//mlir:SCFTransforms\",\n         \"@llvm-project//mlir:Support\",\n         \"@llvm-project//mlir:TransformUtils\",\n+        \"@stablehlo//:stablehlo_ops\",\n         \"@triton//:TritonDialects\",\n     ],\n )"
+        },
+        {
+            "sha": "0506844311f1c83311530fee47baaba6558a0ffa",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/transforms/passes.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e553491067f16c59a87610ee002e2cafbd30cc72/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Fpasses.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e553491067f16c59a87610ee002e2cafbd30cc72/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Fpasses.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Fpasses.h?ref=e553491067f16c59a87610ee002e2cafbd30cc72",
+            "patch": "@@ -45,6 +45,7 @@ std::unique_ptr<mlir::Pass> CreateTritonXLALowerAtomicsPass();\n std::unique_ptr<mlir::Pass> CreateTritonXLALowerBlockBarrierPass();\n std::unique_ptr<mlir::Pass> CreateTritonXLAConvertUnsupportedTypesPass();\n std::unique_ptr<mlir::Pass> CreateTritonXLALowerRemoteAccessPass();\n+std::unique_ptr<mlir::Pass> CreateStableHLOLowerToTritonPass();\n \n // Returns true if the `op` contains an operation in it's regions that satisfies\n // the `fn`."
+        },
+        {
+            "sha": "b244f2f05ec9c2f56dad2857bad6230751fa99d6",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/transforms/passes.td",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 0,
+            "changes": 10,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e553491067f16c59a87610ee002e2cafbd30cc72/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Fpasses.td",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e553491067f16c59a87610ee002e2cafbd30cc72/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Fpasses.td",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Fpasses.td?ref=e553491067f16c59a87610ee002e2cafbd30cc72",
+            "patch": "@@ -190,4 +190,14 @@ def TritonXLAUnswitchLoopsPass :\n   let constructor = \"CreateTritonXLAUnswitchLoopsPass()\";\n }\n \n+def StableHLOLowerToTritonPass\n+    : Pass<\"stablehlo-lower-to-triton\", \"mlir::ModuleOp\"> {\n+  let summary = \"Lowers StableHLO operations to their Triton equivalent.\";\n+  let dependentDialects = [\n+    \"stablehlo::StablehloDialect\",\n+    \"triton::TritonDialect\"\n+  ];\n+  let constructor = \"CreateStableHLOLowerToTritonPass()\";\n+}\n+\n #endif  // XLA_BACKENDS_GPU_CODEGEN_TRITON_PASSES_TD_"
+        },
+        {
+            "sha": "a5506fd37816395f2fb299dc42f89092a52da798",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/transforms/stablehlo_lower_to_triton.cc",
+            "status": "added",
+            "additions": 79,
+            "deletions": 0,
+            "changes": 79,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e553491067f16c59a87610ee002e2cafbd30cc72/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Fstablehlo_lower_to_triton.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e553491067f16c59a87610ee002e2cafbd30cc72/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Fstablehlo_lower_to_triton.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Fstablehlo_lower_to_triton.cc?ref=e553491067f16c59a87610ee002e2cafbd30cc72",
+            "patch": "@@ -0,0 +1,79 @@\n+/* Copyright 2025 The OpenXLA Authors.\n+\n+Licensed under the Apache License, Version 2.0 (the \"License\");\n+you may not use this file except in compliance with the License.\n+You may obtain a copy of the License at\n+\n+    http://www.apache.org/licenses/LICENSE-2.0\n+\n+Unless required by applicable law or agreed to in writing, software\n+distributed under the License is distributed on an \"AS IS\" BASIS,\n+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+See the License for the specific language governing permissions and\n+limitations under the License.\n+==============================================================================*/\n+\n+#include <cstdint>\n+#include <memory>\n+#include <utility>\n+\n+#include \"llvm/ADT/SmallVector.h\"\n+#include \"mlir/Dialect/Func/IR/FuncOps.h\"\n+#include \"mlir/IR/BuiltinTypeInterfaces.h\"\n+#include \"mlir/IR/PatternMatch.h\"\n+#include \"mlir/IR/Value.h\"\n+#include \"mlir/Pass/Pass.h\"\n+#include \"mlir/Support/LLVM.h\"\n+#include \"mlir/Support/LogicalResult.h\"\n+#include \"mlir/Transforms/DialectConversion.h\"\n+#include \"mlir/Transforms/GreedyPatternRewriteDriver.h\"\n+#include \"stablehlo/dialect/StablehloOps.h\"\n+#include \"triton/Dialect/Triton/IR/Dialect.h\"\n+\n+namespace mlir::triton::xla {\n+\n+namespace ttir = ::mlir::triton;\n+\n+#define GEN_PASS_DEF_STABLEHLOLOWERTOTRITONPASS\n+#include \"xla/backends/gpu/codegen/triton/transforms/passes.h.inc\"\n+\n+namespace {\n+\n+class LowerTranspose : public mlir::OpRewritePattern<stablehlo::TransposeOp> {\n+ public:\n+  using OpRewritePattern::OpRewritePattern;\n+\n+ private:\n+  mlir::LogicalResult matchAndRewrite(\n+      stablehlo::TransposeOp op,\n+      mlir::PatternRewriter& rewriter) const override {\n+    SmallVector<int32_t> permutation =\n+        llvm::to_vector_of<int32_t>(op.getPermutation());\n+    rewriter.replaceOpWithNewOp<ttir::TransOp>(op, op.getResult().getType(),\n+                                               op.getOperand(), permutation);\n+    return mlir::success();\n+  }\n+};\n+\n+class StableHLOLowerToTritonPass\n+    : public impl::StableHLOLowerToTritonPassBase<StableHLOLowerToTritonPass> {\n+ public:\n+  void runOnOperation() override {\n+    mlir::MLIRContext* mlir_context = &getContext();\n+    mlir::RewritePatternSet patterns(mlir_context);\n+    patterns.add<LowerTranspose>(mlir_context);\n+\n+    if (mlir::failed(\n+            mlir::applyPatternsGreedily(getOperation(), std::move(patterns)))) {\n+      return signalPassFailure();\n+    }\n+  }\n+};\n+\n+}  // namespace\n+\n+std::unique_ptr<Pass> CreateStableHLOLowerToTritonPass() {\n+  return std::make_unique<StableHLOLowerToTritonPass>();\n+}\n+\n+}  // namespace mlir::triton::xla"
+        },
+        {
+            "sha": "65c88524a078aad281686cdc09134cf3e63bf9a9",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/transforms/tests/stable_hlo_to_triton_lowering.mlir",
+            "status": "added",
+            "additions": 11,
+            "deletions": 0,
+            "changes": 11,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e553491067f16c59a87610ee002e2cafbd30cc72/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftests%2Fstable_hlo_to_triton_lowering.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e553491067f16c59a87610ee002e2cafbd30cc72/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftests%2Fstable_hlo_to_triton_lowering.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftests%2Fstable_hlo_to_triton_lowering.mlir?ref=e553491067f16c59a87610ee002e2cafbd30cc72",
+            "patch": "@@ -0,0 +1,11 @@\n+// RUN: xla-opt %s -split-input-file \\\n+// RUN: -stablehlo-lower-to-triton \\\n+// RUN: | FileCheck %s\n+\n+// CHECK: func @lower_transpose(%[[ARG:.*]]: tensor<2x4x8xf32>) -> tensor<8x2x4xf32>\n+func.func @lower_transpose(%arg0: tensor<2x4x8xf32>) -> tensor<8x2x4xf32> {\n+  // CHECK: %[[RES:.*]] = tt.trans %[[ARG]] {order = array<i32: 2, 0, 1>} : tensor<2x4x8xf32> -> tensor<8x2x4xf32>\n+  %0 = stablehlo.transpose %arg0, dims = [2, 0, 1] : (tensor<2x4x8xf32>) -> tensor<8x2x4xf32>\n+  // CHECK: return %[[RES]] : tensor<8x2x4xf32>\n+  return %0 : tensor<8x2x4xf32>\n+}"
+        },
+        {
+            "sha": "87fbd7160f9a0c7707802913ab627008e6e1c4a6",
+            "filename": "third_party/xla/xla/service/gpu/tests/BUILD",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 2,
+            "changes": 5,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e553491067f16c59a87610ee002e2cafbd30cc72/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftests%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e553491067f16c59a87610ee002e2cafbd30cc72/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftests%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftests%2FBUILD?ref=e553491067f16c59a87610ee002e2cafbd30cc72",
+            "patch": "@@ -695,9 +695,10 @@ lit_test_suite(\n #         \"@llvm-project//mlir:LLVMToLLVMIRTranslation\",\n #         \"@llvm-project//mlir:MlirOptLib\",\n #         \"@llvm-project//mlir:Pass\",\n-#         \"@llvm-project//mlir:RegisterAllExtensions\",\n+#         \"@llvm-project//mlir:RegisterAllExtensions\",  # buildcleaner: keep\n #         \"@llvm-project//mlir:Support\",\n #         \"@llvm-project//mlir:TensorDialect\",\n+#         \"@stablehlo//:stablehlo_ops\",\n #         \"//xla/backends/gpu/codegen/emitters/transforms:passes\",\n #         \"//xla/backends/gpu/codegen/triton:compilation_pipeline\",\n #         \"//xla/backends/gpu/codegen/triton/ir:triton_xla\",\n@@ -708,7 +709,7 @@ lit_test_suite(\n #         \"//xla/stream_executor/cuda:cuda_compute_capability\",\n #         \"@triton//:AllPassesAndDialects\",\n #         \"@triton//:TritonNvidiaGPUTransforms\",\n-#         \"@triton//third_party/amd:TestAMDAnalysis\",\n+#         \"@triton//third_party/amd:TestAMDAnalysis\",  # buildcleaner: keep\n #     ],\n # )\n # copybara:uncomment_end"
+        },
+        {
+            "sha": "b8fdd6c5212418b9300ce173236684f3a6351a48",
+            "filename": "third_party/xla/xla/service/gpu/tests/xla-opt.cc",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 2,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e553491067f16c59a87610ee002e2cafbd30cc72/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftests%2Fxla-opt.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e553491067f16c59a87610ee002e2cafbd30cc72/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftests%2Fxla-opt.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftests%2Fxla-opt.cc?ref=e553491067f16c59a87610ee002e2cafbd30cc72",
+            "patch": "@@ -27,6 +27,7 @@ limitations under the License.\n #include \"mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h\"\n #include \"mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h\"\n #include \"mlir/Tools/mlir-opt/MlirOptMain.h\"\n+#include \"stablehlo/dialect/StablehloOps.h\"\n #include \"xla/backends/gpu/codegen/emitters/transforms/passes.h\"\n #include \"xla/backends/gpu/codegen/triton/compilation_pipeline.h\"\n #include \"xla/backends/gpu/codegen/triton/ir/triton_xla_ops.h\"\n@@ -77,7 +78,7 @@ mlir::PassPipelineRegistration<TritonPipelineOptions>\n \n }  // namespace\n \n-int main(int argc, char **argv) {\n+int main(int argc, char** argv) {\n   mlir::DialectRegistry registry;\n   mlir::registerAllExtensions(registry);\n   registerBuiltinDialectTranslation(registry);\n@@ -86,7 +87,8 @@ int main(int argc, char **argv) {\n   mlir::func::registerInlinerExtension(registry);\n   registerTritonDialects(registry);  // This registers all passes as well.\n   registry.insert<mlir::func::FuncDialect, mlir::tensor::TensorDialect,\n-                  mlir::triton::xla::XlaTritonDialect, xla::XlaDialect>();\n+                  mlir::triton::xla::XlaTritonDialect, xla::XlaDialect,\n+                  mlir::stablehlo::StablehloDialect>();\n   mlir::triton::xla::registerTritonXlaTransformsPasses();\n   xla::emitters::registerTransformsPasses();\n   xla::gpu::registerGpuFusionTransformsPasses();"
+        }
+    ],
+    "stats": {
+        "total": 147,
+        "additions": 135,
+        "deletions": 12
+    }
+}

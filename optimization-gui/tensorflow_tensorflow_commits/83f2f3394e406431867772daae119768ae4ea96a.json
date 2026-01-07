@@ -1,0 +1,48 @@
+{
+    "author": "nputikhin",
+    "message": "[XLA:GPU] Clamp split_k per (block_m, block_n) tile in dot search space\n\nPreviously the split-K limits were calculated globally, which means that default configs could end up using values from unrelated tiles.\n\nPiperOrigin-RevId: 804442383",
+    "sha": "83f2f3394e406431867772daae119768ae4ea96a",
+    "files": [
+        {
+            "sha": "84e5143dbaeaf55f9f2f91a198bd745c63b089d6",
+            "filename": "third_party/xla/xla/service/gpu/autotuning/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/83f2f3394e406431867772daae119768ae4ea96a/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/83f2f3394e406431867772daae119768ae4ea96a/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2FBUILD?ref=83f2f3394e406431867772daae119768ae4ea96a",
+            "patch": "@@ -283,6 +283,7 @@ cc_library(\n         \"//xla/stream_executor:device_description\",\n         \"//xla/stream_executor/cuda:cuda_compute_capability\",\n         \"//xla/tsl/lib/core:bits\",\n+        \"@com_google_absl//absl/container:flat_hash_map\",\n         \"@com_google_absl//absl/container:flat_hash_set\",\n         \"@com_google_absl//absl/log\",\n         \"@com_google_absl//absl/log:check\","
+        },
+        {
+            "sha": "af7271a0ce9608dcdeb0e8c67add496e857ad418",
+            "filename": "third_party/xla/xla/service/gpu/autotuning/dot_search_space.cc",
+            "status": "modified",
+            "additions": 26,
+            "deletions": 5,
+            "changes": 31,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/83f2f3394e406431867772daae119768ae4ea96a/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fdot_search_space.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/83f2f3394e406431867772daae119768ae4ea96a/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fdot_search_space.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fdot_search_space.cc?ref=83f2f3394e406431867772daae119768ae4ea96a",
+            "patch": "@@ -23,6 +23,7 @@ limitations under the License.\n #include <utility>\n #include <vector>\n \n+#include \"absl/container/flat_hash_map.h\"\n #include \"absl/container/flat_hash_set.h\"\n #include \"absl/log/check.h\"\n #include \"absl/log/log.h\"\n@@ -171,9 +172,28 @@ std::vector<TritonGemmConfig> TritonDotFusionSearchSpace::OptimizeConfigSet(\n     return configs;\n   }\n \n-  auto split_limits = std::minmax_element(\n-      configs.begin(), configs.end(),\n-      [](const auto& a, const auto& b) { return a.split_k < b.split_k; });\n+  absl::flat_hash_map<std::pair<int, int>, std::pair<int, int>>\n+      m_n_to_split_limits;\n+  std::pair<int, int> global_split_limits;\n+  auto update_split_limits = [](auto& limits, int value) {\n+    limits = std::minmax({limits.first, limits.second, value});\n+  };\n+  for (const TritonGemmConfig& config : configs) {\n+    auto m_n_key = std::make_pair(config.block_m, config.block_n);\n+    auto& split_limits =\n+        m_n_to_split_limits.try_emplace(m_n_key, config.split_k, config.split_k)\n+            .first->second;\n+    update_split_limits(split_limits, config.split_k);\n+    update_split_limits(global_split_limits, config.split_k);\n+  }\n+\n+  auto get_split_limits = [&](int block_m, int block_n) {\n+    auto m_n_key = std::make_pair(block_m, block_n);\n+    auto split_limits_it = m_n_to_split_limits.find(m_n_key);\n+    return split_limits_it == m_n_to_split_limits.end()\n+               ? global_split_limits\n+               : split_limits_it->second;\n+  };\n   absl::flat_hash_set<TritonGemmConfig> filter;\n   for (TritonGemmConfig config : hints) {\n     // Our default config set does not take problem size into account, so we\n@@ -188,8 +208,9 @@ std::vector<TritonGemmConfig> TritonDotFusionSearchSpace::OptimizeConfigSet(\n         std::clamp(config.block_k, min_contracting_tile_size_,\n                    GetMaxContractingTileSize({config.block_m, config.block_n},\n                                              /*contracting_split=*/1));\n-    config.split_k = std::clamp(config.split_k, split_limits.first->split_k,\n-                                split_limits.second->split_k);\n+    const auto& split_limits = get_split_limits(config.block_m, config.block_n);\n+    config.split_k =\n+        std::clamp(config.split_k, split_limits.first, split_limits.second);\n     VLOG(10) << \"Adding config to hint filter: \" << config.ToString();\n     filter.insert(config);\n   }"
+        },
+        {
+            "sha": "d70c2a3b711c43b8dc16d80a6c7cae0d723c71ab",
+            "filename": "third_party/xla/xla/service/gpu/autotuning/dot_search_space_test.cc",
+            "status": "modified",
+            "additions": 51,
+            "deletions": 0,
+            "changes": 51,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/83f2f3394e406431867772daae119768ae4ea96a/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fdot_search_space_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/83f2f3394e406431867772daae119768ae4ea96a/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fdot_search_space_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fdot_search_space_test.cc?ref=83f2f3394e406431867772daae119768ae4ea96a",
+            "patch": "@@ -16,6 +16,7 @@ limitations under the License.\n #include \"xla/service/gpu/autotuning/dot_search_space.h\"\n \n #include <memory>\n+#include <ostream>\n #include <vector>\n \n #include <gmock/gmock.h>\n@@ -35,6 +36,12 @@ limitations under the License.\n #include \"xla/tsl/platform/statusor.h\"\n \n namespace xla::gpu {\n+\n+// Prints a TritonGemmConfig for test messages.\n+void PrintTo(const TritonGemmConfig& config, std::ostream* os) {\n+  *os << config.ToString();\n+}\n+\n namespace {\n \n using ::testing::AllOf;\n@@ -582,5 +589,49 @@ TEST_F(DotSearchSpaceTest, ReturnsNonEmptySetForUnusualHints) {\n       Not(IsEmpty()));\n }\n \n+TEST_F(DotSearchSpaceTest, RestrictsSplitKPerNMTile) {\n+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,\n+                          GetDefaultDotModule());\n+  TritonDotFusionSearchSpace search_space = MakeSearchSpace(module.get());\n+\n+  auto make_config = [](int block_m, int block_n, int block_k, int split_k) {\n+    return TritonGemmConfig{\n+        /*block_m=*/block_m, /*block_n=*/block_n,\n+        /*block_k=*/block_k, /*split_k=*/split_k,\n+        /*num_stages=*/1,    /*num_warps=*/4,\n+        /*num_ctas=*/1};\n+  };\n+\n+  std::vector<TritonGemmConfig> configs = {\n+      make_config(32, 32, 32, 4),\n+      make_config(32, 32, 32, 8),\n+      make_config(16, 16, 16, 2),\n+      make_config(16, 16, 16, 4),\n+  };\n+\n+  std::vector<TritonGemmConfig> hints = {\n+      // Less than min split k for this tile size.\n+      make_config(32, 32, 32, 1),\n+      // Greater than max split K for this tile size.\n+      make_config(32, 32, 32, 32),\n+      // Less than min split k for this tile size.\n+      make_config(16, 16, 16, 1),\n+      // Greater than max split K for this tile size.\n+      make_config(16, 16, 16, 8),\n+      // Does not have a per-tile split K limit.\n+      make_config(16, 32, 16, 32),\n+  };\n+\n+  std::vector<TritonGemmConfig> expected = {\n+      make_config(32, 32, 32, 4),\n+      make_config(32, 32, 32, 8),\n+      make_config(16, 16, 16, 2),\n+      make_config(16, 16, 16, 4),\n+  };\n+\n+  EXPECT_THAT(search_space.OptimizeConfigSet(configs, hints),\n+              ElementsAreArray(expected));\n+}\n+\n }  // namespace\n }  // namespace xla::gpu"
+        }
+    ],
+    "stats": {
+        "total": 83,
+        "additions": 78,
+        "deletions": 5
+    }
+}

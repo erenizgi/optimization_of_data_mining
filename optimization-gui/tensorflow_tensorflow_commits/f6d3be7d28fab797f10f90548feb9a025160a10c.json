@@ -1,0 +1,72 @@
+{
+    "author": "tensorflower-gardener",
+    "message": "Reverts faf3c370e08bee758945f24b6073707f8ba9a7d3\n\nPiperOrigin-RevId: 850261825",
+    "sha": "f6d3be7d28fab797f10f90548feb9a025160a10c",
+    "files": [
+        {
+            "sha": "31d618c31b886bffef5adb8122da0a0fc16846ab",
+            "filename": "third_party/xla/xla/service/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f6d3be7d28fab797f10f90548feb9a025160a10c/third_party%2Fxla%2Fxla%2Fservice%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f6d3be7d28fab797f10f90548feb9a025160a10c/third_party%2Fxla%2Fxla%2Fservice%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2FBUILD?ref=f6d3be7d28fab797f10f90548feb9a025160a10c",
+            "patch": "@@ -1026,6 +1026,7 @@ cc_library(\n         \"//xla/hlo/pass:hlo_pass\",\n         \"//xla/hlo/transforms/simplifiers:hlo_dce\",\n         \"//xla/hlo/utils:hlo_query\",\n+        \"//xla/service/spmd/shardy:constants\",\n         \"//xla/tsl/platform:errors\",\n         \"//xla/tsl/platform:statusor\",\n         \"@com_google_absl//absl/algorithm:container\","
+        },
+        {
+            "sha": "ac16c42f64ca6baef13d69a8fe8ed9c9984e4e91",
+            "filename": "third_party/xla/xla/service/call_inliner.cc",
+            "status": "modified",
+            "additions": 19,
+            "deletions": 0,
+            "changes": 19,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f6d3be7d28fab797f10f90548feb9a025160a10c/third_party%2Fxla%2Fxla%2Fservice%2Fcall_inliner.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f6d3be7d28fab797f10f90548feb9a025160a10c/third_party%2Fxla%2Fxla%2Fservice%2Fcall_inliner.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fcall_inliner.cc?ref=f6d3be7d28fab797f10f90548feb9a025160a10c",
+            "patch": "@@ -28,6 +28,7 @@ limitations under the License.\n #include \"absl/log/log.h\"\n #include \"absl/status/status.h\"\n #include \"absl/status/statusor.h\"\n+#include \"absl/strings/match.h\"\n #include \"absl/strings/str_cat.h\"\n #include \"absl/strings/string_view.h\"\n #include \"absl/types/span.h\"\n@@ -44,6 +45,7 @@ limitations under the License.\n #include \"xla/hlo/utils/hlo_query.h\"\n #include \"xla/service/call_graph.h\"\n #include \"xla/service/hlo_domain_isolator.h\"\n+#include \"xla/service/spmd/shardy/constants.h\"\n #include \"xla/status_macros.h\"\n #include \"xla/tsl/platform/errors.h\"\n #include \"xla/tsl/platform/statusor.h\"\n@@ -332,6 +334,23 @@ bool CallInliner::IsInlineableCallOp(HloInstruction* instruction) const {\n   if (!prerequisite) {\n     return false;\n   }\n+  if (instruction->GetModule()->config().use_shardy_partitioner() &&\n+      (absl::StrContains(instruction->to_apply()->name(), \"shmap_body\") ||\n+       absl::StrContains(instruction->to_apply()->name(),\n+                         sdy::kManualComputationFuncName.str()))) {\n+    // TODO(b/436603025). Remove this special handling by marking the\n+    // instruction as uninlineable with the frontend attribute.\n+    //\n+    // Specific inlining rules when needing to round-trip from MLIR->HLO->MLIR\n+    // when using Shardy (github.com/openxla/shardy).\n+    //\n+    // - shmap_body: We do not want to inline the bodies of JAX shard maps to\n+    //   import them into an `sdy.ManualComputationOp`. This is for the MHLO\n+    //   round-trip pipeline\n+    // - kManualComputationFuncName: Same as shmap_body except for the SDY\n+    //   round-trip pipeline.\n+    return false;\n+  }\n   return InlineComposites(instruction, composites_to_preserve_);\n }\n "
+        },
+        {
+            "sha": "ebc774166ff38be2bf650cd85a160a99f96c8f2c",
+            "filename": "third_party/xla/xla/service/call_inliner_test.cc",
+            "status": "modified",
+            "additions": 88,
+            "deletions": 0,
+            "changes": 88,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f6d3be7d28fab797f10f90548feb9a025160a10c/third_party%2Fxla%2Fxla%2Fservice%2Fcall_inliner_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f6d3be7d28fab797f10f90548feb9a025160a10c/third_party%2Fxla%2Fxla%2Fservice%2Fcall_inliner_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fcall_inliner_test.cc?ref=f6d3be7d28fab797f10f90548feb9a025160a10c",
+            "patch": "@@ -511,6 +511,94 @@ TEST_F(CallInlinerTest, InlineCallWithOverriddenAttributeInlineableFalse) {\n   EXPECT_EQ(call, nullptr);\n }\n \n+TEST_F(CallInlinerTest, UseShardyMhloToHloShmapBodyNotInlined) {\n+  const char* const hloString = R\"(\n+    HloModule jit_f, entry_computation_layout={(f32[8,8]{1,0})->f32[8,8]{1,0}}\n+\n+    %prefix_shmap_body_suffix.4 (Arg_0.5: f32[1,8]) -> f32[1,8] {\n+      %Arg_0.5 = f32[1,8]{1,0} parameter(0)\n+      ROOT %add.6 = f32[1,8]{1,0} add(f32[1,8]{1,0} %Arg_0.5, f32[1,8]{1,0} %Arg_0.5), metadata={source_file=\"-\" source_line=11}\n+    }\n+\n+    ENTRY %main.10 (Arg_0.1: f32[8,8]) -> f32[8,8] {\n+      %Arg_0.1 = f32[8,8]{1,0} parameter(0)\n+      %custom-call.2 = f32[8,8]{1,0} custom-call(f32[8,8]{1,0} %Arg_0.1), custom_call_target=\"Sharding\", sharding={devices=[8,1]<=[8]}, metadata={source_file=\"-\" source_line=3}\n+      %custom-call.3 = f32[1,8]{1,0} custom-call(f32[8,8]{1,0} %custom-call.2), custom_call_target=\"SPMDFullToShardShape\", sharding={manual}, metadata={source_file=\"-\" source_line=4}\n+      %call.7 = f32[1,8]{1,0} call(f32[1,8]{1,0} %custom-call.3), to_apply=%prefix_shmap_body_suffix.4\n+      %custom-call.8 = f32[1,8]{1,0} custom-call(f32[1,8]{1,0} %call.7), custom_call_target=\"Sharding\", sharding={manual}, metadata={source_file=\"-\" source_line=6}\n+      ROOT %custom-call.9 = f32[8,8]{1,0} custom-call(f32[1,8]{1,0} %custom-call.8), custom_call_target=\"SPMDShardToFullShape\", sharding={devices=[8,1]<=[8]}, metadata={source_file=\"-\" source_line=7}\n+    })\";\n+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(hloString));\n+  module->mutable_config().set_use_shardy_partitioner(true);\n+  TF_ASSERT_OK_AND_ASSIGN(bool changed, CallInliner().Run(module.get()));\n+  VLOG(1) << module->ToString();\n+  // The single call in the module is not inlined.\n+  EXPECT_FALSE(changed);\n+\n+  HloInstruction* call = FindInstruction(module.get(), xla::HloOpcode::kCall);\n+  EXPECT_NE(call, nullptr);\n+  EXPECT_TRUE(call->has_to_apply());\n+  EXPECT_EQ(call->to_apply()->name(), \"prefix_shmap_body_suffix.4\");\n+}\n+\n+// Don't inline when the name starts with \"xla.sdy.manual_computation_body\".\n+TEST_F(CallInlinerTest, UseShardManualComputationBodyNotInlined) {\n+  const char* const hloString = R\"(\n+    HloModule jit_f, entry_computation_layout={(f32[8,8]{1,0})->f32[8,8]{1,0}}\n+\n+    %xla.sdy.manual_computation_body.4 (Arg_0.5: f32[1,8]) -> f32[1,8] {\n+      %Arg_0.5 = f32[1,8]{1,0} parameter(0)\n+      ROOT %add.6 = f32[1,8]{1,0} add(f32[1,8]{1,0} %Arg_0.5, f32[1,8]{1,0} %Arg_0.5), metadata={source_file=\"-\" source_line=11}\n+    }\n+\n+    ENTRY %main.10 (Arg_0.1: f32[8,8]) -> f32[8,8] {\n+      %Arg_0.1 = f32[8,8]{1,0} parameter(0)\n+      %custom-call.3 = f32[1,8]{1,0} custom-call(f32[8,8]{1,0} %Arg_0.1), custom_call_target=\"SPMDFullToShardShape\", sharding={manual}, metadata={source_file=\"-\" source_line=4}\n+      %call.7 = f32[1,8]{1,0} call(f32[1,8]{1,0} %custom-call.3), to_apply=%xla.sdy.manual_computation_body.4\n+      ROOT %custom-call.9 = f32[8,8]{1,0} custom-call(f32[1,8]{1,0} %call.7), custom_call_target=\"SPMDShardToFullShape\", sharding={devices=[8,1]<=[8]}, metadata={source_file=\"-\" source_line=7}\n+    })\";\n+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(hloString));\n+  module->mutable_config().set_use_shardy_partitioner(true);\n+  TF_ASSERT_OK_AND_ASSIGN(bool changed, CallInliner().Run(module.get()));\n+  // The single call in the module is not inlined.\n+  EXPECT_FALSE(changed);\n+\n+  HloInstruction* call = FindInstruction(module.get(), xla::HloOpcode::kCall);\n+  EXPECT_NE(call, nullptr);\n+  EXPECT_TRUE(call->has_to_apply());\n+  EXPECT_EQ(call->to_apply()->name(), \"xla.sdy.manual_computation_body.4\");\n+}\n+\n+// Make sure we check the name of the called function contains the string, not\n+// just the prefix/suffix.\n+TEST_F(CallInlinerTest, UseShardManualComputationBodySurroundedNotInlined) {\n+  const char* const hloString = R\"(\n+    HloModule jit_f, entry_computation_layout={(f32[8,8]{1,0})->f32[8,8]{1,0}}\n+\n+    %my_model.___call__.fwd.xla.sdy.manual_computation_body_14.1234 (Arg_0.5: f32[1,8]) -> f32[1,8] {\n+      %Arg_0.5 = f32[1,8]{1,0} parameter(0)\n+      ROOT %add.6 = f32[1,8]{1,0} add(f32[1,8]{1,0} %Arg_0.5, f32[1,8]{1,0} %Arg_0.5), metadata={source_file=\"-\" source_line=11}\n+    }\n+\n+    ENTRY %main.10 (Arg_0.1: f32[8,8]) -> f32[8,8] {\n+      %Arg_0.1 = f32[8,8]{1,0} parameter(0)\n+      %custom-call.3 = f32[1,8]{1,0} custom-call(f32[8,8]{1,0} %Arg_0.1), custom_call_target=\"SPMDFullToShardShape\", sharding={manual}, metadata={source_file=\"-\" source_line=4}\n+      %call.7 = f32[1,8]{1,0} call(f32[1,8]{1,0} %custom-call.3), to_apply=%my_model.___call__.fwd.xla.sdy.manual_computation_body_14.1234\n+      ROOT %custom-call.9 = f32[8,8]{1,0} custom-call(f32[1,8]{1,0} %call.7), custom_call_target=\"SPMDShardToFullShape\", sharding={devices=[8,1]<=[8]}, metadata={source_file=\"-\" source_line=7}\n+    })\";\n+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(hloString));\n+  module->mutable_config().set_use_shardy_partitioner(true);\n+  TF_ASSERT_OK_AND_ASSIGN(bool changed, CallInliner().Run(module.get()));\n+  // The single call in the module is not inlined.\n+  EXPECT_FALSE(changed);\n+\n+  HloInstruction* call = FindInstruction(module.get(), xla::HloOpcode::kCall);\n+  EXPECT_NE(call, nullptr);\n+  EXPECT_TRUE(call->has_to_apply());\n+  EXPECT_EQ(call->to_apply()->name(),\n+            \"my_model.___call__.fwd.xla.sdy.manual_computation_body_14.1234\");\n+}\n+\n TEST_F(CallInlinerTest, ControlDepsPropagateToRootOfInlinedInstructions) {\n   const char* hlo = R\"(\n   HloModule test"
+        },
+        {
+            "sha": "336d7855e2932397a12ece61707acfedb69f3d00",
+            "filename": "third_party/xla/xla/service/spmd/shardy/shardy_xla_pass.cc",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f6d3be7d28fab797f10f90548feb9a025160a10c/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Fshardy_xla_pass.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f6d3be7d28fab797f10f90548feb9a025160a10c/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Fshardy_xla_pass.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Fshardy_xla_pass.cc?ref=f6d3be7d28fab797f10f90548feb9a025160a10c",
+            "patch": "@@ -409,6 +409,12 @@ bool eraseInlineableAttrForShardyManualComputations(HloModule* module) {\n       if (absl::StrContains(instruction->to_apply()->name(),\n                             sdy::kManualComputationFuncName.str())) {\n         instruction->erase_frontend_attribute(kXlaInlineableAttr);\n+        // TODO(b/436603025). CallInliner do not inline the Shardy related\n+        // manual computations based on the callee name. We have to rename the\n+        // callee to a name such that it can be inlined. If we can remove the\n+        // special handling in CallInliner, we can remove this renaming.\n+        module->SetAndUniquifyComputationName(instruction->to_apply(),\n+                                              \"inlineable_callee\");\n         changed = true;\n       }\n     }"
+        },
+        {
+            "sha": "9e2c4d2fe9401f4e91c69d12c89fcfec26b53ef5",
+            "filename": "third_party/xla/xla/service/spmd/shardy/shardy_xla_pass_test.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f6d3be7d28fab797f10f90548feb9a025160a10c/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Fshardy_xla_pass_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f6d3be7d28fab797f10f90548feb9a025160a10c/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Fshardy_xla_pass_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Fshardy_xla_pass_test.cc?ref=f6d3be7d28fab797f10f90548feb9a025160a10c",
+            "patch": "@@ -1116,6 +1116,7 @@ TEST_F(ShardyXLATest, UpdateInlineableAttr) {\n   HloInstruction* root = module->entry_computation()->root_instruction();\n   EXPECT_EQ(root->opcode(), HloOpcode::kCall);\n   EXPECT_FALSE(root->has_frontend_attributes());\n+  EXPECT_EQ(root->to_apply()->name(), \"inlineable_callee\");\n }\n \n TEST_F(ShardyXLATest, ManualComputationCallOpWithToken) {"
+        }
+    ],
+    "stats": {
+        "total": 115,
+        "additions": 115,
+        "deletions": 0
+    }
+}

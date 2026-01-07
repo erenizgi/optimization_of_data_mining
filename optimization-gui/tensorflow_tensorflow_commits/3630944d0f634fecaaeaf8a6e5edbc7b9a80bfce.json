@@ -1,0 +1,72 @@
+{
+    "author": "ezhulenev",
+    "message": "[xla:ffi] Add support for binding Context object to the handler\n\nPiperOrigin-RevId: 824278531",
+    "sha": "3630944d0f634fecaaeaf8a6e5edbc7b9a80bfce",
+    "files": [
+        {
+            "sha": "0be6b39fb845eb774a12a5181466309a24db57f6",
+            "filename": "third_party/xla/xla/ffi/api/api.h",
+            "status": "modified",
+            "additions": 39,
+            "deletions": 2,
+            "changes": 41,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/3630944d0f634fecaaeaf8a6e5edbc7b9a80bfce/third_party%2Fxla%2Fxla%2Fffi%2Fapi%2Fapi.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/3630944d0f634fecaaeaf8a6e5edbc7b9a80bfce/third_party%2Fxla%2Fxla%2Fffi%2Fapi%2Fapi.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fffi%2Fapi%2Fapi.h?ref=3630944d0f634fecaaeaf8a6e5edbc7b9a80bfce",
+            "patch": "@@ -463,9 +463,14 @@ inline XLA_FFI_Error* Ffi::StructSizeIsGreaterOrEqual(\n // Type tags for distinguishing handler argument types\n //===----------------------------------------------------------------------===//\n \n-// Forward declare.\n+// Dictionary gives type-safe run time access to all attributes. Concrete\n+// implementation is provided by the `ffi.h` header.\n class Dictionary;\n \n+// Context gives run time access to the execution context. Concrete\n+// implementation is provided by the `ffi.h` header.\n+class Context;\n+\n namespace internal {\n \n // WARNING: A lot of template metaprogramming on top of C++ variadic templates\n@@ -500,7 +505,7 @@ struct AttrTag {};\n \n // A type tag to forward all attributes as `Dictionary` (and optionally decode\n // it into a custom struct).\n-template <typename T = Dictionary>\n+template <typename T>\n struct AttrsTag {};\n \n // A type tag to distinguish parameter extracted from an execution context.\n@@ -655,6 +660,10 @@ class Binding {\n     return {std::move(*this)};\n   }\n \n+  Binding<stage, Ts..., internal::CtxTag<Context>> Ctx() && {\n+    return {std::move(*this)};\n+  }\n+\n   template <typename T>\n   Binding<stage, Ts..., internal::AttrTag<T>> Attr(std::string attr) && {\n     static_assert(internal::NumTagged<internal::AttrsTag, Ts...>::value == 0,\n@@ -1402,6 +1411,34 @@ struct internal::Decode<internal::AttrsTag<T>> {\n   }\n };\n \n+//===----------------------------------------------------------------------===//\n+// Type-safe wrapper for accessing context.\n+//===----------------------------------------------------------------------===//\n+\n+namespace internal {\n+\n+class ContextBase {\n+ public:\n+  ContextBase(const XLA_FFI_Api* api, XLA_FFI_ExecutionContext* ctx)\n+      : api_(api), ctx_(ctx) {}\n+\n+  const XLA_FFI_Api* api() const { return api_; }\n+  XLA_FFI_ExecutionContext* ctx() const { return ctx_; }\n+\n+ protected:\n+  template <typename T>\n+  std::optional<typename CtxDecoding<T>::Type> get(\n+      DiagnosticEngine& diagnostic) const {\n+    return CtxDecoding<T>::Decode(api_, ctx_, diagnostic);\n+  }\n+\n+ private:\n+  const XLA_FFI_Api* api_;\n+  XLA_FFI_ExecutionContext* ctx_;\n+};\n+\n+}  // namespace internal\n+\n //===----------------------------------------------------------------------===//\n // Template metaprogramming for decoding handler signature\n //===----------------------------------------------------------------------===//"
+        },
+        {
+            "sha": "183645788d704ab6372af8526e7935cb8c5133b6",
+            "filename": "third_party/xla/xla/ffi/api/ffi.h",
+            "status": "modified",
+            "additions": 34,
+            "deletions": 2,
+            "changes": 36,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/3630944d0f634fecaaeaf8a6e5edbc7b9a80bfce/third_party%2Fxla%2Fxla%2Fffi%2Fapi%2Fffi.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/3630944d0f634fecaaeaf8a6e5edbc7b9a80bfce/third_party%2Fxla%2Fxla%2Fffi%2Fapi%2Fffi.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fffi%2Fapi%2Fffi.h?ref=3630944d0f634fecaaeaf8a6e5edbc7b9a80bfce",
+            "patch": "@@ -1082,8 +1082,8 @@ class Dictionary : public internal::DictionaryBase {\n   template <typename T>\n   ErrorOr<T> get(std::string_view name) const {\n     DiagnosticEngine diagnostic;\n-    std::optional<T> value = internal::DictionaryBase::get<T>(name, diagnostic);\n-    if (!value.has_value()) {\n+    auto value = internal::DictionaryBase::get<T>(name, diagnostic);\n+    if (XLA_FFI_PREDICT_FALSE(!value.has_value())) {\n       return Unexpected(Error::Internal(diagnostic.Result()));\n     }\n     return *value;\n@@ -1114,6 +1114,38 @@ struct AttrDecoding<Dictionary> {\n   }\n };\n \n+//===----------------------------------------------------------------------===//\n+// Type-safe wrapper for accessing context.\n+//===----------------------------------------------------------------------===//\n+\n+class Context : public internal::ContextBase {\n+ public:\n+  using internal::ContextBase::ContextBase;\n+\n+  template <typename T>\n+  ErrorOr<typename CtxDecoding<T>::Type> get() const {\n+    DiagnosticEngine diagnostic;\n+    auto value = internal::ContextBase::get<T>(diagnostic);\n+    if (XLA_FFI_PREDICT_FALSE(!value.has_value())) {\n+      return Unexpected(Error::Internal(diagnostic.Result()));\n+    }\n+    return *value;\n+  }\n+};\n+\n+// Context decoding for catch-all `Context` type.\n+template <>\n+struct CtxDecoding<Context> {\n+  using Type = Context;\n+\n+  XLA_FFI_ATTRIBUTE_ALWAYS_INLINE\n+  static std::optional<Context> Decode(const XLA_FFI_Api* api,\n+                                       XLA_FFI_ExecutionContext* ctx,\n+                                       DiagnosticEngine&) {\n+    return Context(api, ctx);\n+  }\n+};\n+\n //===----------------------------------------------------------------------===//\n // Error helpers\n //===----------------------------------------------------------------------===//"
+        },
+        {
+            "sha": "3f7077c2158afd438da958b79cc6d2d2b1727e29",
+            "filename": "third_party/xla/xla/ffi/api/ffi_test.cc",
+            "status": "modified",
+            "additions": 28,
+            "deletions": 2,
+            "changes": 30,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/3630944d0f634fecaaeaf8a6e5edbc7b9a80bfce/third_party%2Fxla%2Fxla%2Fffi%2Fapi%2Fffi_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/3630944d0f634fecaaeaf8a6e5edbc7b9a80bfce/third_party%2Fxla%2Fxla%2Fffi%2Fapi%2Fffi_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fffi%2Fapi%2Fffi_test.cc?ref=3630944d0f634fecaaeaf8a6e5edbc7b9a80bfce",
+            "patch": "@@ -465,13 +465,39 @@ TEST(FfiTest, RunId) {\n   TF_ASSERT_OK(status);\n }\n \n+TEST(FfiTest, RunIdViaContext) {\n+  CallFrameBuilder builder(/*num_args=*/0, /*num_rets=*/0);\n+  auto call_frame = builder.Build();\n+\n+  auto handler = Ffi::Bind().Ctx().To([&](Context ctx) {\n+    ErrorOr<RunId> run_id = ctx.get<RunId>();\n+    EXPECT_TRUE(run_id.has_value());\n+    EXPECT_EQ(run_id->run_id, 42);\n+    return Error::Success();\n+  });\n+\n+  CallOptions options;\n+  options.run_id = xla::RunId{42};\n+\n+  auto status = Call(*handler, call_frame, options);\n+\n+  TF_ASSERT_OK(status);\n+}\n+\n TEST(FfiTest, DeviceOrdinal) {\n   CallFrameBuilder builder(/*num_args=*/0, /*num_rets=*/0);\n   auto call_frame = builder.Build();\n \n-  auto handler =\n-      Ffi::Bind().Ctx<DeviceOrdinal>().To([&](int32_t device_ordinal) {\n+  auto handler = Ffi::Bind().Ctx<DeviceOrdinal>().Ctx().To(\n+      [&](int32_t device_ordinal, Context ctx) {\n+        // Get device ordinal from the argument.\n         EXPECT_EQ(device_ordinal, 42);\n+\n+        // Get device ordinal from the context.\n+        ErrorOr<int32_t> device_ordinal_or_error = ctx.get<DeviceOrdinal>();\n+        EXPECT_TRUE(device_ordinal_or_error.has_value());\n+        EXPECT_EQ(*device_ordinal_or_error, 42);\n+\n         return Error::Success();\n       });\n "
+        },
+        {
+            "sha": "874fdfb87623aafaffed18c1e09b7980e9af1660",
+            "filename": "third_party/xla/xla/ffi/ffi.h",
+            "status": "modified",
+            "additions": 36,
+            "deletions": 4,
+            "changes": 40,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/3630944d0f634fecaaeaf8a6e5edbc7b9a80bfce/third_party%2Fxla%2Fxla%2Fffi%2Fffi.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/3630944d0f634fecaaeaf8a6e5edbc7b9a80bfce/third_party%2Fxla%2Fxla%2Fffi%2Fffi.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fffi%2Fffi.h?ref=3630944d0f634fecaaeaf8a6e5edbc7b9a80bfce",
+            "patch": "@@ -428,7 +428,7 @@ struct AttrDecoding<absl::string_view> {\n   static std::optional<absl::string_view> Decode(XLA_FFI_AttrType type,\n                                                  void* attr,\n                                                  DiagnosticEngine& diagnostic) {\n-    if (XLA_FFI_PREDICT_FALSE(type != XLA_FFI_AttrType_STRING)) {\n+    if (ABSL_PREDICT_FALSE(type != XLA_FFI_AttrType_STRING)) {\n       return diagnostic.Emit(\"Wrong attribute type: expected \")\n              << XLA_FFI_AttrType_STRING << \" but got \" << type;\n     }\n@@ -472,8 +472,8 @@ class Dictionary : public internal::DictionaryBase {\n   template <typename T>\n   absl::StatusOr<T> get(absl::string_view name) const {\n     DiagnosticEngine diagnostic;\n-    std::optional<T> value = internal::DictionaryBase::get<T>(name, diagnostic);\n-    if (!value.has_value()) {\n+    auto value = internal::DictionaryBase::get<T>(name, diagnostic);\n+    if (ABSL_PREDICT_FALSE(!value.has_value())) {\n       return Internal(\"%s\", diagnostic.Result());\n     }\n     return *value;\n@@ -496,14 +496,46 @@ struct AttrDecoding<Dictionary> {\n   using Type = Dictionary;\n   static std::optional<Dictionary> Decode(XLA_FFI_AttrType type, void* attr,\n                                           DiagnosticEngine& diagnostic) {\n-    if (XLA_FFI_PREDICT_FALSE(type != XLA_FFI_AttrType_DICTIONARY)) {\n+    if (ABSL_PREDICT_FALSE(type != XLA_FFI_AttrType_DICTIONARY)) {\n       return diagnostic.Emit(\"Wrong attribute type: expected \")\n              << XLA_FFI_AttrType_DICTIONARY << \" but got \" << type;\n     }\n     return Dictionary(reinterpret_cast<XLA_FFI_Attrs*>(attr));\n   }\n };\n \n+//===----------------------------------------------------------------------===//\n+// Type-safe wrapper for accessing context.\n+//===----------------------------------------------------------------------===//\n+\n+class Context : public internal::ContextBase {\n+ public:\n+  using internal::ContextBase::ContextBase;\n+\n+  template <typename T>\n+  absl::StatusOr<typename CtxDecoding<T>::Type> get() const {\n+    DiagnosticEngine diagnostic;\n+    auto value = internal::ContextBase::get<T>(diagnostic);\n+    if (ABSL_PREDICT_FALSE(!value.has_value())) {\n+      return Internal(\"%s\", diagnostic.Result());\n+    }\n+    return *value;\n+  }\n+};\n+\n+// Context decoding for catch-all `Context` type.\n+template <>\n+struct CtxDecoding<Context> {\n+  using Type = Context;\n+\n+  XLA_FFI_ATTRIBUTE_ALWAYS_INLINE\n+  static std::optional<Context> Decode(const XLA_FFI_Api* api,\n+                                       XLA_FFI_ExecutionContext* ctx,\n+                                       DiagnosticEngine&) {\n+    return Context(api, ctx);\n+  }\n+};\n+\n //===----------------------------------------------------------------------===//\n // Context decoding\n //===----------------------------------------------------------------------===//"
+        },
+        {
+            "sha": "7558b1db0a7929eba118145570eeb105d5d8a5cc",
+            "filename": "third_party/xla/xla/ffi/ffi_test.cc",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 4,
+            "changes": 11,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/3630944d0f634fecaaeaf8a6e5edbc7b9a80bfce/third_party%2Fxla%2Fxla%2Fffi%2Fffi_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/3630944d0f634fecaaeaf8a6e5edbc7b9a80bfce/third_party%2Fxla%2Fxla%2Fffi%2Fffi_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fffi%2Fffi_test.cc?ref=3630944d0f634fecaaeaf8a6e5edbc7b9a80bfce",
+            "patch": "@@ -213,10 +213,13 @@ TEST(FfiTest, RunId) {\n   CallFrameBuilder builder(/*num_args=*/0, /*num_rets=*/0);\n   auto call_frame = builder.Build();\n \n-  auto handler = Ffi::Bind().Ctx<RunId>().To([&](RunId run_id) {\n-    EXPECT_EQ(run_id.ToInt(), 42);\n-    return absl::OkStatus();\n-  });\n+  auto handler = Ffi::Bind().Ctx<RunId>().Ctx().To(\n+      [&](RunId run_id, Context context) -> absl::Status {\n+        EXPECT_EQ(run_id.ToInt(), 42);\n+        TF_ASSIGN_OR_RETURN(RunId run_id_from_context, context.get<RunId>());\n+        EXPECT_EQ(run_id_from_context.ToInt(), 42);\n+        return absl::OkStatus();\n+      });\n \n   CallOptions options;\n   options.run_id = RunId{42};"
+        }
+    ],
+    "stats": {
+        "total": 158,
+        "additions": 144,
+        "deletions": 14
+    }
+}

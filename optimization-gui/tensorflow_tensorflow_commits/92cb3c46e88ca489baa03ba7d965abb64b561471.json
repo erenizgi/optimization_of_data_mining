@@ -1,0 +1,48 @@
+{
+    "author": "ezhulenev",
+    "message": "[stream_executor:cuda] Add NvshmemMemoryAllocator class\n\nIt is a layering violation to depend from SE to XLA:GPU collectives. All memory allocations should be done via correct se::MemoryAllocator instances. Prepare for removing memory allocation APIs from GPU collectives.\n\nPiperOrigin-RevId: 843733369",
+    "sha": "92cb3c46e88ca489baa03ba7d965abb64b561471",
+    "files": [
+        {
+            "sha": "18502d54c0e9df0db724eb35676d72eade238487",
+            "filename": "third_party/xla/xla/stream_executor/cuda/BUILD",
+            "status": "modified",
+            "additions": 25,
+            "deletions": 0,
+            "changes": 25,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/92cb3c46e88ca489baa03ba7d965abb64b561471/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/92cb3c46e88ca489baa03ba7d965abb64b561471/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2FBUILD?ref=92cb3c46e88ca489baa03ba7d965abb64b561471",
+            "patch": "@@ -979,6 +979,31 @@ cc_library(\n     ],\n )\n \n+cc_library(\n+    name = \"nvshmem_memory_allocator\",\n+    srcs = [\"nvshmem_memory_allocator.cc\"],\n+    hdrs = [\"nvshmem_memory_allocator.h\"],\n+    tags = [\n+        \"cuda-only\",\n+        \"gpu\",\n+    ],\n+    deps = [\n+        \":nvshmem\",\n+        \"//xla/stream_executor:device_address\",\n+        \"//xla/stream_executor:memory_allocation\",\n+        \"//xla/stream_executor:memory_allocator\",\n+        \"//xla/tsl/platform:errors\",\n+        \"//xla/tsl/platform:statusor\",\n+        \"@com_google_absl//absl/log\",\n+        \"@com_google_absl//absl/log:check\",\n+        \"@com_google_absl//absl/status\",\n+        \"@com_google_absl//absl/status:statusor\",\n+        \"@com_google_absl//absl/strings:str_format\",\n+        \"@local_tsl//tsl/platform:numbers\",\n+        \"@nvshmem//:nvshmem_lib\",\n+    ],\n+)\n+\n cc_library(\n     name = \"nvjitlink_support\",\n     srcs = [\"nvjitlink_support.cc\"],"
+        },
+        {
+            "sha": "b05c32458c31a5ab6582ddd0256d6b715c6f1de5",
+            "filename": "third_party/xla/xla/stream_executor/cuda/nvshmem_memory_allocator.cc",
+            "status": "added",
+            "additions": 92,
+            "deletions": 0,
+            "changes": 92,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/92cb3c46e88ca489baa03ba7d965abb64b561471/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fnvshmem_memory_allocator.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/92cb3c46e88ca489baa03ba7d965abb64b561471/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fnvshmem_memory_allocator.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fnvshmem_memory_allocator.cc?ref=92cb3c46e88ca489baa03ba7d965abb64b561471",
+            "patch": "@@ -0,0 +1,92 @@\n+/* Copyright 2025 The OpenXLA Authors.\n+\n+Licensed under the Apache License, Version 2.0 (the \"License\");\n+you may not use this file except in compliance with the License.\n+You may obtain a copy of the License at\n+\n+    http://www.apache.org/licenses/LICENSE-2.0\n+\n+Unless required by applicable law or agreed to in writing, software\n+distributed under the License is distributed on an \"AS IS\" BASIS,\n+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+See the License for the specific language governing permissions and\n+limitations under the License.\n+==============================================================================*/\n+\n+#include \"xla/stream_executor/cuda/nvshmem_memory_allocator.h\"\n+\n+#include <cstdint>\n+#include <memory>\n+\n+#include \"absl/log/check.h\"\n+#include \"absl/log/log.h\"\n+#include \"absl/status/status.h\"\n+#include \"absl/status/statusor.h\"\n+#include \"absl/strings/str_format.h\"\n+#include \"third_party/nvshmem/nvshmem.h\"   // IWYU pragma: keep\n+#include \"third_party/nvshmem/nvshmemx.h\"  // IWYU pragma: keep\n+#include \"xla/stream_executor/cuda/nvshmem.h\"\n+#include \"xla/stream_executor/device_address.h\"\n+#include \"xla/stream_executor/memory_allocation.h\"\n+#include \"xla/tsl/platform/errors.h\"\n+#include \"xla/tsl/platform/statusor.h\"\n+#include \"tsl/platform/numbers.h\"\n+\n+namespace stream_executor::gpu {\n+namespace {\n+\n+absl::StatusOr<void*> NvshmemAllocate(uint64_t size) {\n+  TF_RETURN_IF_ERROR(nvshmem::InitializeOnce());\n+  VLOG(3) << absl::StreamFormat(\n+      \"Start allocation of %s (%llu bytes) for NVSHMEM\",\n+      tsl::strings::HumanReadableNumBytes(size), size);\n+  void* buffer = nvshmem_malloc(size);\n+  if (buffer == nullptr) {\n+    return absl::InternalError(absl::StrFormat(\n+        \"Failed to allocate %s (%llu bytes) from NVSHMEM memory\",\n+        tsl::strings::HumanReadableNumBytes(size), size));\n+  }\n+  return buffer;\n+}\n+\n+absl::Status NvshmemFree(void* ptr) {\n+  TF_RETURN_IF_ERROR(nvshmem::InitializeOnce());\n+  VLOG(3) << absl::StreamFormat(\"Start de-allocation for NVSHMEM buffer: %p\",\n+                                ptr);\n+  nvshmem_free(ptr);\n+  return absl::OkStatus();\n+}\n+\n+// A memory allocated from NVSHMEM on the given executor.\n+class NvshmemMemoryAllocation : public MemoryAllocation {\n+ public:\n+  NvshmemMemoryAllocation(void* ptr, uint64_t size);\n+\n+  ~NvshmemMemoryAllocation() final;\n+  DeviceAddressBase address() const final;\n+\n+ private:\n+  void* ptr_;\n+  uint64_t size_;\n+};\n+\n+}  // namespace\n+\n+NvshmemMemoryAllocation::NvshmemMemoryAllocation(void* ptr, uint64_t size)\n+    : ptr_(ptr), size_(size) {}\n+\n+NvshmemMemoryAllocation::~NvshmemMemoryAllocation() {\n+  CHECK_OK(NvshmemFree(ptr_));  // Crash OK\n+}\n+\n+DeviceAddressBase NvshmemMemoryAllocation::address() const {\n+  return DeviceAddressBase(ptr_, size_);\n+}\n+\n+absl::StatusOr<std::unique_ptr<MemoryAllocation>>\n+NvshmemMemoryAllocator::Allocate(uint64_t size) {\n+  TF_ASSIGN_OR_RETURN(void* ptr, NvshmemAllocate(size));\n+  return std::make_unique<NvshmemMemoryAllocation>(ptr, size);\n+}\n+\n+}  // namespace stream_executor::gpu"
+        },
+        {
+            "sha": "ba19a2f8c8e66d8cdf5399f0f5c3f613f99fc24d",
+            "filename": "third_party/xla/xla/stream_executor/cuda/nvshmem_memory_allocator.h",
+            "status": "added",
+            "additions": 37,
+            "deletions": 0,
+            "changes": 37,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/92cb3c46e88ca489baa03ba7d965abb64b561471/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fnvshmem_memory_allocator.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/92cb3c46e88ca489baa03ba7d965abb64b561471/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fnvshmem_memory_allocator.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fnvshmem_memory_allocator.h?ref=92cb3c46e88ca489baa03ba7d965abb64b561471",
+            "patch": "@@ -0,0 +1,37 @@\n+/* Copyright 2025 The OpenXLA Authors.\n+\n+Licensed under the Apache License, Version 2.0 (the \"License\");\n+you may not use this file except in compliance with the License.\n+You may obtain a copy of the License at\n+\n+    http://www.apache.org/licenses/LICENSE-2.0\n+\n+Unless required by applicable law or agreed to in writing, software\n+distributed under the License is distributed on an \"AS IS\" BASIS,\n+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+See the License for the specific language governing permissions and\n+limitations under the License.\n+==============================================================================*/\n+\n+#ifndef XLA_STREAM_EXECUTOR_CUDA_NVSHMEM_MEMORY_ALLOCATOR_H_\n+#define XLA_STREAM_EXECUTOR_CUDA_NVSHMEM_MEMORY_ALLOCATOR_H_\n+\n+#include <cstdint>\n+#include <memory>\n+\n+#include \"absl/status/statusor.h\"\n+#include \"xla/stream_executor/memory_allocation.h\"\n+#include \"xla/stream_executor/memory_allocator.h\"\n+\n+namespace stream_executor::gpu {\n+\n+// A memory allocator that uses NVSHMEM to allocate memory.\n+class NvshmemMemoryAllocator : public MemoryAllocator {\n+ public:\n+  absl::StatusOr<std::unique_ptr<MemoryAllocation>> Allocate(\n+      uint64_t size) final;\n+};\n+\n+}  // namespace stream_executor::gpu\n+\n+#endif  // XLA_STREAM_EXECUTOR_CUDA_NVSHMEM_MEMORY_ALLOCATOR_H_"
+        }
+    ],
+    "stats": {
+        "total": 154,
+        "additions": 154,
+        "deletions": 0
+    }
+}

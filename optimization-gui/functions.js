@@ -10,7 +10,7 @@ console.log(token);
 const octokit = new Octokit({ auth: token });
 
 function saveEachCommitToFile(commits, folder = "commits_output", setStatus) {
-    if (!fs.existsSync(folder)){
+    if (!fs.existsSync(folder)) {
         fs.mkdirSync(folder);
     }
     let skipped = 0;
@@ -30,14 +30,15 @@ function saveEachCommitToFile(commits, folder = "commits_output", setStatus) {
     });
     console.log(`${written} commits saved, ${skipped} skipped (already exists), to ${folder}/`);
     setStatus(`${written} commits saved, ${skipped} skipped (already exists), to ${folder}/`);
-    return;
+    return [written, skipped];
 }
 
 const commitMetadataFormatter = (commit) => {
 
+    console.log(commit);
 
     return {
-        author: commit.author.login ? commit.author.login : "unknown",
+        author: commit.author?.login ? commit.author.login : "unknown",
         message: commit.commit.message,
         sha: commit.sha,
         files: commit.files ? commit.files.map(file => file) : [""],
@@ -48,14 +49,14 @@ const commitMetadataFormatter = (commit) => {
 
 
 async function getSingleCommit(owner, repo, sha) {
-  const { data } = await octokit.repos.getCommit({
-    owner,
-    repo,
-    ref: sha,
-  });
+    const { data } = await octokit.repos.getCommit({
+        owner,
+        repo,
+        ref: sha,
+    });
 
-  // Artık data.files içinde değişen dosya detayları var:
-  return commitMetadataFormatter(data);
+    // Artık data.files içinde değişen dosya detayları var:
+    return commitMetadataFormatter(data);
 }
 
 /*  Returns commit array */
@@ -72,7 +73,7 @@ async function fetchPagesCommits(owner, repo, page, setStatus) {
         console.log(res.data.length, "shas of commits fetched.");
         setStatus(`${res.data.length} shas of commits fetched.`)
     }
-    else{
+    else {
         return []
     }
     console.log("Fetching commits with details included files.")
@@ -85,20 +86,23 @@ async function fetchPagesCommits(owner, repo, page, setStatus) {
         console.log(`Fetched commit ${i + 1}/${res.data.length} on page ${page}`);
         setStatus(`Fetched commit ${i + 1}/${res.data.length} on page ${page}`);
         await new Promise(resolve => setTimeout(resolve, 1000)); // 1 second delay to respect rate limits
-    
+
     }
     return pagesCommits;
 }
 
 async function fetchAllCommits(owner, repo, pageStart, pageEnd, setStatus) {
-    const allCommits = []
-    page = pageStart;
+    let page = pageStart;
     let keepGoing = true;
-
+    let [written, skipped] = [0, 0]
+    const totalCommits = []
     while (keepGoing) {
-        if (page === pageEnd) {
+        const allCommits = []
+
+        if (page > pageEnd) {
             console.log("Reached page end limit.");
             setStatus("Reached page end limit.");
+            keepGoing = false;
             break;
         }
         const data = await fetchPagesCommits(owner, repo, page, setStatus);
@@ -110,15 +114,15 @@ async function fetchAllCommits(owner, repo, pageStart, pageEnd, setStatus) {
         data.forEach(commit => {
             allCommits.push(commit);
         });
-
-
+        const returned = saveEachCommitToFile(allCommits, `./${owner}_${repo}_commits`, setStatus);
+        written += returned[0];
+        skipped += returned[1];
         page++;
+        totalCommits.push(...allCommits);
     }
-    console.log(`Total commits fetched: ${allCommits.length}`);
-    setStatus(`Total commits fetched: ${allCommits.length}`);
-
-    saveEachCommitToFile(allCommits, `${owner}_${repo}_commits`, setStatus);
-    return allCommits;
+    console.log(`${written} commits saved, ${skipped} skipped (already exists), to ./${owner}_${repo}_commits/, Total: ${written + skipped}`);
+    setStatus(`${written} commits saved, ${skipped} skipped (already exists), to ./${owner}_${repo}_commits/, Total: ${written + skipped}`);
+    return totalCommits;
 }
 
 module.exports = {

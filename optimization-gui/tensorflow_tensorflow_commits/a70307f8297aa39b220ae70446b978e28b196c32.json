@@ -1,0 +1,60 @@
+{
+    "author": "ZixuanJiang",
+    "message": "Add `xla_keep_shardings_after_spmd` debug option.\n\n* If true, keep valid shardings at the end of SPMD partitioner.\n* If false, remove shardings for most instructions. The default value is false.\n\nBefore this change, SPMD partitioner expects most shardings to be removed. Thus, it may generate \"invalid\" shardings. With this change, we only keep **valid** shardings to avoid verification error and should be only for debugging.\n\nPiperOrigin-RevId: 814848587",
+    "sha": "a70307f8297aa39b220ae70446b978e28b196c32",
+    "files": [
+        {
+            "sha": "bd5d497ec415412f1c2cbf8e28cccfa02927c69f",
+            "filename": "third_party/xla/xla/debug_options_flags.cc",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a70307f8297aa39b220ae70446b978e28b196c32/third_party%2Fxla%2Fxla%2Fdebug_options_flags.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a70307f8297aa39b220ae70446b978e28b196c32/third_party%2Fxla%2Fxla%2Fdebug_options_flags.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fdebug_options_flags.cc?ref=a70307f8297aa39b220ae70446b978e28b196c32",
+            "patch": "@@ -455,6 +455,8 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {\n \n   opts.set_xla_cpu_collective_call_warn_stuck_seconds(20);\n   opts.set_xla_cpu_collective_call_terminate_timeout_seconds(40);\n+\n+  opts.set_xla_keep_shardings_after_spmd(false);\n   return opts;\n }\n \n@@ -2579,6 +2581,11 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,\n           &DebugOptions::set_xla_cpu_collective_call_terminate_timeout_seconds),\n       debug_options->xla_cpu_collective_call_terminate_timeout_seconds(),\n       \"Set timeout for Collective Call Rendezvous termination\"));\n+  flag_list->push_back(tsl::Flag(\n+      \"xla_keep_shardings_after_spmd\",\n+      bool_setter_for(&DebugOptions::set_xla_keep_shardings_after_spmd),\n+      debug_options->xla_keep_shardings_after_spmd(),\n+      \"If true, keep shardings after SPMD.\"));\n }  // NOLINT(readability/fn_size)\n \n // Allocates flag_values and flag_objects; this function must not be called more"
+        },
+        {
+            "sha": "f2e8aad78ccd6e9990655f6fbe8cc5278dec9040",
+            "filename": "third_party/xla/xla/service/spmd/spmd_partitioner.cc",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 4,
+            "changes": 19,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a70307f8297aa39b220ae70446b978e28b196c32/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fspmd_partitioner.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a70307f8297aa39b220ae70446b978e28b196c32/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fspmd_partitioner.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fspmd_partitioner.cc?ref=a70307f8297aa39b220ae70446b978e28b196c32",
+            "patch": "@@ -197,7 +197,9 @@ template <typename F>\n \n namespace {\n \n-bool ShouldKeepSharding(const HloInstruction* hlo) {\n+bool ShouldKeepSharding(const HloInstruction* hlo,\n+                        const bool keep_valid_shardings,\n+                        const int64_t num_devices) {\n   // Keep sharding annotation on Infeed/SendRecv instructions.\n   if (hlo->opcode() == HloOpcode::kInfeed ||\n       hlo->opcode() == HloOpcode::kOutfeed ||\n@@ -208,13 +210,19 @@ bool ShouldKeepSharding(const HloInstruction* hlo) {\n       hlo->parent() == hlo->GetModule()->entry_computation()) {\n     return true;\n   }\n+  if (keep_valid_shardings && hlo->has_sharding()) {\n+    // SPMD partitioner can generate invalid shardings since sharding is\n+    // meaningless after this pass. We only keep valid shardings to avoid\n+    // verification error and should be only for debugging.\n+    return hlo->sharding().Validate(hlo->shape(), num_devices).ok();\n+  }\n   return false;\n }\n \n // Clears all sharding attributes from instructions in the module. This must be\n // called only after all SPMD transformation is complete.\n absl::Status ClearShardingAttributes(\n-    HloModule* module,\n+    HloModule* module, int64_t num_devices,\n     const absl::flat_hash_set<absl::string_view>& execution_threads) {\n   auto has_unreduced_axes = [](const HloInstruction* hlo) -> bool {\n     return hlo->frontend_attributes().map().contains(sdy::kHasUnreducedAxes);\n@@ -226,12 +234,14 @@ absl::Status ClearShardingAttributes(\n       param->set_sharding(module->spmd_parameters_shardings()[i]);\n     }\n   }\n+  const bool keep_shardings_after_spmd =\n+      module->config().debug_options().xla_keep_shardings_after_spmd();\n   for (HloComputation* computation : module->computations(execution_threads)) {\n     for (HloInstruction* hlo : computation->instructions()) {\n       if (has_unreduced_axes(hlo)) {\n         hlo->erase_frontend_attribute(sdy::kHasUnreducedAxes);\n       }\n-      if (ShouldKeepSharding(hlo)) {\n+      if (ShouldKeepSharding(hlo, keep_shardings_after_spmd, num_devices)) {\n         continue;\n       }\n       hlo->clear_sharding();\n@@ -5570,7 +5580,8 @@ absl::StatusOr<bool> SpmdPartitioner::Run(\n     TF_RETURN_IF_ERROR(pass.Run(module, execution_threads).status());\n   }\n \n-  TF_RETURN_IF_ERROR(ClearShardingAttributes(module, execution_threads));\n+  TF_RETURN_IF_ERROR(ClearShardingAttributes(\n+      module, num_replicas() * num_partitions(), execution_threads));\n   return changed;\n }\n "
+        },
+        {
+            "sha": "2d52403999adaed4854572a090c62196420af890",
+            "filename": "third_party/xla/xla/service/spmd/spmd_partitioner_test.cc",
+            "status": "modified",
+            "additions": 29,
+            "deletions": 0,
+            "changes": 29,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a70307f8297aa39b220ae70446b978e28b196c32/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fspmd_partitioner_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a70307f8297aa39b220ae70446b978e28b196c32/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fspmd_partitioner_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fspmd_partitioner_test.cc?ref=a70307f8297aa39b220ae70446b978e28b196c32",
+            "patch": "@@ -16675,6 +16675,35 @@ ENTRY entry {\n   TF_EXPECT_OK(partitioner.Run(module.get()).status());\n }\n \n+TEST_P(SpmdPartitioningTest, KeepShardings) {\n+  absl::string_view hlo_string = R\"(\n+HloModule module\n+\n+ENTRY entry {\n+  a = f32[32] parameter(0), sharding={devices=[4]<=[4]}\n+  b = f32[32] parameter(1), sharding={devices=[4]<=[4]}\n+  c = f32[32] add(a, b), sharding={devices=[4]<=[4]}\n+  ROOT d = f32[32] abs(c), sharding={devices=[4]<=[4]}\n+})\";\n+\n+  HloModuleConfig config = GetModuleConfigForTest();\n+  config.set_use_spmd_partitioning(true);\n+  config.set_num_partitions(4);\n+  config.mutable_debug_options().set_xla_keep_shardings_after_spmd(true);\n+  TF_ASSERT_OK_AND_ASSIGN(auto module,\n+                          ParseAndReturnVerifiedModule(hlo_string, config));\n+  SpmdPartitionerOptions options;\n+  options.allow_module_signature_change = true;\n+  SpmdPartitioner partitioner(/*num_partitions=*/4, /*num_replicas=*/1,\n+                              options);\n+  TF_EXPECT_OK(partitioner.Run(module.get()).status());\n+  for (const HloInstruction* inst :\n+       module->entry_computation()->instructions()) {\n+    EXPECT_TRUE(inst->has_sharding());\n+    EXPECT_EQ(inst->shape().dimensions()[0], 8);\n+  }\n+}\n+\n }  // namespace\n }  // namespace spmd\n }  // namespace xla"
+        },
+        {
+            "sha": "408bdd3b6e1b84688afe93a65870ce4a5c03da3c",
+            "filename": "third_party/xla/xla/xla.proto",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 1,
+            "changes": 4,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a70307f8297aa39b220ae70446b978e28b196c32/third_party%2Fxla%2Fxla%2Fxla.proto",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a70307f8297aa39b220ae70446b978e28b196c32/third_party%2Fxla%2Fxla%2Fxla.proto",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fxla.proto?ref=a70307f8297aa39b220ae70446b978e28b196c32",
+            "patch": "@@ -132,6 +132,8 @@ message DebugOptions {\n   optional bool xla_disable_automatic_host_compute_offload = 408;\n   // Perform hash-based cycle detection in fixed-point loops.\n   optional bool xla_hlo_pass_fix_detect_cycles = 370;\n+  // Keep shardings after SPMD.\n+  optional bool xla_keep_shardings_after_spmd = 419;\n   // Crash if HloPassFix can not converge after a fixed number of iterations.\n   optional bool xla_unsupported_crash_on_hlo_pass_fix_max_iterations = 363;\n   // Crash if a pass reports that it changes the HLO but in fact it did not.\n@@ -1358,7 +1360,7 @@ message DebugOptions {\n   // Note: when adding a new flag, please add it to one of the hardware-specific\n   // or hardware-agnostic sections at the top of this proto message.\n \n-  // Next id: 419\n+  // Next id: 420\n \n   // Extra options to pass to the compilation backend (e.g. LLVM); specific\n   // interpretation of these values is left to the backend."
+        }
+    ],
+    "stats": {
+        "total": 59,
+        "additions": 54,
+        "deletions": 5
+    }
+}

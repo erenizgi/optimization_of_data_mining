@@ -1,0 +1,36 @@
+{
+    "author": "akuegel",
+    "message": "Filter out scatters which are not supported by ScatterDeterminismExpander.\n\nIt does not handle variadic scatter, and only scatter indices with type S32\nand S64 are supported.\n\nPiperOrigin-RevId: 803416966",
+    "sha": "ee77e6b5c2f04e2865cd1ef8460f2bc61aeaf9af",
+    "files": [
+        {
+            "sha": "761932320675a1c31557396d1aa93e8f29bcd8fd",
+            "filename": "third_party/xla/xla/service/scatter_determinism_expander.cc",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ee77e6b5c2f04e2865cd1ef8460f2bc61aeaf9af/third_party%2Fxla%2Fxla%2Fservice%2Fscatter_determinism_expander.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ee77e6b5c2f04e2865cd1ef8460f2bc61aeaf9af/third_party%2Fxla%2Fxla%2Fservice%2Fscatter_determinism_expander.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fscatter_determinism_expander.cc?ref=ee77e6b5c2f04e2865cd1ef8460f2bc61aeaf9af",
+            "patch": "@@ -904,13 +904,20 @@ bool CheckOutputDependency(HloComputation* to_apply, int operand_size) {\n   return true;\n }\n \n+bool IsSupportedIndicesType(PrimitiveType primitive_type) {\n+  return primitive_type == S32 || primitive_type == S64;\n+}\n+\n }  // namespace\n \n bool ScatterDeterminismExpander::InstructionMatchesPattern(\n     HloInstruction* inst) {\n   auto* scatter = DynCast<HloScatterInstruction>(inst);\n \n   return (scatter != nullptr) && !IsScatterDeterministic(scatter) &&\n+         scatter->scatter_operand_count() == 1 &&\n+         IsSupportedIndicesType(\n+             scatter->scatter_indices()->shape().element_type()) &&\n          CheckOutputDependency(scatter->to_apply(),\n                                scatter->scatter_operands().size());\n }"
+        },
+        {
+            "sha": "496e9c261d72191f68c08d41e76fd333dc3c32c4",
+            "filename": "third_party/xla/xla/service/scatter_determinism_expander_test.cc",
+            "status": "modified",
+            "additions": 65,
+            "deletions": 0,
+            "changes": 65,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ee77e6b5c2f04e2865cd1ef8460f2bc61aeaf9af/third_party%2Fxla%2Fxla%2Fservice%2Fscatter_determinism_expander_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ee77e6b5c2f04e2865cd1ef8460f2bc61aeaf9af/third_party%2Fxla%2Fxla%2Fservice%2Fscatter_determinism_expander_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fscatter_determinism_expander_test.cc?ref=ee77e6b5c2f04e2865cd1ef8460f2bc61aeaf9af",
+            "patch": "@@ -1084,5 +1084,70 @@ TEST_F(ScatterDeterminismExpanderTest, ScalarUpdateChangesVectorDim) {\n   EXPECT_TRUE(result);\n }\n \n+TEST_F(ScatterDeterminismExpanderTest, UnsupportedScatterIndicesType) {\n+  const char* const kModuleStr = R\"(\n+    HloModule m\n+\n+    update_s32 (lhs: s32[], rhs: s32[]) -> s32[] {\n+      lhs = s32[] parameter(0)\n+      ROOT rhs = s32[] parameter(1)\n+    }\n+\n+    ENTRY main {\n+      operand = s32[129,3]{1,0} parameter(0)\n+      indices = u8[6,2]{1,0} parameter(1)\n+      updates = s32[6,1,1]{2,1,0} parameter(2)\n+      ROOT scatter = s32[129,3]{1,0} scatter(operand, indices, updates),\n+          to_apply=update_s32,\n+          update_window_dims={1,2},\n+          inserted_window_dims={},\n+          scatter_dims_to_operand_dims={0,1},\n+          index_vector_dim=1\n+    }\n+  )\";\n+  TF_ASSERT_OK_AND_ASSIGN(auto module,\n+                          ParseAndReturnVerifiedModule(kModuleStr));\n+\n+  ScatterDeterminismExpander scatter_determinism_expander;\n+  TF_ASSERT_OK_AND_ASSIGN(\n+      bool result, RunHloPass(&scatter_determinism_expander, module.get()));\n+  EXPECT_FALSE(result);\n+}\n+\n+TEST_F(ScatterDeterminismExpanderTest, UnsupportedVariadicScatter) {\n+  const char* const kModuleStr = R\"(\n+    HloModule MultioutputScatter\n+\n+    update {\n+      lhs0 = s32[] parameter(0)\n+      lhs1 = f32[] parameter(1)\n+      rhs0 = s32[] parameter(2)\n+      rhs1 = f32[] parameter(3)\n+      ROOT tuple = (s32[], f32[]) tuple(rhs0, rhs1)\n+    }\n+\n+    ENTRY main {\n+      operand0 = s32[3,3,2] parameter(0)\n+      operand1 = f32[3,3,2] parameter(1)\n+      indices = s32[2,2] parameter(2)\n+      updates0 = s32[2,2] parameter(3)\n+      updates1 = f32[2,2] parameter(4)\n+      ROOT scatter = (s32[3,3,2], f32[3,3,2]) scatter(operand0, operand1, indices, updates0, updates1),\n+          to_apply=update,\n+          update_window_dims={1},\n+          inserted_window_dims={0,1},\n+          scatter_dims_to_operand_dims={0,1},\n+          index_vector_dim=1\n+    }\n+  )\";\n+  TF_ASSERT_OK_AND_ASSIGN(auto module,\n+                          ParseAndReturnVerifiedModule(kModuleStr));\n+\n+  ScatterDeterminismExpander scatter_determinism_expander;\n+  TF_ASSERT_OK_AND_ASSIGN(\n+      bool result, RunHloPass(&scatter_determinism_expander, module.get()));\n+  EXPECT_FALSE(result);\n+}\n+\n }  // namespace\n }  // namespace xla"
+        }
+    ],
+    "stats": {
+        "total": 72,
+        "additions": 72,
+        "deletions": 0
+    }
+}

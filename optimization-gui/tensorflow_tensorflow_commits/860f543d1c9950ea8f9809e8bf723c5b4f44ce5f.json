@@ -1,0 +1,48 @@
+{
+    "author": "WillFroom",
+    "message": "[XLA:CPU][XTile] Create lowering for Iota.\n\nPiperOrigin-RevId: 825789498",
+    "sha": "860f543d1c9950ea8f9809e8bf723c5b4f44ce5f",
+    "files": [
+        {
+            "sha": "88e4df5ca6ea28c2bf5d3bf0ee662347a3271d14",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/tiled/transforms/passes.td",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 3,
+            "changes": 7,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/860f543d1c9950ea8f9809e8bf723c5b4f44ce5f/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Fpasses.td",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/860f543d1c9950ea8f9809e8bf723c5b4f44ce5f/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Fpasses.td",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Fpasses.td?ref=860f543d1c9950ea8f9809e8bf723c5b4f44ce5f",
+            "patch": "@@ -46,11 +46,12 @@ def ShloToVectorPass : Pass<\"xtile-cpu-shlo-to-vector\", \"mlir::ModuleOp\"> {\n   let constructor = \"CreateShloToVectorPass()\";\n \n   let dependentDialects = [\n+    \"mlir::arith::ArithDialect\",\n+    \"mlir::memref::MemRefDialect\",\n+    \"mlir::scf::SCFDialect\",\n+    \"mlir::stablehlo::StablehloDialect\",\n     \"mlir::tensor::TensorDialect\",\n     \"mlir::vector::VectorDialect\",\n-    \"mlir::stablehlo::StablehloDialect\",\n-    \"mlir::scf::SCFDialect\",\n-    \"mlir::memref::MemRefDialect\",\n   ];\n }\n "
+        },
+        {
+            "sha": "37b68b0cefc9f39ab362e1fb001d4006e1514ac2",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/tiled/transforms/shlo_to_vector.cc",
+            "status": "modified",
+            "additions": 30,
+            "deletions": 1,
+            "changes": 31,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/860f543d1c9950ea8f9809e8bf723c5b4f44ce5f/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Fshlo_to_vector.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/860f543d1c9950ea8f9809e8bf723c5b4f44ce5f/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Fshlo_to_vector.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Fshlo_to_vector.cc?ref=860f543d1c9950ea8f9809e8bf723c5b4f44ce5f",
+            "patch": "@@ -317,6 +317,35 @@ struct LowerReshape : mlir::OpRewritePattern<mlir::stablehlo::ReshapeOp> {\n   }\n };\n \n+struct LowerIota : mlir::OpRewritePattern<mlir::stablehlo::IotaOp> {\n+  using OpRewritePattern::OpRewritePattern;\n+\n+  mlir::LogicalResult matchAndRewrite(\n+      mlir::stablehlo::IotaOp op,\n+      mlir::PatternRewriter& rewriter) const override {\n+    if (op.getType().getRank() != 1) {\n+      return rewriter.notifyMatchFailure(\n+          op, \"iota op with rank != 1 is not supported\");\n+    }\n+\n+    auto result_vector_type = GetVectorType(op.getType());\n+    auto element_type = result_vector_type.getElementType();\n+    int64_t iota_size = result_vector_type.getNumElements();\n+\n+    llvm::SmallVector<mlir::Attribute> iota_values(iota_size);\n+    for (int idx = 0; idx != iota_size; ++idx) {\n+      iota_values[idx] = rewriter.getIntegerAttr(element_type, idx);\n+    }\n+\n+    mlir::Value iota_const = mlir::arith::ConstantOp::create(\n+        rewriter, op->getLoc(),\n+        mlir::DenseElementsAttr::get(result_vector_type, iota_values));\n+\n+    rewriter.replaceOp(op, CastToTensor(rewriter, iota_const));\n+    return mlir::success();\n+  }\n+};\n+\n class ShloToVectorPass : public impl::ShloToVectorPassBase<ShloToVectorPass> {\n  public:\n   using ShloToVectorPassBase::ShloToVectorPassBase;\n@@ -325,7 +354,7 @@ class ShloToVectorPass : public impl::ShloToVectorPassBase<ShloToVectorPass> {\n     mlir::MLIRContext* context = &getContext();\n     mlir::RewritePatternSet patterns(context);\n     patterns.add<LowerTranspose, LowerDotGeneral, LowerReduce,\n-                 LowerBroadcastInDim, LowerReshape>(context);\n+                 LowerBroadcastInDim, LowerReshape, LowerIota>(context);\n     if (mlir::failed(\n             mlir::applyPatternsGreedily(getOperation(), std::move(patterns)))) {\n       signalPassFailure();"
+        },
+        {
+            "sha": "d36600e30b48f0953024fd2a9344c790c913a0ef",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/tiled/transforms/tests/shlo_to_vector.mlir",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 0,
+            "changes": 10,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/860f543d1c9950ea8f9809e8bf723c5b4f44ce5f/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Fshlo_to_vector.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/860f543d1c9950ea8f9809e8bf723c5b4f44ce5f/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Fshlo_to_vector.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Fshlo_to_vector.mlir?ref=860f543d1c9950ea8f9809e8bf723c5b4f44ce5f",
+            "patch": "@@ -185,3 +185,13 @@ func.func @reshape(%input : tensor<4xf32>) -> tensor<2x1x2xf32> {\n // CHECK-LABEL: @reshape\n // CHECK:vector.shape_cast {{.*}} : vector<4xf32> to vector<2x1x2xf32>\n \n+// -----\n+\n+func.func @iota() -> tensor<4xi32> {\n+  %result = stablehlo.iota dim = 0 : tensor<4xi32>\n+  return %result : tensor<4xi32>\n+}\n+\n+// CHECK-LABEL: @iota\n+// CHECK: arith.constant dense<[0, 1, 2, 3]> : vector<4xi32>\n+"
+        }
+    ],
+    "stats": {
+        "total": 48,
+        "additions": 44,
+        "deletions": 4
+    }
+}

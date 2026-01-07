@@ -1,0 +1,48 @@
+{
+    "author": "olegshyshkov",
+    "message": "[XLA:GPU] Add a check that each replica group is equally distributed across hosts.\n\nThis way we also make sure that we don't decompose ra2a that stays within single hostl.\n\nPiperOrigin-RevId: 819311950",
+    "sha": "256d7c57ca3cbe69cb438dd8e6ae0625a91add65",
+    "files": [
+        {
+            "sha": "1251402c427c1502d1b16e76d5d996bd026305a6",
+            "filename": "third_party/xla/xla/service/gpu/transforms/BUILD",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/256d7c57ca3cbe69cb438dd8e6ae0625a91add65/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/256d7c57ca3cbe69cb438dd8e6ae0625a91add65/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2FBUILD?ref=256d7c57ca3cbe69cb438dd8e6ae0625a91add65",
+            "patch": "@@ -3228,11 +3228,13 @@ cc_library(\n         \"//xla/tsl/platform:statusor\",\n         \"@com_google_absl//absl/algorithm:container\",\n         \"@com_google_absl//absl/container:flat_hash_set\",\n+        \"@com_google_absl//absl/container:inlined_vector\",\n         \"@com_google_absl//absl/log\",\n         \"@com_google_absl//absl/log:check\",\n         \"@com_google_absl//absl/status\",\n         \"@com_google_absl//absl/status:statusor\",\n         \"@com_google_absl//absl/strings:string_view\",\n+        \"@com_google_absl//absl/types:span\",\n     ],\n )\n "
+        },
+        {
+            "sha": "19a3ad327526eead02ef683e75c3492ef8e67774",
+            "filename": "third_party/xla/xla/service/gpu/transforms/ragged_all_to_all_multi_host_decomposer.cc",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 4,
+            "changes": 20,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/256d7c57ca3cbe69cb438dd8e6ae0625a91add65/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fragged_all_to_all_multi_host_decomposer.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/256d7c57ca3cbe69cb438dd8e6ae0625a91add65/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fragged_all_to_all_multi_host_decomposer.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fragged_all_to_all_multi_host_decomposer.cc?ref=256d7c57ca3cbe69cb438dd8e6ae0625a91add65",
+            "patch": "@@ -22,11 +22,13 @@ limitations under the License.\n \n #include \"absl/algorithm/container.h\"\n #include \"absl/container/flat_hash_set.h\"\n+#include \"absl/container/inlined_vector.h\"\n #include \"absl/log/check.h\"\n #include \"absl/log/log.h\"\n #include \"absl/status/status.h\"\n #include \"absl/status/statusor.h\"\n #include \"absl/strings/string_view.h\"\n+#include \"absl/types/span.h\"\n #include \"xla/hlo/ir/dfs_hlo_visitor.h\"\n #include \"xla/hlo/ir/hlo_casting_utils.h\"\n #include \"xla/hlo/ir/hlo_computation.h\"\n@@ -56,7 +58,7 @@ using hlo_query::NextChannelId;\n HloInstruction* GetIntraHostMetadata(\n     HloRaggedAllToAllInstruction* ragged_all_to_all,\n     HloInstruction* metadata_operand, HloComputation* computation,\n-    const std::vector<ReplicaGroup>& replica_groups, int64_t num_hosts,\n+    absl::Span<ReplicaGroup const> replica_groups, int64_t num_hosts,\n     int64_t num_devices_in_replica, bool correct_offsets) {\n   int64_t num_devices_in_replica_per_host = num_devices_in_replica / num_hosts;\n \n@@ -172,15 +174,25 @@ absl::StatusOr<bool> DecomposeRaggedAllToAll(\n   //   {{0, 8}, {2, 10}, {4, 12}, {6, 14}, {1, 9}, {3, 11}, {5, 13}, {7, 15}}}\n   // And the intra-host replica groups would be:\n   //   {{0, 2, 4, 6}, {8, 10, 12, 14}, {1, 3, 5, 7}, {9, 11, 13, 15}}\n-  std::vector<ReplicaGroup> intra_host_replica_groups;\n-  std::vector<ReplicaGroup> inter_host_replica_groups;\n+  absl::InlinedVector<ReplicaGroup, 8> intra_host_replica_groups;\n+  absl::InlinedVector<ReplicaGroup, 8> inter_host_replica_groups;\n \n   for (const auto& replica_group : replica_groups) {\n-    std::vector<ReplicaGroup> intra_host_replica_group_split(num_hosts);\n+    absl::InlinedVector<int64_t, 8> replicas_per_host(num_hosts);\n+\n+    absl::InlinedVector<ReplicaGroup, 8> intra_host_replica_group_split(\n+        num_hosts);\n     for (int64_t replica_id : replica_group.replica_ids()) {\n       int64_t host_id = replica_id / fast_interconnect_slice_size;\n \n       intra_host_replica_group_split[host_id].add_replica_ids(replica_id);\n+      replicas_per_host[host_id]++;\n+    }\n+\n+    // Check that each group has the same number of replicas per host.\n+    if (!absl::c_all_of(replicas_per_host,\n+                        [&](int64_t v) { return v == replicas_per_host[0]; })) {\n+      return false;\n     }\n \n     absl::c_copy(intra_host_replica_group_split,"
+        },
+        {
+            "sha": "689f7041b21a92f09b6eef28e555d1fbcef49f0c",
+            "filename": "third_party/xla/xla/service/gpu/transforms/ragged_all_to_all_multi_host_decomposer_test.cc",
+            "status": "modified",
+            "additions": 24,
+            "deletions": 0,
+            "changes": 24,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/256d7c57ca3cbe69cb438dd8e6ae0625a91add65/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fragged_all_to_all_multi_host_decomposer_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/256d7c57ca3cbe69cb438dd8e6ae0625a91add65/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fragged_all_to_all_multi_host_decomposer_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fragged_all_to_all_multi_host_decomposer_test.cc?ref=256d7c57ca3cbe69cb438dd8e6ae0625a91add65",
+            "patch": "@@ -203,6 +203,30 @@ ENTRY main {\n   EXPECT_FALSE(changed);\n }\n \n+TEST_F(RaggedAllToAllDecomposerTest,\n+       RaggedAllToAllWithinSingleHostIsNotDecomposed) {\n+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(R\"(\n+HloModule module\n+\n+ENTRY main {\n+    input = bf16[128] parameter(0)\n+    output = bf16[256] parameter(1)\n+    input_offsets = s64[8] parameter(2)\n+    send_sizes = s64[8] parameter(3)\n+    output_offsets = s64[8] parameter(4)\n+    recv_sizes = s64[8] parameter(5)\n+    ROOT ra2a = bf16[256] ragged-all-to-all(input, output, input_offsets,\n+      send_sizes, output_offsets, recv_sizes),\n+      replica_groups={{0,1,2,3,4,5,6,7},{8,9,10,11,12,13,14,15}}\n+}\n+)\"));\n+\n+  RaggedAllToAllMultiHostDecomposer decomposer(\n+      /*fast_interconnect_slice_size=*/8);\n+  TF_ASSERT_OK_AND_ASSIGN(bool changed, decomposer.Run(module.get(), {}));\n+  EXPECT_FALSE(changed);\n+}\n+\n }  // namespace\n }  // namespace gpu\n }  // namespace xla"
+        }
+    ],
+    "stats": {
+        "total": 46,
+        "additions": 42,
+        "deletions": 4
+    }
+}

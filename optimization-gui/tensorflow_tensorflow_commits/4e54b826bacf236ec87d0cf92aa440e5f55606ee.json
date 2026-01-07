@@ -1,0 +1,48 @@
+{
+    "author": "deqiangc",
+    "message": "Always assign new ID to AsyncHandle\n\nPiperOrigin-RevId: 834982495",
+    "sha": "4e54b826bacf236ec87d0cf92aa440e5f55606ee",
+    "files": [
+        {
+            "sha": "2324f958f1926602836534563eed238d2d49e694",
+            "filename": "tensorflow/compiler/mlir/tfrt/translate/mlrt/mlir_to_bytecode.cc",
+            "status": "modified",
+            "additions": 14,
+            "deletions": 8,
+            "changes": 22,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4e54b826bacf236ec87d0cf92aa440e5f55606ee/tensorflow%2Fcompiler%2Fmlir%2Ftfrt%2Ftranslate%2Fmlrt%2Fmlir_to_bytecode.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4e54b826bacf236ec87d0cf92aa440e5f55606ee/tensorflow%2Fcompiler%2Fmlir%2Ftfrt%2Ftranslate%2Fmlrt%2Fmlir_to_bytecode.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcompiler%2Fmlir%2Ftfrt%2Ftranslate%2Fmlrt%2Fmlir_to_bytecode.cc?ref=4e54b826bacf236ec87d0cf92aa440e5f55606ee",
+            "patch": "@@ -177,13 +177,19 @@ struct FunctionEmitterContext {\n   llvm::DenseMap<mlir::Value, RegInfo> register_table;\n   std::vector<int> free_regs;\n \n-  int AssignRegId() {\n-    if (free_regs.empty()) {\n+  int AssignRegId(bool is_persistent) {\n+    if (is_persistent) {\n+      // Persistent types ALWAYS get a brand new ID.\n       return next_reg_id++;\n     }\n-    int id = free_regs.back();\n-    free_regs.pop_back();\n-    return id;\n+\n+    // Non-persistent types can reuse from free_regs.\n+    if (!free_regs.empty()) {\n+      int id = free_regs.back();\n+      free_regs.pop_back();\n+      return id;\n+    }\n+    return next_reg_id++;\n   }\n \n   void FreeRegId(int id) { free_regs.push_back(id); }\n@@ -204,7 +210,7 @@ void EmitKernel(FunctionEmitterContext& function_context,\n     auto iter = function_context.register_table.find(result);\n     CHECK(iter != function_context.register_table.end());  // Crash Ok\n     CHECK_EQ(iter->second.id, -1);                         // Crash Ok\n-    iter->second.id = function_context.AssignRegId();\n+    iter->second.id = function_context.AssignRegId(iter->second.persistent);\n     results.push_back(iter->second.id);\n   }\n   constructor.construct_results(results.size())\n@@ -287,9 +293,9 @@ void EmitFunction(const ModuleEmitterContext& module_context,\n   std::vector<uint32_t> input_regs;\n   input_regs.reserve(block.getNumArguments());\n   for (auto arg : block.getArguments()) {\n-    int id = function_context.AssignRegId();\n-    input_regs.push_back(id);\n     bool persistent = mlir::isa<mlrt::compiler::AsyncHandleType>(arg.getType());\n+    int id = function_context.AssignRegId(persistent);\n+    input_regs.push_back(id);\n     register_table[arg] = {static_cast<int>(std::distance(arg.getUses().begin(),\n                                                           arg.getUses().end())),\n                            id, persistent};"
+        },
+        {
+            "sha": "53f2e7591c8a9a6fbefc935b77940146f114234a",
+            "filename": "tensorflow/compiler/mlir/tfrt/translate/mlrt/mlir_to_bytecode_test.cc",
+            "status": "modified",
+            "additions": 64,
+            "deletions": 1,
+            "changes": 65,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4e54b826bacf236ec87d0cf92aa440e5f55606ee/tensorflow%2Fcompiler%2Fmlir%2Ftfrt%2Ftranslate%2Fmlrt%2Fmlir_to_bytecode_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4e54b826bacf236ec87d0cf92aa440e5f55606ee/tensorflow%2Fcompiler%2Fmlir%2Ftfrt%2Ftranslate%2Fmlrt%2Fmlir_to_bytecode_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcompiler%2Fmlir%2Ftfrt%2Ftranslate%2Fmlrt%2Fmlir_to_bytecode_test.cc?ref=4e54b826bacf236ec87d0cf92aa440e5f55606ee",
+            "patch": "@@ -383,7 +383,7 @@ TEST(MlirToByteCodeTest, CustomDense) {\n   }\n }\n \n-TEST(MlirToByteCodeTest, Async) {\n+TEST(MlirToByteCodeTest, AsyncNotFreed) {\n   constexpr char kAsyncMlir[] =\n       \"tensorflow/compiler/mlir/tfrt/translate/mlrt/testdata/async.mlir\";\n \n@@ -444,5 +444,68 @@ TEST(MlirToByteCodeTest, Async) {\n   EXPECT_THAT(kernels[4].last_uses(), ElementsAreArray({true}));\n }\n \n+TEST(MlirToByteCodeTest, AsyncUseNewId) {\n+  constexpr char kAsyncMlir[] =\n+      \"tensorflow/compiler/mlir/tfrt/translate/mlrt/testdata/async2.mlir\";\n+\n+  mlir::DialectRegistry registry;\n+  registry.insert<mlir::func::FuncDialect, mlrt::compiler::MlrtDialect>();\n+  mlir::MLIRContext mlir_context(registry);\n+  mlir_context.allowUnregisteredDialects();\n+  auto mlir_module = mlir::parseSourceFile<mlir::ModuleOp>(\n+      tsl::GetDataDependencyFilepath(kAsyncMlir), &mlir_context);\n+\n+  AttributeEncoderRegistry attribute_encoder_registry;\n+  bc::Buffer buffer =\n+      EmitExecutable(attribute_encoder_registry, mlir_module.get()).value();\n+\n+  bc::Executable executable(buffer.data());\n+\n+  auto kernel_names = executable.kernel_names();\n+  EXPECT_THAT(kernel_names,\n+              ElementsAreArray({\"test_mlbc.add.i32\", \"return\", \"mlrt.async\",\n+                                \"mlrt.await_handle\"}));\n+\n+  auto functions = executable.functions();\n+  ASSERT_EQ(functions.size(), 2);\n+\n+  auto function = functions[1];\n+  EXPECT_EQ(function.name().str(), \"main\");\n+  EXPECT_EQ(function.num_regs(), 4);\n+  EXPECT_THAT(function.input_regs(), ElementsAreArray({0, 1}));\n+  EXPECT_THAT(function.output_regs(), ElementsAreArray({1}));\n+  EXPECT_THAT(function.output_last_uses(), ElementsAreArray({true}));\n+\n+  auto kernels = function.kernels();\n+  ASSERT_EQ(kernels.size(), 5);\n+\n+  EXPECT_EQ(kernels[0].code(), 0);  // test_mlbc.add.i32\n+  EXPECT_THAT(kernels[0].arguments(), ElementsAreArray({0, 1}));\n+  EXPECT_THAT(kernels[0].results(), ElementsAreArray({2}));\n+  EXPECT_THAT(kernels[0].last_uses(), ElementsAreArray({true, true}));\n+\n+  EXPECT_EQ(kernels[1].code(), 2);  // mlrt.async\n+  EXPECT_THAT(kernels[1].arguments(), ElementsAreArray({2, 2}));\n+  // The returned handle is in register 3, which is never used by other kernels.\n+  EXPECT_THAT(kernels[1].results(), ElementsAreArray({3}));\n+  EXPECT_THAT(kernels[1].last_uses(), ElementsAreArray({false, false}));\n+\n+  EXPECT_EQ(kernels[2].code(), 3);  // mlrt.await_handle\n+  EXPECT_THAT(kernels[2].arguments(), ElementsAreArray({3}));\n+  EXPECT_THAT(kernels[2].results(), IsEmpty());\n+  EXPECT_THAT(kernels[2].last_uses(), ElementsAreArray({false}));\n+\n+  EXPECT_EQ(kernels[3].code(), 0);  // test_mlbc.add.i32\n+  EXPECT_THAT(kernels[3].arguments(), ElementsAreArray({2, 2}));\n+  // AsyncHandle does not free its register. So this can only use 1.\n+  EXPECT_THAT(kernels[3].results(), ElementsAreArray({1}));\n+  EXPECT_THAT(kernels[3].last_uses(), ElementsAreArray({false, true}));\n+\n+  EXPECT_EQ(kernels[4].code(), 1);  // return\n+  EXPECT_THAT(kernels[4].arguments(), ElementsAreArray({1}));\n+  EXPECT_THAT(kernels[4].results(), IsEmpty());\n+  EXPECT_THAT(kernels[4].last_uses(), ElementsAreArray({true}));\n+}\n+\n }  // namespace\n }  // namespace mlrt"
+        },
+        {
+            "sha": "c960fedd2adc25de18348c8162f8351ebe805085",
+            "filename": "tensorflow/compiler/mlir/tfrt/translate/mlrt/testdata/async2.mlir",
+            "status": "added",
+            "additions": 16,
+            "deletions": 0,
+            "changes": 16,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4e54b826bacf236ec87d0cf92aa440e5f55606ee/tensorflow%2Fcompiler%2Fmlir%2Ftfrt%2Ftranslate%2Fmlrt%2Ftestdata%2Fasync2.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4e54b826bacf236ec87d0cf92aa440e5f55606ee/tensorflow%2Fcompiler%2Fmlir%2Ftfrt%2Ftranslate%2Fmlrt%2Ftestdata%2Fasync2.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcompiler%2Fmlir%2Ftfrt%2Ftranslate%2Fmlrt%2Ftestdata%2Fasync2.mlir?ref=4e54b826bacf236ec87d0cf92aa440e5f55606ee",
+            "patch": "@@ -0,0 +1,16 @@\n+func.func @add_i32(%arg0: i32, %arg1: i32) -> i32 {\n+  %0 = \"test_mlbc.add.i32\"(%arg0, %arg1) : (i32, i32) -> i32\n+  func.return %0 : i32\n+}\n+\n+func.func @main(%arg0: i32, %arg1: i32) -> i32 {\n+  %c1 = \"test_mlbc.add.i32\"(%arg0, %arg1) : (i32, i32) -> i32\n+ \n+  %handle = \"mlrt.async\"(%c1, %c1) {callee = @add_i32} : (i32, i32) -> !mlrt.async_handle\n+\n+  \"mlrt.await_handle\"(%handle) : (!mlrt.async_handle) -> () \n+\n+  %c2 = \"test_mlbc.add.i32\"(%c1, %c1) : (i32, i32) -> i32\n+\n+  func.return %c2 : i32\n+}\n\\ No newline at end of file"
+        }
+    ],
+    "stats": {
+        "total": 103,
+        "additions": 94,
+        "deletions": 9
+    }
+}

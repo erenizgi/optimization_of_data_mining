@@ -1,0 +1,36 @@
+{
+    "author": "ezhulenev",
+    "message": "[xla] Add an API to convert PjRtFuture<T>::Promise to a future object\n\nAlso delete `async_value()` getter via promise object. Async value is only available via linked future.\n\nPiperOrigin-RevId: 811082572",
+    "sha": "b927fb6bdb4c4b3e440b566dd9f0c0795a59124b",
+    "files": [
+        {
+            "sha": "bd9ac6765719c73bee41db121d8973389bf79ee4",
+            "filename": "third_party/xla/xla/pjrt/pjrt_future.h",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 16,
+            "changes": 31,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b927fb6bdb4c4b3e440b566dd9f0c0795a59124b/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_future.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b927fb6bdb4c4b3e440b566dd9f0c0795a59124b/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_future.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_future.h?ref=b927fb6bdb4c4b3e440b566dd9f0c0795a59124b",
+            "patch": "@@ -237,9 +237,6 @@ class PjRtFutureBase : public PjRtFutureMoveControl<is_move_only> {\n     Promise(Promise&& other) = default;\n     Promise& operator=(Promise&& other) = default;\n \n-    Promise(const Promise& other) = default;\n-    Promise& operator=(const Promise& other) = default;\n-\n     explicit operator bool() const { return static_cast<bool>(promise_); }\n \n     // Returns if this promise is the unique reference to the underlying value.\n@@ -257,7 +254,7 @@ class PjRtFutureBase : public PjRtFutureMoveControl<is_move_only> {\n     // debugging easier. Also, be aware that the current promise may still be\n     // used to mint a future.\n     bool IsUniqueReference() const {\n-      return async_value()->IsUnique() && !async_value()->HasWaiter();\n+      return promise_.IsUnique() && !promise_.HasWaiter();\n     }\n \n    protected:\n@@ -273,11 +270,6 @@ class PjRtFutureBase : public PjRtFutureMoveControl<is_move_only> {\n     // Takes a reference to the underlying AsyncValueRef container.\n     tsl::AsyncValueRef<T> ref() const { return promise_; }\n \n-    // Returns a pointer to the underlying AsyncValue that can be used to\n-    // track completion of a promise. It is undefined behavior to access the\n-    // value stored in the AsyncValue.\n-    tsl::AsyncValue* async_value() const { return promise_.GetAsyncValue(); }\n-\n    private:\n     tsl::AsyncValueRef<T> promise_;\n   };\n@@ -472,9 +464,6 @@ class PjRtFuture : public internal::PjRtFutureBase<absl::StatusOr<T>> {\n \n   class Promise : public Base::Promise {\n    public:\n-    Promise(Promise&&) = default;\n-    Promise& operator=(Promise&&) = default;\n-\n     using Base::Promise::Promise;\n \n     // Sets the value of the promise. Must be called at most once.\n@@ -491,6 +480,20 @@ class PjRtFuture : public internal::PjRtFutureBase<absl::StatusOr<T>> {\n       return std::make_shared<Promise>(std::move(*this));\n     }\n \n+    // Returns a future associated with the promise. We use a trick we an extra\n+    // template parameter to disable converting promise to future for move-only\n+    // types, as it is illegal to create multiple move-only futures sharing the\n+    // underlying async value storage. For move-only types, the only way to\n+    // create a future is to call `MakePromise`.\n+    template <typename U = void,\n+              std::enable_if_t<!is_move_only && std::is_void_v<U>>* = nullptr>\n+    PjRtFuture<T> future(\n+        PjRtFutureHelpers::OnBlockStartFn on_block_start = nullptr,\n+        PjRtFutureHelpers::OnBlockEndFn on_block_end = nullptr) const {\n+      return PjRtFuture<T>(*this, std::move(on_block_start),\n+                           std::move(on_block_end));\n+    }\n+\n    private:\n     template <typename>\n     friend class PjRtFuture;\n@@ -762,10 +765,6 @@ class PjRtFuture<void> : public internal::PjRtFutureBase<absl::Status> {\n \n   class Promise : public Base::Promise {\n    public:\n-    Promise(Promise&&) = default;\n-    Promise& operator=(Promise&&) = default;\n-\n-    using Base::Promise::async_value;\n     using Base::Promise::Promise;\n \n     // Sets the promise completed with a given status. Must be called at most"
+        },
+        {
+            "sha": "657595ab9211353cbbf57d41c936d1b7f690587f",
+            "filename": "third_party/xla/xla/pjrt/pjrt_future_test.cc",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b927fb6bdb4c4b3e440b566dd9f0c0795a59124b/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_future_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b927fb6bdb4c4b3e440b566dd9f0c0795a59124b/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_future_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_future_test.cc?ref=b927fb6bdb4c4b3e440b566dd9f0c0795a59124b",
+            "patch": "@@ -52,6 +52,15 @@ TEST(PjRtFutureTest, StatelessFuture) {\n       [](absl::Status status) { EXPECT_EQ(status, absl::OkStatus()); });\n }\n \n+TEST(PjRtFutureTest, CreateFutureFromPromise) {\n+  auto [promise, _] = PjRtFuture<int32_t>::MakePromise();\n+  PjRtFuture<int32_t> future = promise.future();\n+\n+  EXPECT_FALSE(future.IsReady());\n+  promise.Set(42);\n+  EXPECT_EQ(*future.Await(), 42);\n+}\n+\n TEST(PjRtFutureTest, StatefulFutureToStateless) {\n   auto [promise, future] = PjRtFuture<int32_t>::MakePromise();\n   PjRtFuture<> ready_future = future.GetReadyFuture();"
+        }
+    ],
+    "stats": {
+        "total": 40,
+        "additions": 24,
+        "deletions": 16
+    }
+}

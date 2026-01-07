@@ -1,0 +1,72 @@
+{
+    "author": "basioli-k",
+    "message": "[XLA][codegen] Emit shlo reshape from the fusion emitter and lower it to triton for the triton backend.\n\nPiperOrigin-RevId: 826147865",
+    "sha": "597384860026efda9d949a32dbd50926b611e407",
+    "files": [
+        {
+            "sha": "e1572971332c3acaa08478facda0889aed5dc893",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/fusion_emitter.cc",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 5,
+            "changes": 7,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/597384860026efda9d949a32dbd50926b611e407/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/597384860026efda9d949a32dbd50926b611e407/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter.cc?ref=597384860026efda9d949a32dbd50926b611e407",
+            "patch": "@@ -651,11 +651,8 @@ absl::StatusOr<ScalarOrTensor> EmitTiledReshape(EmitterLocOpBuilder b,\n                      absl::StrJoin(output_tensor_type.getShape(), \"x\")));\n   }\n \n-  // Conservatively prevent Triton from reordering elements within the tile.\n-  // TODO(b/353637689): see if this restriction can be lifted.\n-  bool allow_reorder = false;\n-  auto reshape = b.create<ttir::ReshapeOp>(output_tensor_type,\n-                                           input.UnwrapUnsafe(), allow_reorder);\n+  auto reshape =\n+      b.create<stablehlo::ReshapeOp>(output_tensor_type, input.UnwrapUnsafe());\n   return ScalarOrTensor(reshape.getResult());\n }\n "
+        },
+        {
+            "sha": "3315edd5a1f42bc05374691ddb8656439bdf0f2b",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/fusion_emitter_device_test.cc",
+            "status": "modified",
+            "additions": 29,
+            "deletions": 12,
+            "changes": 41,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/597384860026efda9d949a32dbd50926b611e407/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter_device_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/597384860026efda9d949a32dbd50926b611e407/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter_device_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter_device_test.cc?ref=597384860026efda9d949a32dbd50926b611e407",
+            "patch": "@@ -1999,11 +1999,20 @@ ENTRY main {\n   const bool is_tma_allowed = GetParam();\n   const std::string hlo_text =\n       absl::Substitute(kHloTextTemplate, is_tma_allowed);\n-  TF_EXPECT_OK(\n-      CreateTritonIrAndFileCheck(this, hlo_text, \"triton_computation\", R\"(\n-CHECK: tt.reshape\n+\n+  TF_ASSERT_OK_AND_ASSIGN(\n+      auto xtile_module_and_hlo_module,\n+      CreateXTileIrAndFileCheck(this, hlo_text, \"triton_computation\", R\"(\n+CHECK: stablehlo.reshape\n )\"));\n \n+  TF_ASSERT_OK(LowerXTileIrToTritonAndFileCheck(\n+      this, xtile_module_and_hlo_module.first.get(), R\"(\n+CHECK: tt.reshape\n+)\",\n+      GetFusionInstruction(*xtile_module_and_hlo_module.second,\n+                           \"triton_computation\")));\n+\n   EXPECT_TRUE(RunAndCompareNoHloPasses(hlo_text, kExactMatch));\n }\n \n@@ -2158,11 +2167,19 @@ ENTRY main {\n           \"num_ctas\":\"1\",\n           \"num_stages\":\"1\"}}}\n })\";\n-  TF_EXPECT_OK(\n-      CreateTritonIrAndFileCheck(this, kHloText, \"triton_computation\", R\"(\n-CHECK: tt.reshape\n+  TF_ASSERT_OK_AND_ASSIGN(\n+      auto xtile_module_and_hlo_module,\n+      CreateXTileIrAndFileCheck(this, kHloText, \"triton_computation\", R\"(\n+CHECK: stablehlo.reshape\n )\"));\n \n+  TF_ASSERT_OK(LowerXTileIrToTritonAndFileCheck(\n+      this, xtile_module_and_hlo_module.first.get(), R\"(\n+CHECK: tt.reshape\n+)\",\n+      GetFusionInstruction(*xtile_module_and_hlo_module.second,\n+                           \"triton_computation\")));\n+\n   EXPECT_TRUE(RunAndCompareNoHloPasses(kHloText, kExactMatch));\n }\n \n@@ -2341,7 +2358,7 @@ ENTRY entry_computation {\n       CreateXTileIrAndFileCheck(this, kHloText, \"triton_computation\", R\"(\n CHECK:     xtile.extract\n CHECK-NOT: stablehlo.transpose\n-CHECK:     tt.reshape\n+CHECK:     stablehlo.reshape\n CHECK-NOT: stablehlo.transpose\n CHECK:     xtile.insert\n           )\"));\n@@ -2388,7 +2405,7 @@ CHECK-SAME: memref<48x16xi32, #triton_xla.layout<[0, 1]>>\n CHECK-SAME: memref<16x16x3xi32>,\n CHECK:      xtile.extract\n CHECK:      stablehlo.transpose\n-CHECK:      tt.reshape\n+CHECK:      stablehlo.reshape\n CHECK-NOT:  stablehlo.transpose\n CHECK:      xtile.insert\n           )\"));\n@@ -2432,7 +2449,7 @@ ENTRY entry_computation {\n       CreateXTileIrAndFileCheck(this, kHloText, \"triton_computation\", R\"(\n CHECK:     xtile.extract\n CHECK-NOT: stablehlo.transpose\n-CHECK:     tt.reshape\n+CHECK:     stablehlo.reshape\n CHECK:     stablehlo.transpose\n CHECK:     xtile.insert\n           )\"));\n@@ -2477,7 +2494,7 @@ ENTRY entry_computation {\n       CreateXTileIrAndFileCheck(this, kHloText, \"triton_computation\", R\"(\n CHECK:     xtile.extract\n CHECK:     stablehlo.transpose\n-CHECK:     tt.reshape\n+CHECK:     stablehlo.reshape\n CHECK:     stablehlo.transpose\n CHECK:     xtile.insert\n           )\"));\n@@ -2521,7 +2538,7 @@ ENTRY entry_computation {\n       CreateXTileIrAndFileCheck(this, kHloText, \"triton_computation\", R\"(\n CHECK:     xtile.extract\n CHECK:     stablehlo.transpose\n-CHECK-NOT: tt.reshape\n+CHECK-NOT: stablehlo.reshape\n CHECK-NOT: stablehlo.transpose\n CHECK:     xtile.insert\n           )\"));\n@@ -3136,7 +3153,7 @@ ENTRY entry_computation {\n       auto xtile_module_and_hlo_module,\n       CreateXTileIrAndFileCheck(this, kHloText, \"triton_computation\", R\"(\n CHECK:     xtile.extract\n-CHECK:     tt.reshape\n+CHECK:     stablehlo.reshape\n CHECK:     stablehlo.reduce\n CHECK:     stablehlo.reduce\n CHECK:     xtile.insert"
+        },
+        {
+            "sha": "fd8f37b055787ca99a9dc3083c87551275b11087",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/fusion_emitter_shared_dialect_test.cc",
+            "status": "modified",
+            "additions": 29,
+            "deletions": 0,
+            "changes": 29,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/597384860026efda9d949a32dbd50926b611e407/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter_shared_dialect_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/597384860026efda9d949a32dbd50926b611e407/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter_shared_dialect_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter_shared_dialect_test.cc?ref=597384860026efda9d949a32dbd50926b611e407",
+            "patch": "@@ -229,6 +229,35 @@ CHECK: }\n )\"));\n }\n \n+TEST_F(XTileDialectTest, HloReshapeIsLoweredToStableHloReshape) {\n+  constexpr absl::string_view kHloText = R\"(\n+HloModule t, is_scheduled=true\n+\n+reshape_fusion {\n+  p0 = s32[150] parameter(0)\n+  ROOT reshape = s32[15, 10] reshape(p0)\n+}\n+\n+ENTRY e {\n+  p0 = s32[150] parameter(0)\n+  ROOT custom-call = s32[15, 10] fusion(p0), kind=kCustom,\n+    calls=reshape_fusion,\n+    backend_config={\"fusion_backend_config\": {kind: \"__triton\"}}\n+})\";\n+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,\n+                          ParseAndReturnVerifiedModule(kHloText));\n+\n+  BlockLevelParameters block_level_parameters;\n+  block_level_parameters.output_tile_sizes = {{1, 16}};\n+\n+  TF_EXPECT_OK(CreateXTileIrAndFileCheck(\n+      this, *module->GetComputationWithName(\"reshape_fusion\"),\n+      block_level_parameters,\n+      R\"(\n+CHECK: %[[RES:.*]] = stablehlo.reshape %[[ARG:.*]] : (tensor<16xi32>) -> tensor<1x16xi32>\n+)\"));\n+}\n+\n }  // namespace\n }  // namespace gpu\n }  // namespace xla"
+        },
+        {
+            "sha": "49a3cf92c33f03ee15a62054be5578ba3edc25d7",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/transforms/stablehlo_lower_to_triton.cc",
+            "status": "modified",
+            "additions": 17,
+            "deletions": 1,
+            "changes": 18,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/597384860026efda9d949a32dbd50926b611e407/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Fstablehlo_lower_to_triton.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/597384860026efda9d949a32dbd50926b611e407/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Fstablehlo_lower_to_triton.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Fstablehlo_lower_to_triton.cc?ref=597384860026efda9d949a32dbd50926b611e407",
+            "patch": "@@ -313,14 +313,30 @@ class LowerReduce : public mlir::OpRewritePattern<stablehlo::ReduceOp> {\n   }\n };\n \n+class LowerReshape : public mlir::OpRewritePattern<stablehlo::ReshapeOp> {\n+ public:\n+  using OpRewritePattern::OpRewritePattern;\n+\n+ private:\n+  mlir::LogicalResult matchAndRewrite(\n+      stablehlo::ReshapeOp op, mlir::PatternRewriter& rewriter) const override {\n+    // Conservatively prevent Triton from reordering elements within the tile.\n+    // TODO(b/353637689): see if this restriction can be lifted.\n+    bool allow_reorder = false;\n+    rewriter.replaceOpWithNewOp<ttir::ReshapeOp>(\n+        op, op.getResult().getType(), op.getOperand(), allow_reorder);\n+    return mlir::success();\n+  }\n+};\n+\n class StableHLOLowerToTritonPass\n     : public impl::StableHLOLowerToTritonPassBase<StableHLOLowerToTritonPass> {\n  public:\n   void runOnOperation() override {\n     mlir::MLIRContext* mlir_context = &getContext();\n     mlir::RewritePatternSet patterns(mlir_context);\n     patterns.add<LowerTranspose, LowerIotaToMakeRange, LowerBroadcastInDim,\n-                 LowerReduce>(mlir_context);\n+                 LowerReduce, LowerReshape>(mlir_context);\n \n     if (mlir::failed(\n             mlir::applyPatternsGreedily(getOperation(), std::move(patterns)))) {"
+        },
+        {
+            "sha": "df2b7bd3fbcebbc5baddb71d88c90b320b982b48",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/transforms/tests/stable_hlo_to_triton_lowering.mlir",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/597384860026efda9d949a32dbd50926b611e407/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftests%2Fstable_hlo_to_triton_lowering.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/597384860026efda9d949a32dbd50926b611e407/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftests%2Fstable_hlo_to_triton_lowering.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftests%2Fstable_hlo_to_triton_lowering.mlir?ref=597384860026efda9d949a32dbd50926b611e407",
+            "patch": "@@ -175,3 +175,9 @@ func.func @reduce_with_multiple_inputs(%arg0: tensor<16x8xf32>, %arg1: tensor<16\n   return %1 : tensor<8xf32>\n }\n \n+func.func @lower_reshape(%arg0: tensor<2x4x8xf32>) -> tensor<8x2x4xf32> {\n+  // CHECK: %[[RES:.*]] = tt.reshape %[[ARG]] : tensor<2x4x8xf32> -> tensor<8x2x4xf32>\n+  %0 = stablehlo.reshape %arg0 : (tensor<2x4x8xf32>) -> tensor<8x2x4xf32>\n+  return %0 : tensor<8x2x4xf32>\n+}\n+"
+        }
+    ],
+    "stats": {
+        "total": 101,
+        "additions": 83,
+        "deletions": 18
+    }
+}

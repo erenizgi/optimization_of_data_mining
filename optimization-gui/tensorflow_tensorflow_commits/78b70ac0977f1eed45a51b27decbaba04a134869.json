@@ -1,0 +1,36 @@
+{
+    "author": "mwhittaker",
+    "message": "Propagate errors in TFRT GPU client.\n\nA `TrackedGpuDeviceBuffer` has two futures: a `definition_event_` and a\n`ready_event_`. The definition event is fulfilled when the GPU computation that\nwrites the buffer is scheduled. The ready event is fulfilled when the GPU\ncomputation that writes the buffer finishes.\n\nDefinition events are critical for scheduling a sequence of data-dependent\ncomputations on the GPU. If the output of computation A is an input to\ncomputation B, then you cannot schedule B until A's definition event is\nfulfilled.\n\nReady events, on the other hand, are not needed for scheduling computation.\nInstead, they are used to wait for computations to finish. This is needed in\ntwo scenarios. First, if a user calls `BlockUntilReady`, we can block on a\nbuffer's ready event. Second, if a user tranfers a GPU buffer to host memory to\ninspect it (e.g., print it), then we can also block on the buffers ready event.\n\nBefore this change, the TFRT GPU client was not implementing ready events\ncorrectly for two reasons. First, device to host transfer was ignoring the\nready event. Second, the ready event of a computation was ignoring errors on\nthe ready events of its inputs. This fixes both issues, ensuring that errors\nare fully propagated.\n\nPiperOrigin-RevId: 827567082",
+    "sha": "78b70ac0977f1eed45a51b27decbaba04a134869",
+    "files": [
+        {
+            "sha": "2ddf0c82620b2cd8433cc8d9b9c41333385d4a01",
+            "filename": "third_party/xla/xla/pjrt/gpu/tfrt/tfrt_gpu_buffer.cc",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/78b70ac0977f1eed45a51b27decbaba04a134869/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Ftfrt%2Ftfrt_gpu_buffer.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/78b70ac0977f1eed45a51b27decbaba04a134869/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Ftfrt%2Ftfrt_gpu_buffer.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Ftfrt%2Ftfrt_gpu_buffer.cc?ref=78b70ac0977f1eed45a51b27decbaba04a134869",
+            "patch": "@@ -485,6 +485,12 @@ Future<> TfrtGpuBuffer::ToLiteralHelper(Future<MutableLiteralBase*> literal) {\n               promise.Set(status);\n               return;\n             }\n+\n+            tsl::BlockUntilReady(device_buffer->ready_event());\n+            if (device_buffer->ready_event().IsError()) {\n+              promise.Set(device_buffer->ready_event().GetError());\n+              return;\n+            }\n           }\n           void* buffer;\n           if (should_unpack) {"
+        },
+        {
+            "sha": "7b0fb3f81b0e1ef99e7f663eb250e80317967529",
+            "filename": "third_party/xla/xla/pjrt/gpu/tfrt/tfrt_gpu_executable.cc",
+            "status": "modified",
+            "additions": 25,
+            "deletions": 0,
+            "changes": 25,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/78b70ac0977f1eed45a51b27decbaba04a134869/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Ftfrt%2Ftfrt_gpu_executable.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/78b70ac0977f1eed45a51b27decbaba04a134869/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Ftfrt%2Ftfrt_gpu_executable.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Ftfrt%2Ftfrt_gpu_executable.cc?ref=78b70ac0977f1eed45a51b27decbaba04a134869",
+            "patch": "@@ -427,6 +427,7 @@ absl::StatusOr<PjRtLoadedExecutable::Result> TfrtGpuExecutable::ExecuteHelper(\n   // the single definition event.\n   std::vector<tsl::RCReference<tsl::AsyncValue>> prepare_input_deps;\n   std::vector<tsl::RCReference<tsl::AsyncValue>> input_deps;\n+  std::vector<tsl::RCReference<tsl::AsyncValue>> ready_deps;\n   input_deps.reserve(argument_handles.size() + 1);\n \n   absl::Span<int const> donated_params =\n@@ -512,6 +513,7 @@ absl::StatusOr<PjRtLoadedExecutable::Result> TfrtGpuExecutable::ExecuteHelper(\n                 << definition_event.GetAsyncValue();\n         input_deps.push_back(definition_event.CopyRCRef());\n       }\n+      ready_deps.push_back(tracked_buffer->ready_event().CopyRCRef());\n     }\n   }\n \n@@ -610,6 +612,7 @@ absl::StatusOr<PjRtLoadedExecutable::Result> TfrtGpuExecutable::ExecuteHelper(\n        gpu_executable(std::move(gpu_executable)),\n        device_assignment(device_assignment), executable_name(name()),\n        ffi_context(ffi_context), inputs_avs(CopyAsyncValues(input_deps)),\n+       ready_deps(std::move(ready_deps)),\n        execution_profile(options.execution_profile),\n        send_device_memory(std::move(send_device_memory)),\n        recv_device_memory(std::move(recv_device_memory)),\n@@ -796,6 +799,28 @@ absl::StatusOr<PjRtLoadedExecutable::Result> TfrtGpuExecutable::ExecuteHelper(\n           return;\n         }\n \n+        // Propagate errors (if any) from dependencies.\n+        absl::Status ready_deps_status;\n+        for (const tsl::RCReference<tsl::AsyncValue>& ready : ready_deps) {\n+          tsl::BlockUntilReady(ready.get());\n+          if (!ready->IsError()) {\n+            continue;\n+          }\n+          absl::Status err = ready->GetError();\n+          LOG(ERROR) << \"Computation has failed dependency: \" << err;\n+          if (ready_deps_status.ok()) {\n+            ready_deps_status = err;\n+          } else {\n+            ready_deps_status = absl::Status(\n+                err.code(),\n+                absl::StrCat(ready_deps_status.message(), \"; \", err.message()));\n+          }\n+        }\n+        if (!ready_deps_status.ok()) {\n+          complete_event.SetError(ready_deps_status);\n+          return;\n+        }\n+\n         // If any collective is stale, then the collective may have aborted.\n         // Note that NCCL doesn't provide a way to *know* if the collective was\n         // aborted, but we conservatively assume it was."
+        }
+    ],
+    "stats": {
+        "total": 31,
+        "additions": 31,
+        "deletions": 0
+    }
+}

@@ -1,0 +1,36 @@
+{
+    "author": "sfvaroglu",
+    "message": "PR #30718: [XLA/GPU] Apply size threshold only to AllReduce ops in CollectiveBackendAssigner\n\nImported from GitHub PR https://github.com/openxla/xla/pull/30718\n\n📝 Summary of Changes\nThis PR removes size threshold for CollectivePermute ops in CollectiveBackendAssigner.\n\n🎯 Justification\nSize-based backend selection is unnecessary for CollectivePermute, since NVSHMEM uses copy engines and delivers consistent performance regardless of message size, unlike AllReduce where scaling overhead justifies thresholds.\n\n🚀 Kind of Contribution\n⚡️ Performance Improvement\n\n📊 Benchmark (for Performance Improvements)\nNo NVSHMEM performance tracking in\n`compiler/xla/tools/benchmarks/hlo/`.\n\nWe evaluated back-to-back CollectivePermute ops using multihost-hlo-runner, measuring nvshmemx_float_put_nbi_on_stream kernel execution times across data sizes from 1KB to 32MB. NVSHMEM maintained ~5.6-7.5μs latency across all data sizes. This demonstrates scalability for CollectivePermute operations, maintaining constant low latency regardless of data size.\n\n🧪 Unit Tests:\nUpdated an existing unit test.\n\n🧪 Execution Tests:\nN/A\n\nCopybara import of the project:\n\n--\nf8caddd9dbe23eab5dea7d9756c6619a73764e67 by Sevin Varoglu <svaroglu@nvidia.com>:\n\n[XLA/GPU] Apply size threshold only to AllReduce ops in CollectiveBackendAssigner\n\nMerging this change closes #30718\n\nPiperOrigin-RevId: 803065028",
+    "sha": "7b4ce312f61533c82ad85a9ef58e3a070102c48b",
+    "files": [
+        {
+            "sha": "344e399448c1488b77b9ccb104cf5df7a7cb7e9e",
+            "filename": "third_party/xla/xla/service/gpu/transforms/collectives/collective_backend_assigner.cc",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 1,
+            "changes": 8,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/7b4ce312f61533c82ad85a9ef58e3a070102c48b/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fcollectives%2Fcollective_backend_assigner.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/7b4ce312f61533c82ad85a9ef58e3a070102c48b/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fcollectives%2Fcollective_backend_assigner.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fcollectives%2Fcollective_backend_assigner.cc?ref=7b4ce312f61533c82ad85a9ef58e3a070102c48b",
+            "patch": "@@ -44,6 +44,11 @@ bool IsCollectiveOp(const HloInstruction* instr) {\n                           HloOpcode::kCollectivePermuteStart>(instr);\n }\n \n+bool IsAllReduceOp(const HloInstruction* instr) {\n+  return HloPredicateIsOp<HloOpcode::kAllReduce, HloOpcode::kAllReduceStart>(\n+      instr);\n+}\n+\n int64_t GetShapeSize(const Shape& shape) {\n   if (shape.IsTuple()) {\n     int64_t size_in_bytes = 0;\n@@ -93,7 +98,8 @@ absl::StatusOr<bool> CollectiveBackendAssigner::Run(\n               << \" threshold_in_bytes_=\" << threshold_in_bytes_;\n       bool use_nvshmem = (num_visible_devices_per_process_ == 1 ||\n                           comm_type == GPUCommunicationType::SINGLE_HOST) &&\n-                         GetShapeSize(instr->shape()) < threshold_in_bytes_;\n+                         (!IsAllReduceOp(instr) ||\n+                          GetShapeSize(instr->shape()) < threshold_in_bytes_);\n       if (!use_nvshmem) {\n         continue;\n       }"
+        },
+        {
+            "sha": "fef570812387d0b465dffab64bb6f7c6dab71819",
+            "filename": "third_party/xla/xla/service/gpu/transforms/collectives/collective_backend_assigner_test.cc",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 3,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/7b4ce312f61533c82ad85a9ef58e3a070102c48b/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fcollectives%2Fcollective_backend_assigner_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/7b4ce312f61533c82ad85a9ef58e3a070102c48b/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fcollectives%2Fcollective_backend_assigner_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fcollectives%2Fcollective_backend_assigner_test.cc?ref=7b4ce312f61533c82ad85a9ef58e3a070102c48b",
+            "patch": "@@ -126,7 +126,7 @@ TEST_F(CollectiveBackendAssignerTest, SmallCollectivePermuteUsesNvshmem) {\n               absl_testing::IsOkAndHolds(CollectiveBackendConfig::NVSHMEM));\n }\n \n-TEST_F(CollectiveBackendAssignerTest, LargeCollectivePermuteUsesDefault) {\n+TEST_F(CollectiveBackendAssignerTest, LargeCollectivePermuteUsesNvshmem) {\n   absl::string_view kHloText = R\"(\n     HloModule m\n \n@@ -139,12 +139,12 @@ TEST_F(CollectiveBackendAssignerTest, LargeCollectivePermuteUsesDefault) {\n \n   TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(kHloText));\n   EXPECT_THAT(RunCollectiveBackendAssigner(module.get()),\n-              absl_testing::IsOkAndHolds(false));\n+              absl_testing::IsOkAndHolds(true));\n \n   const HloInstruction* permute =\n       module->entry_computation()->root_instruction();\n   EXPECT_THAT(GetCollectiveBackendConfig(permute),\n-              absl_testing::IsOkAndHolds(CollectiveBackendConfig::DEFAULT));\n+              absl_testing::IsOkAndHolds(CollectiveBackendConfig::NVSHMEM));\n }\n \n }  // namespace"
+        }
+    ],
+    "stats": {
+        "total": 14,
+        "additions": 10,
+        "deletions": 4
+    }
+}

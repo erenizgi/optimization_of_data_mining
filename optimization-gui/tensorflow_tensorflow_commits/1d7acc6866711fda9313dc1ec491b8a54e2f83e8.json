@@ -1,0 +1,60 @@
+{
+    "author": "tensorflower-gardener",
+    "message": "[Autotuner] Consider scratch bytes to pick the best config.\n\nPiperOrigin-RevId: 798170893",
+    "sha": "1d7acc6866711fda9313dc1ec491b8a54e2f83e8",
+    "files": [
+        {
+            "sha": "738559e8eb4ad64bfe5c56e087b25c1bd28aac78",
+            "filename": "third_party/xla/xla/backends/autotuner/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/1d7acc6866711fda9313dc1ec491b8a54e2f83e8/third_party%2Fxla%2Fxla%2Fbackends%2Fautotuner%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/1d7acc6866711fda9313dc1ec491b8a54e2f83e8/third_party%2Fxla%2Fxla%2Fbackends%2Fautotuner%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fautotuner%2FBUILD?ref=1d7acc6866711fda9313dc1ec491b8a54e2f83e8",
+            "patch": "@@ -81,6 +81,7 @@ xla_cc_test(\n         \"@com_google_absl//absl/status:statusor\",\n         \"@com_google_absl//absl/strings:string_view\",\n         \"@com_google_absl//absl/time\",\n+        \"@com_google_absl//absl/types:optional\",\n         \"@com_google_googletest//:gtest_main\",\n         \"@local_tsl//tsl/platform:path\",\n     ] + if_google([\"@com_google_protobuf//:any_cc_proto\"]),"
+        },
+        {
+            "sha": "b1494809b45f39f106015554af43705483469e06",
+            "filename": "third_party/xla/xla/backends/autotuner/autotuner.cc",
+            "status": "modified",
+            "additions": 37,
+            "deletions": 8,
+            "changes": 45,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/1d7acc6866711fda9313dc1ec491b8a54e2f83e8/third_party%2Fxla%2Fxla%2Fbackends%2Fautotuner%2Fautotuner.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/1d7acc6866711fda9313dc1ec491b8a54e2f83e8/third_party%2Fxla%2Fxla%2Fbackends%2Fautotuner%2Fautotuner.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fautotuner%2Fautotuner.cc?ref=1d7acc6866711fda9313dc1ec491b8a54e2f83e8",
+            "patch": "@@ -201,7 +201,12 @@ absl::StatusOr<Autotuner::Config> Autotuner::ProfileAndPickBest(\n     return absl::InternalError(\"No executables to profile!\");\n   }\n   VLOG(1) << \"Profiling \" << candidates.size() << \" executable candidates.\";\n-  Config best_config{nullptr, nullptr};\n+  struct ConfigAndScratchBytes {\n+    Config* config;\n+    int scratch_bytes;\n+  };\n+  std::vector<ConfigAndScratchBytes> top_configs_and_scratch_bytes;\n+  Config* min_duration_config = nullptr;\n   absl::Duration min_duration = absl::InfiniteDuration();\n \n   TF_ASSIGN_OR_RETURN(\n@@ -237,22 +242,46 @@ absl::StatusOr<Autotuner::Config> Autotuner::ProfileAndPickBest(\n       }\n     }\n \n-    if (profile_result.value().duration < min_duration) {\n-      min_duration = profile_result.value().duration;\n-      best_config = std::move(candidates[i].config);\n+    absl::Duration duration = profile_result.value().duration;\n+    if (autotune_config_.optimize_scratch_bytes &&\n+        duration <\n+            min_duration + absl::Microseconds(\n+                               autotune_config_.scratch_bytes_window_size_us)) {\n+      top_configs_and_scratch_bytes.push_back(\n+          {&candidates[i].config, profile_result.value().scratch_bytes});\n+    }\n+    if (duration < min_duration) {\n+      min_duration = duration;\n+      min_duration_config = &candidates[i].config;\n     }\n   }\n-  if (best_config.codegen_backend == nullptr) {\n+  if (min_duration_config == nullptr) {\n     return absl::InternalError(\"No valid config found!\");\n   }\n \n+  Config* best_config = min_duration_config;\n+  if (autotune_config_.optimize_scratch_bytes) {\n+    Config* best_scratch_bytes_config = nullptr;\n+    int min_scratch_bytes = -1;\n+    for (auto& config_and_scratch : top_configs_and_scratch_bytes) {\n+      if (best_scratch_bytes_config == nullptr ||\n+          config_and_scratch.scratch_bytes < min_scratch_bytes) {\n+        best_scratch_bytes_config = config_and_scratch.config;\n+        min_scratch_bytes = config_and_scratch.scratch_bytes;\n+      }\n+    }\n+    if (best_scratch_bytes_config != nullptr) {\n+      best_config = best_scratch_bytes_config;\n+    }\n+  }\n+\n   AutotunerCacheEntry cache_entry;\n-  cache_entry.set_codegen_backend(best_config.codegen_backend->name());\n-  *cache_entry.mutable_backend_config() = *best_config.backend_config;\n+  cache_entry.set_codegen_backend(min_duration_config->codegen_backend->name());\n+  *cache_entry.mutable_backend_config() = *best_config->backend_config;\n   if (cache_) {\n     TF_RETURN_IF_ERROR(cache_->Insert(instr, cache_entry));\n   }\n-  return best_config;\n+  return std::move(*best_config);\n }\n \n absl::StatusOr<ScopedShapedBuffer> Autotuner::GetReferenceOutput("
+        },
+        {
+            "sha": "e9ff4780142773c985cab9bed68b2cadf7099f4f",
+            "filename": "third_party/xla/xla/backends/autotuner/autotuner.h",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 0,
+            "changes": 8,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/1d7acc6866711fda9313dc1ec491b8a54e2f83e8/third_party%2Fxla%2Fxla%2Fbackends%2Fautotuner%2Fautotuner.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/1d7acc6866711fda9313dc1ec491b8a54e2f83e8/third_party%2Fxla%2Fxla%2Fbackends%2Fautotuner%2Fautotuner.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fautotuner%2Fautotuner.h?ref=1d7acc6866711fda9313dc1ec491b8a54e2f83e8",
+            "patch": "@@ -47,6 +47,14 @@ struct AutotuneConfig {\n   float relative_tolerance = 1e-6;\n   // Whether to crash the process on check failure.\n   bool crash_on_check_failure = false;\n+  // If true, in addition to the duration, the best algorithm will be chosen\n+  // based on the scratch bytes. This is only useful if backends use scratch\n+  // space for temporary tensors. The best config will be the one with the\n+  // smallest scratch space among top minimum duration configs in\n+  // scratch_bytes_window_size_us window.\n+  bool optimize_scratch_bytes = false;\n+  // Window size in microseconds to consider for scratch bytes optimization.\n+  int scratch_bytes_window_size_us = 4;\n };\n \n class Autotuner {"
+        },
+        {
+            "sha": "b61d0ddeab1d02aece6215291a7af7eb7cb3e151",
+            "filename": "third_party/xla/xla/backends/autotuner/autotuner_test.cc",
+            "status": "modified",
+            "additions": 45,
+            "deletions": 0,
+            "changes": 45,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/1d7acc6866711fda9313dc1ec491b8a54e2f83e8/third_party%2Fxla%2Fxla%2Fbackends%2Fautotuner%2Fautotuner_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/1d7acc6866711fda9313dc1ec491b8a54e2f83e8/third_party%2Fxla%2Fxla%2Fbackends%2Fautotuner%2Fautotuner_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fautotuner%2Fautotuner_test.cc?ref=1d7acc6866711fda9313dc1ec491b8a54e2f83e8",
+            "patch": "@@ -453,5 +453,50 @@ TEST_F(AutotunerTest, AutotuneWithBufferCheck) {\n   auto dummy_instr = HloInstruction::CreateConstant(LiteralUtil::CreateR0(1));\n   EXPECT_THAT(autotuner->Autotune(dummy_instr.get()), IsOk());\n }\n+\n+TEST_F(AutotunerTest, AutotuneWithScratchBytesOptimization) {\n+  std::vector<std::unique_ptr<BackendConfig>> configs;\n+  configs.push_back(GetTestConfig(\"config_more_time_less_scratch\"));\n+  configs.push_back(GetTestConfig(\"config_less_time_more_scratch\"));\n+  auto backend_1 = std::make_unique<MockCodegenBackend>();\n+  EXPECT_CALL(*backend_1, GetSupportedConfigs)\n+      .WillOnce(Return(std::move(configs)));\n+  EXPECT_CALL(*backend_1, Compile(_, _))\n+      .WillOnce(Return(std::unique_ptr<Executable>()))\n+      .WillOnce(Return(std::unique_ptr<Executable>()));\n+\n+  EXPECT_CALL(*backend_1,\n+              ApplyConfig(_, ConfigMatcher(\"config_more_time_less_scratch\")))\n+      .Times(1)\n+      .WillRepeatedly(Return(absl::OkStatus()));\n+\n+  auto profiler = std::make_unique<MockProfiler>();\n+  EXPECT_CALL(*profiler, CreateInputBuffers(_))\n+      .WillOnce(Return(std::make_unique<InputBuffers>()));\n+  EXPECT_CALL(*profiler, Profile(_, _))\n+      .WillOnce(Return(ProfileResult({\n+          /*duration=*/absl::Microseconds(2),\n+          /*output_buffer=*/std::nullopt,\n+          /*scratch_bytes=*/100,\n+      })))\n+      .WillOnce(Return(ProfileResult({\n+          /*duration=*/absl::Microseconds(1),\n+          /*output_buffer=*/std::nullopt,\n+          /*scratch_bytes=*/200,\n+      })));\n+\n+  std::vector<std::unique_ptr<CodegenBackend>> backends;\n+  backends.push_back(std::move(backend_1));\n+  AutotuneConfig config;\n+  config.optimize_scratch_bytes = true;\n+  config.scratch_bytes_window_size_us = 2;\n+  TF_ASSERT_OK_AND_ASSIGN(\n+      auto autotuner,\n+      Autotuner::Create(std::move(backends), std::move(profiler), config,\n+                        std::make_unique<MockAutotunerCache>()));\n+  auto dummy_instr = HloInstruction::CreateConstant(LiteralUtil::CreateR0(1));\n+  EXPECT_THAT(autotuner->Autotune(dummy_instr.get()), IsOk());\n+}\n+\n }  // namespace\n }  // namespace xla"
+        }
+    ],
+    "stats": {
+        "total": 99,
+        "additions": 91,
+        "deletions": 8
+    }
+}

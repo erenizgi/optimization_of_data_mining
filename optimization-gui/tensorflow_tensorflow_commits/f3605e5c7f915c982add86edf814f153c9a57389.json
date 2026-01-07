@@ -1,0 +1,168 @@
+{
+    "author": "WillFroom",
+    "message": "[XLA:CPU][XTile] Create new fusion_compiler_opt that is specifically built upon the cpu fusion_compiler.\n\nThis means there is a single source of truth and allows for registration pass pipelines such as bufferization.\n\nPiperOrigin-RevId: 830399452",
+    "sha": "f3605e5c7f915c982add86edf814f153c9a57389",
+    "files": [
+        {
+            "sha": "ae18962a36ccd51b2c25dde74c41d16100937cb5",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f3605e5c7f915c982add86edf814f153c9a57389/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f3605e5c7f915c982add86edf814f153c9a57389/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2FBUILD?ref=f3605e5c7f915c982add86edf814f153c9a57389",
+            "patch": "@@ -245,6 +245,7 @@ cc_library(\n         \"@llvm-project//mlir:VectorTransforms\",\n         \"@local_tsl//tsl/profiler/lib:traceme\",\n         \"@local_tsl//tsl/profiler/lib:traceme_encode\",\n+        \"@stablehlo//:stablehlo_ops\",\n         \"@stablehlo//:stablehlo_passes\",\n     ],\n )"
+        },
+        {
+            "sha": "01fc3725bf9acae27910f8d2bb639c4ec0ae378b",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/fusion_compiler.cc",
+            "status": "modified",
+            "additions": 51,
+            "deletions": 9,
+            "changes": 60,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f3605e5c7f915c982add86edf814f153c9a57389/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ffusion_compiler.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f3605e5c7f915c982add86edf814f153c9a57389/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ffusion_compiler.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ffusion_compiler.cc?ref=f3605e5c7f915c982add86edf814f153c9a57389",
+            "patch": "@@ -28,6 +28,7 @@ limitations under the License.\n #include \"absl/strings/str_cat.h\"\n #include \"absl/strings/str_join.h\"\n #include \"absl/strings/string_view.h\"\n+#include \"llvm/ADT/STLFunctionalExtras.h\"\n #include \"llvm/ADT/StringRef.h\"\n #include \"llvm/IR/BasicBlock.h\"\n #include \"llvm/IR/FMF.h\"\n@@ -77,12 +78,15 @@ limitations under the License.\n #include \"mlir/IR/Visitors.h\"\n #include \"mlir/Pass/Pass.h\"\n #include \"mlir/Pass/PassManager.h\"\n+#include \"mlir/Pass/PassOptions.h\"\n+#include \"mlir/Pass/PassRegistry.h\"\n #include \"mlir/Support/LLVM.h\"\n #include \"mlir/Support/WalkResult.h\"\n #include \"mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h\"\n #include \"mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h\"\n #include \"mlir/Target/LLVMIR/Export.h\"\n #include \"mlir/Transforms/Passes.h\"\n+#include \"stablehlo/dialect/StablehloOps.h\"\n #include \"stablehlo/transforms/Passes.h\"\n #include \"xla/backends/cpu/codegen/emitters/ir/xla_cpu_dialect.h\"\n #include \"xla/backends/cpu/codegen/emitters/transforms/passes.h\"\n@@ -111,6 +115,30 @@ limitations under the License.\n \n namespace xla::cpu {\n \n+static void RegisterPassPipeline(\n+    absl::string_view name, absl::string_view description,\n+    absl::FunctionRef<void(mlir::OpPassManager&)> pipeline_builder) {\n+  using ErrorHandlerFn =\n+      llvm::function_ref<mlir::LogicalResult(const llvm::Twine&)>;\n+\n+  mlir::PassRegistryFunction register_pass_callback =\n+      [pipeline_builder](mlir::OpPassManager& pm, llvm::StringRef options,\n+                         ErrorHandlerFn error_handler) {\n+        if (!options.empty()) {\n+          return mlir::failure();\n+        }\n+        pipeline_builder(pm);\n+        return mlir::success();\n+      };\n+\n+  auto option_handler =\n+      [](llvm::function_ref<void(const mlir::detail::PassOptions&)>\n+             options_handler) { options_handler(mlir::detail::PassOptions()); };\n+\n+  mlir::registerPassPipeline(name, description, register_pass_callback,\n+                             option_handler);\n+}\n+\n class ModuleCallbackPass\n     : public mlir::PassWrapper<ModuleCallbackPass,\n                                mlir::OperationPass<mlir::ModuleOp>> {\n@@ -435,16 +463,24 @@ std::unique_ptr<mlir::MLIRContext> FusionCompiler::CreateContext() {\n   auto context = std::make_unique<mlir::MLIRContext>(\n       mlir::MLIRContext::Threading::DISABLED);\n \n-  context->loadDialect<mlir::DLTIDialect, mlir::affine::AffineDialect,\n-                       mlir::arith::ArithDialect, mlir::cf::ControlFlowDialect,\n-                       mlir::func::FuncDialect, mlir::math::MathDialect,\n-                       xla::cpu::XlaCpuDialect, mlir::mhlo::MhloDialect,\n-                       mlir::scf::SCFDialect, mlir::LLVM::LLVMDialect,\n-                       mlir::tensor::TensorDialect, mlir::vector::VectorDialect,\n-                       xla::XlaDialect, xla::xtile::XTileDialect>();\n+  context->appendDialectRegistry(CreateDialectRegistry());\n+  context->loadAllAvailableDialects();\n \n+  return context;\n+}\n+\n+mlir::DialectRegistry FusionCompiler::CreateDialectRegistry(\n+    bool register_pass_pipelines) {\n   mlir::DialectRegistry registry;\n \n+  registry.insert<\n+      mlir::DLTIDialect, mlir::affine::AffineDialect, mlir::arith::ArithDialect,\n+      mlir::cf::ControlFlowDialect, mlir::func::FuncDialect,\n+      mlir::math::MathDialect, xla::cpu::XlaCpuDialect, mlir::mhlo::MhloDialect,\n+      mlir::scf::SCFDialect, mlir::LLVM::LLVMDialect,\n+      mlir::tensor::TensorDialect, mlir::vector::VectorDialect, xla::XlaDialect,\n+      xla::xtile::XTileDialect, mlir::stablehlo::StablehloDialect>();\n+\n   mlir::LLVM::registerInlinerInterface(registry);\n   mlir::func::registerInlinerExtension(registry);\n \n@@ -464,9 +500,15 @@ std::unique_ptr<mlir::MLIRContext> FusionCompiler::CreateContext() {\n   mlir::ub::registerConvertUBToLLVMInterface(registry);\n   mlir::vector::registerConvertVectorToLLVMInterface(registry);\n \n-  context->appendDialectRegistry(registry);\n+  if (register_pass_pipelines) {\n+    RegisterPassPipeline(\n+        \"xla-test-optimize\",\n+        \"Test pipeline of passes up to inlining. Intended to simplify IR in \"\n+        \"tests.\",\n+        &xla::emitters::RegisterOptimizationPasses);\n+  }\n \n-  return context;\n+  return registry;\n }\n \n }  // namespace xla::cpu"
+        },
+        {
+            "sha": "9dc88e385e8de0073e63c71ffa765a0e8839b14c",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/fusion_compiler.h",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f3605e5c7f915c982add86edf814f153c9a57389/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ffusion_compiler.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f3605e5c7f915c982add86edf814f153c9a57389/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ffusion_compiler.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ffusion_compiler.h?ref=f3605e5c7f915c982add86edf814f153c9a57389",
+            "patch": "@@ -63,6 +63,13 @@ class FusionCompiler {\n   // compiling an XLA:CPU fusion.\n   static std::unique_ptr<mlir::MLIRContext> CreateContext();\n \n+  // Create a dialect registry for the compiler with the required dialects for\n+  // compiling an XLA:CPU fusion. If `register_pass_pipelines` is true, this\n+  // will also register the pass pipelines for the compiler, typically to be\n+  // used in tests.\n+  static mlir::DialectRegistry CreateDialectRegistry(\n+      bool register_pass_pipelines = false);\n+\n  private:\n   Options options_;\n   CompilationHooks hooks_;"
+        },
+        {
+            "sha": "7efb5865d7b8d03a794f32e4c8428236dc019a69",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/tiled/transforms/tests/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f3605e5c7f915c982add86edf814f153c9a57389/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f3605e5c7f915c982add86edf814f153c9a57389/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2FBUILD?ref=f3605e5c7f915c982add86edf814f153c9a57389",
+            "patch": "@@ -10,7 +10,7 @@ lit_test_suite(\n     srcs = glob([\"*.mlir\"]),\n     cfg = \"//xla:lit.cfg.py\",\n     tools = [\n-        \"//xla/codegen/tools:emitters_opt\",\n+        \"//xla/backends/cpu/codegen/tools:fusion_compiler_opt\",\n         \"@llvm-project//llvm:FileCheck\",\n     ],\n )"
+        },
+        {
+            "sha": "d8a7e8410cf8c9345117cf58f38ddc4a42fabb79",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/tiled/transforms/tests/arith_to_vector.mlir",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f3605e5c7f915c982add86edf814f153c9a57389/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Farith_to_vector.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f3605e5c7f915c982add86edf814f153c9a57389/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Farith_to_vector.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Farith_to_vector.mlir?ref=f3605e5c7f915c982add86edf814f153c9a57389",
+            "patch": "@@ -1,4 +1,4 @@\n-// RUN: emitters_opt %s --xtile-cpu-elemental-tensor-to-vector -split-input-file | FileCheck %s\n+// RUN: fusion_compiler_opt %s --xtile-cpu-elemental-tensor-to-vector -split-input-file | FileCheck %s\n \n func.func @addf(%lhs : tensor<1024xf32>, %rhs : tensor<1024xf32>) -> tensor<1024xf32> {\n   // CHECK: arith.addf %{{.*}}, %{{.*}} : vector<1024xf32>"
+        },
+        {
+            "sha": "63bbe9248cbc275f9adef942f09d99e404cddfa7",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/tiled/transforms/tests/lower_xtile_entry.mlir",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f3605e5c7f915c982add86edf814f153c9a57389/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Flower_xtile_entry.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f3605e5c7f915c982add86edf814f153c9a57389/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Flower_xtile_entry.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Flower_xtile_entry.mlir?ref=f3605e5c7f915c982add86edf814f153c9a57389",
+            "patch": "@@ -1,4 +1,4 @@\n-// RUN: emitters_opt %s --xtile-cpu-lower-xtile-entry -split-input-file | FileCheck %s\n+// RUN: fusion_compiler_opt %s --xtile-cpu-lower-xtile-entry -split-input-file | FileCheck %s\n \n xtile.entry_func @simple_wrap(%input: memref<1024xf32> {xla.some_attr = 1},\n                              %output: memref<32xf64>,"
+        },
+        {
+            "sha": "d85d978ab6643977517a1bc6143c72cbe5a86dff",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/tiled/transforms/tests/math_to_vector.mlir",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f3605e5c7f915c982add86edf814f153c9a57389/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Fmath_to_vector.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f3605e5c7f915c982add86edf814f153c9a57389/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Fmath_to_vector.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Fmath_to_vector.mlir?ref=f3605e5c7f915c982add86edf814f153c9a57389",
+            "patch": "@@ -1,4 +1,4 @@\n-// RUN: emitters_opt %s --xtile-cpu-elemental-tensor-to-vector -split-input-file | FileCheck %s\n+// RUN: fusion_compiler_opt %s --xtile-cpu-elemental-tensor-to-vector -split-input-file | FileCheck %s\n \n func.func @absf(%input : tensor<1024xf32>) -> tensor<1024xf32> {\n   // CHECK: math.absf %{{.*}} : vector<1024xf32>"
+        },
+        {
+            "sha": "5b799d02781394767fe5b99aa718f04af68e6ebe",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/tiled/transforms/tests/rewrite_dynamic_vector_extract.mlir",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f3605e5c7f915c982add86edf814f153c9a57389/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Frewrite_dynamic_vector_extract.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f3605e5c7f915c982add86edf814f153c9a57389/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Frewrite_dynamic_vector_extract.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Frewrite_dynamic_vector_extract.mlir?ref=f3605e5c7f915c982add86edf814f153c9a57389",
+            "patch": "@@ -1,4 +1,4 @@\n-// RUN: emitters_opt %s \\\n+// RUN: fusion_compiler_opt %s \\\n // RUN: -xtile-cpu-rewrite-dynamic-vector-extract -canonicalize \\\n // RUN: -split-input-file | FileCheck %s\n "
+        },
+        {
+            "sha": "6484ec1712c4a4aa309b7de5b07f2924f3bc5299",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/tiled/transforms/tests/shlo_to_vector.mlir",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f3605e5c7f915c982add86edf814f153c9a57389/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Fshlo_to_vector.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f3605e5c7f915c982add86edf814f153c9a57389/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Fshlo_to_vector.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Fshlo_to_vector.mlir?ref=f3605e5c7f915c982add86edf814f153c9a57389",
+            "patch": "@@ -1,4 +1,4 @@\n-// RUN: emitters_opt %s --xtile-cpu-shlo-to-vector -split-input-file | FileCheck %s\n+// RUN: fusion_compiler_opt %s --xtile-cpu-shlo-to-vector -split-input-file | FileCheck %s\n \n func.func @transpose(%input : tensor<1024x32xf32>) -> tensor<32x1024xf32> {\n   // CHECK: vector.transpose %{{.*}}, [1, 0] : vector<1024x32xf32> to vector<32x1024xf32>"
+        },
+        {
+            "sha": "c091c0256fb38bad880ed2dfe88e81f2f4cfd5cd",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/tiled/transforms/tests/tensor_ops_to_vector.mlir",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f3605e5c7f915c982add86edf814f153c9a57389/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Ftensor_ops_to_vector.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f3605e5c7f915c982add86edf814f153c9a57389/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Ftensor_ops_to_vector.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Ftensor_ops_to_vector.mlir?ref=f3605e5c7f915c982add86edf814f153c9a57389",
+            "patch": "@@ -1,4 +1,4 @@\n-// RUN: emitters_opt %s -xtile-cpu-tensor-ops-to-vector -split-input-file | FileCheck %s\n+// RUN: fusion_compiler_opt %s -xtile-cpu-tensor-ops-to-vector -split-input-file | FileCheck %s\n \n func.func @from_elements(%input : f32) -> tensor<f32> {\n   // CHECK: vector.from_elements %{{.*}} : vector<f32>"
+        },
+        {
+            "sha": "92513bb55b6d4b3beb93c968a0cc752569c9de59",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/tiled/transforms/tests/xtile_to_vector.mlir",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f3605e5c7f915c982add86edf814f153c9a57389/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Fxtile_to_vector.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f3605e5c7f915c982add86edf814f153c9a57389/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Fxtile_to_vector.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Fxtile_to_vector.mlir?ref=f3605e5c7f915c982add86edf814f153c9a57389",
+            "patch": "@@ -1,4 +1,4 @@\n-// RUN: emitters_opt %s --xtile-cpu-xtile-to-vector -cse -split-input-file | FileCheck %s\n+// RUN: fusion_compiler_opt %s --xtile-cpu-xtile-to-vector -cse -split-input-file | FileCheck %s\n \n // CHECK-LABEL: @simple_insert_extract\n // CHECK-SAME: (%[[INPUT:.*]]: memref<1024xf32>, %[[OUTPUT:.*]]: memref<1024xf32>, %[[TILE_ID:.*]]: index)"
+        },
+        {
+            "sha": "82d012eec12a9ad9e85bb12414c49f5731c9ddd6",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/tools/BUILD",
+            "status": "modified",
+            "additions": 19,
+            "deletions": 0,
+            "changes": 19,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f3605e5c7f915c982add86edf814f153c9a57389/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftools%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f3605e5c7f915c982add86edf814f153c9a57389/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftools%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftools%2FBUILD?ref=f3605e5c7f915c982add86edf814f153c9a57389",
+            "patch": "@@ -92,3 +92,22 @@ xla_cc_binary(\n         \"@local_tsl//tsl/platform:platform_port\",\n     ],\n )\n+\n+xla_cc_binary(\n+    name = \"fusion_compiler_opt\",\n+    srcs = [\"fusion_compiler_opt.cc\"],\n+    deps = [\n+        \"//xla/backends/cpu/codegen:fusion_compiler\",\n+        \"//xla/backends/cpu/codegen/emitters/transforms:passes\",\n+        \"//xla/backends/cpu/codegen/tiled/transforms:passes\",\n+        \"//xla/codegen/emitters/transforms:convert_pure_call_ops_pass\",\n+        \"//xla/codegen/xtile/ir/transforms:passes\",\n+        \"@llvm-project//llvm:Support\",\n+        \"@llvm-project//mlir:AllPassesAndDialects\",\n+        \"@llvm-project//mlir:FuncExtensions\",\n+        \"@llvm-project//mlir:LLVMIRTransforms\",\n+        \"@llvm-project//mlir:MlirOptLib\",\n+        \"@llvm-project//mlir:RegisterAllPasses\",  # buildcleaner: keep\n+        \"@llvm-project//mlir:Support\",\n+    ],\n+)"
+        },
+        {
+            "sha": "3de9e1692e26ceb4704e3bfbbaca56f8dc5fbb49",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/tools/fusion_compiler_opt.cc",
+            "status": "added",
+            "additions": 41,
+            "deletions": 0,
+            "changes": 41,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f3605e5c7f915c982add86edf814f153c9a57389/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftools%2Ffusion_compiler_opt.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f3605e5c7f915c982add86edf814f153c9a57389/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftools%2Ffusion_compiler_opt.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftools%2Ffusion_compiler_opt.cc?ref=f3605e5c7f915c982add86edf814f153c9a57389",
+            "patch": "@@ -0,0 +1,41 @@\n+/* Copyright 2024 The OpenXLA Authors.\n+\n+Licensed under the Apache License, Version 2.0 (the \"License\");\n+you may not use this file except in compliance with the License.\n+You may obtain a copy of the License at\n+\n+    http://www.apache.org/licenses/LICENSE-2.0\n+\n+Unless required by applicable law or agreed to in writing, software\n+distributed under the License is distributed on an \"AS IS\" BASIS,\n+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+See the License for the specific language governing permissions and\n+limitations under the License.\n+==============================================================================*/\n+\n+#include \"llvm/ADT/StringRef.h\"\n+#include \"mlir/Dialect/Func/Extensions/AllExtensions.h\"\n+#include \"mlir/Dialect/LLVMIR/Transforms/InlinerInterfaceImpl.h\"\n+#include \"mlir/InitAllPasses.h\"\n+#include \"mlir/Support/LogicalResult.h\"\n+#include \"mlir/Tools/mlir-opt/MlirOptMain.h\"\n+#include \"xla/backends/cpu/codegen/emitters/transforms/passes.h\"\n+#include \"xla/backends/cpu/codegen/fusion_compiler.h\"\n+#include \"xla/backends/cpu/codegen/tiled/transforms/passes.h\"\n+#include \"xla/codegen/emitters/transforms/passes.h\"\n+#include \"xla/codegen/xtile/ir/transforms/passes.h\"\n+\n+int main(int argc, char** argv) {\n+  mlir::DialectRegistry registry =\n+      xla::cpu::FusionCompiler::CreateDialectRegistry(true);\n+\n+  mlir::registerAllPasses();\n+\n+  xla::emitters::registerTransformsPasses();\n+  xla::cpu::registerXlaCpuTransformsPasses();\n+  xla::cpu::registerXTileCpuTransformsPasses();\n+  xla::xtile::registerXTileTransformsPasses();\n+\n+  return mlir::failed(MlirOptMain(\n+      argc, argv, \"XLA:CPU Fusion compiler pass driver\\n\", registry));\n+}"
+        }
+    ],
+    "stats": {
+        "total": 144,
+        "additions": 127,
+        "deletions": 17
+    }
+}

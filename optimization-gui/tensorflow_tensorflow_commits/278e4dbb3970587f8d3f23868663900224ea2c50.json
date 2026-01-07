@@ -1,0 +1,48 @@
+{
+    "author": "nvgrw",
+    "message": "Define HLO CSE ConstantKey separately.\n\nThis is to allow it to be tested.\n\nPiperOrigin-RevId: 840480144",
+    "sha": "278e4dbb3970587f8d3f23868663900224ea2c50",
+    "files": [
+        {
+            "sha": "65c123d169d3b7d17c58da6beddbafece787084c",
+            "filename": "third_party/xla/xla/service/BUILD",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 1,
+            "changes": 13,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/278e4dbb3970587f8d3f23868663900224ea2c50/third_party%2Fxla%2Fxla%2Fservice%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/278e4dbb3970587f8d3f23868663900224ea2c50/third_party%2Fxla%2Fxla%2Fservice%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2FBUILD?ref=278e4dbb3970587f8d3f23868663900224ea2c50",
+            "patch": "@@ -3929,8 +3929,8 @@ cc_library(\n     srcs = [\"hlo_cse.cc\"],\n     hdrs = [\"hlo_cse.h\"],\n     deps = [\n+        \":hlo_cse_constant_key\",\n         \":hlo_domain_map\",\n-        \"//xla:literal\",\n         \"//xla:shape_util\",\n         \"//xla/hlo/ir:hlo\",\n         \"//xla/hlo/pass:hlo_pass\",\n@@ -3976,6 +3976,17 @@ xla_cc_test(\n     ],\n )\n \n+cc_library(\n+    name = \"hlo_cse_constant_key\",\n+    hdrs = [\"hlo_cse_constant_key.h\"],\n+    deps = [\n+        \"//xla:literal\",\n+        \"//xla:shape_util\",\n+        \"@com_google_absl//absl/base:core_headers\",\n+        \"@com_google_absl//absl/strings:string_view\",\n+    ],\n+)\n+\n cc_library(\n     name = \"hlo_domain_map\",\n     srcs = [\"hlo_domain_map.cc\"],"
+        },
+        {
+            "sha": "abe0ffa740e545487fd2f4a524ba8d80089d9282",
+            "filename": "third_party/xla/xla/service/hlo_cse.cc",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 27,
+            "changes": 39,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/278e4dbb3970587f8d3f23868663900224ea2c50/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_cse.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/278e4dbb3970587f8d3f23868663900224ea2c50/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_cse.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_cse.cc?ref=278e4dbb3970587f8d3f23868663900224ea2c50",
+            "patch": "@@ -35,36 +35,16 @@ limitations under the License.\n #include \"xla/hlo/ir/hlo_instruction.h\"\n #include \"xla/hlo/ir/hlo_instructions.h\"\n #include \"xla/hlo/ir/hlo_opcode.h\"\n-#include \"xla/literal.h\"\n+#include \"xla/service/hlo_cse_constant_key.h\"\n #include \"xla/service/hlo_domain_map.h\"\n #include \"xla/shape.h\"\n #include \"xla/shape_util.h\"\n #include \"xla/tsl/platform/errors.h\"\n #include \"xla/tsl/platform/statusor.h\"\n \n namespace xla {\n-\n namespace {\n \n-template <bool kIsLayoutSensitive>\n-struct ConstantKey {\n-  template <typename H>\n-  friend H AbslHashValue(H h, const ConstantKey& key) {\n-    h = H::combine(std::move(h), key.domain);\n-    return Literal::Hash<H, kIsLayoutSensitive, /*kByteLimit=*/64>(\n-        std::move(h), key.hlo->literal());\n-  }\n-  friend bool operator==(const ConstantKey& lhs, const ConstantKey& rhs) {\n-    return lhs.domain == rhs.domain &&\n-           (kIsLayoutSensitive ? Shape::Equal()\n-                               : Shape::Equal().IgnoreLayout())(\n-               lhs.hlo->shape(), rhs.hlo->shape()) &&\n-           lhs.hlo->literal().Equal(rhs.hlo->literal(), kIsLayoutSensitive);\n-  }\n-  HloConstantInstruction* hlo;\n-  int64_t domain;\n-};\n-\n // Find and combine identical constants. Constants are identical if they have\n // the same type and value.\n //\n@@ -88,7 +68,9 @@ absl::StatusOr<bool> CombineConstants(\n   // Map from the literal hash of a constant or the shape hash of an iota all\n   // equivalent instructions. This avoids extreme quadratic behavior with many\n   // scalar constants.\n-  absl::flat_hash_set<ConstantKey<kIsLayoutSensitive>> constants;\n+  absl::flat_hash_map<CseConstantKey<kIsLayoutSensitive>,\n+                      HloConstantInstruction*>\n+      constants;\n   int64_t combined = 0;\n   auto inst_it = computation->instructions().begin();\n   while (inst_it != computation->instructions().end()) {\n@@ -105,11 +87,14 @@ absl::StatusOr<bool> CombineConstants(\n \n     HloInstruction* match = nullptr;\n     if (auto* constant_inst = DynCast<HloConstantInstruction>(instruction)) {\n-      auto insert_result = constants.insert(ConstantKey<kIsLayoutSensitive>{\n-          constant_inst,\n-          (domain_map != nullptr ? domain_map->GetDomainId(instruction) : 0)});\n-      if (!insert_result.second) {\n-        match = insert_result.first->hlo;\n+      auto [it, did_insert] = constants.insert(\n+          {CseConstantKey<kIsLayoutSensitive>{\n+               constant_inst->literal(), constant_inst->shape(),\n+               (domain_map != nullptr ? domain_map->GetDomainId(instruction)\n+                                      : 0)},\n+           constant_inst});\n+      if (!did_insert) {\n+        match = it->second;\n       }\n     }\n "
+        },
+        {
+            "sha": "8cecb71842aa0d620779f57780e19689eead345f",
+            "filename": "third_party/xla/xla/service/hlo_cse_constant_key.h",
+            "status": "added",
+            "additions": 55,
+            "deletions": 0,
+            "changes": 55,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/278e4dbb3970587f8d3f23868663900224ea2c50/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_cse_constant_key.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/278e4dbb3970587f8d3f23868663900224ea2c50/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_cse_constant_key.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_cse_constant_key.h?ref=278e4dbb3970587f8d3f23868663900224ea2c50",
+            "patch": "@@ -0,0 +1,55 @@\n+/* Copyright 2025 The OpenXLA Authors.\n+\n+Licensed under the Apache License, Version 2.0 (the \"License\");\n+you may not use this file except in compliance with the License.\n+You may obtain a copy of the License at\n+\n+    http://www.apache.org/licenses/LICENSE-2.0\n+\n+Unless required by applicable law or agreed to in writing, software\n+distributed under the License is distributed on an \"AS IS\" BASIS,\n+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+See the License for the specific language governing permissions and\n+limitations under the License.\n+==============================================================================*/\n+\n+#ifndef XLA_SERVICE_HLO_CSE_CONSTANT_KEY_H_\n+#define XLA_SERVICE_HLO_CSE_CONSTANT_KEY_H_\n+\n+#include <cstdint>\n+#include <utility>\n+\n+#include \"absl/base/attributes.h\"\n+#include \"xla/literal.h\"\n+#include \"xla/shape.h\"\n+\n+namespace xla {\n+template <bool kIsLayoutSensitive>\n+struct CseConstantKey {\n+  template <typename H>\n+  friend H AbslHashValue(H h, const CseConstantKey& key) {\n+    h = H::combine(std::move(h), key.domain);\n+    return Literal::Hash<H, kIsLayoutSensitive, /*kByteLimit=*/64>(std::move(h),\n+                                                                   key.literal);\n+  }\n+  friend bool operator==(const CseConstantKey& lhs, const CseConstantKey& rhs) {\n+    return lhs.domain == rhs.domain &&\n+           (kIsLayoutSensitive\n+                ? Shape::Equal()\n+                : Shape::Equal().IgnoreLayout())(lhs.shape, rhs.shape) &&\n+           lhs.literal.Equal(rhs.literal, kIsLayoutSensitive);\n+  }\n+  template <typename Sink>\n+  friend void AbslStringify(Sink& sink, const CseConstantKey& key) {\n+    absl::Format(&sink, \"literal: %s, shape: %s, domain: %d\",\n+                 key.literal.ToString(), key.shape.ToString(kIsLayoutSensitive),\n+                 key.domain);\n+  }\n+\n+  const Literal& literal ABSL_REQUIRE_EXPLICIT_INIT;\n+  const Shape& shape ABSL_REQUIRE_EXPLICIT_INIT;\n+  int64_t domain ABSL_REQUIRE_EXPLICIT_INIT;\n+};\n+}  // namespace xla\n+\n+#endif  // XLA_SERVICE_HLO_CSE_CONSTANT_KEY_H_"
+        }
+    ],
+    "stats": {
+        "total": 107,
+        "additions": 79,
+        "deletions": 28
+    }
+}

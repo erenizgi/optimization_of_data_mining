@@ -1,0 +1,72 @@
+{
+    "author": "sohaibiftikhar",
+    "message": "[XLA:GPU]: Add ability to pass opaque args count to xtile entry function.\n\nIn certain cases the arguments to a triton/xtile function could be scalars\nor opaque arguments such as pointers to synchronization memory on a another GPU\nthat should not be tiled with the regular tiling infra.\n\nThis change allows skipping type validation for such arguments if the count\nof such arguments is explicitly specified as an attribute.\n\nPiperOrigin-RevId: 827912269",
+    "sha": "19e033d298ee8050a6b2e54a05ad4fbb5077271f",
+    "files": [
+        {
+            "sha": "071f12e52020804a59620dd9b3554298092d991e",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/transforms/tests/triton_xla_lower_xtile.mlir",
+            "status": "modified",
+            "additions": 17,
+            "deletions": 0,
+            "changes": 17,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/19e033d298ee8050a6b2e54a05ad4fbb5077271f/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftests%2Ftriton_xla_lower_xtile.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/19e033d298ee8050a6b2e54a05ad4fbb5077271f/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftests%2Ftriton_xla_lower_xtile.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftests%2Ftriton_xla_lower_xtile.mlir?ref=19e033d298ee8050a6b2e54a05ad4fbb5077271f",
+            "patch": "@@ -53,6 +53,23 @@ xtile.entry_func @scalar_insert_extract(%input: !memref_type,\n \n // -----\n \n+!memref_type = memref<32xf64, #nvvm.memory_space<global>>\n+// CHECK:func.func @insert_extract_with_opaque_arg(\n+// CHECK-SAME: %[[ARG0:.*]]: !tt.ptr<f64>, %[[ARG1:.*]]: !tt.ptr<f64>, %[[ARG2:.*]]: i32) {\n+xtile.entry_func @insert_extract_with_opaque_arg(%input: !memref_type,\n+                                                 %output: !memref_type,\n+                                                 %opaque_arg: i32,\n+                                                 %tile_id: index) attributes {\n+                                                   num_opaque_args = 1: i32} {\n+  // CHECK: %[[SCALAR_VALUE:.*]] = tt.load %[[ARG0]] : !tt.ptr<f64>\n+  %tile = xtile.extract %input[%tile_id][1][1] : !memref_type -> tensor<f64>\n+  // CHECK: tt.store %[[ARG1]], %[[SCALAR_VALUE]] : !tt.ptr<f64>\n+  xtile.insert %tile into %output[%tile_id][1][1] : tensor<f64> -> !memref_type\n+  xtile.return\n+}\n+\n+// -----\n+\n // CHECK-LABEL: func.func @fold_transpose_into_ptr\n // CHECK-SAME: (%[[ARG0:.*]]: memref<32x16xf64, #triton_xla.layout<[0, 1]>>)\n func.func @fold_transpose_into_ptr("
+        },
+        {
+            "sha": "8444c33a84f3151b4fa2edd50d5e0d99c1d10bc5",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/transforms/triton_xla_lower_xtile_pass.cc",
+            "status": "modified",
+            "additions": 20,
+            "deletions": 7,
+            "changes": 27,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/19e033d298ee8050a6b2e54a05ad4fbb5077271f/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftriton_xla_lower_xtile_pass.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/19e033d298ee8050a6b2e54a05ad4fbb5077271f/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftriton_xla_lower_xtile_pass.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftriton_xla_lower_xtile_pass.cc?ref=19e033d298ee8050a6b2e54a05ad4fbb5077271f",
+            "patch": "@@ -26,7 +26,6 @@ limitations under the License.\n #include \"mlir/Dialect/Arith/IR/Arith.h\"\n #include \"mlir/Dialect/Func/IR/FuncOps.h\"\n #include \"mlir/Dialect/MemRef/IR/MemRef.h\"\n-#include \"mlir/Dialect/Tensor/IR/Tensor.h\"\n #include \"mlir/IR/Builders.h\"\n #include \"mlir/IR/BuiltinAttributes.h\"\n #include \"mlir/IR/BuiltinOps.h\"\n@@ -63,14 +62,18 @@ namespace ma = ::mlir::arith;\n \n // Get the new arg types of the lowered function by translating memrefs to the\n // corresponding pointer types.\n-llvm::SmallVector<mlir::Type> GetPtrArgTypes(mlir::ValueRange args) {\n+llvm::SmallVector<mlir::Type> GetTransformedArgTypes(\n+    ::xla::xtile::EntryFuncOp& entry_op) {\n   llvm::SmallVector<mlir::Type> arg_types;\n-  arg_types.reserve(args.size());\n-  for (auto arg : args) {\n+  // Tile id is not carried over hence -1.\n+  arg_types.reserve(entry_op.getNumArguments() - 1U);\n+  for (const auto& arg : entry_op.getBufferArgs()) {\n     mlir::MemRefType memref_type = mlir::cast<mlir::MemRefType>(arg.getType());\n     arg_types.push_back(\n         ::xla::gpu::triton::GetGlobalPointerType(memref_type.getElementType()));\n   }\n+  mlir::TypeRange opaque_args(entry_op.getOpaqueArgs());\n+  arg_types.append(opaque_args.begin(), opaque_args.end());\n   return arg_types;\n }\n \n@@ -145,7 +148,8 @@ class XTileEntryToTriton\n     mlir::ImplicitLocOpBuilder builder(module->getLoc(), module);\n     builder.setInsertionPointToStart(module.getBody());\n \n-    auto new_arg_types = GetPtrArgTypes(entry_op.getBufferArgs());\n+    const int64_t num_buffer_args = entry_op.getBufferArgs().size();\n+    auto new_arg_types = GetTransformedArgTypes(entry_op);\n     auto new_func_op = builder.create<mlir::func::FuncOp>(\n         entry_op.getName(), builder.getFunctionType(new_arg_types, {}));\n \n@@ -168,8 +172,10 @@ class XTileEntryToTriton\n         builder.create<ma::IndexCastOp>(builder.getIndexType(), pid);\n     rewriter.replaceAllUsesWith(tile_id_arg, pid_idx);\n \n-    // Handle memeref arguments.\n-    for (auto [old_arg, new_arg] : llvm::zip(old_args, new_args)) {\n+    // Handle memref arguments.\n+    for (auto [old_arg, new_arg] :\n+         llvm::zip(old_args,\n+                   mlir::ValueRange(new_args).take_front(num_buffer_args))) {\n       mlir::MemRefType memref_type =\n           mlir::cast<mlir::MemRefType>(old_arg.getType());\n \n@@ -179,6 +185,13 @@ class XTileEntryToTriton\n       // Replace all uses of the old argument with the result of the cast.\n       rewriter.replaceAllUsesWith(old_arg, memref_cast);\n     }\n+    // For opaque arguments, we can simply replace all uses with the new\n+    // argument.\n+    for (auto [old_arg, new_arg] :\n+         llvm::zip(mlir::ValueRange(old_args).drop_front(num_buffer_args),\n+                   mlir::ValueRange(new_args).drop_front(num_buffer_args))) {\n+      rewriter.replaceAllUsesWith(old_arg, new_arg);\n+    }\n \n     entry_block.eraseArguments(0, old_args.size());\n "
+        },
+        {
+            "sha": "57b9e8fa4527d50df3fe54f63e4a3ad7637b7974",
+            "filename": "third_party/xla/xla/codegen/xtile/ir/tests/ops.mlir",
+            "status": "modified",
+            "additions": 17,
+            "deletions": 0,
+            "changes": 17,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/19e033d298ee8050a6b2e54a05ad4fbb5077271f/third_party%2Fxla%2Fxla%2Fcodegen%2Fxtile%2Fir%2Ftests%2Fops.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/19e033d298ee8050a6b2e54a05ad4fbb5077271f/third_party%2Fxla%2Fxla%2Fcodegen%2Fxtile%2Fir%2Ftests%2Fops.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fcodegen%2Fxtile%2Fir%2Ftests%2Fops.mlir?ref=19e033d298ee8050a6b2e54a05ad4fbb5077271f",
+            "patch": "@@ -30,6 +30,23 @@ xtile.entry_func @too_many_tile_ids(%input: memref<1024xf32>, %id0: index, %id1:\n \n // -----\n \n+xtile.entry_func @correct_opaque_args(\n+  %input: memref<1024xf32>, %opaque0: index, %opaque1: index, %id1: index)\n+  attributes {num_opaque_args = 2 : i32}  {\n+  xtile.return\n+}\n+\n+// -----\n+\n+// expected-error@+1 {{entry function arguments should be of the form (arg: memref..., tile_id: index)}}\n+xtile.entry_func @wrong_opaque_args(\n+  %input: memref<1024xf32>, %opaque0: index, %opaque1: index, %id1: index)\n+  attributes {num_opaque_args = 1 : i32}  {\n+  xtile.return\n+}\n+\n+// -----\n+\n func.func @incorrect_full_shape_extract(%arg: memref<1024xf32>) -> tensor<10xf32> {\n   %offset = arith.constant 0 : index\n   // expected-error@+1 {{full tile shape size: 2 does not match rank of buffer: 1}}"
+        },
+        {
+            "sha": "d29eadffa85ed9e8be95728eb57a125327c50839",
+            "filename": "third_party/xla/xla/codegen/xtile/ir/xtile_ops.cc",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 1,
+            "changes": 4,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/19e033d298ee8050a6b2e54a05ad4fbb5077271f/third_party%2Fxla%2Fxla%2Fcodegen%2Fxtile%2Fir%2Fxtile_ops.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/19e033d298ee8050a6b2e54a05ad4fbb5077271f/third_party%2Fxla%2Fxla%2Fcodegen%2Fxtile%2Fir%2Fxtile_ops.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fcodegen%2Fxtile%2Fir%2Fxtile_ops.cc?ref=19e033d298ee8050a6b2e54a05ad4fbb5077271f",
+            "patch": "@@ -162,7 +162,9 @@ mlir::LogicalResult EntryFuncOp::verify() {\n       \"entry function arguments should be of the form (arg: memref..., \"\n       \"tile_id: index)\";\n \n-  for (mlir::Type arg_types : getArgumentTypes().drop_back()) {\n+  // + 1 for the tile id.\n+  const int64_t num_opaque_args = getNumOpaqueArgs() + 1;\n+  for (mlir::Type arg_types : getArgumentTypes().drop_back(num_opaque_args)) {\n     if (!mlir::isa<mlir::MemRefType>(arg_types)) {\n       return emitOpError() << argument_error;\n     }"
+        },
+        {
+            "sha": "a5aa4a368695225d54c545dda7ba9ab339ab7497",
+            "filename": "third_party/xla/xla/codegen/xtile/ir/xtile_ops.td",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 2,
+            "changes": 14,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/19e033d298ee8050a6b2e54a05ad4fbb5077271f/third_party%2Fxla%2Fxla%2Fcodegen%2Fxtile%2Fir%2Fxtile_ops.td",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/19e033d298ee8050a6b2e54a05ad4fbb5077271f/third_party%2Fxla%2Fxla%2Fcodegen%2Fxtile%2Fir%2Fxtile_ops.td",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fcodegen%2Fxtile%2Fir%2Fxtile_ops.td?ref=19e033d298ee8050a6b2e54a05ad4fbb5077271f",
+            "patch": "@@ -87,7 +87,11 @@ def EntryFuncOp : XTile_Op<\"entry_func\", [\n                        TypeAttrOf<FunctionType>:$function_type,\n                        OptionalAttr<DictArrayAttr>:$arg_attrs,\n                        OptionalAttr<XTile_TilingInfoAttr>:$tile_info,\n-                       OptionalAttr<DictArrayAttr>:$res_attrs\n+                       OptionalAttr<DictArrayAttr>:$res_attrs,\n+                       // The number of arguments that are opaque to tiling\n+                       // infrastructure and hence do not correspond to a memref\n+                       // argument.\n+                       DefaultValuedAttr<I32Attr, \"0\">:$num_opaque_args\n   );\n \n   // The entry function has no return values.\n@@ -106,7 +110,13 @@ def EntryFuncOp : XTile_Op<\"entry_func\", [\n     // Helper Methods\n     //===------------------------------------------------------------------===//\n     mlir::ValueRange getBufferArgs() {\n-      return getBody().getArguments().drop_back();\n+      // +1 for the tile id argument.\n+      return getBody().getArguments().drop_back(getNumOpaqueArgs() + 1);\n+    }\n+\n+    mlir::ValueRange getOpaqueArgs() {\n+      return getBody().getArguments().take_back(getNumOpaqueArgs() + 1)\n+          .drop_back();\n     }\n \n     mlir::Value getTileId() {"
+        }
+    ],
+    "stats": {
+        "total": 79,
+        "additions": 69,
+        "deletions": 10
+    }
+}

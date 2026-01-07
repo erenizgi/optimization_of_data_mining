@@ -1,0 +1,48 @@
+{
+    "author": "subhankarshah",
+    "message": "Remove `explicit_pinning_mode` from MSA options. As of now `explicit_pinning_mode` only makes sense when used along side block allcations.\n\nPiperOrigin-RevId: 803285783",
+    "sha": "990bf57a50f489601b48fd7af7167196a0692092",
+    "files": [
+        {
+            "sha": "6441d9cecd16a9814434cb84094abfd45c9f0ad7",
+            "filename": "third_party/xla/xla/service/memory_space_assignment/algorithm.cc",
+            "status": "modified",
+            "additions": 31,
+            "deletions": 8,
+            "changes": 39,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/990bf57a50f489601b48fd7af7167196a0692092/third_party%2Fxla%2Fxla%2Fservice%2Fmemory_space_assignment%2Falgorithm.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/990bf57a50f489601b48fd7af7167196a0692092/third_party%2Fxla%2Fxla%2Fservice%2Fmemory_space_assignment%2Falgorithm.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fmemory_space_assignment%2Falgorithm.cc?ref=990bf57a50f489601b48fd7af7167196a0692092",
+            "patch": "@@ -2085,7 +2085,7 @@ absl::flat_hash_set<HloPosition> GetParameterInstructionsAliasedToOutput(\n }  // namespace\n \n void MsaAlgorithm::ProcessBlockPrefetches() {\n-  if (options_.reserved_bytes_for_block_prefetches == 0) {\n+  if (options_.reserved_bytes_for_block_prefetches <= 0) {\n     return;\n   }\n   absl::flat_hash_set<HloPosition> aliased_parameter_positions =\n@@ -2126,7 +2126,7 @@ void MsaAlgorithm::ProcessBlockPrefetches() {\n     int64_t first_use_time;\n     int64_t last_use_time;\n   };\n-  // Compute the live ranges for each block prefetched value\n+  // Compute the live ranges for each block prefetched value.\n   absl::flat_hash_map<const HloValue*, LiveRange> value_to_live_ranges;\n   for (const HloValue* value : block_prefetched_values) {\n     LiveRange& live_range = value_to_live_ranges[value];\n@@ -2347,7 +2347,16 @@ absl::StatusOr<HeapSimulator::Result<HloValue>> MsaAlgorithm::Finish() {\n   std::vector<MsaBufferInterval> sorted_buffer_intervals =\n       GetSortedBufferIntervals();\n \n-  if (options_.explicit_pinning_mode) {\n+  if (options_.reserved_bytes_for_block_prefetches > 0) {\n+    // All prefetches will happen as a part of block prefetching, regular MSA\n+    // will not do any prefetching and run in a pin-only mode. We need to sort\n+    // the buffers in the following order:\n+    // 1. Pre-colored buffers first.\n+    //    - Within pre-colored buffers, sort by definition time and last use\n+    //      time in that order.\n+    // 2. Rest of the buffers.\n+    //    - Within these buffers, sort by size, definition time and last use\n+    //      time in that order.\n     const auto& instruction_schedule = hlo_live_range_.instruction_schedule();\n     auto get_instruction_time = [&](const HloInstruction* inst,\n                                     int64_t default_time) {\n@@ -2357,6 +2366,8 @@ absl::StatusOr<HeapSimulator::Result<HloValue>> MsaAlgorithm::Finish() {\n       }\n       return it->second;\n     };\n+    // TODO(b/442852498): Move this custom sorting logic to a new\n+    // BufferIntervalComparator class.\n     absl::c_stable_sort(\n         sorted_buffer_intervals,\n         [&](const MsaBufferInterval& a, const MsaBufferInterval& b) {\n@@ -2368,11 +2379,11 @@ absl::StatusOr<HeapSimulator::Result<HloValue>> MsaAlgorithm::Finish() {\n           bool b_is_colored = b_value->shape().has_layout() &&\n                               b_value->shape().layout().memory_space() ==\n                                   options_.alternate_memory_space;\n-          if (!(a_is_colored && b_is_colored)) {\n+          if (a_is_colored != b_is_colored) {\n+            // If one buffer is colored and the other is not, we want to place\n+            // the colored buffer first.\n             return a_is_colored;\n           }\n-          // Both buffers are colored, so we want to sort them by definition\n-          // time and last use time in that order.\n           int64_t a_definition_time =\n               get_instruction_time(a_value->defining_instruction(),\n                                    std::numeric_limits<int64_t>::max());\n@@ -2393,8 +2404,20 @@ absl::StatusOr<HeapSimulator::Result<HloValue>> MsaAlgorithm::Finish() {\n                 get_instruction_time(use.instruction,\n                                      std::numeric_limits<int64_t>::min()));\n           }\n-          return std::forward_as_tuple(a_definition_time, a_last_use_time) <\n-                 std::forward_as_tuple(b_definition_time, b_last_use_time);\n+          // Both buffers are colored, so sort by definition time and last use\n+          // time in that order.\n+          if (a_is_colored && b_is_colored) {\n+            return std::forward_as_tuple(a_definition_time, a_last_use_time) <\n+                   std::forward_as_tuple(b_definition_time, b_last_use_time);\n+          }\n+          // Both buffers are not colored, so sort by size, definition time,\n+          // and last use time in that order.\n+          int64_t a_size = a.size;\n+          int64_t b_size = b.size;\n+          return std::forward_as_tuple(a_size, a_definition_time,\n+                                       a_last_use_time) <\n+                 std::forward_as_tuple(b_size, b_definition_time,\n+                                       b_last_use_time);\n         });\n   }\n "
+        },
+        {
+            "sha": "42c31500ed8ff0d33f08e53d29fce4c09a700ba3",
+            "filename": "third_party/xla/xla/service/memory_space_assignment/memory_space_assignment_test.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/990bf57a50f489601b48fd7af7167196a0692092/third_party%2Fxla%2Fxla%2Fservice%2Fmemory_space_assignment%2Fmemory_space_assignment_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/990bf57a50f489601b48fd7af7167196a0692092/third_party%2Fxla%2Fxla%2Fservice%2Fmemory_space_assignment%2Fmemory_space_assignment_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fmemory_space_assignment%2Fmemory_space_assignment_test.cc?ref=990bf57a50f489601b48fd7af7167196a0692092",
+            "patch": "@@ -14634,6 +14634,7 @@ ENTRY entry {\n   memory_space_options.max_size_in_bytes = 24;\n   memory_space_options.reserved_bytes_for_block_prefetches = 23;\n   memory_space_options.max_outstanding_block_prefetches = 10;\n+  memory_space_options.max_outstanding_prefetches = 0;\n \n   HloInstruction* p0 = FindInstruction(module.get(), \"p0\");\n   HloPosition p0_position{p0, {}};"
+        },
+        {
+            "sha": "3511c5440c2fe8d9a0e5e74dbfa7fc32352a83ac",
+            "filename": "third_party/xla/xla/service/memory_space_assignment/options.h",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 7,
+            "changes": 9,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/990bf57a50f489601b48fd7af7167196a0692092/third_party%2Fxla%2Fxla%2Fservice%2Fmemory_space_assignment%2Foptions.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/990bf57a50f489601b48fd7af7167196a0692092/third_party%2Fxla%2Fxla%2Fservice%2Fmemory_space_assignment%2Foptions.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fmemory_space_assignment%2Foptions.h?ref=990bf57a50f489601b48fd7af7167196a0692092",
+            "patch": "@@ -406,15 +406,10 @@ struct Options {\n   // allocate for post-module operations.\n   uint64_t post_module_scoped_alternate_memory_size_in_bytes = 0;\n \n-  // If true, MSA will allocate buffers for explicitly pinned buffers in\n-  // alternate memory first, and then run the rest of the algorithm.\n-  bool explicit_pinning_mode = false;\n-\n-  // If set, this is the maximum number of concurrent block prefetches allowed.\n+  // This is the maximum number of concurrent block prefetches allowed.\n   int64_t max_outstanding_block_prefetches = 0;\n \n-  // If set, this is the size of scoped alternate memory that we require MSA to\n-  // allocate for block prefetches.\n+  // This is the size of alternate memory that available for block prefetches.\n   uint64_t reserved_bytes_for_block_prefetches = 0;\n \n   // List of hlo positions for block prefetches."
+        }
+    ],
+    "stats": {
+        "total": 49,
+        "additions": 34,
+        "deletions": 15
+    }
+}

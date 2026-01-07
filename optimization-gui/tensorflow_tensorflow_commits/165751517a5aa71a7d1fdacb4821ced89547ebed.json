@@ -1,0 +1,84 @@
+{
+    "author": "WillFroom",
+    "message": "[XLA:CPU][XTile] Update arith/math conversion patterns work correctly with vector inputs.\n\nPrior to this change they would be missed and would then be emitted as libm calls.\n\nPiperOrigin-RevId: 833267055",
+    "sha": "165751517a5aa71a7d1fdacb4821ced89547ebed",
+    "files": [
+        {
+            "sha": "cab42ce16aab098981283455a58deb4da2a0e320",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/emitters/transforms/BUILD",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 5,
+            "changes": 5,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/165751517a5aa71a7d1fdacb4821ced89547ebed/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Femitters%2Ftransforms%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/165751517a5aa71a7d1fdacb4821ced89547ebed/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Femitters%2Ftransforms%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Femitters%2Ftransforms%2FBUILD?ref=165751517a5aa71a7d1fdacb4821ced89547ebed",
+            "patch": "@@ -43,15 +43,10 @@ cc_library(\n         \":passes_inc_gen\",\n         \":xla_cpu_rewrite_patterns\",\n         \"//xla/backends/cpu/codegen/emitters/ir:xla_cpu\",\n-        \"//xla/codegen/emitters:implicit_arith_op_builder\",\n         \"//xla/codegen/emitters/ir:xla\",\n-        \"//xla/codegen/intrinsic:fptrunc\",\n-        \"//xla/codegen/intrinsic:log1p\",\n         \"//xla/hlo/analysis:indexing_analysis\",\n-        \"//xla/mlir/utils:type_util\",\n         \"@com_google_absl//absl/container:inlined_vector\",\n         \"@com_google_absl//absl/functional:any_invocable\",\n-        \"@com_google_absl//absl/strings:string_view\",\n         \"@com_google_absl//absl/types:span\",\n         \"@llvm-project//llvm:Support\",\n         \"@llvm-project//mlir:ArithDialect\","
+        },
+        {
+            "sha": "4a565b5c696d462803b4f4b71b272907a949bbf3",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/emitters/transforms/expand_float_ops.cc",
+            "status": "modified",
+            "additions": 29,
+            "deletions": 32,
+            "changes": 61,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/165751517a5aa71a7d1fdacb4821ced89547ebed/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Femitters%2Ftransforms%2Fexpand_float_ops.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/165751517a5aa71a7d1fdacb4821ced89547ebed/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Femitters%2Ftransforms%2Fexpand_float_ops.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Femitters%2Ftransforms%2Fexpand_float_ops.cc?ref=165751517a5aa71a7d1fdacb4821ced89547ebed",
+            "patch": "@@ -17,26 +17,24 @@ limitations under the License.\n #include <memory>\n #include <utility>\n \n-#include \"absl/strings/string_view.h\"\n #include \"mlir/Dialect/Arith/IR/Arith.h\"\n #include \"mlir/Dialect/Func/IR/FuncOps.h\"\n #include \"mlir/Dialect/Math/IR/Math.h\"\n+#include \"mlir/IR/Builders.h\"\n+#include \"mlir/IR/BuiltinAttributeInterfaces.h\"\n #include \"mlir/IR/BuiltinAttributes.h\"\n-#include \"mlir/IR/BuiltinOps.h\"\n #include \"mlir/IR/BuiltinTypeInterfaces.h\"\n #include \"mlir/IR/BuiltinTypes.h\"\n #include \"mlir/IR/Diagnostics.h\"\n-#include \"mlir/IR/ImplicitLocOpBuilder.h\"\n #include \"mlir/IR/PatternMatch.h\"\n+#include \"mlir/IR/TypeUtilities.h\"\n #include \"mlir/IR/Types.h\"\n #include \"mlir/IR/Value.h\"\n #include \"mlir/IR/ValueRange.h\"\n #include \"mlir/Pass/Pass.h\"\n #include \"mlir/Support/LLVM.h\"\n #include \"mlir/Support/LogicalResult.h\"\n #include \"mlir/Transforms/GreedyPatternRewriteDriver.h\"\n-#include \"xla/codegen/emitters/implicit_arith_op_builder.h\"\n-#include \"xla/mlir/utils/type_util.h\"\n \n namespace xla::cpu {\n \n@@ -48,33 +46,31 @@ namespace {\n \n namespace ma = ::mlir::arith;\n \n-mlir::func::FuncOp GetOrInsertDeclaration(mlir::PatternRewriter& rewriter,\n-                                          mlir::ModuleOp& module_op,\n-                                          absl::string_view name,\n-                                          mlir::FunctionType func_type) {\n-  // Check if the function already exists\n-  if (auto func = module_op.lookupSymbol<mlir::func::FuncOp>(name)) {\n-    // Ensure the existing function has the correct type\n-    if (func.getFunctionType() == func_type) {\n-      return func;\n+mlir::Value EmitBF16ToF32(mlir::Type dst_ty, mlir::Value in,\n+                          mlir::ImplicitLocOpBuilder& b) {\n+  auto get_type = [&](mlir::Type element_type) -> mlir::Type {\n+    if (auto vector_type = mlir::dyn_cast<mlir::VectorType>(in.getType())) {\n+      return vector_type.clone(element_type);\n     }\n-  }\n+    return element_type;\n+  };\n \n-  // If not found or type mismatch, create the declaration\n-  mlir::PatternRewriter::InsertionGuard insertGuard(rewriter);\n-  rewriter.setInsertionPointToStart(module_op.getBody());\n+  mlir::Type i16_type = get_type(b.getI16Type());\n+  mlir::Type i32_type = get_type(b.getI32Type());\n \n-  auto func_decl =\n-      rewriter.create<mlir::func::FuncOp>(module_op.getLoc(), name, func_type);\n-  func_decl.setPrivate();\n-  return func_decl;\n-}\n+  mlir::Value i16 = ma::BitcastOp::create(b, i16_type, in);\n+  mlir::Value i32 = ma::ExtUIOp::create(b, i32_type, i16);\n+\n+  mlir::TypedAttr shift_attr = b.getI32IntegerAttr(16);\n+  if (auto vector_type = mlir::dyn_cast<mlir::VectorType>(in.getType())) {\n+    shift_attr = mlir::SplatElementsAttr::get(\n+        mlir::cast<mlir::ShapedType>(i32_type), shift_attr);\n+  }\n+  mlir::Value shift_const =\n+      mlir::arith::ConstantOp::create(b, i32_type, shift_attr);\n \n-mlir::Value EmitBF16ToF32(mlir::Value in, mlir::ImplicitLocOpBuilder& b) {\n-  mlir::Value i16 = b.create<ma::BitcastOp>(b.getI16Type(), in);\n-  emitters::ImplicitArithOpBuilder i32(\n-      b.create<ma::ExtUIOp>(b.getI32Type(), i16), &b);\n-  return b.create<ma::BitcastOp>(b.getType<mlir::Float32Type>(), i32 << 16);\n+  mlir::Value i32_shl = mlir::arith::ShLIOp::create(b, i32, shift_const);\n+  return ma::BitcastOp::create(b, dst_ty, i32_shl);\n }\n \n struct RewriteExtFPattern : public mlir::OpRewritePattern<ma::ExtFOp> {\n@@ -83,13 +79,14 @@ struct RewriteExtFPattern : public mlir::OpRewritePattern<ma::ExtFOp> {\n   mlir::LogicalResult matchAndRewrite(\n       ma::ExtFOp op, mlir::PatternRewriter& rewriter) const override {\n     auto src = op.getOperand();\n-    auto dst_ty = mlir::cast<mlir::FloatType>(op.getType());\n+    auto dst_ty = op.getType();\n \n     mlir::ImplicitLocOpBuilder builder(op.getLoc(), rewriter);\n \n-    if (mlir::isa<mlir::BFloat16Type>(src.getType()) &&\n-        mlir::isa<mlir::Float32Type>(dst_ty)) {\n-      rewriter.replaceOp(op, EmitBF16ToF32(src, builder));\n+    if (mlir::isa<mlir::BFloat16Type>(\n+            mlir::getElementTypeOrSelf(src.getType())) &&\n+        mlir::isa<mlir::Float32Type>(mlir::getElementTypeOrSelf(dst_ty))) {\n+      rewriter.replaceOp(op, EmitBF16ToF32(dst_ty, src, builder));\n       return mlir::success();\n     }\n "
+        },
+        {
+            "sha": "4f0bf66f9c93b1886468f09052fdbbaa63b43480",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/emitters/transforms/tests/expand_float_ops.mlir",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 3,
+            "changes": 11,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/165751517a5aa71a7d1fdacb4821ced89547ebed/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Femitters%2Ftransforms%2Ftests%2Fexpand_float_ops.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/165751517a5aa71a7d1fdacb4821ced89547ebed/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Femitters%2Ftransforms%2Ftests%2Fexpand_float_ops.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Femitters%2Ftransforms%2Ftests%2Fexpand_float_ops.mlir?ref=165751517a5aa71a7d1fdacb4821ced89547ebed",
+            "patch": "@@ -1,12 +1,18 @@\n // RUN: emitters_opt %s -split-input-file -xla-cpu-expand-float-ops | FileCheck %s\n \n-\n func.func @extend(%input: bf16) -> f32 {\n+  // CHECK-NOT: arith.extf\n   %truncated = arith.extf %input : bf16 to f32\n   func.return %truncated : f32\n }\n \n-// CHECK-NOT: arith.extf\n+// -----\n+\n+func.func @extend_vector(%input: vector<8xbf16>) -> vector<8xf32> {\n+  // CHECK-NOT: arith.extf\n+  %truncated = arith.extf %input : vector<8xbf16> to vector<8xf32>\n+  func.return %truncated : vector<8xf32>\n+}\n \n // -----\n \n@@ -15,7 +21,6 @@ func.func @cbrt(%arg0: f64) -> f64 {\n   return %ret : f64\n }\n \n-\n // CHECK: @cbrt(%[[ARG:.*]]: f64) -> f64\n // CHECK-NOT: math.cbrt\n // CHECK-DAG: %[[CONSTANT:.*]] = arith.constant 0.3333333"
+        },
+        {
+            "sha": "a27582037997c0e3eaa6e02a7aa3dbd1bbdac293",
+            "filename": "third_party/xla/xla/codegen/emitters/transforms/lower_xla_intrinsic_lib.cc",
+            "status": "modified",
+            "additions": 22,
+            "deletions": 5,
+            "changes": 27,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/165751517a5aa71a7d1fdacb4821ced89547ebed/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftransforms%2Flower_xla_intrinsic_lib.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/165751517a5aa71a7d1fdacb4821ced89547ebed/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftransforms%2Flower_xla_intrinsic_lib.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftransforms%2Flower_xla_intrinsic_lib.cc?ref=165751517a5aa71a7d1fdacb4821ced89547ebed",
+            "patch": "@@ -27,6 +27,7 @@ limitations under the License.\n #include \"mlir/IR/BuiltinTypes.h\"\n #include \"mlir/IR/ImplicitLocOpBuilder.h\"\n #include \"mlir/IR/PatternMatch.h\"\n+#include \"mlir/IR/TypeUtilities.h\"\n #include \"mlir/IR/Types.h\"\n #include \"mlir/IR/Value.h\"\n #include \"mlir/IR/ValueRange.h\"\n@@ -139,17 +140,26 @@ class LowerTruncF32BF16FPattern\n       mlir::arith::TruncFOp op,\n       mlir::PatternRewriter& rewriter) const override {\n     auto src = op.getOperand();\n-    auto dst_ty = mlir::cast<mlir::FloatType>(op.getType());\n+    auto dst_ty = op.getType();\n \n-    if (!mlir::isa<mlir::Float32Type>(src.getType()) ||\n-        !mlir::isa<mlir::BFloat16Type>(dst_ty)) {\n+    if (!mlir::isa<mlir::Float32Type>(\n+            mlir::getElementTypeOrSelf(src.getType())) ||\n+        !mlir::isa<mlir::BFloat16Type>(mlir::getElementTypeOrSelf(dst_ty))) {\n       return rewriter.notifyMatchFailure(op, \"Not f32 -> bf16\");\n     }\n \n+    if (auto vec_type = mlir::dyn_cast<mlir::VectorType>(src.getType());\n+        vec_type && vec_type.getRank() != 1) {\n+      // These will later be converted to loops of 1D vectors but will then miss\n+      // the XLA intrinsic lowering.\n+      op->emitWarning() << \"Missed XLA intrinsic lowering as vector rank != 1.\";\n+      return rewriter.notifyMatchFailure(op, \"Vector rank is not 1.\");\n+    }\n+\n     mlir::ImplicitLocOpBuilder b(op.getLoc(), rewriter);\n \n-    Type src_type = Type::S(F32);\n-    Type dst_type = Type::S(BF16);\n+    auto src_type = Type::TypeFromIrType(src.getType());\n+    auto dst_type = Type::TypeFromIrType(dst_ty);\n     auto f32_to_bf16_decl =\n         codegen::intrinsics::FpTrunc::GetOrInsertDeclaration(\n             rewriter, module_op_, src_type, dst_type);\n@@ -171,6 +181,13 @@ class LowerIntrinsicPattern : public mlir::OpRewritePattern<Op> {\n \n   mlir::LogicalResult matchAndRewrite(\n       Op op, mlir::PatternRewriter& rewriter) const override {\n+    if (auto vec_type = mlir::dyn_cast<mlir::VectorType>(op.getType());\n+        vec_type && vec_type.getRank() != 1) {\n+      // These will later be converted to loops of 1D vectors but will then miss\n+      // the XLA intrinsic lowering.\n+      op->emitWarning() << \"Missed XLA intrinsic lowering as vector rank != 1.\";\n+      return rewriter.notifyMatchFailure(op, \"Vector rank is not 1.\");\n+    }\n     Type type = Type::TypeFromIrType(op.getType());\n     mlir::StringAttr features =\n         module_op_->getAttrOfType<mlir::StringAttr>(\"mhlo.cpu_features\");"
+        },
+        {
+            "sha": "1de01583caab8fe0f70ef05286ed1f60d434d7af",
+            "filename": "third_party/xla/xla/codegen/emitters/transforms/tests/lower_xla_intrinsic_lib.mlir",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 0,
+            "changes": 13,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/165751517a5aa71a7d1fdacb4821ced89547ebed/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftransforms%2Ftests%2Flower_xla_intrinsic_lib.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/165751517a5aa71a7d1fdacb4821ced89547ebed/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftransforms%2Ftests%2Flower_xla_intrinsic_lib.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftransforms%2Ftests%2Flower_xla_intrinsic_lib.mlir?ref=165751517a5aa71a7d1fdacb4821ced89547ebed",
+            "patch": "@@ -53,6 +53,19 @@ module {\n \n // -----\n \n+module {\n+  // CHECK-LABEL: @trunc\n+  func.func @trunc_vector(%input: vector<8xf32>) -> vector<8xbf16> {\n+    // CHECK-SAME: (%[[ARG:.*]]: vector<8xf32>) -> vector<8xbf16>\n+    // CHECK: %[[TRUNC_CALL:.*]] = call @local_xla.fptrunc.v8f32.to.v8bf16(%[[ARG]])\n+    %truncated = arith.truncf %input : vector<8xf32> to vector<8xbf16>\n+    // CHECK: return %[[TRUNC_CALL]]\n+    func.return %truncated : vector<8xbf16>\n+  }\n+}\n+\n+// -----\n+\n module {\n   func.func @erf32(%arg0: f32) -> f32 {\n     %ret = math.erf %arg0 : f32"
+        },
+        {
+            "sha": "2ffbb71b4d95151d60ed97ee0d7bd422431ff766",
+            "filename": "third_party/xla/xla/codegen/intrinsic/type.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/165751517a5aa71a7d1fdacb4821ced89547ebed/third_party%2Fxla%2Fxla%2Fcodegen%2Fintrinsic%2Ftype.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/165751517a5aa71a7d1fdacb4821ced89547ebed/third_party%2Fxla%2Fxla%2Fcodegen%2Fintrinsic%2Ftype.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fcodegen%2Fintrinsic%2Ftype.cc?ref=165751517a5aa71a7d1fdacb4821ced89547ebed",
+            "patch": "@@ -201,6 +201,7 @@ mlir::Type Type::to_ir_type(mlir::MLIRContext& context) const {\n \n Type Type::TypeFromIrType(mlir::Type type) {\n   if (auto vec_type = mlir::dyn_cast<mlir::VectorType>(type)) {\n+    CHECK_EQ(vec_type.getRank(), 1) << \"Expected rank 1 for vector type.\";\n     return Type(ConvertMlirTypeToPrimitiveType(vec_type.getElementType()),\n                 vec_type.getShape().front());\n   }"
+        }
+    ],
+    "stats": {
+        "total": 118,
+        "additions": 73,
+        "deletions": 45
+    }
+}

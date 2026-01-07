@@ -1,0 +1,48 @@
+{
+    "author": "tensorflower-gardener",
+    "message": "[XLA:TPU:Partitioner] Support subgroup sharding to have both replicated and unreduced.\n\nPiperOrigin-RevId: 800136812",
+    "sha": "ba9693e555107a20998c78583d8f9e5fa649c278",
+    "files": [
+        {
+            "sha": "05f85c9472fb72b1da613fce99ad4f26294775ac",
+            "filename": "third_party/xla/xla/hlo/ir/hlo_sharding.h",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ba9693e555107a20998c78583d8f9e5fa649c278/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_sharding.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ba9693e555107a20998c78583d8f9e5fa649c278/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_sharding.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_sharding.h?ref=ba9693e555107a20998c78583d8f9e5fa649c278",
+            "patch": "@@ -522,6 +522,15 @@ class HloSharding {\n     return -1;\n   }\n \n+  // Returns the unreduced subgroup dim, or -1 if it doesn't exist.\n+  int64_t SubgroupUnreducedDim() const {\n+    auto it = absl::c_find(subgroup_types_, OpSharding::UNREDUCED);\n+    if (it != subgroup_types_.end()) {\n+      return (it - subgroup_types_.begin()) + TiledDataRank();\n+    }\n+    return -1;\n+  }\n+\n   // Returns the data rank for tiled sharding. It doesn't include subgroup dims.\n   int64_t TiledDataRank() const {\n     CHECK(IsTiled());"
+        },
+        {
+            "sha": "073282a9d1755d83f27335af718ef628821b4d1f",
+            "filename": "third_party/xla/xla/service/spmd/spmd_partitioner.cc",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 6,
+            "changes": 22,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ba9693e555107a20998c78583d8f9e5fa649c278/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fspmd_partitioner.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ba9693e555107a20998c78583d8f9e5fa649c278/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fspmd_partitioner.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fspmd_partitioner.cc?ref=ba9693e555107a20998c78583d8f9e5fa649c278",
+            "patch": "@@ -5665,14 +5665,24 @@ absl::Status SpmdPartitioner::ConvertUnreducedSharding(\n       auto convert_unreduced_subgroup_sharding =\n           [](HloInstruction* hlo,\n              const HloSharding& sharding) -> absl::StatusOr<HloSharding> {\n-        // TODO(b/438306205, b/438308782): Remove this check once the unreduced\n-        // subgroup sharding is compatible with manual and replicated.\n-        TF_RET_CHECK(!sharding.HasPartialReplication() &&\n-                     !sharding.IsManualSubgroup())\n+        // TODO(b/438306205): Remove this check once the unreduced\n+        // subgroup sharding is compatible with manual.\n+        TF_RET_CHECK(!sharding.IsManualSubgroup())\n             << \"Incompatible unreduced sharding at \" << hlo->ToString();\n         hlo->add_frontend_attribute(sdy::kHasUnreducedAxes, \"true\");\n-        return HloSharding::PartialTile(sharding.tile_assignment(),\n-                                        sharding.metadata());\n+        TileAssignment tile_assignment = sharding.tile_assignment();\n+        if (sharding.HasPartialReplication()) {\n+          // When we have both replicated and unreduced, merge them into one\n+          // in the tile assignment.\n+          int64_t unreduced_dim = sharding.SubgroupUnreducedDim();\n+          DimensionVector new_dims(tile_assignment.dimensions().begin(),\n+                                   tile_assignment.dimensions().end());\n+          new_dims[sharding.SubgroupReplicationDim()] *=\n+              new_dims[unreduced_dim];\n+          new_dims.erase(new_dims.begin() + unreduced_dim);\n+          tile_assignment = tile_assignment.Reshape(new_dims);\n+        }\n+        return HloSharding::PartialTile(tile_assignment, sharding.metadata());\n       };\n       if (sharding.IsTuple()) {\n         std::vector<HloSharding> subshardings = sharding.tuple_elements();"
+        },
+        {
+            "sha": "bfaba4dce745298763acf0028e0f42a57c254b86",
+            "filename": "third_party/xla/xla/service/spmd/spmd_partitioner_test.cc",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 0,
+            "changes": 16,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ba9693e555107a20998c78583d8f9e5fa649c278/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fspmd_partitioner_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ba9693e555107a20998c78583d8f9e5fa649c278/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fspmd_partitioner_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fspmd_partitioner_test.cc?ref=ba9693e555107a20998c78583d8f9e5fa649c278",
+            "patch": "@@ -16512,6 +16512,22 @@ ENTRY entry {\n   EXPECT_EQ(FindInstruction(module.get(), HloOpcode::kAllReduce), nullptr);\n }\n \n+TEST_P(SpmdPartitioningTest, SubgroupUnreducedAndReplicated) {\n+  absl::string_view hlo_string = R\"(\n+HloModule module\n+\n+ENTRY entry {\n+  a = f32[8,1024]{1,0} parameter(0), sharding={devices=[2,2,4]<=[2,2,4]T(0,1,2) last_tile_dim_replicate}\n+  b = f32[1024,256]{1,0} parameter(1), sharding={devices=[2,2,4]<=[2,2,4]T(1,2,0) last_tile_dim_replicate}\n+  ROOT dot = f32[8,256]{1,0} dot(a, b), lhs_contracting_dims={1}, rhs_contracting_dims={0}, sharding={devices=[2,2,2,2]<=[2,2,2,2]T(0,2,1,3) last_tile_dims={unreduced,replicated}}\n+})\";\n+  TF_ASSERT_OK_AND_ASSIGN(auto module,\n+                          PartitionComputation(hlo_string, /*num_devices=*/16));\n+  VLOG(1) << module->ToString();\n+  EXPECT_THAT(module->entry_computation()->root_instruction(), op::Dot());\n+  EXPECT_EQ(FindInstruction(module.get(), HloOpcode::kAllReduce), nullptr);\n+}\n+\n TEST_P(SpmdPartitioningTest, OriginalValueWithTrivialShardingAnnotation) {\n   absl::string_view hlo_string = R\"(\n HloModule module"
+        }
+    ],
+    "stats": {
+        "total": 47,
+        "additions": 41,
+        "deletions": 6
+    }
+}

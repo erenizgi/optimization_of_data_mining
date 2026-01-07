@@ -1,0 +1,36 @@
+{
+    "author": "nvgrw",
+    "message": "HloRunnerPjRt replicated execution should use entry computation layouts.\n\nWhen transferring literals, use ECL as the authoritative source of layouts, just\nlike we do for single device execution via `Execute`.\n\nPiperOrigin-RevId: 807799665",
+    "sha": "daeb3b4504a1355031d0a959256ae0f62c26f650",
+    "files": [
+        {
+            "sha": "e278f8d4bda3102c5cc266f7797eda7f6cf12dc3",
+            "filename": "third_party/xla/xla/service/hlo_runner_pjrt.cc",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 6,
+            "changes": 22,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/daeb3b4504a1355031d0a959256ae0f62c26f650/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_runner_pjrt.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/daeb3b4504a1355031d0a959256ae0f62c26f650/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_runner_pjrt.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_runner_pjrt.cc?ref=daeb3b4504a1355031d0a959256ae0f62c26f650",
+            "patch": "@@ -580,6 +580,7 @@ absl::StatusOr<std::vector<Literal>> HloRunnerPjRt::ExecuteReplicated(\n         return pjrt_executable->Execute(argument_buffer_slices,\n                                         execute_options);\n       },\n+      [&](int64_t replica) { return wrapped_executable; },\n       [&](int64_t replica) { return options.arguments.size(); },\n       [&](int64_t replica, int64_t index) { return options.arguments[index]; },\n       options, device_assignment);\n@@ -656,14 +657,16 @@ absl::StatusOr<std::vector<Literal>> HloRunnerPjRt::ExecuteReplicated(\n         }\n         return results;\n       },\n-      argument_count_provider, argument_provider, options, device_assignment);\n+      executable_provider, argument_count_provider, argument_provider, options,\n+      device_assignment);\n }\n \n absl::StatusOr<std::vector<Literal>> HloRunnerPjRt::ExecuteReplicatedImpl(\n     std::function<\n         absl::StatusOr<std::vector<std::vector<std::unique_ptr<PjRtBuffer>>>>(\n             absl::Span<const std::vector<PjRtBuffer*>>)>\n         execution_helper,\n+    std::function<OpaqueExecutable*(int64_t)> executable_provider,\n     std::function<int64_t(int64_t)> argument_count_provider,\n     std::function<const Literal*(int64_t, int64_t)> argument_provider,\n     const ReplicatedExecuteOptions& options,\n@@ -681,20 +684,27 @@ absl::StatusOr<std::vector<Literal>> HloRunnerPjRt::ExecuteReplicatedImpl(\n                             DeviceIdForInvocation(*device_assignment, i)));\n     replica_devices[i] = device_ptr;\n \n+    // Get the entry layout.\n+    OpaqueExecutable* const wrapped_executable = executable_provider(i);\n+    TF_ASSIGN_OR_RETURN(const HloModule* const module,\n+                        HloModuleFromWrapped(wrapped_executable));\n+    const ComputationLayout& ecl = module->entry_computation_layout();\n+\n     // Transfer literals to device.\n     const int64_t argument_count = argument_count_provider(i);\n     std::vector<std::unique_ptr<PjRtBuffer>> replica_buffers;\n     replica_buffers.reserve(argument_count);\n     for (int64_t arg_index = 0; arg_index < argument_count; arg_index++) {\n       const Literal* const argument = argument_provider(i, arg_index);\n       TF_RET_CHECK(argument != nullptr);\n-      TF_RET_CHECK(argument->shape().has_layout())\n-          << \"Replica \" << i << \" argument \" << arg_index << \" has no layout.\";\n+      const ShapeLayout& layout = ecl.parameter_layout(arg_index);\n+      TF_RET_CHECK(layout.LayoutIsSet());\n+\n       TF_ASSIGN_OR_RETURN(PjRtMemorySpace * memory_space,\n                           device_ptr->default_memory_space());\n-      TF_ASSIGN_OR_RETURN(std::unique_ptr<PjRtBuffer> assignment,\n-                          TransferLiteralToDevice(*argument, memory_space,\n-                                                  argument->shape().layout()));\n+      TF_ASSIGN_OR_RETURN(\n+          std::unique_ptr<PjRtBuffer> assignment,\n+          TransferLiteralToDevice(*argument, memory_space, layout.layout()));\n       replica_buffers.push_back(std::move(assignment));\n     }\n     argument_buffer_slices.push_back(std::move(replica_buffers));"
+        },
+        {
+            "sha": "56190590675520c4ca96a41fed7a5eca97939ecf",
+            "filename": "third_party/xla/xla/service/hlo_runner_pjrt.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/daeb3b4504a1355031d0a959256ae0f62c26f650/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_runner_pjrt.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/daeb3b4504a1355031d0a959256ae0f62c26f650/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_runner_pjrt.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_runner_pjrt.h?ref=daeb3b4504a1355031d0a959256ae0f62c26f650",
+            "patch": "@@ -137,6 +137,7 @@ class HloRunnerPjRt : public HloRunnerInterface {\n           absl::StatusOr<std::vector<std::vector<std::unique_ptr<PjRtBuffer>>>>(\n               absl::Span<const std::vector<PjRtBuffer*>>)>\n           execution_helper,\n+      std::function<OpaqueExecutable*(int64_t)> executable_provider,\n       std::function<int64_t(int64_t)> argument_count_provider,\n       std::function<const Literal*(int64_t, int64_t)> argument_provider,\n       const ReplicatedExecuteOptions& options,"
+        }
+    ],
+    "stats": {
+        "total": 23,
+        "additions": 17,
+        "deletions": 6
+    }
+}

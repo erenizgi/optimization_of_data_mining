@@ -1,0 +1,180 @@
+{
+    "author": "pschuh",
+    "message": "Move mutability tracking from Tracked buffers to RawBuffers as this is only used for importing foreign memory and clutters the API.\n\nPiperOrigin-RevId: 846916941",
+    "sha": "9d833374f9caee892d2e915623bbf67fca7c4b26",
+    "files": [
+        {
+            "sha": "1eca83fcb8a3d82b3b8de7f84de9e055d50ee9f9",
+            "filename": "third_party/xla/xla/pjrt/common_pjrt_client.cc",
+            "status": "modified",
+            "additions": 18,
+            "deletions": 23,
+            "changes": 41,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/9d833374f9caee892d2e915623bbf67fca7c4b26/third_party%2Fxla%2Fxla%2Fpjrt%2Fcommon_pjrt_client.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/9d833374f9caee892d2e915623bbf67fca7c4b26/third_party%2Fxla%2Fxla%2Fpjrt%2Fcommon_pjrt_client.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fcommon_pjrt_client.cc?ref=9d833374f9caee892d2e915623bbf67fca7c4b26",
+            "patch": "@@ -158,8 +158,7 @@ CommonPjRtClient::BufferFromHostLiteral(const LiteralSlice& literal,\n                     HostBufferSemantics::kImmutableUntilTransferCompletes,\n                     raw_buffer));\n   return DefineBuffer(device_shape, memory_space, std::move(raw_buffer),\n-                      {std::move(definition_event)},\n-                      /*raw_buffer_is_mutable=*/true);\n+                      {std::move(definition_event)});\n }\n \n absl::StatusOr<std::unique_ptr<PjRtBuffer>>\n@@ -193,8 +192,7 @@ CommonPjRtClient::CreateUninitializedBuffer(const Shape& shape,\n                       raw_buffer->MakeAllocationReadyEvent());\n   TF_ASSIGN_OR_RETURN(auto output_buffer,\n                       DefineBuffer(device_shape, memory_space, raw_buffer,\n-                                   {std::move(definition_event)},\n-                                   /*raw_buffer_is_mutable=*/true));\n+                                   {std::move(definition_event)}));\n   return output_buffer;\n }\n \n@@ -270,8 +268,7 @@ CommonPjRtClient::CreateAliasBuffer(const Shape& shape,\n \n   TF_ASSIGN_OR_RETURN(auto result_buffer,\n                       DefineBuffer(shape, memory_space, std::move(raw_buffer),\n-                                   {std::move(definition_event)},\n-                                   /*raw_buffer_is_mutable=*/true));\n+                                   {std::move(definition_event)}));\n \n   return std::make_pair(std::move(result_buffer), std::move(fulfill_cb));\n }\n@@ -302,14 +299,14 @@ CommonPjRtClient::BufferFromHostBuffer(\n           ImportForeignMemory(\n               const_cast<void*>(data),  // CONST_CAST_OK=flag controlled.\n               std::move(on_done_with_host_buffer), on_device_bytes_count,\n-              memory_space));\n+              memory_space,\n+              host_buffer_semantics ==\n+                  PjRtClient::HostBufferSemantics::kMutableZeroCopy));\n       TF_ASSIGN_OR_RETURN(\n           auto output_buffer,\n           DefineBuffer(\n               device_shape, memory_space, raw_buffer,\n-              absl::InlinedVector<tsl::RCReference<PjRtDeviceEvent>, 4>{},\n-              /*raw_buffer_is_mutable=*/host_buffer_semantics ==\n-                  PjRtClient::HostBufferSemantics::kMutableZeroCopy));\n+              absl::InlinedVector<tsl::RCReference<PjRtDeviceEvent>, 4>{}));\n       return output_buffer;\n     }\n   }\n@@ -327,8 +324,7 @@ CommonPjRtClient::BufferFromHostBuffer(\n           std::move(on_done_with_host_buffer), device_shape, raw_buffer));\n   TF_ASSIGN_OR_RETURN(std::unique_ptr<PjRtBuffer> output_buffer,\n                       DefineBuffer(device_shape, memory_space, raw_buffer,\n-                                   {std::move(definition_event)},\n-                                   /*raw_buffer_is_mutable=*/true));\n+                                   {std::move(definition_event)}));\n   return output_buffer;\n }\n \n@@ -351,12 +347,13 @@ CommonPjRtClient::CreateViewOfDeviceBuffer(\n   TF_ASSIGN_OR_RETURN(\n       auto raw_buffer,\n       ImportForeignMemory(device_ptr, std::move(on_delete_callback),\n-                          on_device_bytes_count, memory_space));\n+                          on_device_bytes_count, memory_space,\n+                          /*is_mutable=*/false));\n   TF_ASSIGN_OR_RETURN(\n       auto output_buffer,\n-      DefineBuffer(device_shape, memory_space, raw_buffer,\n-                   absl::InlinedVector<tsl::RCReference<PjRtDeviceEvent>, 4>{},\n-                   /*raw_buffer_is_mutable=*/false));\n+      DefineBuffer(\n+          device_shape, memory_space, raw_buffer,\n+          absl::InlinedVector<tsl::RCReference<PjRtDeviceEvent>, 4>{}));\n   return output_buffer;\n }\n \n@@ -705,9 +702,9 @@ static std::unique_ptr<PjRtBuffer> CreateOutputLeafBuffer(\n     CHECK(memory_space) << \"No memory space found for device: \"\n                         << device->DebugString() << \" kind: \" << kind_id;\n   }\n-  auto buffer_or = client->DefineBuffer(\n-      output_leaf_shape, memory_space, std::move(leaf_buffer),\n-      {definition_event}, /*raw_buffer_is_mutable=*/true);\n+  auto buffer_or =\n+      client->DefineBuffer(output_leaf_shape, memory_space,\n+                           std::move(leaf_buffer), {definition_event});\n   CHECK_OK(buffer_or);\n   return *std::move(buffer_or);\n }\n@@ -1154,8 +1151,7 @@ CommonPjRtBufferImpl::CopyToCpuMemorySpace(const xla::Shape& dst_shape,\n   TF_ASSIGN_OR_RETURN(\n       auto buffer,\n       dst_client->DefineBuffer(dst_shape, dst_memory_space, dst_raw_buffer,\n-                               {std::move(definition_event)},\n-                               /*raw_buffer_is_mutable=*/true));\n+                               {std::move(definition_event)}));\n   auto* base_ptr = dst_raw_buffer->GetHostPointer();\n   std::unique_ptr<MutableLiteralBase> literal;\n   bool needs_second_copy = false;\n@@ -1265,8 +1261,7 @@ static absl::Status CommonCopyToMemorySpace(\n     TF_ASSIGN_OR_RETURN(\n         dst_buffer,\n         dst_client->DefineBuffer(dst_shape, dst_memory_space, dst_raw_buffer,\n-                                 {std::move(definition_event)},\n-                                 /*raw_buffer_is_mutable=*/true));\n+                                 {std::move(definition_event)}));\n     TF_RETURN_IF_ERROR(src_buffer->AcquireScopedRawBuffer(\n         [&](tsl::RCReference<CommonPjRtRawBuffer> buf_raw_buffer,\n             std::vector<tsl::RCReference<tsl::AsyncValue>>"
+        },
+        {
+            "sha": "d03af18392ec5d12a8734b83210012426607aecc",
+            "filename": "third_party/xla/xla/pjrt/common_pjrt_client.h",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 3,
+            "changes": 5,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/9d833374f9caee892d2e915623bbf67fca7c4b26/third_party%2Fxla%2Fxla%2Fpjrt%2Fcommon_pjrt_client.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/9d833374f9caee892d2e915623bbf67fca7c4b26/third_party%2Fxla%2Fxla%2Fpjrt%2Fcommon_pjrt_client.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fcommon_pjrt_client.h?ref=9d833374f9caee892d2e915623bbf67fca7c4b26",
+            "patch": "@@ -87,7 +87,7 @@ class CommonPjRtClient : public PjRtClient {\n   ImportForeignMemory(void* device_ptr,\n                       absl::AnyInvocable<void() &&> on_delete_callback,\n                       size_t on_device_bytes_count,\n-                      PjRtMemorySpace* memory_space) {\n+                      PjRtMemorySpace* memory_space, bool is_mutable) {\n     return absl::UnimplementedError(\"ImportForeignMemory is not supported\");\n   }\n \n@@ -105,8 +105,7 @@ class CommonPjRtClient : public PjRtClient {\n       const Shape& on_device_shape, PjRtMemorySpace* memory_space,\n       tsl::RCReference<CommonPjRtRawBuffer> raw_buffer,\n       absl::InlinedVector<tsl::RCReference<PjRtDeviceEvent>, 4>\n-          definition_device_events,\n-      bool raw_buffer_is_mutable) {\n+          definition_device_events) {\n     return absl::UnimplementedError(\"DefineBuffer is not supported\");\n   }\n "
+        },
+        {
+            "sha": "3ad33cd715e612a033c6688a35d4ced6eafdb0ea",
+            "filename": "third_party/xla/xla/pjrt/cpu/cpu_client.cc",
+            "status": "modified",
+            "additions": 19,
+            "deletions": 15,
+            "changes": 34,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/9d833374f9caee892d2e915623bbf67fca7c4b26/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fcpu_client.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/9d833374f9caee892d2e915623bbf67fca7c4b26/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fcpu_client.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fcpu_client.cc?ref=9d833374f9caee892d2e915623bbf67fca7c4b26",
+            "patch": "@@ -888,10 +888,11 @@ static bool IsAlignedData(void* ptr) {\n absl::StatusOr<tsl::RCReference<CommonPjRtRawBuffer>>\n PjRtCpuClient::ImportForeignMemory(\n     void* device_ptr, absl::AnyInvocable<void() &&> on_delete_callback,\n-    size_t on_device_bytes_count, PjRtMemorySpace* memory_space) {\n-  return CpuRawBuffer::ImportForeignMemory(device_ptr,\n-                                           std::move(on_delete_callback),\n-                                           on_device_bytes_count, memory_space);\n+    size_t on_device_bytes_count, PjRtMemorySpace* memory_space,\n+    bool is_mutable) {\n+  return CpuRawBuffer::ImportForeignMemory(\n+      device_ptr, std::move(on_delete_callback), on_device_bytes_count,\n+      memory_space, is_mutable);\n }\n \n absl::StatusOr<std::unique_ptr<PjRtBuffer>> PjRtCpuClient::CreateErrorBuffer(\n@@ -910,7 +911,7 @@ absl::StatusOr<std::unique_ptr<PjRtBuffer>> PjRtCpuClient::CreateErrorBuffer(\n   return std::make_unique<CommonPjRtBufferImpl>(\n       shape,\n       std::make_unique<TrackedCpuDeviceBuffer>(\n-          /*owns_buffers=*/true, std::move(raw_buffer),\n+          std::move(raw_buffer),\n           tsl::AsyncValueRef<CpuEvent>(\n               tsl::MakeErrorAsyncValueRef(std::move(error)))),\n       memory_space);\n@@ -995,8 +996,7 @@ absl::StatusOr<std::unique_ptr<PjRtBuffer>> PjRtCpuClient::DefineBuffer(\n     const Shape& on_device_shape, PjRtMemorySpace* memory_space,\n     tsl::RCReference<CommonPjRtRawBuffer> raw_buffer,\n     absl::InlinedVector<tsl::RCReference<PjRtDeviceEvent>, 4>\n-        definition_device_events,\n-    bool raw_buffer_is_mutable) {\n+        definition_device_events) {\n   if (raw_buffer && raw_buffer->memory_space() != memory_space) {\n     return absl::InvalidArgumentError(\n         absl::StrFormat(\"DefineBuffer: Mismatch in memory spaces: %s vs %s\",\n@@ -1006,7 +1006,7 @@ absl::StatusOr<std::unique_ptr<PjRtBuffer>> PjRtCpuClient::DefineBuffer(\n   return std::unique_ptr<PjRtBuffer>(std::make_unique<CommonPjRtBufferImpl>(\n       on_device_shape,\n       std::make_unique<TrackedCpuDeviceBuffer>(\n-          /*owns_buffers=*/raw_buffer_is_mutable, std::move(raw_buffer),\n+          std::move(raw_buffer),\n           CpuTrackedDeviceEvent::AfterAll(definition_device_events)),\n       memory_space));\n }\n@@ -1029,7 +1029,7 @@ PjRtCpuClient::CreateRawBufferChannel(PjRtMemorySpace* memory_space,\n   auto buffer_promise = tsl::MakeIndirectAsyncValue();\n   auto raw_buffer = tsl::MakeRef<CpuRawBuffer>(\n       memory_space, tsl::AsyncValueRef<CpuDeviceMemory>(buffer_promise),\n-      on_device_bytes_count);\n+      on_device_bytes_count, /*is_mutable=*/true);\n \n   auto buffer_promise_cb =\n       [buffer_promise = std::move(buffer_promise), memory_space](\n@@ -1250,7 +1250,9 @@ static absl::StatusOr<BufferInfo> MemoryForAllocation(\n     // If we don't own the buffer, we can't overwrite it or donate it. For\n     // example we might be pointing to a buffer owned by the client whose\n     // lifetime will not extend past the lifetime of the donated input buffer.\n-    if ((!can_donate || (arg && !arg->owns_buffers())) &&\n+    if ((!can_donate ||\n+         (arg && !tensorflow::down_cast<CpuRawBuffer*>(arg->raw_buffer().get())\n+                      ->is_mutable())) &&\n         !allocation.is_readonly()) {\n       auto copy = CpuDeviceMemory::CreateDelayedMemory();\n \n@@ -1265,7 +1267,9 @@ static absl::StatusOr<BufferInfo> MemoryForAllocation(\n     }\n \n     buffer_info.buffer = out.CopyRef();\n-    buffer_info.owns_buffer = !arg || arg->owns_buffers();\n+    buffer_info.owns_buffer =\n+        !arg || tensorflow::down_cast<CpuRawBuffer*>(arg->raw_buffer().get())\n+                    ->is_mutable();\n     buffer_info.buffer_size = buffer_size;\n     return buffer_info;\n \n@@ -1856,10 +1860,10 @@ absl::StatusOr<PjRtLoadedExecutable::Result> PjRtCpuExecutable::ExecuteHelper(\n       // Program execution writes to output buffers so it's a definition event.\n       auto leaf_tracked_device_buffer =\n           std::make_unique<TrackedCpuDeviceBuffer>(\n-              result_buffers_info[i].owns_buffer,\n               tsl::MakeRef<CpuRawBuffer>(\n                   memory_space, std::move(result_buffers_info[i].buffer),\n-                  result_buffers_info[i].buffer_size),\n+                  result_buffers_info[i].buffer_size,\n+                  result_buffers_info[i].owns_buffer),\n               execute_event.CopyRef());\n       auto leaf_buffer = std::make_unique<CommonPjRtBufferImpl>(\n           result_shape.tuple_shapes(i), std::move(leaf_tracked_device_buffer),\n@@ -1870,10 +1874,10 @@ absl::StatusOr<PjRtLoadedExecutable::Result> PjRtCpuExecutable::ExecuteHelper(\n     CHECK_EQ(result_buffers_info.size(), 1);\n     // Program execution writes to output buffers so it's a definition event.\n     auto tracked_device_buffer = std::make_unique<TrackedCpuDeviceBuffer>(\n-        result_buffers_info[0].owns_buffer,\n         tsl::MakeRef<CpuRawBuffer>(memory_space,\n                                    std::move(result_buffers_info[0].buffer),\n-                                   result_buffers_info[0].buffer_size),\n+                                   result_buffers_info[0].buffer_size,\n+                                   result_buffers_info[0].owns_buffer),\n         /*definition_event=*/execute_event);\n     auto output_buffer = std::make_unique<CommonPjRtBufferImpl>(\n         result_shape, std::move(tracked_device_buffer), memory_space);"
+        },
+        {
+            "sha": "813834bfcfe5047d1c279916350cc0e4990dcdcc",
+            "filename": "third_party/xla/xla/pjrt/cpu/cpu_client.h",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 3,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/9d833374f9caee892d2e915623bbf67fca7c4b26/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fcpu_client.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/9d833374f9caee892d2e915623bbf67fca7c4b26/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fcpu_client.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fcpu_client.h?ref=9d833374f9caee892d2e915623bbf67fca7c4b26",
+            "patch": "@@ -174,7 +174,8 @@ class PjRtCpuClient final : public CommonPjRtClient {\n \n   absl::StatusOr<tsl::RCReference<CommonPjRtRawBuffer>> ImportForeignMemory(\n       void* device_ptr, absl::AnyInvocable<void() &&> on_delete_callback,\n-      size_t on_device_bytes_count, PjRtMemorySpace* memory_space) override;\n+      size_t on_device_bytes_count, PjRtMemorySpace* memory_space,\n+      bool is_mutable) override;\n \n   tsl::thread::ThreadPool* pjrt_client_thread_pool() const {\n     return pjrt_client_thread_pool_.get();\n@@ -234,8 +235,7 @@ class PjRtCpuClient final : public CommonPjRtClient {\n       const Shape& on_device_shape, PjRtMemorySpace* memory_space,\n       tsl::RCReference<CommonPjRtRawBuffer> raw_buffer,\n       absl::InlinedVector<tsl::RCReference<PjRtDeviceEvent>, 4>\n-          definition_device_events,\n-      bool raw_buffer_is_mutable) override;\n+          definition_device_events) override;\n \n   absl::StatusOr<int64_t> GetOnDeviceBytesCount(\n       PjRtMemorySpace* memory_space, const xla::Shape& shape) const override;"
+        },
+        {
+            "sha": "57963004deb68fee60c0c2c6f51e1caf527dd58f",
+            "filename": "third_party/xla/xla/pjrt/cpu/raw_buffer.cc",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 4,
+            "changes": 9,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/9d833374f9caee892d2e915623bbf67fca7c4b26/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fraw_buffer.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/9d833374f9caee892d2e915623bbf67fca7c4b26/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fraw_buffer.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fraw_buffer.cc?ref=9d833374f9caee892d2e915623bbf67fca7c4b26",
+            "patch": "@@ -130,14 +130,15 @@ CpuRawBuffer::Allocate(PjRtMemorySpace* memory_space, size_t size_bytes,\n                        const CpuDeviceMemory::Allocator& allocator) {\n   TF_ASSIGN_OR_RETURN(auto memory,\n                       CpuDeviceMemory::Allocate(size_bytes, allocator));\n-  return tsl::MakeRef<CpuRawBuffer>(memory_space, std::move(memory),\n-                                    size_bytes);\n+  return tsl::MakeRef<CpuRawBuffer>(memory_space, std::move(memory), size_bytes,\n+                                    /*is_mutable=*/true);\n }\n \n /*static*/ absl::StatusOr<tsl::RCReference<CpuRawBuffer>>\n CpuRawBuffer::ImportForeignMemory(\n     void* data, absl::AnyInvocable<void() &&> on_delete_callback,\n-    size_t on_device_bytes_count, PjRtMemorySpace* memory_space) {\n+    size_t on_device_bytes_count, PjRtMemorySpace* memory_space,\n+    bool is_mutable) {\n   if ((absl::bit_cast<std::uintptr_t>(data) & (cpu::MinAlign() - 1)) != 0) {\n     return InvalidArgument(\n         \"Can't create a view of buffer with unaligned data, ptr: %#x is not \"\n@@ -148,7 +149,7 @@ CpuRawBuffer::ImportForeignMemory(\n       memory_space,\n       CpuDeviceMemory::CreateForeignMemory(data, on_device_bytes_count,\n                                            std::move(on_delete_callback)),\n-      on_device_bytes_count);\n+      on_device_bytes_count, is_mutable);\n }\n \n size_t CpuRawBuffer::GetOnDeviceSizeInBytes() const { return buffer_size_; }"
+        },
+        {
+            "sha": "03227be74217fa339956ea192dc10538ea08d124",
+            "filename": "third_party/xla/xla/pjrt/cpu/raw_buffer.h",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 3,
+            "changes": 12,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/9d833374f9caee892d2e915623bbf67fca7c4b26/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fraw_buffer.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/9d833374f9caee892d2e915623bbf67fca7c4b26/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fraw_buffer.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fraw_buffer.h?ref=9d833374f9caee892d2e915623bbf67fca7c4b26",
+            "patch": "@@ -95,10 +95,12 @@ class CpuTrackedDeviceEvent : public PjRtDeviceEvent {\n class CpuRawBuffer : public CommonPjRtRawBuffer {\n  public:\n   CpuRawBuffer(PjRtMemorySpace* memory_space,\n-               tsl::AsyncValueRef<CpuDeviceMemory> buffer, size_t buffer_size)\n+               tsl::AsyncValueRef<CpuDeviceMemory> buffer, size_t buffer_size,\n+               bool is_mutable)\n       : memory_space_(memory_space),\n         buffer_(std::move(buffer)),\n-        buffer_size_(buffer_size) {}\n+        buffer_size_(buffer_size),\n+        is_mutable_(is_mutable) {}\n \n   absl::Status ValidateSlice(int64_t offset, int64_t slice_size);\n \n@@ -111,7 +113,8 @@ class CpuRawBuffer : public CommonPjRtRawBuffer {\n   // Imports foreign memory.\n   static absl::StatusOr<tsl::RCReference<CpuRawBuffer>> ImportForeignMemory(\n       void* data, absl::AnyInvocable<void() &&> on_delete_callback,\n-      size_t on_device_bytes_count, PjRtMemorySpace* memory_space);\n+      size_t on_device_bytes_count, PjRtMemorySpace* memory_space,\n+      bool is_mutable);\n \n   size_t GetOnDeviceSizeInBytes() const override;\n \n@@ -129,6 +132,8 @@ class CpuRawBuffer : public CommonPjRtRawBuffer {\n \n   PjRtMemorySpace* memory_space() const override { return memory_space_; }\n \n+  bool is_mutable() const { return is_mutable_; }\n+\n   absl::StatusOr<tsl::RCReference<PjRtDeviceEvent>>\n   CopyRawHostToDeviceAndReturnEvent(const void* src, int64_t offset,\n                                     int64_t transfer_size) override;\n@@ -175,6 +180,7 @@ class CpuRawBuffer : public CommonPjRtRawBuffer {\n   PjRtMemorySpace* const memory_space_;\n   tsl::AsyncValueRef<CpuDeviceMemory> buffer_;\n   size_t buffer_size_;\n+  bool is_mutable_;\n };\n \n absl::StatusOr<xla::Shape> MakeDefaultCpuBufferShape(xla::Shape shape,"
+        },
+        {
+            "sha": "a172969dccc501bce8f8f5309cdde130c9f58395",
+            "filename": "third_party/xla/xla/pjrt/cpu/tracked_cpu_device_buffer.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/9d833374f9caee892d2e915623bbf67fca7c4b26/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Ftracked_cpu_device_buffer.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/9d833374f9caee892d2e915623bbf67fca7c4b26/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Ftracked_cpu_device_buffer.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Ftracked_cpu_device_buffer.cc?ref=9d833374f9caee892d2e915623bbf67fca7c4b26",
+            "patch": "@@ -189,10 +189,9 @@ absl::Status CpuDeviceMemory::AllocateInto(\n //===----------------------------------------------------------------------===//\n \n TrackedCpuDeviceBuffer::TrackedCpuDeviceBuffer(\n-    bool owns_buffers, tsl::RCReference<CommonPjRtRawBuffer> raw_buffer,\n+    tsl::RCReference<CommonPjRtRawBuffer> raw_buffer,\n     tsl::AsyncValueRef<CpuEvent> definition_event)\n     : AbstractTrackedDeviceBuffer(std::move(raw_buffer)),\n-      owns_buffers_(owns_buffers),\n       definition_event_(std::move(definition_event)) {\n   DCHECK(definition_event_);\n }"
+        },
+        {
+            "sha": "a1ca122405e24b830c183cb62a759d330a7e2d1d",
+            "filename": "third_party/xla/xla/pjrt/cpu/tracked_cpu_device_buffer.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 6,
+            "changes": 7,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/9d833374f9caee892d2e915623bbf67fca7c4b26/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Ftracked_cpu_device_buffer.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/9d833374f9caee892d2e915623bbf67fca7c4b26/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Ftracked_cpu_device_buffer.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Ftracked_cpu_device_buffer.h?ref=9d833374f9caee892d2e915623bbf67fca7c4b26",
+            "patch": "@@ -141,8 +141,7 @@ class CpuDeviceMemory {\n class TrackedCpuDeviceBuffer : public AbstractTrackedDeviceBuffer {\n  public:\n   // Variant with single definition event.\n-  TrackedCpuDeviceBuffer(bool owns_buffers,\n-                         tsl::RCReference<CommonPjRtRawBuffer> raw_buffer,\n+  TrackedCpuDeviceBuffer(tsl::RCReference<CommonPjRtRawBuffer> raw_buffer,\n                          tsl::AsyncValueRef<CpuEvent> definition_event);\n \n   TrackedCpuDeviceBuffer(TrackedCpuDeviceBuffer&&) noexcept = default;\n@@ -170,8 +169,6 @@ class TrackedCpuDeviceBuffer : public AbstractTrackedDeviceBuffer {\n   absl::InlinedVector<tsl::AsyncValueRef<CpuEvent>, 4>\n   LockUseAndTransferUsageEvents();\n \n-  bool owns_buffers() const { return owns_buffers_; }\n-\n   std::vector<tsl::RCReference<tsl::AsyncValue>> GetAsyncValueDefinitionEvents()\n       override;\n \n@@ -190,8 +187,6 @@ class TrackedCpuDeviceBuffer : public AbstractTrackedDeviceBuffer {\n  private:\n   void ConfirmDonation() override;\n \n-  bool owns_buffers_;\n-\n   // The definition event are associated with CPU operations that write to the\n   // buffers.\n   tsl::AsyncValueRef<CpuEvent> definition_event_;"
+        },
+        {
+            "sha": "7579fef3c0ee3dac6edbf894e8baf9ace2840072",
+            "filename": "third_party/xla/xla/pjrt/cpu/tracked_cpu_device_buffer_test.cc",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 6,
+            "changes": 10,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/9d833374f9caee892d2e915623bbf67fca7c4b26/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Ftracked_cpu_device_buffer_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/9d833374f9caee892d2e915623bbf67fca7c4b26/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Ftracked_cpu_device_buffer_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Ftracked_cpu_device_buffer_test.cc?ref=9d833374f9caee892d2e915623bbf67fca7c4b26",
+            "patch": "@@ -57,8 +57,7 @@ TEST(TrackedCpuDeviceBufferTest, Basic) {\n     definition_event.SetStateConcrete();\n   });\n \n-  TrackedCpuDeviceBuffer tracked_buffer(\n-      /*owns_buffers=*/true, buffer, definition_event);\n+  TrackedCpuDeviceBuffer tracked_buffer(buffer, definition_event);\n \n   BlockUntilReady(tracked_buffer.definition_event().GetAsyncValue());\n \n@@ -85,8 +84,7 @@ TEST(TrackedCpuDeviceBufferTest, BasicError) {\n         Internal(\"tracked_cpu_device_buffer_test error.\"));\n   });\n \n-  TrackedCpuDeviceBuffer tracked_buffer(\n-      /*owns_buffers=*/true, buffer, definition_event);\n+  TrackedCpuDeviceBuffer tracked_buffer(buffer, definition_event);\n \n   BlockUntilReady(tracked_buffer.definition_event().GetAsyncValue());\n \n@@ -108,8 +106,8 @@ TEST(TrackedCpuDeviceBufferTest, DelayedAllocation) {\n \n   auto definition_event = MakeConstructedAsyncValueRef<CpuEvent>();\n   TrackedCpuDeviceBuffer tracked_buffer(\n-      /*owns_buffers=*/true,\n-      tsl::MakeRef<CpuRawBuffer>(memory_space, buffer, expected.size()),\n+      tsl::MakeRef<CpuRawBuffer>(memory_space, buffer, expected.size(),\n+                                 /*is_mutable=*/true),\n       definition_event);\n   auto result = tracked_buffer.buffer();\n   ASSERT_FALSE(result.IsAvailable());"
+        },
+        {
+            "sha": "d072e94c364fdd21dec38aad398fe089e50ed1d5",
+            "filename": "third_party/xla/xla/pjrt/gpu/se_gpu_pjrt_client.cc",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 4,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/9d833374f9caee892d2e915623bbf67fca7c4b26/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Fse_gpu_pjrt_client.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/9d833374f9caee892d2e915623bbf67fca7c4b26/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Fse_gpu_pjrt_client.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Fse_gpu_pjrt_client.cc?ref=9d833374f9caee892d2e915623bbf67fca7c4b26",
+            "patch": "@@ -611,8 +611,7 @@ absl::StatusOr<PreparedReceive> PrepareReceive(\n \n   TF_ASSIGN_OR_RETURN(std::unique_ptr<PjRtBuffer> buffer,\n                       client->DefineBuffer(on_device_shape, memory_space,\n-                                           raw_buffer, {definition_event},\n-                                           /*raw_buffer_is_mutable=*/true));\n+                                           raw_buffer, {definition_event}));\n   definition_event->AndThen([raw_buffer]() {});\n \n   return PreparedReceive(client, std::move(clique_key), std::move(buffer),\n@@ -917,8 +916,7 @@ StreamExecutorGpuClient::PrepareReceiveBuffer(PjRtDevice* device, Shape shape) {\n       auto buffer,\n       DefineBuffer(\n           on_device_shape, memory_space, raw_buffer,\n-          {tsl::MakeRef<PjRtStreamExecutorDeviceEvent>(definition_event)},\n-          /*raw_buffer_is_mutable=*/true));\n+          {tsl::MakeRef<PjRtStreamExecutorDeviceEvent>(definition_event)}));\n \n   return PrepareReceiveBufferResult{std::move(buffer), std::move(raw_buffer),\n                                     local_device, stream,"
+        },
+        {
+            "sha": "a75c9f3900af8022c82572756c5d99e6571b9322",
+            "filename": "third_party/xla/xla/pjrt/gpu/se_gpu_pjrt_client_test.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/9d833374f9caee892d2e915623bbf67fca7c4b26/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Fse_gpu_pjrt_client_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/9d833374f9caee892d2e915623bbf67fca7c4b26/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Fse_gpu_pjrt_client_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Fse_gpu_pjrt_client_test.cc?ref=9d833374f9caee892d2e915623bbf67fca7c4b26",
+            "patch": "@@ -2875,8 +2875,7 @@ TEST(StreamExecutorGpuClientTest, LinkedEventPromise) {\n                           client->CreateLinkedEventPromise(memory_space, \"\"));\n   TF_ASSERT_OK_AND_ASSIGN(\n       auto buffer, client->DefineBuffer(device_shape, memory_space, raw_buffer,\n-                                        {std::move(event)},\n-                                        /*raw_buffer_is_mutable=*/true));\n+                                        {std::move(event)}));\n \n   TF_ASSERT_OK_AND_ASSIGN(\n       auto definition_event,"
+        },
+        {
+            "sha": "aab104323a24a674faf54480cd57655d486baa55",
+            "filename": "third_party/xla/xla/pjrt/host_to_device_transfer_manager.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/9d833374f9caee892d2e915623bbf67fca7c4b26/third_party%2Fxla%2Fxla%2Fpjrt%2Fhost_to_device_transfer_manager.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/9d833374f9caee892d2e915623bbf67fca7c4b26/third_party%2Fxla%2Fxla%2Fpjrt%2Fhost_to_device_transfer_manager.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fhost_to_device_transfer_manager.cc?ref=9d833374f9caee892d2e915623bbf67fca7c4b26",
+            "patch": "@@ -154,8 +154,7 @@ class CommonAsyncHostToDeviceTransferManager\n       TF_ASSIGN_OR_RETURN(\n           auto buffer,\n           client->DefineBuffer(device_shape, memory_space, raw_buffer,\n-                               {std::move(definition_event)},\n-                               /*raw_buffer_is_mutable=*/true));\n+                               {std::move(definition_event)}));\n       device_shapes.push_back(std::move(device_shape));\n       buffers.push_back(std::move(buffer));\n       undispatched_buffer_refs.push_back(raw_buffer);"
+        },
+        {
+            "sha": "3a28a3e0441676449109458f7fe047c319442605",
+            "filename": "third_party/xla/xla/pjrt/pjrt_stream_executor_client.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/9d833374f9caee892d2e915623bbf67fca7c4b26/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_stream_executor_client.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/9d833374f9caee892d2e915623bbf67fca7c4b26/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_stream_executor_client.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_stream_executor_client.cc?ref=9d833374f9caee892d2e915623bbf67fca7c4b26",
+            "patch": "@@ -512,8 +512,7 @@ PjRtStreamExecutorClient::DefineBuffer(\n     const Shape& on_device_shape, PjRtMemorySpace* memory_space,\n     tsl::RCReference<CommonPjRtRawBuffer> raw_buffer,\n     absl::InlinedVector<tsl::RCReference<PjRtDeviceEvent>, 4>\n-        definition_device_events,\n-    bool raw_buffer_is_mutable) {\n+        definition_device_events) {\n   if (raw_buffer && raw_buffer->memory_space() != memory_space) {\n     return absl::InvalidArgumentError(\n         absl::StrFormat(\"DefineBuffer: Mismatch in memory spaces: %s vs %s\","
+        },
+        {
+            "sha": "a67ee1895cbf65c590ca059838e2105a948abbe2",
+            "filename": "third_party/xla/xla/pjrt/pjrt_stream_executor_client.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/9d833374f9caee892d2e915623bbf67fca7c4b26/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_stream_executor_client.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/9d833374f9caee892d2e915623bbf67fca7c4b26/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_stream_executor_client.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_stream_executor_client.h?ref=9d833374f9caee892d2e915623bbf67fca7c4b26",
+            "patch": "@@ -396,8 +396,7 @@ class PjRtStreamExecutorClient : public CommonPjRtClient {\n       const Shape& on_device_shape, PjRtMemorySpace* memory_space,\n       tsl::RCReference<CommonPjRtRawBuffer> raw_buffer,\n       absl::InlinedVector<tsl::RCReference<PjRtDeviceEvent>, 4>\n-          definition_device_events,\n-      bool raw_buffer_is_mutable) override;\n+          definition_device_events) override;\n \n   absl::StatusOr<std::pair<tsl::RCReference<CommonPjRtRawBuffer>,\n                            PjRtFulfillAliasRawBufferCallback>>"
+        }
+    ],
+    "stats": {
+        "total": 145,
+        "additions": 68,
+        "deletions": 77
+    }
+}

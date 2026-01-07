@@ -1,0 +1,48 @@
+{
+    "author": "thomasjoerg",
+    "message": "[XLA:GPU] Run DotMerger after the simplification fix-point pass pipeline.\n\nThe simplification passes alg-simplifier, constant_folding, cse, and dot-strength-reduction are cheap compared to dot-merger. Running these passes to a fix-point first can greatly reduce the number of merge candidates that dot-merger needs to consider. The dot-merger pass itself is designed to do all merging in one go. Hence, there is no need to run it to a fix point.\n\nAlso clarify the semantic of the dot-merger threshold in xla.proto and remove an early exit in dot_merger.cc that was not in-line with it.\n\nPiperOrigin-RevId: 845731882",
+    "sha": "c660aef0d5c2b73f3e97684a335c8ab94a629825",
+    "files": [
+        {
+            "sha": "21611ee012954040945dd29c931663d8189a939b",
+            "filename": "third_party/xla/xla/hlo/transforms/simplifiers/dot_merger.cc",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 5,
+            "changes": 14,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/c660aef0d5c2b73f3e97684a335c8ab94a629825/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fsimplifiers%2Fdot_merger.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/c660aef0d5c2b73f3e97684a335c8ab94a629825/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fsimplifiers%2Fdot_merger.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fsimplifiers%2Fdot_merger.cc?ref=c660aef0d5c2b73f3e97684a335c8ab94a629825",
+            "patch": "@@ -17,6 +17,7 @@ limitations under the License.\n \n #include <cstdint>\n #include <functional>\n+#include <numeric>\n #include <set>\n #include <string>\n #include <utility>\n@@ -478,7 +479,14 @@ absl::StatusOr<bool> MergeDots(\n   }\n \n   VLOG(0) << \"Merging Dots in computation: \" << comp->name();\n-  VLOG(1) << \"Found \" << equivalence_classes.size() << \" equivalence classes.\";\n+  VLOG(1) << \"Found \" << equivalence_classes.size()\n+          << \" equivalence classes with \"\n+          << std::accumulate(equivalence_classes.begin(),\n+                             equivalence_classes.end(), std::uint64_t{0},\n+                             [](std::uint64_t total, auto const& values) {\n+                               return values.second.size() + total;\n+                             })\n+          << \" dots in total.\";\n \n   // Build a dependency graph representing the whole computation.\n   GraphCycles graph;\n@@ -567,10 +575,6 @@ absl::StatusOr<bool> MergeDots(\n           dead_instrs.insert(b);\n           dots[i] = merged;\n           dots[j] = nullptr;\n-          if (!is_merge_candidate(merged)) {\n-            // The merged dot is not a candidate for futher merging.\n-            break;\n-          }\n         }\n       }\n     }"
+        },
+        {
+            "sha": "36471b34d7a2ac14e27ff12b668c5e1b3aef5ac5",
+            "filename": "third_party/xla/xla/service/gpu/gpu_compiler.cc",
+            "status": "modified",
+            "additions": 22,
+            "deletions": 13,
+            "changes": 35,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/c660aef0d5c2b73f3e97684a335c8ab94a629825/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_compiler.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/c660aef0d5c2b73f3e97684a335c8ab94a629825/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_compiler.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_compiler.cc?ref=c660aef0d5c2b73f3e97684a335c8ab94a629825",
+            "patch": "@@ -754,18 +754,6 @@ absl::Status RunOptimizationPasses(\n         gpu_target_config.device_description.gpu_compute_capability());\n     pipeline.AddPass<GpuAlgebraicSimplifier>(layout_insensitive_algsimp_opts,\n                                              gpu_version);\n-    // Only merge \"smallish\" dots.  This threshold defaults to 32MB today, with\n-    // a flag to override.\n-    // Do not merge dots when they are assigned different stream ids.\n-    std::function<int64_t(const HloInstruction* dot)> queue_id =\n-        [&](const HloInstruction* dot) -> int64_t {\n-      return dot->backend_config<GpuBackendConfig>()->operation_queue_id();\n-    };\n-    pipeline.AddPass<DotMerger>(\n-        /*max_size_to_merge=*/int64_t{debug_options\n-                                          .xla_gpu_dot_merger_threshold_mb()}\n-            << 20,\n-        queue_id);\n     pipeline.AddPass<SortSimplifier>();\n     pipeline.AddPass<TupleSimplifier>();\n     pipeline.AddPass<WhileLoopConstantSinking>();\n@@ -778,11 +766,32 @@ absl::Status RunOptimizationPasses(\n     pipeline.AddPass<HloConstantFolding>();\n     pipeline.AddPass<ConditionalSimplifier>();\n     pipeline.AddPass<RealImagExpander>();\n-    pipeline.AddPass<TransposeFolding>(CanFoldTransposeOperandIntoDot);\n+    // Do not fold transpose operands into dots yet. This can undo the normal\n+    // form established by DotDecomposer, which the DotMerger pass requires.\n+    pipeline.AddPass<TransposeFolding>(\n+        /*dot_can_fold_transpose_operand=*/\n+        [&](const HloInstruction& dot,\n+            int64_t operand) -> absl::StatusOr<bool> { return false; });\n     pipeline.AddPass<HloCSE>(/*is_layout_sensitive=*/false);\n     pipeline.AddPass<HloDCE>();\n   }();\n \n+  // Do not merge dots when they are assigned different stream ids.\n+  std::function<int64_t(const HloInstruction* dot)> queue_id =\n+      [&](const HloInstruction* dot) -> int64_t {\n+    return dot->backend_config<GpuBackendConfig>()->operation_queue_id();\n+  };\n+  // Only merge \"smallish\" dots. This threshold defaults to 32MB today, with\n+  // a flag to override.\n+  pipeline.AddPass<DotMerger>(\n+      /*max_size_to_merge=*/int64_t{debug_options\n+                                        .xla_gpu_dot_merger_threshold_mb()}\n+          << 20,\n+      queue_id);\n+  // Folding transpose operands into dots can undo the normal form established\n+  // by DotDecomposer. Subsequent passes must not rely on it from this point on.\n+  pipeline.AddPass<TransposeFolding>(CanFoldTransposeOperandIntoDot);\n+\n   // ConvertMover and ReshapeMover fight with each other: ConvertMover wants\n   // to move some converts down the graph, but ReshapeMover wants to move them\n   // up the graph.  As a compromise, let ReshapeMover run to a fixed point,"
+        },
+        {
+            "sha": "6575b4803029e2da13948acf45addd5d4074d48b",
+            "filename": "third_party/xla/xla/xla.proto",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/c660aef0d5c2b73f3e97684a335c8ab94a629825/third_party%2Fxla%2Fxla%2Fxla.proto",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/c660aef0d5c2b73f3e97684a335c8ab94a629825/third_party%2Fxla%2Fxla%2Fxla.proto",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fxla.proto?ref=c660aef0d5c2b73f3e97684a335c8ab94a629825",
+            "patch": "@@ -468,6 +468,9 @@ message DebugOptions {\n   optional bool xla_gpu_disable_gpuasm_optimizations = 103;\n \n   // DotMerger pass threshold size to be used in MB.\n+  // This pass merges dots that are too small to achieve good occupancy with\n+  // other dots. Dots are considered for merging when the size of their\n+  // inputs+output is within the threshold.\n   optional int32 xla_gpu_dot_merger_threshold_mb = 331;\n \n   // File to write autotune logs to. It will stored in txt format."
+        }
+    ],
+    "stats": {
+        "total": 52,
+        "additions": 34,
+        "deletions": 18
+    }
+}

@@ -1,0 +1,84 @@
+{
+    "author": "tensorflower-gardener",
+    "message": "Enable reduced fingerprint for text-proto models\n\nPiperOrigin-RevId: 825618056",
+    "sha": "9cbe7bd184c7bf0558c5b908da4f92446cc1b2a0",
+    "files": [
+        {
+            "sha": "d4dc54dc160a629ab05f9c5756e420b723f476d9",
+            "filename": "tensorflow/cc/saved_model/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/9cbe7bd184c7bf0558c5b908da4f92446cc1b2a0/tensorflow%2Fcc%2Fsaved_model%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/9cbe7bd184c7bf0558c5b908da4f92446cc1b2a0/tensorflow%2Fcc%2Fsaved_model%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcc%2Fsaved_model%2FBUILD?ref=9cbe7bd184c7bf0558c5b908da4f92446cc1b2a0",
+            "patch": "@@ -341,6 +341,7 @@ filegroup(\n     srcs = glob([\n         \"testdata/bert2/**\",\n         \"testdata/bert1/**\",\n+        \"testdata/half_plus_two_pbtxt/**\",\n     ]),\n )\n "
+        },
+        {
+            "sha": "71b2c8a332874e2434f164a4d8deb725a88be328",
+            "filename": "tensorflow/cc/saved_model/fingerprinting.cc",
+            "status": "modified",
+            "additions": 48,
+            "deletions": 12,
+            "changes": 60,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/9cbe7bd184c7bf0558c5b908da4f92446cc1b2a0/tensorflow%2Fcc%2Fsaved_model%2Ffingerprinting.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/9cbe7bd184c7bf0558c5b908da4f92446cc1b2a0/tensorflow%2Fcc%2Fsaved_model%2Ffingerprinting.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcc%2Fsaved_model%2Ffingerprinting.cc?ref=9cbe7bd184c7bf0558c5b908da4f92446cc1b2a0",
+            "patch": "@@ -44,9 +44,9 @@ limitations under the License.\n #if !defined(PLATFORM_WINDOWS) && !defined(__APPLE__)\n #include \"tensorflow/cc/saved_model/fingerprinting_utils.h\"\n #include \"tensorflow/tools/proto_splitter/cc/util.h\"\n-#endif\n #include \"tsl/platform/errors.h\"\n #include \"tsl/platform/statusor.h\"\n+#endif\n // IWYU pragma: no_include \"third_party/protobuf/io/coded_stream.h\"\n // IWYU pragma: no_include \"third_party/protobuf/io/zero_copy_stream_impl_lite.h\"\n \n@@ -152,12 +152,23 @@ absl::StatusOr<uint64_t> RegularizeAndHashSavedObjectGraph(\n   return result_hash;\n }\n \n+void SetFingerprintUUID(FingerprintDef* fingerprint_def) {\n+  // Assign a random UUID to the fingerprint. This can happen regardless of\n+  // whether the SavedModel was read successfully. It serves as a unique\n+  // identifier for the model even in situations where the SavedModel is\n+  // non-existent or unreadable.\n+  fingerprint_def->set_uuid(CreateRandomUUID());\n+}\n+\n // Creates a FingerprintDef proto from a SavedModel and the checkpoint meta file\n // (.index) in `export_dir`.\n absl::StatusOr<FingerprintDef> CreateFingerprintDefPb(\n     absl::string_view export_dir, std::string pb_file) {\n   // Version of the code that produced the fingerprint.\n-  const int kFingerprintProducer = 1;\n+  // Note corresponding version definition in\n+  // FingerprintingUtils.cc:CreateFingerprintDefCpb() and in\n+  // Fingerprinting.cc:CreateReducedFingerprintDef()\n+  const int kFingerprintProducer = 4;\n \n   SavedModel saved_model;\n   TF_RETURN_IF_ERROR(ReadBinaryProto(Env::Default(), pb_file, &saved_model));\n@@ -182,8 +193,23 @@ absl::StatusOr<FingerprintDef> CreateFingerprintDefPb(\n   fingerprint_def.set_saved_object_graph_hash(object_graph_hash);\n   // Set fingerprint field #5.\n   fingerprint_def.set_checkpoint_hash(HashCheckpointIndexFile(export_dir));\n-  // Assign a random UUID to the fingerprint.\n-  fingerprint_def.set_uuid(CreateRandomUUID());\n+  SetFingerprintUUID(&fingerprint_def);\n+  // Set version of the fingerprint.\n+  VersionDef* version = fingerprint_def.mutable_version();\n+  version->set_producer(kFingerprintProducer);\n+\n+  return fingerprint_def;\n+}\n+\n+absl::StatusOr<FingerprintDef> CreateReducedFingerprintDef() {\n+  // Version of the code that produced the fingerprint.\n+  // Note corresponding version definition in\n+  // FingerprintingUtils.cc:CreateFingerprintDefCpb() and in\n+  // Fingerprinting.cc:CreateFingerprintDefPb()\n+  const int kFingerprintProducer = 5;\n+\n+  FingerprintDef fingerprint_def;\n+  SetFingerprintUUID(&fingerprint_def);\n   // Set version of the fingerprint.\n   VersionDef* version = fingerprint_def.mutable_version();\n   version->set_producer(kFingerprintProducer);\n@@ -198,15 +224,25 @@ absl::StatusOr<FingerprintDef> CreateFingerprintDef(\n   std::string prefix = io::JoinPath(export_dir, kSavedModelFilenamePrefix);\n \n #if !defined(PLATFORM_WINDOWS) && !defined(__APPLE__)\n-  TF_ASSIGN_OR_RETURN(bool only_contains_pb,\n-                      tools::proto_splitter::OnlyContainsPb(prefix));\n-  if (only_contains_pb) {\n-    return CreateFingerprintDefPb(export_dir, absl::StrCat(prefix, \".pb\"));\n+  absl::StatusOr<bool> only_contains_pb =\n+      tools::proto_splitter::OnlyContainsPb(prefix);\n+  // TODO: b/455882293 - Enable reporting errors if the .[c]pb files are\n+  // important but still missing.\n+  if (only_contains_pb.ok()) {\n+    if (*only_contains_pb) {\n+      return CreateFingerprintDefPb(export_dir, absl::StrCat(prefix, \".pb\"));\n+    }\n+    return CreateFingerprintDefCpb(export_dir, absl::StrCat(prefix, \".cpb\"));\n   }\n-\n-  return CreateFingerprintDefCpb(export_dir, absl::StrCat(prefix, \".cpb\"));\n-#else\n-  return CreateFingerprintDefPb(export_dir, absl::StrCat(prefix, \".pb\"));\n+  // At this point we have neither saved_model.pb nor saved_model.cpb.\n+  return CreateReducedFingerprintDef();  // Only sets the UUID.\n+#else  // The following runs on Windows and Mac.\n+  absl::StatusOr<FingerprintDef> fingerprint_def =\n+      CreateFingerprintDefPb(export_dir, absl::StrCat(prefix, \".pb\"));\n+  if (!fingerprint_def.ok()) {\n+    return CreateReducedFingerprintDef();\n+  }\n+  return fingerprint_def;\n #endif\n }\n "
+        },
+        {
+            "sha": "135646df74fdf99463180ad163c5ffd4745454ec",
+            "filename": "tensorflow/cc/saved_model/fingerprinting_test.cc",
+            "status": "modified",
+            "additions": 28,
+            "deletions": 1,
+            "changes": 29,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/9cbe7bd184c7bf0558c5b908da4f92446cc1b2a0/tensorflow%2Fcc%2Fsaved_model%2Ffingerprinting_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/9cbe7bd184c7bf0558c5b908da4f92446cc1b2a0/tensorflow%2Fcc%2Fsaved_model%2Ffingerprinting_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcc%2Fsaved_model%2Ffingerprinting_test.cc?ref=9cbe7bd184c7bf0558c5b908da4f92446cc1b2a0",
+            "patch": "@@ -78,6 +78,33 @@ TEST(FingerprintingTest, TestCreateFingerprint) {\n   EXPECT_GT(fingerprint_def.checkpoint_hash(), 0);\n }\n \n+TEST(FingerprintingTest, TestCreateFingerprintForPbtxtWorks) {\n+  // This test ensures that we get a minimal fingerprint with an uuid, even\n+  // when the SavedModel cannot be read.\n+  const std::string export_dir =\n+      io::JoinPath(testing::TensorFlowSrcRoot(), \"cc/saved_model/testdata\",\n+                   \"half_plus_two_pbtxt\");\n+  TF_ASSERT_OK_AND_ASSIGN(FingerprintDef fingerprint_def,\n+                          CreateFingerprintDef(export_dir));\n+\n+  EXPECT_EQ(fingerprint_def.saved_model_checksum(), 0);\n+  EXPECT_EQ(fingerprint_def.graph_def_program_hash(), 0);\n+  EXPECT_EQ(fingerprint_def.signature_def_hash(), 0);\n+  EXPECT_EQ(fingerprint_def.saved_object_graph_hash(), 0);\n+  EXPECT_EQ(fingerprint_def.checkpoint_hash(), 0);\n+\n+  // The uuid is a random number (as string), but it should be a number > 0.\n+  absl::uint128 uuid = 0;\n+  EXPECT_TRUE(absl::SimpleAtoi(fingerprint_def.uuid(), &uuid))\n+      << \"String to Uint128 conversion failed. \"\n+      << \"UUID from proto, and Uint128Max(): \\n\"\n+      << fingerprint_def.uuid() << \"\\n\"\n+      << absl::Uint128Max();\n+  EXPECT_GT(uuid, 0);\n+  // version().producer()differs between WIN and non-WIN platforms.\n+  EXPECT_GT(fingerprint_def.version().producer(), 3);\n+}\n+\n // Compare the fingerprints of two models saved by calling\n // `tf.saved_model.save` twice in a row in the same program.\n TEST(FingerprintingTest, TestCompareFingerprintForTwoModelSavedTwice) {\n@@ -131,7 +158,7 @@ TEST(FingerprintingTest, TestFingerprintHasVersion) {\n                           ReadSavedModel(export_dir));\n   TF_ASSERT_OK_AND_ASSIGN(FingerprintDef fingerprint_def,\n                           CreateFingerprintDef(export_dir));\n-  EXPECT_EQ(fingerprint_def.version().producer(), 1);\n+  EXPECT_EQ(fingerprint_def.version().producer(), 4);\n }\n \n TEST(FingerprintingTest, TestHashCheckpointForModelWithNoVariables) {"
+        },
+        {
+            "sha": "8b94635dc4c5811028074bd22e0f3a56e3863076",
+            "filename": "tensorflow/python/saved_model/BUILD",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/9cbe7bd184c7bf0558c5b908da4f92446cc1b2a0/tensorflow%2Fpython%2Fsaved_model%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/9cbe7bd184c7bf0558c5b908da4f92446cc1b2a0/tensorflow%2Fpython%2Fsaved_model%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fpython%2Fsaved_model%2FBUILD?ref=9cbe7bd184c7bf0558c5b908da4f92446cc1b2a0",
+            "patch": "@@ -69,6 +69,7 @@ py_strict_library(\n         \":pywrap_saved_model\",\n         \":signature_def_utils\",\n         \"//tensorflow/core:protos_all_py\",\n+        \"//tensorflow/core/protobuf:for_core_protos_py_proto\",\n         \"//tensorflow/python/framework:dtypes\",\n         \"//tensorflow/python/framework:ops\",\n         \"//tensorflow/python/framework:tensor\",\n@@ -176,6 +177,7 @@ tf_py_strict_test(\n         \":tag_constants\",\n         \":utils\",\n         \"//tensorflow/core:protos_all_py\",\n+        \"//tensorflow/core/protobuf:for_core_protos_py_proto\",\n         \"//tensorflow/python/client:session\",\n         \"//tensorflow/python/framework:constant_op\",\n         \"//tensorflow/python/framework:dtypes\","
+        },
+        {
+            "sha": "ab9767ad10d8145f3d868c437408a0c79325c23a",
+            "filename": "tensorflow/python/saved_model/builder_impl.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/9cbe7bd184c7bf0558c5b908da4f92446cc1b2a0/tensorflow%2Fpython%2Fsaved_model%2Fbuilder_impl.py",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/9cbe7bd184c7bf0558c5b908da4f92446cc1b2a0/tensorflow%2Fpython%2Fsaved_model%2Fbuilder_impl.py",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fpython%2Fsaved_model%2Fbuilder_impl.py?ref=9cbe7bd184c7bf0558c5b908da4f92446cc1b2a0",
+            "patch": "@@ -464,7 +464,7 @@ def save(self, as_text=False, experimental_image_format=False,\n         file_io.write_string_to_file(\n             path, self._saved_model.SerializeToString(deterministic=True)\n         )\n-      # Placeholder for internal TF1 model fingerprint write\n+    # Placeholder for internal TF1 model fingerprint write\n     tf_logging.info(\"SavedModel written to: %s\", compat.as_text(path))\n     metrics.IncrementWrite(write_version=\"1\")\n "
+        },
+        {
+            "sha": "5e321ad85435af4eeecdafdd10ca8d9c047eef98",
+            "filename": "tensorflow/python/saved_model/saved_model_test.py",
+            "status": "modified",
+            "additions": 23,
+            "deletions": 0,
+            "changes": 23,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/9cbe7bd184c7bf0558c5b908da4f92446cc1b2a0/tensorflow%2Fpython%2Fsaved_model%2Fsaved_model_test.py",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/9cbe7bd184c7bf0558c5b908da4f92446cc1b2a0/tensorflow%2Fpython%2Fsaved_model%2Fsaved_model_test.py",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fpython%2Fsaved_model%2Fsaved_model_test.py?ref=9cbe7bd184c7bf0558c5b908da4f92446cc1b2a0",
+            "patch": "@@ -1395,6 +1395,29 @@ def testFingerprint(self):\n         except ValueError:\n           self.fail(\"Fingerprint read failed.\")\n \n+  def testFingerprintInTextFormatModel(self):\n+    \"\"\"Tests that fingerprinting works with as_text saved models.\"\"\"\n+    self.skipTest(\"TF1 fingerprinting disabled in OSS.\")\n+    export_dir = self._get_export_dir(\"fingerprint_pbtxt\")\n+    builder = saved_model_builder._SavedModelBuilder(export_dir)\n+\n+    with ops.Graph().as_default():\n+      with self.session(graph=ops.Graph()) as sess:\n+        builder.add_meta_graph_and_variables(sess, [\"foo\"])\n+\n+      # Setting as_text to True.\n+      builder.save(as_text=True)\n+\n+      # Restore the graph with tag \"foo\", whose variables were saved.\n+      with self.session(graph=ops.Graph()) as sess:\n+        loader.load(sess, [\"foo\"], export_dir)\n+\n+        # Load the model's fingerprint.\n+        try:\n+          fingerprinting.read_fingerprint(export_dir)\n+        except ValueError:\n+          self.fail(\"Fingerprint read failed.\")\n+\n \n class SavedModelV1Test(SavedModelTestBase):\n "
+        }
+    ],
+    "stats": {
+        "total": 117,
+        "additions": 103,
+        "deletions": 14
+    }
+}

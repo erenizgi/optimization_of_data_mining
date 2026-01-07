@@ -1,0 +1,36 @@
+{
+    "author": "dimitar-asenov",
+    "message": "[XLA:GPU] Fix an edge-case with choosing autotuning configs based on scratch.\n\nThe old code did not update `min_duration_with_optimzed_scratch_bytes` in case the scratch sizes are equal. This could lead to subtle situation where a kernel with the most optimal time and cache is not picked, if all scratch sizes are the same, but the optimal one in terms of time does not appear at the end.\n\nI've updated the associated test to verify this situation. The new test fails before this CL.\n\nPiperOrigin-RevId: 823019660",
+    "sha": "e9356bcee5ca73c5464a3d15a20d842accfaaa69",
+    "files": [
+        {
+            "sha": "5db3d795b2dd62e1ae71e3a804f88e5b93a6cde0",
+            "filename": "third_party/xla/xla/backends/autotuner/autotuner.cc",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 4,
+            "changes": 9,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e9356bcee5ca73c5464a3d15a20d842accfaaa69/third_party%2Fxla%2Fxla%2Fbackends%2Fautotuner%2Fautotuner.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e9356bcee5ca73c5464a3d15a20d842accfaaa69/third_party%2Fxla%2Fxla%2Fbackends%2Fautotuner%2Fautotuner.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fautotuner%2Fautotuner.cc?ref=e9356bcee5ca73c5464a3d15a20d842accfaaa69",
+            "patch": "@@ -380,13 +380,14 @@ absl::StatusOr<Autotuner::ConfigResult> Autotuner::PickBestConfig(\n         absl::InfiniteDuration();\n     for (ConfigResult& result : results) {\n       if (!result.failure.has_value() && result.duration <= duration_limit) {\n-        if (result.scratch_bytes < min_scratch_bytes) {\n+        bool current_result_is_better =\n+            result.scratch_bytes < min_scratch_bytes ||\n+            (result.scratch_bytes == min_scratch_bytes &&\n+             result.duration < min_duration_with_optimzed_scratch_bytes);\n+        if (current_result_is_better) {\n           min_scratch_bytes = result.scratch_bytes;\n           min_duration_with_optimzed_scratch_bytes = result.duration;\n           best_result = &result;\n-        } else if (result.scratch_bytes == min_scratch_bytes &&\n-                   result.duration < min_duration_with_optimzed_scratch_bytes) {\n-          best_result = &result;\n         }\n       }\n     }"
+        },
+        {
+            "sha": "e4597fc60ae3acd93d0985a6ea4555d6344a25d1",
+            "filename": "third_party/xla/xla/backends/autotuner/autotuner_test.cc",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 3,
+            "changes": 13,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e9356bcee5ca73c5464a3d15a20d842accfaaa69/third_party%2Fxla%2Fxla%2Fbackends%2Fautotuner%2Fautotuner_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e9356bcee5ca73c5464a3d15a20d842accfaaa69/third_party%2Fxla%2Fxla%2Fbackends%2Fautotuner%2Fautotuner_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fautotuner%2Fautotuner_test.cc?ref=e9356bcee5ca73c5464a3d15a20d842accfaaa69",
+            "patch": "@@ -503,13 +503,15 @@ TEST_F(AutotunerTest, AutotuneWithBufferCheck) {\n \n TEST_F(AutotunerTest, AutotuneWithScratchBytesOptimization) {\n   std::vector<std::unique_ptr<BackendConfig>> configs;\n-  configs.push_back(GetTestConfig(\"config_more_time_less_scratch\"));\n+  configs.push_back(GetTestConfig(\"config_most_time_less_scratch\"));\n   configs.push_back(GetTestConfig(\"config_less_time_less_scratch\"));\n   configs.push_back(GetTestConfig(\"config_least_time_most_scratch\"));\n+  configs.push_back(GetTestConfig(\"config_more_time_less_scratch\"));\n   auto backend_1 = std::make_unique<MockCodegenBackend>();\n   EXPECT_CALL(*backend_1, GetSupportedConfigs)\n       .WillOnce(Return(std::move(configs)));\n   EXPECT_CALL(*backend_1, Compile(_, _))\n+      .WillOnce(Return(std::unique_ptr<Executable>()))\n       .WillOnce(Return(std::unique_ptr<Executable>()))\n       .WillOnce(Return(std::unique_ptr<Executable>()))\n       .WillOnce(Return(std::unique_ptr<Executable>()));\n@@ -524,7 +526,7 @@ TEST_F(AutotunerTest, AutotuneWithScratchBytesOptimization) {\n       .WillOnce(Return(std::make_unique<InputBuffers>()));\n   EXPECT_CALL(*profiler, Profile(_, _))\n       .WillOnce(Return(ProfileResult({\n-          /*duration=*/absl::Microseconds(5),\n+          /*duration=*/absl::Microseconds(7),\n           /*output_buffer=*/std::nullopt,\n           /*scratch_bytes=*/100,\n       })))\n@@ -537,12 +539,17 @@ TEST_F(AutotunerTest, AutotuneWithScratchBytesOptimization) {\n           /*duration=*/absl::Microseconds(2),\n           /*output_buffer=*/std::nullopt,\n           /*scratch_bytes=*/200,\n+      })))\n+      .WillOnce(Return(ProfileResult({\n+          /*duration=*/absl::Microseconds(6),\n+          /*output_buffer=*/std::nullopt,\n+          /*scratch_bytes=*/100,\n       })));\n \n   std::vector<std::unique_ptr<CodegenBackend>> backends;\n   backends.push_back(std::move(backend_1));\n   config_.optimize_scratch_bytes = true;\n-  config_.scratch_bytes_window_size_us = 2;\n+  config_.scratch_bytes_window_size_us = 8;\n   TF_ASSERT_OK_AND_ASSIGN(\n       auto autotuner,\n       Autotuner::Create(std::move(backends), std::move(profiler), config_,"
+        }
+    ],
+    "stats": {
+        "total": 22,
+        "additions": 15,
+        "deletions": 7
+    }
+}

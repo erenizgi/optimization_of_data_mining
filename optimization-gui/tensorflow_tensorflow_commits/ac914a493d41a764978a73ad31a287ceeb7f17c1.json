@@ -1,0 +1,96 @@
+{
+    "author": "Tixxx",
+    "message": "PR #32970: [NVIDIA GPU] Set nccl max channels to 32 for blackwell\n\nImported from GitHub PR https://github.com/openxla/xla/pull/32970\n\n📝 Summary of Changes\nStarting NCCL 2.28, nccl reduced the default max channels for collectives on blackwell from 32 to 16.\nWe need to pin it to 32 in xla to avoid surprise perf regressions.\n\n🎯 Justification\nWithout this, default xla will incur perf regression after nccl 2.28 on blackwell.\n\n🚀 Kind of Contribution\n🐛 Bug Fix\n\n📊 Benchmark (for Performance Improvements)\nRan all benchmarks on blackwell and observed no perf regressions with this change.\n\n🧪 Unit Tests:\nNA\n\n🧪 Execution Tests:\nAll benchmarks under tools/benchmark\n\nCopybara import of the project:\n\n--\n9da412947d8bd1af2c28bc0ece4dbe43e9119723 by TJ Xu <tjx@nvidia.com>:\n\nset nccl max channels to 32 for blackwell\n\n--\n1838ffdf04a90cfbd4f75d5ff138be395d74d6e7 by TJ Xu <tjx@nvidia.com>:\n\nOnly set the cta count for blackwell only\n\n--\n53e0ec113f43556a94022634ee4bd22a08c83975 by TJ Xu <tjx@nvidia.com>:\n\nremoved macro\n\n--\nee2d6038b150b8412afcd3de54ca0f3d8dd53dde by TJ Xu <tjx@nvidia.com>:\n\nuse runtime check for nccl version\n\n--\n9d68d5ca880d7afd7e458902337b16ff75fdfb43 by TJ Xu <tjx@nvidia.com>:\n\nChanged include file\n\nMerging this change closes #32970\n\nPiperOrigin-RevId: 829360907",
+    "sha": "ac914a493d41a764978a73ad31a287ceeb7f17c1",
+    "files": [
+        {
+            "sha": "4e864c139f890bd2d680f670d893acfbbd3e70d7",
+            "filename": "third_party/xla/xla/backends/cpu/collectives/cpu_collectives.h",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ac914a493d41a764978a73ad31a287ceeb7f17c1/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcollectives%2Fcpu_collectives.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ac914a493d41a764978a73ad31a287ceeb7f17c1/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcollectives%2Fcpu_collectives.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcollectives%2Fcpu_collectives.h?ref=ac914a493d41a764978a73ad31a287ceeb7f17c1",
+            "patch": "@@ -64,7 +64,8 @@ class CpuCollectives : public Collectives {\n \n   absl::StatusOr<std::vector<std::unique_ptr<Communicator>>> SplitCommunicators(\n       absl::Span<const Communicator* const> comms, int32_t color,\n-      absl::Span<const RankId> keys, const Config& config) final {\n+      absl::Span<const RankId> keys, const Config& config,\n+      absl::Span<const DeviceRank> ranks) final {\n     return Unimplemented(\n         \"CPU collectives do not support communicator splitting\");\n   }"
+        },
+        {
+            "sha": "29927e5e2947ed70c78009e40ba54909506589e5",
+            "filename": "third_party/xla/xla/backends/gpu/collectives/gpu_cliques.cc",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 9,
+            "changes": 18,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ac914a493d41a764978a73ad31a287ceeb7f17c1/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcollectives%2Fgpu_cliques.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ac914a493d41a764978a73ad31a287ceeb7f17c1/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcollectives%2Fgpu_cliques.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcollectives%2Fgpu_cliques.cc?ref=ac914a493d41a764978a73ad31a287ceeb7f17c1",
+            "patch": "@@ -497,7 +497,6 @@ InitializeGpuClique(GpuCollectives* collectives, se::StreamExecutor* device,\n     // creating new communicators.\n     std::vector<Communicator*> parent_comms;\n     std::vector<RankId> keys;\n-\n     for (auto& [parent_rank, split_rank] : rank_mapping) {\n       auto parent_comm = (*parent_clique)->comm(parent_rank);\n       if (!parent_comm.has_value()) {\n@@ -510,6 +509,12 @@ InitializeGpuClique(GpuCollectives* collectives, se::StreamExecutor* device,\n       keys.push_back(split_rank);\n     }\n \n+    std::vector<DeviceRank> ranks;\n+    ranks.reserve(rank_pairs.size());\n+    for (auto& rank_pair : rank_pairs) {\n+      ranks.emplace_back(rank_pair->second);\n+    }\n+\n     // Get a globally consistent color value for newly created clique.\n     int32_t color = GetCommSplitColor(clique_key);\n \n@@ -521,11 +526,6 @@ InitializeGpuClique(GpuCollectives* collectives, se::StreamExecutor* device,\n     } else {\n       // The parent clique is not local, but this clique can be local. We need\n       // to check if peer access is possible between all devices in this clique.\n-      std::vector<DeviceRank> ranks;\n-      ranks.reserve(rank_pairs.size());\n-      for (auto& rank_pair : rank_pairs) {\n-        ranks.emplace_back(rank_pair->second);\n-      }\n       TF_ASSIGN_OR_RETURN(peer_access_enabled,\n                           EnablePeerAccess(clique_key, ranks));\n     }\n@@ -548,9 +548,9 @@ InitializeGpuClique(GpuCollectives* collectives, se::StreamExecutor* device,\n     }\n \n     VLOG(5) << \"Splitting communicators\";\n-    TF_ASSIGN_OR_RETURN(\n-        auto splitted_comms,\n-        collectives->SplitCommunicators(parent_comms, color, keys, config));\n+    TF_ASSIGN_OR_RETURN(auto splitted_comms,\n+                        collectives->SplitCommunicators(parent_comms, color,\n+                                                        keys, config, ranks));\n \n     absl::btree_map<RankId, std::unique_ptr<Communicator>> comms;\n     for (size_t i = 0; i < splitted_comms.size(); ++i) {"
+        },
+        {
+            "sha": "45aedd20acbbbe9382e15fdc66cfdfa0b0471212",
+            "filename": "third_party/xla/xla/backends/gpu/collectives/gpu_collectives_stub.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ac914a493d41a764978a73ad31a287ceeb7f17c1/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcollectives%2Fgpu_collectives_stub.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ac914a493d41a764978a73ad31a287ceeb7f17c1/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcollectives%2Fgpu_collectives_stub.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcollectives%2Fgpu_collectives_stub.h?ref=ac914a493d41a764978a73ad31a287ceeb7f17c1",
+            "patch": "@@ -58,7 +58,7 @@ class GpuCollectivesStub : public GpuCollectives {\n \n   absl::StatusOr<std::vector<std::unique_ptr<Communicator>>> SplitCommunicators(\n       absl::Span<const Communicator* const>, int32_t, absl::Span<const RankId>,\n-      const Collectives::Config&) final {\n+      const Collectives::Config&, absl::Span<const DeviceRank> ranks) final {\n     return UnimplementedError();\n   }\n "
+        },
+        {
+            "sha": "41b656218f8ac74c29dd7b675f3f44458c12a52b",
+            "filename": "third_party/xla/xla/backends/gpu/collectives/nccl_collectives.cc",
+            "status": "modified",
+            "additions": 27,
+            "deletions": 4,
+            "changes": 31,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ac914a493d41a764978a73ad31a287ceeb7f17c1/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcollectives%2Fnccl_collectives.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ac914a493d41a764978a73ad31a287ceeb7f17c1/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcollectives%2Fnccl_collectives.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcollectives%2Fnccl_collectives.cc?ref=ac914a493d41a764978a73ad31a287ceeb7f17c1",
+            "patch": "@@ -51,6 +51,7 @@ limitations under the License.\n #include \"xla/service/global_device_id.h\"\n #include \"xla/service/gpu/gpu_executable_run_options.h\"\n #include \"xla/status_macros.h\"\n+#include \"xla/stream_executor/stream_executor.h\"\n #include \"xla/tsl/platform/env.h\"\n #include \"xla/tsl/platform/errors.h\"\n #include \"xla/tsl/platform/logging.h\"\n@@ -105,15 +106,28 @@ NcclCollectives::GetCliqueIdCallback(const CliqueIdCallback* clique_id_callback,\n   return local_callback;\n }\n \n-static ncclConfig_t AsNcclConfig(const GpuCollectives::Config& config) {\n+static absl::StatusOr<ncclConfig_t> AsNcclConfig(\n+    const GpuCollectives::Config& config,\n+    const se::StreamExecutor* stream_executor) {\n   ncclConfig_t comm_config = NCCL_CONFIG_INITIALIZER;\n   comm_config.blocking = config.blocking_communicators ? 1 : 0;\n #if !defined(TENSORFLOW_USE_ROCM) || TF_ROCM_VERSION > 50700\n   comm_config.splitShare = config.split_share;\n #endif\n+  int nccl_version;\n+  XLA_NCCL_RETURN_IF_ERROR(ncclGetVersion(&nccl_version));\n   if (config.max_nchannels > 0) {\n     VLOG(1) << \"Maximum number of channels is set to: \" << comm_config.maxCTAs;\n     comm_config.maxCTAs = config.max_nchannels;\n+  } else if (stream_executor->GetDeviceDescription()\n+                 .cuda_compute_capability()\n+                 .IsBlackwell() &&\n+             nccl_version >= NCCL_VERSION(2, 28, 0)) {\n+    // Future NCCL versions will reduce the default max number of channels on\n+    // Blackwell to 16. We need to manually set it to 32 here to avoid surprise\n+    // perf regressions.\n+    VLOG(1) << \"Setting max number of channels to 32 on Blackwell.\";\n+    comm_config.maxCTAs = 32;\n   }\n   return comm_config;\n }\n@@ -154,7 +168,6 @@ NcclCollectives::CreateCommunicators(const CliqueKey& clique_key,\n         \"async_execution is false. Non-blocking communicators require \"\n         \"asynchronous execution.\");\n   }\n-  ncclConfig_t comm_config = AsNcclConfig(gpu_config);\n \n   // make_comm returns a new ncclComm_t.\n   auto make_comm = [&](int i) -> absl::StatusOr<ncclComm_t> {\n@@ -165,6 +178,10 @@ NcclCollectives::CreateCommunicators(const CliqueKey& clique_key,\n     auto* device = tsl::down_cast<GpuCollectives::Device*>(ranks[i].device);\n     TF_RET_CHECK(device != nullptr);\n     auto activate_context = device->stream_executor()->Activate();\n+\n+    TF_ASSIGN_OR_RETURN(ncclConfig_t comm_config,\n+                        AsNcclConfig(gpu_config, device->stream_executor()));\n+\n     TF_ASSIGN_OR_RETURN(auto nccl_unique_id, AsNcclUniqueId(clique_ids->at(0)));\n     ncclComm_t comm;\n     XLA_NCCL_RETURN_IF_ERROR(\n@@ -201,7 +218,8 @@ absl::StatusOr<std::vector<std::unique_ptr<Communicator>>>\n NcclCollectives::SplitCommunicators(absl::Span<const Communicator* const> comms,\n                                     int32_t color,\n                                     absl::Span<const RankId> keys,\n-                                    const Collectives::Config& config) {\n+                                    const Collectives::Config& config,\n+                                    absl::Span<const DeviceRank> ranks) {\n   auto rank_formatter = [](std::string* str, RankId rank) {\n     absl::StrAppend(str, rank.value());\n   };\n@@ -218,10 +236,15 @@ NcclCollectives::SplitCommunicators(absl::Span<const Communicator* const> comms,\n \n   const auto& gpu_config =\n       tsl::down_cast<const GpuCollectives::Config&>(config);\n-  ncclConfig_t comm_config = AsNcclConfig(gpu_config);\n \n #if !defined(TENSORFLOW_USE_ROCM) || TF_ROCM_VERSION >= 60000\n   auto make_comm = [&](int i) -> absl::StatusOr<ncclComm_t> {\n+    auto* device = tsl::down_cast<GpuCollectives::Device*>(ranks[i].device);\n+    TF_RET_CHECK(device != nullptr);\n+\n+    TF_ASSIGN_OR_RETURN(ncclConfig_t comm_config,\n+                        AsNcclConfig(gpu_config, device->stream_executor()));\n+\n     VLOG(1) << \"Split NCCL communicator \" << comms[i] << \" with color \" << color\n             << \" and key \" << keys[i];\n     ncclComm_t split_comm;"
+        },
+        {
+            "sha": "cadeb41d97b9e634c424e7bda2c892275a1f432a",
+            "filename": "third_party/xla/xla/backends/gpu/collectives/nccl_collectives.h",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ac914a493d41a764978a73ad31a287ceeb7f17c1/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcollectives%2Fnccl_collectives.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ac914a493d41a764978a73ad31a287ceeb7f17c1/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcollectives%2Fnccl_collectives.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcollectives%2Fnccl_collectives.h?ref=ac914a493d41a764978a73ad31a287ceeb7f17c1",
+            "patch": "@@ -56,7 +56,8 @@ class NcclCollectives : public GpuCollectives {\n   }\n   absl::StatusOr<std::vector<std::unique_ptr<Communicator>>> SplitCommunicators(\n       absl::Span<const Communicator* const> comms, int32_t color,\n-      absl::Span<const RankId> keys, const Collectives::Config& config) final;\n+      absl::Span<const RankId> keys, const Collectives::Config& config,\n+      absl::Span<const DeviceRank> ranks) final;\n \n   absl::StatusOr<void*> Allocate(uint64_t bytes) final;\n "
+        },
+        {
+            "sha": "4fc7485d48a0e19f7c9e8a9bf885bade9f7cc1b3",
+            "filename": "third_party/xla/xla/backends/gpu/collectives/nvshmem_collectives.h",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ac914a493d41a764978a73ad31a287ceeb7f17c1/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcollectives%2Fnvshmem_collectives.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ac914a493d41a764978a73ad31a287ceeb7f17c1/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcollectives%2Fnvshmem_collectives.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcollectives%2Fnvshmem_collectives.h?ref=ac914a493d41a764978a73ad31a287ceeb7f17c1",
+            "patch": "@@ -76,7 +76,8 @@ class NvshmemCollectives : public GpuCollectives {\n \n   absl::StatusOr<std::vector<std::unique_ptr<Communicator>>> SplitCommunicators(\n       absl::Span<const Communicator* const> comms, int32_t color,\n-      absl::Span<const RankId> keys, const Collectives::Config& config) final {\n+      absl::Span<const RankId> keys, const Collectives::Config& config,\n+      absl::Span<const DeviceRank> ranks) final {\n     return absl::UnimplementedError(\"Not implemented.\");\n   }\n "
+        },
+        {
+            "sha": "903ba4bb44100642cd625df9055dd27b80336b92",
+            "filename": "third_party/xla/xla/core/collectives/collectives.h",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ac914a493d41a764978a73ad31a287ceeb7f17c1/third_party%2Fxla%2Fxla%2Fcore%2Fcollectives%2Fcollectives.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ac914a493d41a764978a73ad31a287ceeb7f17c1/third_party%2Fxla%2Fxla%2Fcore%2Fcollectives%2Fcollectives.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fcore%2Fcollectives%2Fcollectives.h?ref=ac914a493d41a764978a73ad31a287ceeb7f17c1",
+            "patch": "@@ -79,7 +79,8 @@ class Collectives {\n   // Creates communicators by splitting `comms`.\n   virtual absl::StatusOr<std::vector<std::unique_ptr<Communicator>>>\n   SplitCommunicators(absl::Span<const Communicator* const> comms, int32_t color,\n-                     absl::Span<const RankId> keys, const Config& config) = 0;\n+                     absl::Span<const RankId> keys, const Config& config,\n+                     absl::Span<const DeviceRank> ranks) = 0;\n \n   // Collectives instance can be ephemeral and used only for a small number of\n   // XLA program executions. XLA backends that rely on the collectives instances"
+        }
+    ],
+    "stats": {
+        "total": 63,
+        "additions": 45,
+        "deletions": 18
+    }
+}

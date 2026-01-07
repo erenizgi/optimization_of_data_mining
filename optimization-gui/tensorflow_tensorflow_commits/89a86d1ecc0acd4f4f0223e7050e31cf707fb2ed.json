@@ -1,0 +1,36 @@
+{
+    "author": "jaro-sevcik",
+    "message": "PR #31902: [XLA:GPU] Escape MLIR in triton parsing error\n\nImported from GitHub PR https://github.com/openxla/xla/pull/31902\n\n📝 Summary of Changes\nThis patch escapes the dumped IR in the error message when triton\nparser fails. This ensures that the error message is always valid UTF-8.\n\n🎯 Justification\nJAX interprets error message as UTF8. If an error message is\nan invalid UTF8, JAX presents the exception as a failed UTF8\ndecoding exception, rather than showing the actual error message.\nWith this patch, the users gets the correct error message.\n\n🚀 Kind of Contribution\n🐛 Bug Fix\n\n📊 Benchmark (for Performance Improvements)\nN/A\n\n🧪 Unit Tests:\nThe unit test checks that the error message contains\nthe escaped IR.\n\n🧪 Execution Tests:\nN/A\nCopybara import of the project:\n\n--\nc4b182e42db4e92a8e43033da30ba275f540d199 by Jaroslav Sevcik <jsevcik@nvidia.com>:\n\n[GPU] Escape MLIR in triton parsing error\n\nMerging this change closes #31902\n\nPiperOrigin-RevId: 833340250",
+    "sha": "89a86d1ecc0acd4f4f0223e7050e31cf707fb2ed",
+    "files": [
+        {
+            "sha": "6df95cc86cead2955553f731696d40937cdd11fc",
+            "filename": "third_party/xla/xla/service/gpu/ir_emitter_unnested.cc",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/89a86d1ecc0acd4f4f0223e7050e31cf707fb2ed/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fir_emitter_unnested.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/89a86d1ecc0acd4f4f0223e7050e31cf707fb2ed/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fir_emitter_unnested.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fir_emitter_unnested.cc?ref=89a86d1ecc0acd4f4f0223e7050e31cf707fb2ed",
+            "patch": "@@ -34,6 +34,7 @@ limitations under the License.\n #include \"absl/log/check.h\"\n #include \"absl/log/log.h\"\n #include \"absl/status/status.h\"\n+#include \"absl/strings/escaping.h\"\n #include \"absl/strings/str_cat.h\"\n #include \"absl/strings/str_format.h\"\n #include \"absl/strings/str_join.h\"\n@@ -1400,7 +1401,7 @@ absl::Status IrEmitterUnnested::EmitTritonCustomCall(\n         return absl::InvalidArgumentError(\n             absl::StrCat(\"Failed to parse Triton module: \",\n                          diagnostic_handler.ConsumeStatus().message(),\n-                         \"\\ninput ir: \", call.ir));\n+                         \"\\ninput ir: \\\"\", absl::CHexEscape(call.ir), \"\\\"\"));\n       }\n     }\n "
+        },
+        {
+            "sha": "9581d76bc17c795c40f39cfbf1af92538427b39d",
+            "filename": "third_party/xla/xla/service/gpu/tests/gpu_triton_custom_call_test.cc",
+            "status": "modified",
+            "additions": 37,
+            "deletions": 0,
+            "changes": 37,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/89a86d1ecc0acd4f4f0223e7050e31cf707fb2ed/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftests%2Fgpu_triton_custom_call_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/89a86d1ecc0acd4f4f0223e7050e31cf707fb2ed/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftests%2Fgpu_triton_custom_call_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftests%2Fgpu_triton_custom_call_test.cc?ref=89a86d1ecc0acd4f4f0223e7050e31cf707fb2ed",
+            "patch": "@@ -166,6 +166,43 @@ TEST_F(GpuIrEmitterUnnestedTest,\n                      /*match_optimized_ir=*/false);\n }\n \n+TEST_F(GpuIrEmitterUnnestedTest, EmitTritonCustomCallParseErrorHasEscapedIr) {\n+  if (!GetCudaComputeCapability().IsAtLeastAmpere()) {\n+    GTEST_SKIP() << \"Triton support is only enabled for Ampere GPUs and up.\";\n+  }\n+\n+  // Tests that MLIR IR with invalid unicode characters is escaped correctly\n+  // on error.\n+  constexpr absl::string_view kMlirIrInvalidUnicode = \"ML\\xef\";\n+\n+  HloComputation::Builder computation_builder(TestName());\n+\n+  // Create parameters and custom call in the computation builder.\n+  Shape scalar_shape = xla::ShapeUtil::MakeShape(xla::F32, {});\n+  Shape tuple_shape = ShapeUtil::MakeTupleShape({scalar_shape, scalar_shape});\n+\n+  HloInstruction* param_0 = computation_builder.AddInstruction(\n+      HloInstruction::CreateParameter(0, scalar_shape, \"arg_0\"));\n+\n+  HloInstruction* param_1 = computation_builder.AddInstruction(\n+      HloInstruction::CreateParameter(1, scalar_shape, \"arg_1\"));\n+\n+  computation_builder.AddInstruction(CreateTritonCustomCall(\n+      tuple_shape, param_0, param_1, kMlirIrInvalidUnicode, kCallName));\n+\n+  auto module = CreateNewVerifiedModule();\n+  module->AddEntryComputation(computation_builder.Build());\n+\n+  auto result =\n+      CompileToExecutable(std::move(module), /*run_optimization_passes=*/true);\n+  EXPECT_FALSE(result.ok());\n+  EXPECT_THAT(result.status().message(),\n+              HasSubstr(\"Failed to parse Triton module\"));\n+\n+  // Verify that the error message contains the escaped IR.\n+  EXPECT_THAT(result.status().message(), HasSubstr(\"input ir: \\\"ML\\\\xef\\\"\"));\n+}\n+\n TEST_F(GpuIrEmitterUnnestedTest,\n        EmitTritonCustomCallWithCorrectKernelParamAttributes) {\n   if (!GetCudaComputeCapability().IsAtLeastAmpere()) {"
+        }
+    ],
+    "stats": {
+        "total": 40,
+        "additions": 39,
+        "deletions": 1
+    }
+}

@@ -1,0 +1,133 @@
+{
+    "author": "tensorflower-gardener",
+    "message": "Enable hermetic toolchain support in configure.py\n\nThis change allows `configure.py` to support builds using a hermetic Clang toolchain on Linux x86_64 and aarch64. When a hermetic build is detected, the script will not search for system-installed `clang` and `lld`. The generated bazelrc will only include paths to Clang if a path was explicitly provided or found on the system.\n\nPiperOrigin-RevId: 805566670",
+    "sha": "e329aa709a7588408c516a96df1711e442e04112",
+    "files": [
+        {
+            "sha": "c9e45369012620dab4dceda296d3fbc79eee02b5",
+            "filename": "third_party/xla/build_tools/configure/BUILD",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 1,
+            "changes": 4,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e329aa709a7588408c516a96df1711e442e04112/third_party%2Fxla%2Fbuild_tools%2Fconfigure%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e329aa709a7588408c516a96df1711e442e04112/third_party%2Fxla%2Fbuild_tools%2Fconfigure%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fbuild_tools%2Fconfigure%2FBUILD?ref=e329aa709a7588408c516a96df1711e442e04112",
+            "patch": "@@ -32,11 +32,13 @@ py_test(\n     name = \"configure_test\",\n     srcs = [\"configure_test.py\"],\n     data = [\n-        \"testdata/clang.bazelrc\",\n+        \"testdata/clang_local.bazelrc\",\n         \"testdata/cuda_clang.bazelrc\",\n+        \"testdata/cuda_clang_local.bazelrc\",\n         \"testdata/default_cuda_clang.bazelrc\",\n         \"testdata/gcc.bazelrc\",\n         \"testdata/nvcc_clang.bazelrc\",\n+        \"testdata/nvcc_clang_local.bazelrc\",\n         \"testdata/nvcc_gcc.bazelrc\",\n     ],\n     # After https://github.com/openxla/xla/commit/7d3043283, this test is no"
+        },
+        {
+            "sha": "bf7e6643956ff9924a805142d9b71120aab990ec",
+            "filename": "third_party/xla/build_tools/configure/configure.py",
+            "status": "modified",
+            "additions": 49,
+            "deletions": 22,
+            "changes": 71,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e329aa709a7588408c516a96df1711e442e04112/third_party%2Fxla%2Fbuild_tools%2Fconfigure%2Fconfigure.py",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e329aa709a7588408c516a96df1711e442e04112/third_party%2Fxla%2Fbuild_tools%2Fconfigure%2Fconfigure.py",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fbuild_tools%2Fconfigure%2Fconfigure.py?ref=e329aa709a7588408c516a96df1711e442e04112",
+            "patch": "@@ -262,24 +262,34 @@ def get_relevant_paths_and_versions(self, config: \"XLAConfigOptions\"):\n       self.ld_library_path = os.environ.get(\"LD_LIBRARY_PATH\", None)\n \n     if config.host_compiler == HostCompiler.CLANG:\n-      self.clang_path = _find_executable_or_die(\"clang\", self.clang_path)\n-      self.clang_major_version = (\n-          self.clang_major_version or _get_clang_major_version(self.clang_path)\n-      )\n+      if self.clang_path or not is_hermetic_build(config.backend, config.os):\n+        self.clang_path = _find_executable_or_die(\"clang\", self.clang_path)\n+        self.clang_major_version = (\n+            self.clang_major_version\n+            or _get_clang_major_version(self.clang_path)\n+        )\n+\n+        # Notably, we don't use `_find_executable_or_die` for lld, as it changes\n+        # which commands it accepts based on its name! ld.lld is symlinked to a\n+        # different executable just called lld, which should not be invoked\n+        # directly.\n+        self.lld_path = self.lld_path or shutil.which(\"ld.lld\")\n+      else:\n+        # TODO: b/443091874 - set the version of Clang when it will be\n+        # available outside of rules_ml_toolchain. Current hermetic Clang\n+        # version is 18\n+        self.clang_major_version = 18   # Hermetic toolchain\n \n-      # Notably, we don't use `_find_executable_or_die` for lld, as it changes\n-      # which commands it accepts based on its name! ld.lld is symlinked to a\n-      # different executable just called lld, which should not be invoked\n-      # directly.\n-      self.lld_path = self.lld_path or shutil.which(\"ld.lld\")\n     elif config.host_compiler == HostCompiler.GCC:\n       self.gcc_path = _find_executable_or_die(\"gcc\", self.gcc_path)\n       self.gcc_major_version = self.gcc_major_version or _get_gcc_major_version(\n           self.gcc_path\n       )\n \n     if config.backend == Backend.CUDA:\n-      if config.cuda_compiler == CudaCompiler.CLANG:\n+      if config.cuda_compiler == CudaCompiler.CLANG and (\n+          self.clang_path or not is_hermetic_build(config.backend, config.os)\n+      ):\n         self.clang_path = _find_executable_or_die(\"clang\", self.clang_path)\n \n       if not self.cuda_compute_capabilities:\n@@ -334,9 +344,11 @@ def to_bazelrc_lines(\n     if self.host_compiler == HostCompiler.GCC:\n       rc.append(f\"build --action_env GCC_HOST_COMPILER_PATH={dpav.gcc_path}\")\n     elif self.host_compiler == HostCompiler.CLANG:\n-      rc.append(f\"build --action_env CLANG_COMPILER_PATH={dpav.clang_path}\")\n-      rc.append(f\"build --repo_env CC={dpav.clang_path}\")\n-      rc.append(f\"build --repo_env BAZEL_COMPILER={dpav.clang_path}\")\n+      if dpav.clang_path:\n+        rc.append(\"build --config clang_local\")\n+        rc.append(f\"build --action_env CLANG_COMPILER_PATH={dpav.clang_path}\")\n+        rc.append(f\"build --repo_env CC={dpav.clang_path}\")\n+        rc.append(f\"build --repo_env BAZEL_COMPILER={dpav.clang_path}\")\n       self.compiler_options.append(\"-Wno-error=unused-command-line-argument\")\n       if dpav.lld_path:\n         rc.append(f\"build --linkopt --ld-path={dpav.lld_path}\")\n@@ -351,16 +363,22 @@ def to_bazelrc_lines(\n       compiler_pair = self.cuda_compiler, self.host_compiler\n \n       if compiler_pair == (CudaCompiler.CLANG, HostCompiler.CLANG):\n-        rc.append(\"build --config cuda_clang\")\n-        rc.append(\n-            f\"build --action_env CLANG_CUDA_COMPILER_PATH={dpav.clang_path}\"\n-        )\n+        if not dpav.clang_path:\n+          rc.append(\"build --config cuda_clang\")\n+        else:\n+          rc.append(\"build --config cuda_clang_local\")\n+          rc.append(\n+              f\"build --action_env CLANG_CUDA_COMPILER_PATH={dpav.clang_path}\"\n+          )\n       elif compiler_pair == (CudaCompiler.NVCC, HostCompiler.CLANG):\n-        rc.append(\"build --config cuda_nvcc\")\n-        # This is demanded by cuda_configure.bzl\n-        rc.append(\n-            f\"build --action_env CLANG_CUDA_COMPILER_PATH={dpav.clang_path}\"\n-        )\n+        if not dpav.clang_path:\n+          rc.append(\"build --config cuda_nvcc\")\n+        else:\n+          rc.append(\"build --config cuda_nvcc_clang_local\")\n+          # This is demanded by cuda_configure.bzl\n+          rc.append(\n+              f\"build --action_env CLANG_CUDA_COMPILER_PATH={dpav.clang_path}\"\n+          )\n       elif compiler_pair == (CudaCompiler.NVCC, HostCompiler.GCC):\n         rc.append(\"build --config cuda\")\n       else:\n@@ -608,5 +626,14 @@ def main():\n     logging.info(\"Writing bazelrc to %s...\", bazelrc_path)\n     f.write(bazelrc_contents)\n \n+\n+def is_hermetic_build(backend: Backend, os_host: OS):\n+  return (\n+      backend != Backend.ROCM\n+      and backend != Backend.SYCL\n+      and os_host == OS.LINUX\n+  )\n+\n+\n if __name__ == \"__main__\":\n   raise SystemExit(main())"
+        },
+        {
+            "sha": "d5eb041a4549194505f24b2bc5c327e36bfa303e",
+            "filename": "third_party/xla/build_tools/configure/configure_test.py",
+            "status": "modified",
+            "additions": 38,
+            "deletions": 8,
+            "changes": 46,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e329aa709a7588408c516a96df1711e442e04112/third_party%2Fxla%2Fbuild_tools%2Fconfigure%2Fconfigure_test.py",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e329aa709a7588408c516a96df1711e442e04112/third_party%2Fxla%2Fbuild_tools%2Fconfigure%2Fconfigure_test.py",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fbuild_tools%2Fconfigure%2Fconfigure_test.py?ref=e329aa709a7588408c516a96df1711e442e04112",
+            "patch": "@@ -63,8 +63,8 @@ def setUpClass(cls):\n         test_utils.xla_src_root() / \"build_tools\" / \"configure\" / \"testdata\"\n     )\n \n-    with (testdata / \"clang.bazelrc\").open() as f:\n-      cls.clang_bazelrc_lines = [line.strip() for line in f.readlines()]\n+    with (testdata / \"clang_local.bazelrc\").open() as f:\n+      cls.clang_local_bazelrc_lines = [line.strip() for line in f.readlines()]\n \n     with (testdata / \"gcc.bazelrc\").open() as f:\n       resolved_gcc_path = os.path.realpath(_GCC_PATH)\n@@ -76,13 +76,20 @@ def setUpClass(cls):\n     with (testdata / \"cuda_clang.bazelrc\").open() as f:\n       cls.cuda_clang_bazelrc_lines = [line.strip() for line in f.readlines()]\n \n+    with (testdata / \"cuda_clang_local.bazelrc\").open() as f:\n+      cls.cuda_clang_local_bazelrc_lines = [\n+          line.strip() for line in f.readlines()\n+      ]\n+\n     with (testdata / \"default_cuda_clang.bazelrc\").open() as f:\n       cls.default_cuda_clang_bazelrc_lines = [\n           line.strip() for line in f.readlines()\n       ]\n \n-    with (testdata / \"nvcc_clang.bazelrc\").open() as f:\n-      cls.nvcc_clang_bazelrc_lines = [line.strip() for line in f.readlines()]\n+    with (testdata / \"nvcc_clang_local.bazelrc\").open() as f:\n+      cls.nvcc_clang_local_bazelrc_lines = [\n+          line.strip() for line in f.readlines()\n+      ]\n \n     with (testdata / \"nvcc_gcc.bazelrc\").open() as f:\n       resolved_gcc_path = os.path.realpath(_GCC_PATH)\n@@ -112,7 +119,7 @@ def test_clang_bazelrc(self):\n         )\n     )\n \n-    self.assertEqual(bazelrc_lines, self.clang_bazelrc_lines)\n+    self.assertEqual(bazelrc_lines, self.clang_local_bazelrc_lines)\n \n   def test_gcc_bazelrc(self):\n     config = XLAConfigOptions(\n@@ -149,6 +156,29 @@ def test_cuda_clang_bazelrc(self):\n         sycl_compiler=SyclCompiler.ICPX,\n     )\n \n+    bazelrc_lines = config.to_bazelrc_lines(\n+        DiscoverablePathsAndVersions(\n+            clang_path=None,\n+            clang_major_version=None,\n+            **_CUDA_SPECIFIC_PATHS_AND_VERSIONS,\n+        )\n+    )\n+\n+    self.assertEqual(bazelrc_lines, self.cuda_clang_bazelrc_lines)\n+\n+  def test_cuda_clang_local_bazelrc(self):\n+    config = XLAConfigOptions(\n+        backend=Backend.CUDA,\n+        os=OS.LINUX,\n+        python_bin_path=_PYTHON_BIN_PATH,\n+        host_compiler=HostCompiler.CLANG,\n+        compiler_options=list(_COMPILER_OPTIONS),\n+        cuda_compiler=CudaCompiler.CLANG,\n+        using_nccl=False,\n+        rocm_compiler=RocmCompiler.HIPCC,\n+        sycl_compiler=SyclCompiler.ICPX,\n+    )\n+\n     bazelrc_lines = config.to_bazelrc_lines(\n         DiscoverablePathsAndVersions(\n             clang_path=_CLANG_PATH,\n@@ -157,7 +187,7 @@ def test_cuda_clang_bazelrc(self):\n         )\n     )\n \n-    self.assertEqual(bazelrc_lines, self.cuda_clang_bazelrc_lines)\n+    self.assertEqual(bazelrc_lines, self.cuda_clang_local_bazelrc_lines)\n \n   def test_default_cuda_clang_bazelrc(self):\n     config = XLAConfigOptions(\n@@ -182,7 +212,7 @@ def test_default_cuda_clang_bazelrc(self):\n \n     self.assertEqual(bazelrc_lines, self.default_cuda_clang_bazelrc_lines)\n \n-  def test_nvcc_clang_bazelrc(self):\n+  def test_nvcc_clang_local_bazelrc(self):\n     config = XLAConfigOptions(\n         backend=Backend.CUDA,\n         os=OS.LINUX,\n@@ -203,7 +233,7 @@ def test_nvcc_clang_bazelrc(self):\n         )\n     )\n \n-    self.assertEqual(bazelrc_lines, self.nvcc_clang_bazelrc_lines)\n+    self.assertEqual(bazelrc_lines, self.nvcc_clang_local_bazelrc_lines)\n \n   def test_nvcc_gcc_bazelrc(self):\n     config = XLAConfigOptions("
+        },
+        {
+            "sha": "977302f067ea520853d4f322add2e1e89a00d187",
+            "filename": "third_party/xla/build_tools/configure/testdata/clang_local.bazelrc",
+            "status": "renamed",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e329aa709a7588408c516a96df1711e442e04112/third_party%2Fxla%2Fbuild_tools%2Fconfigure%2Ftestdata%2Fclang_local.bazelrc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e329aa709a7588408c516a96df1711e442e04112/third_party%2Fxla%2Fbuild_tools%2Fconfigure%2Ftestdata%2Fclang_local.bazelrc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fbuild_tools%2Fconfigure%2Ftestdata%2Fclang_local.bazelrc?ref=e329aa709a7588408c516a96df1711e442e04112",
+            "patch": "@@ -1,3 +1,4 @@\n+build --config clang_local\n build --action_env CLANG_COMPILER_PATH=/usr/lib/llvm-18/bin/clang\n build --repo_env CC=/usr/lib/llvm-18/bin/clang\n build --repo_env BAZEL_COMPILER=/usr/lib/llvm-18/bin/clang",
+            "previous_filename": "third_party/xla/build_tools/configure/testdata/clang.bazelrc"
+        },
+        {
+            "sha": "00c1ccfea0d2972507f50b3180fa7f4e90a896fd",
+            "filename": "third_party/xla/build_tools/configure/testdata/cuda_clang.bazelrc",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 4,
+            "changes": 4,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e329aa709a7588408c516a96df1711e442e04112/third_party%2Fxla%2Fbuild_tools%2Fconfigure%2Ftestdata%2Fcuda_clang.bazelrc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e329aa709a7588408c516a96df1711e442e04112/third_party%2Fxla%2Fbuild_tools%2Fconfigure%2Ftestdata%2Fcuda_clang.bazelrc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fbuild_tools%2Fconfigure%2Ftestdata%2Fcuda_clang.bazelrc?ref=e329aa709a7588408c516a96df1711e442e04112",
+            "patch": "@@ -1,8 +1,4 @@\n-build --action_env CLANG_COMPILER_PATH=/usr/lib/llvm-18/bin/clang\n-build --repo_env CC=/usr/lib/llvm-18/bin/clang\n-build --repo_env BAZEL_COMPILER=/usr/lib/llvm-18/bin/clang\n build --config cuda_clang\n-build --action_env CLANG_CUDA_COMPILER_PATH=/usr/lib/llvm-18/bin/clang\n build:cuda --repo_env HERMETIC_CUDA_VERSION=\"12.8.0\"\n build:cuda --repo_env HERMETIC_CUDA_COMPUTE_CAPABILITIES=7.5\n build:cuda --repo_env HERMETIC_CUDNN_VERSION=\"9.8.0\""
+        },
+        {
+            "sha": "374a26797f0d6c494a5c6eced982fd0b6b09bfd8",
+            "filename": "third_party/xla/build_tools/configure/testdata/cuda_clang_local.bazelrc",
+            "status": "added",
+            "additions": 22,
+            "deletions": 0,
+            "changes": 22,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e329aa709a7588408c516a96df1711e442e04112/third_party%2Fxla%2Fbuild_tools%2Fconfigure%2Ftestdata%2Fcuda_clang_local.bazelrc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e329aa709a7588408c516a96df1711e442e04112/third_party%2Fxla%2Fbuild_tools%2Fconfigure%2Ftestdata%2Fcuda_clang_local.bazelrc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fbuild_tools%2Fconfigure%2Ftestdata%2Fcuda_clang_local.bazelrc?ref=e329aa709a7588408c516a96df1711e442e04112",
+            "patch": "@@ -0,0 +1,22 @@\n+build --config clang_local\n+build --action_env CLANG_COMPILER_PATH=/usr/lib/llvm-18/bin/clang\n+build --repo_env CC=/usr/lib/llvm-18/bin/clang\n+build --repo_env BAZEL_COMPILER=/usr/lib/llvm-18/bin/clang\n+build --config cuda_clang_local\n+build --action_env CLANG_CUDA_COMPILER_PATH=/usr/lib/llvm-18/bin/clang\n+build:cuda --repo_env HERMETIC_CUDA_VERSION=\"12.8.0\"\n+build:cuda --repo_env HERMETIC_CUDA_COMPUTE_CAPABILITIES=7.5\n+build:cuda --repo_env HERMETIC_CUDNN_VERSION=\"9.8.0\"\n+build --config nonccl\n+build --action_env LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64\n+build --action_env PYTHON_BIN_PATH=/usr/bin/python3\n+build --python_path /usr/bin/python3\n+test --test_env LD_LIBRARY_PATH\n+test --test_size_filters small,medium\n+build --copt -Wno-sign-compare\n+build --copt -Wno-error=unused-command-line-argument\n+build --copt -Wno-gnu-offsetof-extensions\n+build --build_tag_filters -no_oss,-rocm-only,-oneapi-only\n+build --test_tag_filters -no_oss,-rocm-only,-oneapi-only\n+test --build_tag_filters -no_oss,-rocm-only,-oneapi-only\n+test --test_tag_filters -no_oss,-rocm-only,-oneapi-only"
+        },
+        {
+            "sha": "cc2227ba9a221114f07a8209b797fa3efac3a66d",
+            "filename": "third_party/xla/build_tools/configure/testdata/default_cuda_clang.bazelrc",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e329aa709a7588408c516a96df1711e442e04112/third_party%2Fxla%2Fbuild_tools%2Fconfigure%2Ftestdata%2Fdefault_cuda_clang.bazelrc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e329aa709a7588408c516a96df1711e442e04112/third_party%2Fxla%2Fbuild_tools%2Fconfigure%2Ftestdata%2Fdefault_cuda_clang.bazelrc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fbuild_tools%2Fconfigure%2Ftestdata%2Fdefault_cuda_clang.bazelrc?ref=e329aa709a7588408c516a96df1711e442e04112",
+            "patch": "@@ -1,7 +1,8 @@\n+build --config clang_local\n build --action_env CLANG_COMPILER_PATH=/usr/lib/llvm-18/bin/clang\n build --repo_env CC=/usr/lib/llvm-18/bin/clang\n build --repo_env BAZEL_COMPILER=/usr/lib/llvm-18/bin/clang\n-build --config cuda_clang\n+build --config cuda_clang_local\n build --action_env CLANG_CUDA_COMPILER_PATH=/usr/lib/llvm-18/bin/clang\n build:cuda --repo_env HERMETIC_CUDA_COMPUTE_CAPABILITIES=sm_50,sm_60,sm_70,sm_80,compute_90\n build --config nonccl"
+        },
+        {
+            "sha": "be8717a80d466be3b15953337121b86b766af08c",
+            "filename": "third_party/xla/build_tools/configure/testdata/nvcc_clang.bazelrc",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 4,
+            "changes": 4,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e329aa709a7588408c516a96df1711e442e04112/third_party%2Fxla%2Fbuild_tools%2Fconfigure%2Ftestdata%2Fnvcc_clang.bazelrc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e329aa709a7588408c516a96df1711e442e04112/third_party%2Fxla%2Fbuild_tools%2Fconfigure%2Ftestdata%2Fnvcc_clang.bazelrc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fbuild_tools%2Fconfigure%2Ftestdata%2Fnvcc_clang.bazelrc?ref=e329aa709a7588408c516a96df1711e442e04112",
+            "patch": "@@ -1,8 +1,4 @@\n-build --action_env CLANG_COMPILER_PATH=/usr/lib/llvm-18/bin/clang\n-build --repo_env CC=/usr/lib/llvm-18/bin/clang\n-build --repo_env BAZEL_COMPILER=/usr/lib/llvm-18/bin/clang\n build --config cuda_nvcc\n-build --action_env CLANG_CUDA_COMPILER_PATH=/usr/lib/llvm-18/bin/clang\n build:cuda --repo_env HERMETIC_CUDA_VERSION=\"12.8.0\"\n build:cuda --repo_env HERMETIC_CUDA_COMPUTE_CAPABILITIES=7.5\n build:cuda --repo_env HERMETIC_CUDNN_VERSION=\"9.8.0\""
+        },
+        {
+            "sha": "71d6ac77f7cd011978b08c337798bbe44fb1b5e6",
+            "filename": "third_party/xla/build_tools/configure/testdata/nvcc_clang_local.bazelrc",
+            "status": "added",
+            "additions": 22,
+            "deletions": 0,
+            "changes": 22,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e329aa709a7588408c516a96df1711e442e04112/third_party%2Fxla%2Fbuild_tools%2Fconfigure%2Ftestdata%2Fnvcc_clang_local.bazelrc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e329aa709a7588408c516a96df1711e442e04112/third_party%2Fxla%2Fbuild_tools%2Fconfigure%2Ftestdata%2Fnvcc_clang_local.bazelrc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fbuild_tools%2Fconfigure%2Ftestdata%2Fnvcc_clang_local.bazelrc?ref=e329aa709a7588408c516a96df1711e442e04112",
+            "patch": "@@ -0,0 +1,22 @@\n+build --config clang_local\n+build --action_env CLANG_COMPILER_PATH=/usr/lib/llvm-18/bin/clang\n+build --repo_env CC=/usr/lib/llvm-18/bin/clang\n+build --repo_env BAZEL_COMPILER=/usr/lib/llvm-18/bin/clang\n+build --config cuda_nvcc_clang_local\n+build --action_env CLANG_CUDA_COMPILER_PATH=/usr/lib/llvm-18/bin/clang\n+build:cuda --repo_env HERMETIC_CUDA_VERSION=\"12.8.0\"\n+build:cuda --repo_env HERMETIC_CUDA_COMPUTE_CAPABILITIES=7.5\n+build:cuda --repo_env HERMETIC_CUDNN_VERSION=\"9.8.0\"\n+build --config nonccl\n+build --action_env LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64\n+build --action_env PYTHON_BIN_PATH=/usr/bin/python3\n+build --python_path /usr/bin/python3\n+test --test_env LD_LIBRARY_PATH\n+test --test_size_filters small,medium\n+build --copt -Wno-sign-compare\n+build --copt -Wno-error=unused-command-line-argument\n+build --copt -Wno-gnu-offsetof-extensions\n+build --build_tag_filters -no_oss,-rocm-only,-oneapi-only\n+build --test_tag_filters -no_oss,-rocm-only,-oneapi-only\n+test --build_tag_filters -no_oss,-rocm-only,-oneapi-only\n+test --test_tag_filters -no_oss,-rocm-only,-oneapi-only"
+        },
+        {
+            "sha": "5c8774fd85cea8ef0bfc49199111a88571bc764d",
+            "filename": "third_party/xla/tensorflow.bazelrc",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e329aa709a7588408c516a96df1711e442e04112/third_party%2Fxla%2Ftensorflow.bazelrc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e329aa709a7588408c516a96df1711e442e04112/third_party%2Fxla%2Ftensorflow.bazelrc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Ftensorflow.bazelrc?ref=e329aa709a7588408c516a96df1711e442e04112",
+            "patch": "@@ -216,6 +216,10 @@ build:cuda_clang --host_linkopt=\"-lm\"\n build:cuda_clang --linkopt=\"-fuse-ld=lld\"\n build:cuda_clang --linkopt=\"-lm\"\n \n+build:cuda_clang_local --config=cuda_clang\n+build:cuda_clang_local --config=clang_local\n+build:cuda_clang_local --crosstool_top=@local_config_cuda//crosstool:toolchain\n+\n # Set up compilation CUDA version and paths and use the CUDA Clang toolchain.\n build:cuda_clang_official --config=cuda_clang\n build:cuda_clang_official --config=cuda_version\n@@ -229,6 +233,11 @@ build:cuda_nvcc --@local_config_cuda//:cuda_compiler=nvcc\n # Old config for backward compatibility\n build:nvcc_clang --config=cuda_nvcc\n \n+# Deprecated cuda_nvcc config with non-hermetic toolchains\n+build:cuda_nvcc_clang_local --config=cuda_nvcc\n+build:cuda_nvcc_clang_local --config=clang_local\n+build:cuda_nvcc_clang_local --crosstool_top=@local_config_cuda//crosstool:toolchain\n+\n # Debug config. Enables Bazel's 'dbg' compilation mode, build with debugging enabled\n build:dbg -c dbg\n # Compiling all dependencies with debug info can cause linker failures"
+        }
+    ],
+    "stats": {
+        "total": 186,
+        "additions": 146,
+        "deletions": 40
+    }
+}

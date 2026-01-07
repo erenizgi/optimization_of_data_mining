@@ -1,0 +1,48 @@
+{
+    "author": "basioli-k",
+    "message": "[XLA:GPU][host offloading] Load HostOffloadingExecutable from proto, don't compile at runtime.\n\nHost offloading executables are currently getting compiled when being \"loaded from proto\".\n\nFor XLA:GPU we want to decouple runtime from compilation so this is not acceptable.\n\nPiperOrigin-RevId: 811745756",
+    "sha": "4e0036294391317617254ff384c5c51cd575a60e",
+    "files": [
+        {
+            "sha": "28c48cec5a592d2c35b68c487af311af255df093",
+            "filename": "third_party/xla/xla/service/gpu/BUILD",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4e0036294391317617254ff384c5c51cd575a60e/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4e0036294391317617254ff384c5c51cd575a60e/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2FBUILD?ref=4e0036294391317617254ff384c5c51cd575a60e",
+            "patch": "@@ -1458,8 +1458,11 @@ cc_library(\n         \"//xla:xla_data_proto_cc\",\n         \"//xla:xla_proto_cc\",\n         \"//xla/backends/autotuner:codegen_backend\",\n+        \"//xla/backends/cpu/nanort:nanort_client\",\n+        \"//xla/backends/cpu/nanort:nanort_executable\",\n         \"//xla/backends/gpu/autotuner:block_level_emitter\",\n         \"//xla/backends/gpu/codegen/triton:support\",\n+        \"//xla/backends/gpu/runtime:host_execute_thunk\",\n         \"//xla/backends/gpu/runtime:runtime_intrinsics\",\n         \"//xla/backends/gpu/runtime:sequential_thunk\",\n         \"//xla/backends/gpu/runtime:thunk\",\n@@ -1468,6 +1471,7 @@ cc_library(\n         \"//xla/hlo/analysis:alias_info\",\n         \"//xla/hlo/analysis:hlo_dataflow_analysis\",\n         \"//xla/hlo/analysis:hlo_ordering\",\n+        \"//xla/hlo/builder:xla_computation\",\n         \"//xla/hlo/ir:hlo\",\n         \"//xla/hlo/ir:hlo_module_group\",\n         \"//xla/hlo/pass:hlo_pass\",\n@@ -1585,6 +1589,7 @@ cc_library(\n         \"//xla/service:while_loop_all_reduce_code_motion\",\n         \"//xla/service:while_loop_constant_sinking\",\n         \"//xla/service:while_loop_simplifier\",\n+        \"//xla/service/cpu:cpu_aot_compilation_result\",\n         \"//xla/service/debug:unstable_reduction_detector\",\n         \"//xla/service/gpu/autotuning:autotuner_pass\",\n         \"//xla/service/gpu/autotuning:autotuner_util\","
+        },
+        {
+            "sha": "8cbe74dc21a466b47dc27d090f5ab654063f7baf",
+            "filename": "third_party/xla/xla/service/gpu/gpu_compiler.cc",
+            "status": "modified",
+            "additions": 42,
+            "deletions": 0,
+            "changes": 42,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4e0036294391317617254ff384c5c51cd575a60e/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_compiler.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4e0036294391317617254ff384c5c51cd575a60e/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_compiler.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_compiler.cc?ref=4e0036294391317617254ff384c5c51cd575a60e",
+            "patch": "@@ -60,12 +60,17 @@ limitations under the License.\n #include \"llvm/Transforms/Utils/SplitModule.h\"\n #include \"mlir/IR/Diagnostics.h\"\n #include \"mlir/Support/LLVM.h\"\n+#include \"xla/backends/cpu/nanort/nanort_client.h\"\n+#include \"xla/backends/cpu/nanort/nanort_executable.h\"\n #include \"xla/backends/gpu/codegen/triton/support.h\"\n+#include \"xla/backends/gpu/runtime/host_execute_thunk.h\"\n #include \"xla/backends/gpu/runtime/runtime_intrinsics.h\"\n #include \"xla/backends/gpu/runtime/sequential_thunk.h\"\n+#include \"xla/backends/gpu/runtime/thunk.h\"\n #include \"xla/core/host_offloading/hlo_host_device_type_call_wrapper.h\"\n #include \"xla/core/host_offloading/host_compute_asyncifier.h\"\n #include \"xla/hlo/analysis/alias_info.h\"\n+#include \"xla/hlo/builder/xla_computation.h\"\n #include \"xla/hlo/ir/hlo_casting_utils.h\"\n #include \"xla/hlo/ir/hlo_computation.h\"\n #include \"xla/hlo/ir/hlo_instruction.h\"\n@@ -152,6 +157,7 @@ limitations under the License.\n #include \"xla/service/compiler.h\"\n #include \"xla/service/conditional_simplifier.h\"\n #include \"xla/service/copy_insertion.h\"\n+#include \"xla/service/cpu/cpu_aot_compilation_result.h\"\n #include \"xla/service/cpu_gpu_shape_verifier.h\"\n #include \"xla/service/debug/unstable_reduction_detector.h\"\n #include \"xla/service/dump.h\"\n@@ -166,6 +172,7 @@ limitations under the License.\n #include \"xla/service/gpu/compile_module_to_llvm_ir.h\"\n #include \"xla/service/gpu/conv_layout_normalization.h\"\n #include \"xla/service/gpu/cublas_cudnn.h\"\n+#include \"xla/service/gpu/executable.pb.h\"\n #include \"xla/service/gpu/execution_stream_assignment.h\"\n #include \"xla/service/gpu/flag_utils.h\"\n #include \"xla/service/gpu/fusion_dispatch_pipeline.h\"\n@@ -2464,6 +2471,21 @@ absl::StatusOr<GpuCompiler::BackendCompileResult> GpuCompiler::CompileAndLink(\n   return BackendCompileResult{ptx_snippets, std::move(*maybe_backend_result)};\n }\n \n+namespace {\n+absl::StatusOr<xla::cpu::CompilationResultProto> GetCpuCompilationResult(\n+    const HloModuleProto& hlo_proto) {\n+  xla::cpu::NanoRtClient client;\n+  XlaComputation computation(hlo_proto);\n+  TF_ASSIGN_OR_RETURN(std::unique_ptr<xla::cpu::NanoRtExecutable> executable,\n+                      client.Compile(computation));\n+  TF_ASSIGN_OR_RETURN(std::unique_ptr<AotCompilationResult> result,\n+                      client.Export(executable.get()));\n+  xla::cpu::CpuAotCompilationResult* cpu_aot_compilation_result =\n+      tsl::down_cast<xla::cpu::CpuAotCompilationResult*>(result.get());\n+  return cpu_aot_compilation_result->proto();\n+}\n+}  // namespace\n+\n absl::StatusOr<GpuCompiler::CompileResultWithMetadata>\n GpuCompiler::CompileToBackendResult(\n     HloModule* module, llvm::LLVMContext* llvm_context,\n@@ -2558,6 +2580,26 @@ GpuCompiler::CompileToBackendResult(\n         compile_module_results.executable->ToString(/*indent=*/0));\n   }\n \n+  // Host executable has to be compiled the GPU compilation is done to\n+  // avoid a deadlock on the LLVM command line options lock. We can then load\n+  // it.\n+  for (auto& thunk : compile_module_results.executable->thunks()) {\n+    if (thunk->kind() == Thunk::Kind::kHostExecuteStart) {\n+      auto* host_execute_start_thunk =\n+          tsl::down_cast<HostExecuteStartThunk*>(thunk.get());\n+      TF_ASSIGN_OR_RETURN(\n+          xla::cpu::CompilationResultProto cpu_compilation_result,\n+          GetCpuCompilationResult(\n+              host_execute_start_thunk->executable_proto().hlo_module()));\n+\n+      *host_execute_start_thunk->mutable_executable_proto()\n+           ->mutable_aot_compilation_result() =\n+          std::move(cpu_compilation_result);\n+\n+      TF_RETURN_IF_ERROR(host_execute_start_thunk->LoadExecutable());\n+    }\n+  }\n+\n   return CompileResultWithMetadata{std::move(backend_result),\n                                    std::move(compile_module_results)};\n }"
+        },
+        {
+            "sha": "17de725d07619d3d30349a28db340d441da92b5a",
+            "filename": "third_party/xla/xla/service/gpu/ir_emitter_unnested.cc",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 5,
+            "changes": 18,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4e0036294391317617254ff384c5c51cd575a60e/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fir_emitter_unnested.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4e0036294391317617254ff384c5c51cd575a60e/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fir_emitter_unnested.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fir_emitter_unnested.cc?ref=4e0036294391317617254ff384c5c51cd575a60e",
+            "patch": "@@ -3273,11 +3273,19 @@ absl::Status IrEmitterUnnested::EmitHloInstruction(\n               result_slices.push_back({slice, indexed.shape});\n             }\n \n-            auto thunk = std::make_unique<HostExecuteStartThunk>(\n-                Thunk::ThunkInfo::WithProfileAnnotation(\n-                    instr, ir_emitter_context_->GetNextThunkId()),\n-                *hlo_module, std::move(operand_slices),\n-                std::move(result_slices));\n+            HostOffloadingExecutableProto host_offloading_executable_proto;\n+            *host_offloading_executable_proto.mutable_hlo_module() =\n+                hlo_module->ToProto();\n+            host_offloading_executable_proto.set_executable_type(\n+                HostOffloadingExecutableProto::EXECUTABLE_TYPE_NANORT);\n+\n+            TF_ASSIGN_OR_RETURN(\n+                auto thunk,\n+                HostExecuteStartThunk::Create(\n+                    Thunk::ThunkInfo::WithProfileAnnotation(\n+                        instr, ir_emitter_context_->GetNextThunkId()),\n+                    std::move(host_offloading_executable_proto),\n+                    std::move(operand_slices), std::move(result_slices)));\n \n             auto async_events = thunk->async_events();\n "
+        }
+    ],
+    "stats": {
+        "total": 65,
+        "additions": 60,
+        "deletions": 5
+    }
+}

@@ -1,0 +1,36 @@
+{
+    "author": "WillFroom",
+    "message": "[XLA:CPU] Fix UnrollExtractLoops to stop false-positive unroll when the vector itself is dependent on for loop.\n\nPiperOrigin-RevId: 825427562",
+    "sha": "a8356f63df6e5c91a937b0e585ad649a1d70fa1b",
+    "files": [
+        {
+            "sha": "42a5bd27c16acacf4b1b753e91b2af73940e38f5",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/tiled/transforms/rewrite_dynamic_vector_extract.cc",
+            "status": "modified",
+            "additions": 51,
+            "deletions": 13,
+            "changes": 64,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a8356f63df6e5c91a937b0e585ad649a1d70fa1b/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Frewrite_dynamic_vector_extract.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a8356f63df6e5c91a937b0e585ad649a1d70fa1b/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Frewrite_dynamic_vector_extract.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Frewrite_dynamic_vector_extract.cc?ref=a8356f63df6e5c91a937b0e585ad649a1d70fa1b",
+            "patch": "@@ -16,6 +16,7 @@ limitations under the License.\n #include <cassert>\n #include <cstdint>\n #include <memory>\n+#include <optional>\n #include <utility>\n \n #include \"llvm/ADT/STLExtras.h\"\n@@ -39,6 +40,7 @@ limitations under the License.\n #include \"mlir/Interfaces/DataLayoutInterfaces.h\"\n #include \"mlir/Pass/Pass.h\"\n #include \"mlir/Support/LLVM.h\"\n+#include \"mlir/Support/WalkResult.h\"\n #include \"mlir/Transforms/GreedyPatternRewriteDriver.h\"\n #include \"xla/backends/cpu/codegen/tiled/transforms/passes.h\"\n \n@@ -50,6 +52,38 @@ namespace xla::cpu {\n \n namespace {\n \n+// Check if the given extract operands depends on the given value.\n+bool ExtractDependsOnValue(mlir::vector::ExtractOp extract_op,\n+                           mlir::Value value) {\n+  mlir::BackwardSliceOptions backward_slice_options;\n+  backward_slice_options.omitUsesFromAbove = false;\n+  backward_slice_options.inclusive = true;\n+\n+  for (mlir::Value dynamic_index : extract_op.getDynamicPosition()) {\n+    // We have to explicitly check the index itself as getBackwardSlice only\n+    // starts from the defining operation.\n+    if (dynamic_index == value) {\n+      return true;\n+    }\n+\n+    llvm::SetVector<mlir::Operation*> backwardSlice;\n+    if (mlir::failed(mlir::getBackwardSlice(dynamic_index, &backwardSlice,\n+                                            backward_slice_options))) {\n+      continue;\n+    }\n+\n+    for (mlir::Operation* op : backwardSlice) {\n+      for (mlir::Value operand : op->getOperands()) {\n+        if (operand == value) {\n+          return true;\n+        }\n+      }\n+    }\n+  }\n+\n+  return false;\n+}\n+\n struct FoldExtractIntoTransferRead\n     : mlir::OpRewritePattern<mlir::vector::ExtractOp> {\n   using OpRewritePattern::OpRewritePattern;\n@@ -197,23 +231,27 @@ struct UnrollExtractLoops : mlir::OpRewritePattern<mlir::scf::ForOp> {\n   using OpRewritePattern::OpRewritePattern;\n \n   mlir::LogicalResult matchAndRewrite(\n-      mlir::scf::ForOp op, mlir::PatternRewriter& rewriter) const override {\n-    if (op.getRegion().getOps<mlir::vector::ExtractOp>().empty()) {\n-      return rewriter.notifyMatchFailure(op,\n-                                         \"loop does not contain an extract\");\n-    }\n+      mlir::scf::ForOp for_op, mlir::PatternRewriter& rewriter) const override {\n+    std::optional<mlir::LogicalResult> unroll_result;\n+    // Walk the body of the loop and unroll if we have a dependent extract.\n+    for_op.getBody()->walk([&](mlir::vector::ExtractOp extract) {\n+      if (!ExtractDependsOnValue(extract, for_op.getInductionVar())) {\n+        return mlir::WalkResult::advance();\n+      }\n+      unroll_result = mlir::loopUnrollFull(for_op);\n+      return mlir::WalkResult::interrupt();\n+    });\n \n-    llvm::SetVector<mlir::Operation*> slices;\n-    mlir::getForwardSlice(op.getInductionVar(), &slices);\n+    if (!unroll_result.has_value()) {\n+      return rewriter.notifyMatchFailure(\n+          for_op, \"loop does not contain a dependent extract\");\n+    }\n \n-    for (auto slice : slices) {\n-      if (mlir::isa<mlir::vector::ExtractOp>(slice)) {\n-        return mlir::loopUnrollFull(op);\n-      }\n+    if (mlir::failed(*unroll_result)) {\n+      return rewriter.notifyMatchFailure(for_op, \"failed to unroll loop\");\n     }\n \n-    return rewriter.notifyMatchFailure(\n-        op, \"loop does not contain a dependent extract\");\n+    return mlir::success();\n   }\n };\n "
+        },
+        {
+            "sha": "236e2669de68e12fbd0955ba65f17386952a3960",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/tiled/transforms/tests/rewrite_dynamic_vector_extract.mlir",
+            "status": "modified",
+            "additions": 25,
+            "deletions": 0,
+            "changes": 25,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a8356f63df6e5c91a937b0e585ad649a1d70fa1b/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Frewrite_dynamic_vector_extract.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a8356f63df6e5c91a937b0e585ad649a1d70fa1b/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Frewrite_dynamic_vector_extract.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Frewrite_dynamic_vector_extract.mlir?ref=a8356f63df6e5c91a937b0e585ad649a1d70fa1b",
+            "patch": "@@ -102,3 +102,28 @@ func.func @does_not_unroll_independent_vector_extract(%input: vector<8x2xf32>, %\n // CHECK-LABEL:    func.func @does_not_unroll_independent_vector_extract(\n // CHECK:            scf.for\n // CHECK-COUNT-1:     vector.extract\n+\n+// -----\n+\n+// Ensure that we don't unroll loops that have a vector that depends on the for\n+// loop but the index itself does not.\n+func.func @does_not_unroll_only_dependent_vector(\n+    %input: memref<8x2xf32>, %arg_index: index) -> vector<2xf32> {\n+  %c0 = arith.constant 0 : index\n+  %c2 = arith.constant 2 : index\n+  %c8 = arith.constant 8 : index\n+  %c0_f32 = arith.constant 0. : f32\n+  %init = vector.broadcast %c0_f32 : f32 to vector<2xf32>\n+  %result = scf.for %index = %c0 to %c8 step %c2 iter_args(%carry = %init) -> vector<2xf32> {\n+    %input_vector = vector.transfer_read %input[%index, %c0], %c0_f32  : memref<8x2xf32>, vector<2x2xf32>\n+    %extract = vector.extract %input_vector[0] : vector<2xf32> from vector<2x2xf32>\n+    %add = arith.addf %carry, %extract : vector<2xf32>\n+    scf.yield %add : vector<2xf32>\n+  }\n+  return %result : vector<2xf32>\n+}\n+\n+\n+// CHECK-LABEL:    func.func @does_not_unroll_only_dependent_vector(\n+// CHECK:            scf.for\n+// CHECK-COUNT-1:     vector.extract"
+        }
+    ],
+    "stats": {
+        "total": 89,
+        "additions": 76,
+        "deletions": 13
+    }
+}

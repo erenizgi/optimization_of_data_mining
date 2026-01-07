@@ -1,0 +1,36 @@
+{
+    "author": "mfrancepillois",
+    "message": "PR #34467: [ROCm] Fix ExtractThreadDims for AMD targets\n\nImported from GitHub PR https://github.com/openxla/xla/pull/34467\n\n📝 Summary of Changes\nAMD/ROCm Triton backend does not support warp specialization. `ThreadDims` are therefore calculated from module attributes and not retrieved from `nvvm.reqntid`.\n\n🎯 Justification\nAs warp specialization is not currently supported by the AMD/ROCm Triton backend, this backend ignores the `nvvm.reqntid` attribute. Therefore, this attribute does not contain a correct value, as the currently Triton implementation assumes the number of threads per warp is always 32, which is not the case for some AMD targets (see https://github.com/triton-lang/triton/blob/49e174c6856aed1d36b85fb2b398ffaa32a80aa8/lib/Conversion/TritonGPUToLLVM/FuncOpToLLVM.cpp#L204C53-L204C68).\nConsequently, the `ExtractThreadDims` has been adapted to calculate `ThreadDims` only based on attributes used and updated by the AMD triton backend.\n\n🚀 Kind of Contribution\nPlease remove what does not apply: 🐛 Bug Fix\n\n📊 Benchmark (for Performance Improvements)\nNot relevant\n\n🧪 Unit Tests:\nFixes failures of type:\n```\nxla/backends/gpu/codegen/triton/fusion_emitter_device_test.cc:4234: Failure\nValue of: RunAndCompareNoHloPasses(kHloText, ErrorSpecForDotAlgorithm(algorithm))\n Actual: false (INTERNAL: Expected total threads as per reqntid attribute to be 32 but got 64 as per ttg.total-num-warps and tt.threads-per-warp attributes.)\nExpected: true\n```\nfor Triton Tests when targeting AMD GPUs.\n\n🧪 Execution Tests:\nNot relevant\n\nCopybara import of the project:\n\n--\n24086e4e80223cdccd38c82af46f5bde96124b5a by Maxime France-Pillois <mfrancep@amd.com>:\n\n[ROCm] Fix ExtractThreadDims for AMD targets\n\nAMD/ROCm Triton backend does not support warp specialization.\nThreadDims are therefore calculated from the Module attributes and not retrieved from `nvvm.reqntid`.\n\nMerging this change closes #34467\n\nPiperOrigin-RevId: 837500152",
+    "sha": "565285802a88713b2c156a90d0e435bc96f32db4",
+    "files": [
+        {
+            "sha": "502f22fafa6b354f7d07e46be3cef5f103452238",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/compilation_pipeline_rocm.cc",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 4,
+            "changes": 4,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/565285802a88713b2c156a90d0e435bc96f32db4/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Fcompilation_pipeline_rocm.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/565285802a88713b2c156a90d0e435bc96f32db4/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Fcompilation_pipeline_rocm.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Fcompilation_pipeline_rocm.cc?ref=565285802a88713b2c156a90d0e435bc96f32db4",
+            "patch": "@@ -123,10 +123,6 @@ static void MakeLLIR(mlir::OpPassManager* pm,\n                      const stream_executor::RocmComputeCapability& rocm_cc,\n                      int num_stages) {\n   const int custom_lds_size = 0;\n-  // The `createTritonGPUAllocateWarpGroups` pass is not implemented in the\n-  // upstream Triton, but is necessary for `ExtractThreadDims` in emitter\n-  // helpers. It adds the `ttg.total-num-warps` attribute.\n-  pm->addPass(mt::gpu::createTritonGPUAllocateWarpGroups());\n   pm->addPass(mlir::triton::AMD::createOptimizeLDSUsagePass(\n       rocm_cc.gfx_version(), custom_lds_size));\n   pm->addPass(mlir::createSCFToControlFlowPass());"
+        },
+        {
+            "sha": "21adb83d3cffea08b14e6bff216e2e9357ea9cb2",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/lowering_util.cc",
+            "status": "modified",
+            "additions": 14,
+            "deletions": 0,
+            "changes": 14,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/565285802a88713b2c156a90d0e435bc96f32db4/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Flowering_util.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/565285802a88713b2c156a90d0e435bc96f32db4/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Flowering_util.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Flowering_util.cc?ref=565285802a88713b2c156a90d0e435bc96f32db4",
+            "patch": "@@ -50,6 +50,20 @@ absl::StatusOr<stream_executor::ThreadDim> ExtractThreadDims(\n   if (!num_warps_attr) {\n     return absl::InternalError(\"ttg.num-warps attribute not found.\");\n   }\n+  // AMD/ROCm Triton backend does not support warp specialization.\n+  // Consequently, `ttg.total-num-warps` and  `nvvm.reqntid` are not added\n+  // to triton module/function.\n+  // ThreadDim is therefore calculated from the Module attributes and not\n+  // retrieved from `nvvm.reqntid`.\n+  auto target = triton_module->getAttrOfType<mlir::StringAttr>(\"ttg.target\");\n+  if (!target) {\n+    return absl::InternalError(\"ttg.target attribute not found.\");\n+  }\n+  if (target.getValue().find(\"gfx\") != std::string::npos) {\n+    stream_executor::ThreadDim thread_dims(\n+        num_warps_attr.getInt() * threads_per_warp_attr.getInt(), 1, 1);\n+    return thread_dims;\n+  }\n   auto total_num_warps_attr =\n       triton_module->getAttrOfType<mlir::IntegerAttr>(\"ttg.total-num-warps\");\n   if (!total_num_warps_attr) {"
+        }
+    ],
+    "stats": {
+        "total": 18,
+        "additions": 14,
+        "deletions": 4
+    }
+}

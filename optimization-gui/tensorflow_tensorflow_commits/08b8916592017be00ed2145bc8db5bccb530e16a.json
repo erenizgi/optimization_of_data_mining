@@ -1,0 +1,36 @@
+{
+    "author": "mwhittaker",
+    "message": "Abort GPU communicators concurrently to avoid getting stuck.\n\nRecall that when a GPU PjRt client detects that a process has failed, it will\nattempt to abort all communicators with that process as a participant.\nPreviously, the communicators were aborted serially, but this was leading to a\ndeadlock.\n\nConsider a deployment with three processes: A, B, and C. There are two\ncommunicators: one for A, B, and C and one for A and C. Imagine C fails during\na collective on the ABC communicator. If process A attempts to abort the AC\ncommunicator before the ABC communicator, the cancellation of the AC\ncommunicator gets blocked by the pending collective, and the collective is\nnever cancelled because the ABC communicator is not aborted until after the AC\ncommunicator.\n\nThis commit changes the aborts to happen concurrently and was suggested by the\nNCCL team. Emprically, it has solved the problem so far.\n\nPiperOrigin-RevId: 830497401",
+    "sha": "08b8916592017be00ed2145bc8db5bccb530e16a",
+    "files": [
+        {
+            "sha": "232fa3a36f8b8eb9979ec6f494dd64a9d55d9461",
+            "filename": "third_party/xla/xla/backends/gpu/collectives/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/08b8916592017be00ed2145bc8db5bccb530e16a/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcollectives%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/08b8916592017be00ed2145bc8db5bccb530e16a/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcollectives%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcollectives%2FBUILD?ref=08b8916592017be00ed2145bc8db5bccb530e16a",
+            "patch": "@@ -173,6 +173,7 @@ cc_library(\n         \"@com_google_absl//absl/container:node_hash_map\",\n         \"@com_google_absl//absl/functional:function_ref\",\n         \"@com_google_absl//absl/log\",\n+        \"@com_google_absl//absl/memory\",\n         \"@com_google_absl//absl/status\",\n         \"@com_google_absl//absl/status:statusor\",\n         \"@com_google_absl//absl/strings\","
+        },
+        {
+            "sha": "f19720baab95e376b5c09ba764b5544700713d41",
+            "filename": "third_party/xla/xla/backends/gpu/collectives/gpu_cliques.cc",
+            "status": "modified",
+            "additions": 38,
+            "deletions": 7,
+            "changes": 45,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/08b8916592017be00ed2145bc8db5bccb530e16a/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcollectives%2Fgpu_cliques.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/08b8916592017be00ed2145bc8db5bccb530e16a/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcollectives%2Fgpu_cliques.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcollectives%2Fgpu_cliques.cc?ref=08b8916592017be00ed2145bc8db5bccb530e16a",
+            "patch": "@@ -33,6 +33,7 @@ limitations under the License.\n #include \"absl/container/node_hash_map.h\"\n #include \"absl/functional/function_ref.h\"\n #include \"absl/log/log.h\"\n+#include \"absl/memory/memory.h\"\n #include \"absl/status/status.h\"\n #include \"absl/status/statusor.h\"\n #include \"absl/strings/str_cat.h\"\n@@ -761,20 +762,50 @@ static absl::Status AbortCliquesWithIncarnations(\n     }\n   }\n \n-  // Delete constructed collectives.\n+  // Abort collectives.\n   absl::Status result;\n+  absl::Mutex result_mu;\n+  {\n+    // We need to abort all communicators concurrently. If we abort serially, an\n+    // abort of one communicator may get blocked by a pending collective on a\n+    // different communicator.\n+    std::vector<std::unique_ptr<tsl::Thread>> threads;\n+    for (auto& [key, lockable_clique] : map) {\n+      if (!CliqueKeyContainsIncarnation(key, incarnation_set)) {\n+        VLOG(1) << \"Not aborting GPU clique \" << key.ToString()\n+                << \" because it does not include a stale incarnation\";\n+        continue;\n+      }\n+\n+      auto abort = [&result, &result_mu, key = key,\n+                    lockable_clique = &lockable_clique]() {\n+        VLOG(1) << \"Aborting GPU clique \" << key.ToString();\n+        if (absl::Status s = lockable_clique->Abort(); !s.ok()) {\n+          LOG(ERROR) << \"Error aborting GPU clique \" << key.ToString() << \": \"\n+                     << s;\n+          absl::MutexLock lock(result_mu);\n+          result = std::move(s);\n+        } else {\n+          VLOG(1) << \"Aborted GPU clique \" << key.ToString();\n+        }\n+      };\n+\n+      VLOG(1) << \"Launching thread to abort GPU clique \" << key.ToString();\n+      threads.push_back(absl::WrapUnique(tsl::Env::Default()->StartThread(\n+          tsl::ThreadOptions(), \"abort\", abort)));\n+    }\n+  }  // threads' destructor will block until all threads finish.\n+\n+  // Garbage collect aborted collectives.\n   for (auto it = map.begin(); it != map.end();) {\n     auto copy = it++;\n     auto& [key, lockable_clique] = *copy;\n     if (!CliqueKeyContainsIncarnation(key, incarnation_set)) {\n-      VLOG(1) << \"Not aborting GPU clique \" << key.ToString();\n+      VLOG(1) << \"Not removing GPU clique \" << key.ToString()\n+              << \" because it does not include a stale incarnation\";\n       continue;\n     }\n-    VLOG(1) << \"Aborting GPU clique \" << key.ToString();\n-    if (absl::Status s = lockable_clique.Abort(); !s.ok()) {\n-      LOG(ERROR) << \"Error aborting GPU clique \" << key.ToString() << \": \" << s;\n-      result = std::move(s);\n-    }\n+    VLOG(1) << \"Removing GPU clique \" << key.ToString();\n     map.erase(copy);\n   }\n   return result;"
+        }
+    ],
+    "stats": {
+        "total": 46,
+        "additions": 39,
+        "deletions": 7
+    }
+}

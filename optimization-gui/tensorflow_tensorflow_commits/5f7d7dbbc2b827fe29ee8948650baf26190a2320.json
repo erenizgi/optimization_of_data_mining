@@ -1,0 +1,84 @@
+{
+    "author": "ezhulenev",
+    "message": "[xla] Migrate to PjRtFuture<>::MakePromise() API\n\nPiperOrigin-RevId: 807518373",
+    "sha": "5f7d7dbbc2b827fe29ee8948650baf26190a2320",
+    "files": [
+        {
+            "sha": "605759f112adb13db7d9d1b7dab3b92cf9a739f5",
+            "filename": "third_party/xla/xla/pjrt/abstract_tracked_device_buffer.h",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 16,
+            "changes": 27,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/5f7d7dbbc2b827fe29ee8948650baf26190a2320/third_party%2Fxla%2Fxla%2Fpjrt%2Fabstract_tracked_device_buffer.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/5f7d7dbbc2b827fe29ee8948650baf26190a2320/third_party%2Fxla%2Fxla%2Fpjrt%2Fabstract_tracked_device_buffer.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fabstract_tracked_device_buffer.h?ref=5f7d7dbbc2b827fe29ee8948650baf26190a2320",
+            "patch": "@@ -25,14 +25,14 @@ limitations under the License.\n #include \"absl/log/check.h\"\n #include \"absl/status/status.h\"\n #include \"absl/status/statusor.h\"\n-#include \"absl/strings/str_cat.h\"\n #include \"absl/synchronization/mutex.h\"\n #include \"xla/pjrt/device_event.h\"\n #include \"xla/pjrt/pjrt_client.h\"\n #include \"xla/pjrt/pjrt_future.h\"\n #include \"xla/pjrt/raw_buffer.h\"\n #include \"xla/tsl/concurrency/async_value.h\"\n #include \"xla/tsl/concurrency/ref_count.h\"\n+#include \"xla/util.h\"\n \n namespace xla {\n \n@@ -65,33 +65,28 @@ class AbstractTrackedDeviceBuffer {\n   virtual absl::StatusOr<std::unique_ptr<AbstractTrackedDeviceBuffer>>\n   CloneWithControlDependency(PjRtMemorySpace* memory_space,\n                              PjRtFuture<> dependency) {\n-    return absl::UnimplementedError(\n-        \"DonateWithControlDependency is not supported.\");\n+    return Unimplemented(\"DonateWithControlDependency is not supported.\");\n   }\n \n-  // Populates a future::promise when all the definition events are complete.\n-  virtual PjRtFuture<>::Promise GetReadyFuturePromise(\n-      PjRtMemorySpace* memory_space) {\n-    auto promise = PjRtFuture<>::CreatePromise();\n-    promise.Set(absl::UnimplementedError(\n-        absl::StrCat(\"GetReadyFuturePromise not supported for \",\n-                     memory_space->DebugString())));\n-    return promise;\n+  // Returns a future that becomes available when all definition events are\n+  // complete.\n+  virtual PjRtFuture<> GetReadyFuture(PjRtMemorySpace* memory_space) {\n+    return PjRtFuture<>(Unimplemented(\"GetReadyFuture not supported for %s\",\n+                                      memory_space->DebugString()));\n   }\n \n   // Waits for all usage and definition events to complete synchronously\n   // and returns the status.\n   virtual absl::Status BlockForOperationsToComplete(\n       PjRtMemorySpace* memory_space) {\n-    return absl::UnimplementedError(\n-        absl::StrCat(\"BlockForOperationsToComplete not supported for \",\n-                     memory_space->DebugString()));\n+    return Unimplemented(\"BlockForOperationsToComplete not supported for %s\",\n+                         memory_space->DebugString());\n   }\n \n   virtual absl::StatusOr<tsl::RCReference<PjRtDeviceEvent>> GetDefinitionEvent(\n       PjRtMemorySpace* memory_space) {\n-    return absl::UnimplementedError(absl::StrCat(\n-        \"GetDefinitionEvent is not supported for \", memory_space->ToString()));\n+    return Unimplemented(\"GetDefinitionEvent is not supported for %s\",\n+                         memory_space->ToString());\n   }\n };\n "
+        },
+        {
+            "sha": "7893e2c9e07ccd06dce283122a50de4058f585f9",
+            "filename": "third_party/xla/xla/pjrt/common_pjrt_client.cc",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 6,
+            "changes": 16,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/5f7d7dbbc2b827fe29ee8948650baf26190a2320/third_party%2Fxla%2Fxla%2Fpjrt%2Fcommon_pjrt_client.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/5f7d7dbbc2b827fe29ee8948650baf26190a2320/third_party%2Fxla%2Fxla%2Fpjrt%2Fcommon_pjrt_client.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fcommon_pjrt_client.cc?ref=5f7d7dbbc2b827fe29ee8948650baf26190a2320",
+            "patch": "@@ -73,11 +73,15 @@ PjRtFuture<>::Promise CommonPjRtClient::CreateUserPromise(\n PjRtFuture<> CommonPjRtClient::CreateFutureFromUserPromise(\n     PjRtMemorySpace* memory_space, const char* callee_type,\n     const char* callee_method, PjRtFuture<>::Promise promise) {\n-  return CreateTrackedFuture(memory_space, callee_type, callee_method,\n-                             PjRtFuture<>(std::move(promise)));\n+  return CreateProfiledFuture(memory_space, callee_type, callee_method,\n+                              PjRtFuture<>(std::move(promise)));\n }\n \n-PjRtFuture<> CommonPjRtClient::CreateTrackedFuture(\n+void CommonPjRtClient::TrackFuture(PjRtMemorySpace* memory_space,\n+                                   absl::string_view debug_info,\n+                                   const PjRtFuture<>& future) {}\n+\n+PjRtFuture<> CommonPjRtClient::CreateProfiledFuture(\n     PjRtMemorySpace* memory_space, const char* callee_type,\n     const char* callee_method, PjRtFuture<> future) {\n   return PjRtFutureHelpers::WithProfiling(\n@@ -1203,9 +1207,9 @@ PjRtFuture<> CommonPjRtBufferImpl::GetReadyFuture() {\n         \"GetReadyFuture() called on deleted or donated buffer\"));\n   }\n   if (!definition_future_) {\n-    auto promise = device_buffer()->GetReadyFuturePromise(memory_space());\n-    definition_future_ = client()->CreateFutureFromUserPromise(\n-        memory_space(), \"CommonPjRtBuffer\", \"Await\", std::move(promise));\n+    auto future = device_buffer()->GetReadyFuture(memory_space());\n+    definition_future_ = client()->CreateProfiledFuture(\n+        memory_space(), \"CommonPjRtBuffer\", \"Await\", std::move(future));\n   }\n   return definition_future_;\n }"
+        },
+        {
+            "sha": "2995475d5d08442c9f83b3fe49fc59cdc0839589",
+            "filename": "third_party/xla/xla/pjrt/common_pjrt_client.h",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 5,
+            "changes": 16,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/5f7d7dbbc2b827fe29ee8948650baf26190a2320/third_party%2Fxla%2Fxla%2Fpjrt%2Fcommon_pjrt_client.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/5f7d7dbbc2b827fe29ee8948650baf26190a2320/third_party%2Fxla%2Fxla%2Fpjrt%2Fcommon_pjrt_client.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fcommon_pjrt_client.h?ref=5f7d7dbbc2b827fe29ee8948650baf26190a2320",
+            "patch": "@@ -132,12 +132,18 @@ class CommonPjRtClient : public PjRtClient {\n       PjRtMemorySpace* memory_space, const char* callee_type,\n       const char* callee_method, PjRtFuture<>::Promise promise);\n \n-  // Creates a future from a user-provided future with event tracking and\n+  // Track a user-provided future with attached debug_info (if\n+  // event_tracking_enabled()).\n+  virtual void TrackFuture(PjRtMemorySpace* memory_space,\n+                           absl::string_view debug_info,\n+                           const PjRtFuture<>& future);\n+\n+  // Creates a future from a user-provided future with profiling and\n   // traceme scopes.\n-  virtual PjRtFuture<> CreateTrackedFuture(PjRtMemorySpace* memory_space,\n-                                           const char* callee_type,\n-                                           const char* callee_method,\n-                                           PjRtFuture<> future);\n+  virtual PjRtFuture<> CreateProfiledFuture(PjRtMemorySpace* memory_space,\n+                                            const char* callee_type,\n+                                            const char* callee_method,\n+                                            PjRtFuture<> future);\n \n   // Create a linked PjRtFuture<> and ::Promise pair for operations on\n   // buffers in memory_space which populates debug information like linked"
+        },
+        {
+            "sha": "cfbe8c351b688f3c262a346e2d5bdfeff9338ddc",
+            "filename": "third_party/xla/xla/pjrt/cpu/tracked_cpu_device_buffer.cc",
+            "status": "modified",
+            "additions": 18,
+            "deletions": 15,
+            "changes": 33,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/5f7d7dbbc2b827fe29ee8948650baf26190a2320/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Ftracked_cpu_device_buffer.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/5f7d7dbbc2b827fe29ee8948650baf26190a2320/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Ftracked_cpu_device_buffer.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Ftracked_cpu_device_buffer.cc?ref=5f7d7dbbc2b827fe29ee8948650baf26190a2320",
+            "patch": "@@ -322,22 +322,25 @@ void TrackedCpuDeviceBuffer::Delete(PjRtMemorySpace* memory_space) {\n   });\n }\n \n-PjRtFuture<>::Promise TrackedCpuDeviceBuffer::GetReadyFuturePromise(\n+PjRtFuture<> TrackedCpuDeviceBuffer::GetReadyFuture(\n     PjRtMemorySpace* memory_space) {\n-  PjRtFuture<>::Promise promise =\n-      tensorflow::down_cast<CommonPjRtClient*>(memory_space->client())\n-          ->CreateUserPromise(memory_space, \"BufferDefinitionEvent\");\n-  definition_event().AndThen(\n-      [definition_event = definition_event().AsPtr(), promise]() mutable {\n-        if (definition_event.IsError()) {\n-          const absl::Status& s = definition_event.GetError();\n-          promise.Set(tsl::errors::CreateWithUpdatedMessage(\n-              s, absl::StrCat(\"Buffer Definition Event: \", s.message())));\n-        } else {\n-          promise.Set();\n-        }\n-      });\n-  return promise;\n+  auto [promise, future] = PjRtFuture<>::MakePromise();\n+\n+  tensorflow::down_cast<CommonPjRtClient*>(memory_space->client())\n+      ->TrackFuture(memory_space, \"BufferDefinitionEvent\", future);\n+\n+  definition_event().AndThen([definition_event = definition_event().AsPtr(),\n+                              promise = std::move(promise)]() mutable {\n+    if (definition_event.IsError()) {\n+      const absl::Status& s = definition_event.GetError();\n+      promise.Set(tsl::errors::CreateWithUpdatedMessage(\n+          s, absl::StrCat(\"Buffer Definition Event: \", s.message())));\n+    } else {\n+      promise.Set();\n+    }\n+  });\n+\n+  return future;\n }\n \n absl::Status TrackedCpuDeviceBuffer::BlockForOperationsToComplete("
+        },
+        {
+            "sha": "85928bf9382a12bf3aa1d1bfe5e35022ad585d08",
+            "filename": "third_party/xla/xla/pjrt/cpu/tracked_cpu_device_buffer.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/5f7d7dbbc2b827fe29ee8948650baf26190a2320/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Ftracked_cpu_device_buffer.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/5f7d7dbbc2b827fe29ee8948650baf26190a2320/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Ftracked_cpu_device_buffer.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Ftracked_cpu_device_buffer.h?ref=5f7d7dbbc2b827fe29ee8948650baf26190a2320",
+            "patch": "@@ -208,8 +208,7 @@ class TrackedCpuDeviceBuffer : public AbstractTrackedDeviceBuffer {\n \n   void Delete(PjRtMemorySpace* memory_space) override;\n \n-  PjRtFuture<>::Promise GetReadyFuturePromise(\n-      PjRtMemorySpace* memory_space) override;\n+  PjRtFuture<> GetReadyFuture(PjRtMemorySpace* memory_space) override;\n \n   absl::Status BlockForOperationsToComplete(\n       PjRtMemorySpace* memory_space) override;"
+        },
+        {
+            "sha": "1e5a0e216a2ee1484483228fee684d97acd34ae0",
+            "filename": "third_party/xla/xla/pjrt/pjrt_future.h",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/5f7d7dbbc2b827fe29ee8948650baf26190a2320/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_future.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/5f7d7dbbc2b827fe29ee8948650baf26190a2320/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_future.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_future.h?ref=5f7d7dbbc2b827fe29ee8948650baf26190a2320",
+            "patch": "@@ -219,6 +219,11 @@ class PjRtFutureBase : public PjRtFutureMoveControl<is_move_only> {\n \n   explicit operator bool() const { return static_cast<bool>(promise_); }\n \n+  // Returns a pointer to the underlying AsyncValue that can be used to\n+  // track completion of a future. It is undefined behavior to access the\n+  // value stored in the AsyncValue.\n+  tsl::AsyncValue* async_value() const { return promise_.GetAsyncValue(); }\n+\n  protected:\n   static constexpr bool IsMoveOnly() { return is_move_only; }\n "
+        }
+    ],
+    "stats": {
+        "total": 100,
+        "additions": 56,
+        "deletions": 44
+    }
+}

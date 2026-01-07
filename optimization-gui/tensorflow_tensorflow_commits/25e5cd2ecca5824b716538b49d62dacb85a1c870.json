@@ -1,0 +1,60 @@
+{
+    "author": "akhilgoe",
+    "message": "PR #34356: [XLA:GPU][spirv] Add support to block unsupported extensions\n\nImported from GitHub PR https://github.com/openxla/xla/pull/34356\n\nThis PR adds support to block unsupported SPIRV extensions. The added function will filter out unsupported extensions from the full set of valid extensions for the default SPIRV target triple.\n\nCopybara import of the project:\n\n--\n22987463afffd7ed0d7b67956c2e589f62c5a489 by Akhil Goel <akhil.goel@intel.com>:\n\nAdd support to block unsupported extensions\n\nMerging this change closes #34356\n\nPiperOrigin-RevId: 838707241",
+    "sha": "25e5cd2ecca5824b716538b49d62dacb85a1c870",
+    "files": [
+        {
+            "sha": "08865af2fdca70b04fb52dd85bf38dc74f590940",
+            "filename": "third_party/xla/xla/service/gpu/llvm_gpu_backend/BUILD",
+            "status": "modified",
+            "additions": 18,
+            "deletions": 0,
+            "changes": 18,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/25e5cd2ecca5824b716538b49d62dacb85a1c870/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fllvm_gpu_backend%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/25e5cd2ecca5824b716538b49d62dacb85a1c870/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fllvm_gpu_backend%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fllvm_gpu_backend%2FBUILD?ref=25e5cd2ecca5824b716538b49d62dacb85a1c870",
+            "patch": "@@ -370,3 +370,21 @@ cc_library(\n         \"@local_tsl//tsl/platform:errors\",\n     ],\n )\n+\n+xla_cc_test(\n+    name = \"spirv_backend_test\",\n+    srcs = [\"spirv_backend_test.cc\"],\n+    tags = [\n+        \"gpu\",\n+        \"oneapi-only\",\n+    ] + if_google([\n+        \"notap\",\n+        \"nobuilder\",\n+        \"manual\",\n+    ]),\n+    deps = [\n+        \":spirv_backend\",\n+        \"//xla/tests:xla_internal_test_main\",\n+        \"@com_google_googletest//:gtest\",\n+    ],\n+)"
+        },
+        {
+            "sha": "f4e1637b274e5a7e630be255df2ef62c88507e46",
+            "filename": "third_party/xla/xla/service/gpu/llvm_gpu_backend/spirv_backend.cc",
+            "status": "modified",
+            "additions": 30,
+            "deletions": 1,
+            "changes": 31,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/25e5cd2ecca5824b716538b49d62dacb85a1c870/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fllvm_gpu_backend%2Fspirv_backend.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/25e5cd2ecca5824b716538b49d62dacb85a1c870/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fllvm_gpu_backend%2Fspirv_backend.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fllvm_gpu_backend%2Fspirv_backend.cc?ref=25e5cd2ecca5824b716538b49d62dacb85a1c870",
+            "patch": "@@ -24,7 +24,9 @@ limitations under the License.\n #include \"llvm/Support/TargetSelect.h\"\n #include \"llvm/Transforms/Scalar.h\"\n #include \"llvm/Transforms/Utils/Cloning.h\"\n+#include \"llvm/lib/Target/SPIRV/MCTargetDesc/SPIRVBaseInfo.h\"\n #include \"llvm/lib/Target/SPIRV/SPIRVAPI.h\"\n+#include \"llvm/lib/Target/SPIRV/SPIRVCommandLine.h\"\n #include \"xla/service/gpu/llvm_gpu_backend/gpu_backend_lib.h\"\n #include \"xla/service/llvm_ir/llvm_command_line_options.h\"\n #include \"tsl/platform/errors.h\"\n@@ -70,10 +72,29 @@ std::vector<std::string> GetSPIRVBackendOptions(\n   return backend_llvm_opts;\n }\n \n+std::vector<std::string> RemoveUnsupportedExtensionsFromAll(\n+    llvm::Triple triple,\n+    const std::vector<std::string> unsupported_extensions) {\n+  std::set<std::string> extensions;\n+  auto valid_extensions =\n+      llvm::SPIRVExtensionsParser::getValidExtensions(triple);\n+\n+  for (auto& ext : valid_extensions) {\n+    extensions.insert(llvm::getSymbolicOperandMnemonic(\n+        llvm::SPIRV::OperandCategory::ExtensionOperand, ext));\n+  }\n+\n+  for (auto& ext : unsupported_extensions) {\n+    extensions.erase(ext);\n+  }\n+  return std::vector<std::string>(extensions.begin(), extensions.end());\n+}\n+\n absl::StatusOr<std::string> CompileToSPIRV(\n     llvm::Module* module, stream_executor::GpuComputeCapability gpu_version,\n     const DebugOptions& debug_options) {\n   static absl::once_flag backend_init_flag;\n+  static std::vector<std::string> spirv_extensions{};\n   absl::call_once(backend_init_flag, SPIRVBackendInit);\n   auto llvm_opts = GetSPIRVBackendOptions(debug_options);\n   llvm_ir::LLVMCommandLineOptionsLock llvm_lock(llvm_opts);\n@@ -138,6 +159,15 @@ absl::StatusOr<std::string> CompileToSPIRV(\n   }\n \n   llvm::Triple default_target_triple(\"spirv64-unknown-unknown\");\n+  // List of extensions to block during module translation.\n+  // Block SPV_KHR_float_controls2 extension because the current L0 drivers lack\n+  // the needed translation support.\n+  const std::vector<std::string> unsupported_extensions = {\n+      \"SPV_KHR_float_controls2\"};\n+  if (spirv_extensions.empty()) {\n+    spirv_extensions = RemoveUnsupportedExtensionsFromAll(\n+        default_target_triple, unsupported_extensions);\n+  }\n   std::unique_ptr<llvm::TargetMachine> target_machine =\n       GetTargetMachine(default_target_triple, \"\", debug_options, \"\");\n   TF_RETURN_IF_ERROR(LinkAndOptimizeModule(\n@@ -153,7 +183,6 @@ absl::StatusOr<std::string> CompileToSPIRV(\n \n   std::string spirv_str;\n   std::string spirv_err_msg;\n-  std::vector<std::string> spirv_extensions{\"all\"};\n   std::vector<std::string> spirv_options{default_target_triple.str()};\n   bool spirv_success = llvm::SPIRVTranslateModule(\n       module, spirv_str, spirv_err_msg, spirv_extensions, spirv_options);"
+        },
+        {
+            "sha": "b935509b8c3510895d79109efe5bd03d8ea2017c",
+            "filename": "third_party/xla/xla/service/gpu/llvm_gpu_backend/spirv_backend.h",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/25e5cd2ecca5824b716538b49d62dacb85a1c870/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fllvm_gpu_backend%2Fspirv_backend.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/25e5cd2ecca5824b716538b49d62dacb85a1c870/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fllvm_gpu_backend%2Fspirv_backend.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fllvm_gpu_backend%2Fspirv_backend.h?ref=25e5cd2ecca5824b716538b49d62dacb85a1c870",
+            "patch": "@@ -33,6 +33,10 @@ absl::StatusOr<std::string> CompileToSPIRV(\n     llvm::Module* module, stream_executor::GpuComputeCapability gpu_version,\n     const DebugOptions& debug_options);\n \n+// Filters out \"unsupported_extensions\" from the extensions list\n+std::vector<std::string> RemoveUnsupportedExtensionsFromAll(\n+    llvm::Triple triple, const std::vector<std::string> unsupported_extensions);\n+\n // Returns the LLVM command line flags that we use for compilation.\n std::vector<std::string> GetSPIRVBackendOptions(\n     const DebugOptions& debug_options);"
+        },
+        {
+            "sha": "088c8a2d97f3c8f13a5dec1f6f927b0653ad8165",
+            "filename": "third_party/xla/xla/service/gpu/llvm_gpu_backend/spirv_backend_test.cc",
+            "status": "added",
+            "additions": 49,
+            "deletions": 0,
+            "changes": 49,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/25e5cd2ecca5824b716538b49d62dacb85a1c870/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fllvm_gpu_backend%2Fspirv_backend_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/25e5cd2ecca5824b716538b49d62dacb85a1c870/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fllvm_gpu_backend%2Fspirv_backend_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fllvm_gpu_backend%2Fspirv_backend_test.cc?ref=25e5cd2ecca5824b716538b49d62dacb85a1c870",
+            "patch": "@@ -0,0 +1,49 @@\n+/* Copyright 2025 The OpenXLA Authors.\n+\n+Licensed under the Apache License, Version 2.0 (the \"License\");\n+you may not use this file except in compliance with the License.\n+You may obtain a copy of the License at\n+\n+    http://www.apache.org/licenses/LICENSE-2.0\n+\n+Unless required by applicable law or agreed to in writing, software\n+distributed under the License is distributed on an \"AS IS\" BASIS,\n+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+See the License for the specific language governing permissions and\n+limitations under the License.\n+==============================================================================*/\n+\n+#include \"xla/service/gpu/llvm_gpu_backend/spirv_backend.h\"\n+\n+#include <gtest/gtest.h>\n+\n+namespace xla::gpu::spirv {\n+namespace {\n+\n+TEST(SpirvBackendTest, TestUnsupportedExtensions) {\n+  llvm::Triple target_triple(\"spirv64-unknown-unknown\");\n+  const std::vector<std::string> unsupported_extensions = {\n+      \"SPV_EXT_optnone\", \"SPV_EXT_arithmetic_fence\", \"SPV_EXT_hypthetical_name\",\n+      \"SPV_KHR_uniform_group_instructions\", \"SPV_KHR_linkonce_odr\"};\n+\n+  auto extensions =\n+      RemoveUnsupportedExtensionsFromAll(target_triple, unsupported_extensions);\n+  auto extensions_set =\n+      std::set<std::string>(extensions.begin(), extensions.end());\n+\n+  EXPECT_EQ(extensions_set.find(\"SPV_EXT_optnone\"), extensions_set.end());\n+  EXPECT_EQ(extensions_set.find(\"SPV_EXT_arithmetic_fence\"),\n+            extensions_set.end());\n+  EXPECT_EQ(extensions_set.find(\"SPV_EXT_hypthetical_name\"),\n+            extensions_set.end());\n+  EXPECT_EQ(extensions_set.find(\"SPV_KHR_uniform_group_instructions\"),\n+            extensions_set.end());\n+  EXPECT_EQ(extensions_set.find(\"SPV_KHR_linkonce_odr\"), extensions_set.end());\n+  EXPECT_NE(extensions_set.find(\"SPV_KHR_cooperative_matrix\"),\n+            extensions_set.end());\n+  EXPECT_NE(extensions_set.find(\"SPV_EXT_shader_atomic_float_add\"),\n+            extensions_set.end());\n+}\n+\n+}  // namespace\n+}  // namespace xla::gpu::spirv"
+        }
+    ],
+    "stats": {
+        "total": 102,
+        "additions": 101,
+        "deletions": 1
+    }
+}

@@ -1,0 +1,96 @@
+{
+    "author": "jcai19",
+    "message": "[XLA][Numerics][HLO Value Tracking] Set original values properly when exporting stableHLO tuple results to HLO\n\nPiperOrigin-RevId: 816810263",
+    "sha": "ffaaaec04057b73880d5968aa1cffb8196a17acc",
+    "files": [
+        {
+            "sha": "1b0208994b556e2763a9c71bec4f1c7223418504",
+            "filename": "third_party/xla/xla/hlo/builder/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ffaaaec04057b73880d5968aa1cffb8196a17acc/third_party%2Fxla%2Fxla%2Fhlo%2Fbuilder%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ffaaaec04057b73880d5968aa1cffb8196a17acc/third_party%2Fxla%2Fxla%2Fhlo%2Fbuilder%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fbuilder%2FBUILD?ref=ffaaaec04057b73880d5968aa1cffb8196a17acc",
+            "patch": "@@ -195,6 +195,7 @@ xla_cc_test(\n         \"//xla:comparison_util\",\n         \"//xla:debug_options_flags\",\n         \"//xla:shape_util\",\n+        \"//xla:tuple_tree\",\n         \"//xla:util\",\n         \"//xla:xla_data_proto_cc\",\n         \"//xla/hlo/ir:hlo\","
+        },
+        {
+            "sha": "b033159e9fcc92ff349ac7602e971ae602f65a68",
+            "filename": "third_party/xla/xla/hlo/builder/xla_builder.cc",
+            "status": "modified",
+            "additions": 43,
+            "deletions": 0,
+            "changes": 43,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ffaaaec04057b73880d5968aa1cffb8196a17acc/third_party%2Fxla%2Fxla%2Fhlo%2Fbuilder%2Fxla_builder.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ffaaaec04057b73880d5968aa1cffb8196a17acc/third_party%2Fxla%2Fxla%2Fhlo%2Fbuilder%2Fxla_builder.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fbuilder%2Fxla_builder.cc?ref=ffaaaec04057b73880d5968aa1cffb8196a17acc",
+            "patch": "@@ -50,6 +50,7 @@ limitations under the License.\n #include \"xla/hlo/builder/xla_computation.h\"\n #include \"xla/hlo/ir/hlo_input_output_alias_config.h\"\n #include \"xla/hlo/ir/hlo_opcode.h\"\n+#include \"xla/hlo/ir/hlo_original_value.h\"\n #include \"xla/hlo/ir/hlo_sharding.h\"\n #include \"xla/layout.h\"\n #include \"xla/layout_util.h\"\n@@ -2052,6 +2053,33 @@ absl::StatusOr<XlaOp> XlaBuilder::TupleInternal(\n     const Shape& shape, absl::Span<const XlaOp> elements) {\n   HloInstructionProto instr;\n   *instr.mutable_shape() = shape.ToProto();\n+  // Create a new original value for the tuple instruction. The original value\n+  // for each element is copied to the corresponding position in the tuple\n+  // original value.\n+  std::shared_ptr<OriginalValue> original_value =\n+      std::make_shared<OriginalValue>(shape);\n+  bool has_original_value = false;\n+  for (int64_t i = 0; i < elements.size(); ++i) {\n+    HloInstructionProto* element_instr =\n+        xla::internal::XlaBuilderFriend::GetInstruction(elements[i]);\n+    if (element_instr->has_original_value()) {\n+      has_original_value = true;\n+      auto element_original_value =\n+          xla::OriginalValue::FromProto(element_instr->original_value());\n+      original_value->mutable_tree()\n+          ->CopySubtreeFrom(/*other*/\n+                            xla::OriginalValue::FromProto(\n+                                element_instr->original_value())\n+                                ->tree(),\n+                            /*src_index=*/{}, /*dst_index=*/{i});\n+    }\n+  }\n+  std::optional<OriginalValueProto> original_value_proto;\n+  if (has_original_value) {\n+    original_value_proto = original_value->ToProto();\n+  }\n+  xla::XlaScopedOriginalValueAssignment original_value_assignment(\n+      this, original_value_proto);\n   return AddInstruction(std::move(instr), HloOpcode::kTuple, elements);\n }\n \n@@ -2080,6 +2108,21 @@ absl::StatusOr<XlaOp> XlaBuilder::GetTupleElementInternal(const Shape& shape,\n   HloInstructionProto instr;\n   *instr.mutable_shape() = shape.ToProto();\n   instr.set_tuple_index(index);\n+\n+  std::optional<OriginalValueProto> original_value_proto = original_value();\n+  if (original_value_proto.has_value()) {\n+    auto original_value = xla::OriginalValue::FromProto(*original_value_proto);\n+    auto subtree = original_value->tree().Subtree({index});\n+    if (subtree.ok()) {\n+      auto element_original_value =\n+          std::make_shared<xla::OriginalValue>(subtree.value());\n+      original_value_proto = element_original_value->ToProto();\n+    }\n+  }\n+\n+  XlaScopedOriginalValueAssignment original_value_assignment(\n+      this, original_value_proto);\n+\n   return AddInstruction(std::move(instr), HloOpcode::kGetTupleElement,\n                         {tuple_data});\n }"
+        },
+        {
+            "sha": "67c2c94392a765958cca3e7679f190c31f9ba66a",
+            "filename": "third_party/xla/xla/hlo/builder/xla_builder_test.cc",
+            "status": "modified",
+            "additions": 47,
+            "deletions": 0,
+            "changes": 47,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ffaaaec04057b73880d5968aa1cffb8196a17acc/third_party%2Fxla%2Fxla%2Fhlo%2Fbuilder%2Fxla_builder_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ffaaaec04057b73880d5968aa1cffb8196a17acc/third_party%2Fxla%2Fxla%2Fhlo%2Fbuilder%2Fxla_builder_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fbuilder%2Fxla_builder_test.cc?ref=ffaaaec04057b73880d5968aa1cffb8196a17acc",
+            "patch": "@@ -47,6 +47,7 @@ limitations under the License.\n #include \"xla/hlo/ir/hlo_instructions.h\"\n #include \"xla/hlo/ir/hlo_module.h\"\n #include \"xla/hlo/ir/hlo_opcode.h\"\n+#include \"xla/hlo/ir/hlo_original_value.h\"\n #include \"xla/hlo/ir/hlo_sharding.h\"\n #include \"xla/hlo/parser/hlo_parser.h\"\n #include \"xla/hlo/testlib/pattern_matcher_gmock.h\"\n@@ -58,6 +59,7 @@ limitations under the License.\n #include \"xla/shape.h\"\n #include \"xla/shape_util.h\"\n #include \"xla/tsl/platform/statusor.h\"\n+#include \"xla/tuple_tree.h\"\n #include \"xla/util.h\"\n #include \"xla/xla_data.pb.h\"\n #include \"tsl/platform/status_matchers.h\"\n@@ -4066,5 +4068,50 @@ TEST(XlaBuilderTest, BuildProtoWritesFullRootId) {\n   }\n }\n \n+TEST(XlaBuilderTest, OriginalValue) {\n+  XlaBuilder b(TestName());\n+  auto create_parameter_with_original_value =\n+      [&b](int64_t index, const Shape& shape, const std::string& param_name,\n+           const xla::OriginalArray& original_array) {\n+        auto original_value = std::make_shared<xla::OriginalValue>(shape);\n+        original_value->mutable_tree()->begin()->second = original_array;\n+        b.SetOriginalValue(original_value->ToProto());\n+        return Parameter(&b, index, shape, param_name);\n+      };\n+\n+  TF_ASSERT_OK_AND_ASSIGN(const Shape shape0, ParseShape(\"f32[2, 4]\"));\n+  auto original_array0 = xla::OriginalArray{\"x\", {}};\n+  auto param0 = create_parameter_with_original_value(0, shape0, \"param0\",\n+                                                     original_array0);\n+\n+  TF_ASSERT_OK_AND_ASSIGN(const Shape shape1, ParseShape(\"f32[2, 4]\"));\n+  auto original_array1 = xla::OriginalArray{\"y\", {}};\n+  auto param1 = create_parameter_with_original_value(1, shape1, \"param1\",\n+                                                     original_array1);\n+\n+  GetTupleElement(Tuple(&b, {param0, param1}), 1);\n+  TF_ASSERT_OK_AND_ASSIGN(const std::unique_ptr<xla::HloModule> module,\n+                          BuildHloModule(b));\n+\n+  HloInstruction* gte = GetRoot(*module);\n+  EXPECT_THAT(gte->opcode(), HloOpcode::kGetTupleElement);\n+  xla::OriginalValue expected_gte_original_value(\n+      TupleTree<std::optional<xla::OriginalArray>>::Node::Leaf(\n+          original_array1));\n+  std::shared_ptr<xla::OriginalValue> gte_original_value =\n+      gte->original_value();\n+  EXPECT_NE(gte_original_value, nullptr);\n+  EXPECT_THAT(*gte_original_value, expected_gte_original_value);\n+\n+  const HloInstruction* tuple = gte->operand(0);\n+  EXPECT_THAT(tuple->opcode(), HloOpcode::kTuple);\n+  std::shared_ptr<xla::OriginalValue> tuple_original_value =\n+      tuple->original_value();\n+  xla::OriginalValue expected_tuple_original_value(\n+      {original_array0, original_array1});\n+  EXPECT_NE(tuple_original_value, nullptr);\n+  EXPECT_THAT(*tuple_original_value, expected_tuple_original_value);\n+}\n+\n }  // namespace\n }  // namespace xla"
+        },
+        {
+            "sha": "34446cf4f9aecd6013770d702daf251f3bc471e3",
+            "filename": "third_party/xla/xla/hlo/translate/mhlo_to_hlo/mlir_hlo_to_hlo.cc",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 23,
+            "changes": 23,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ffaaaec04057b73880d5968aa1cffb8196a17acc/third_party%2Fxla%2Fxla%2Fhlo%2Ftranslate%2Fmhlo_to_hlo%2Fmlir_hlo_to_hlo.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ffaaaec04057b73880d5968aa1cffb8196a17acc/third_party%2Fxla%2Fxla%2Fhlo%2Ftranslate%2Fmhlo_to_hlo%2Fmlir_hlo_to_hlo.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Ftranslate%2Fmhlo_to_hlo%2Fmlir_hlo_to_hlo.cc?ref=ffaaaec04057b73880d5968aa1cffb8196a17acc",
+            "patch": "@@ -1315,21 +1315,6 @@ void BuildGetTupleElementsForTupleResults(\n     mlir::Operation* op, xla::XlaOp tuple, xla::XlaBuilder* builder,\n     llvm::DenseMap<mlir::Value, xla::XlaOp>& values,\n     unsigned num_implicit_results = 0) {\n-  auto get_tuple_element_original_value_proto =\n-      [&builder](int64_t index) -> std::optional<xla::OriginalValueProto> {\n-    auto original_value_proto = builder->original_value();\n-    if (original_value_proto.has_value()) {\n-      auto original_value =\n-          xla::OriginalValue::FromProto(*original_value_proto);\n-      auto subtree = original_value->tree().Subtree({index});\n-      if (subtree.ok()) {\n-        auto element_original_value =\n-            std::make_shared<xla::OriginalValue>(std::move(subtree.value()));\n-        return element_original_value->ToProto();\n-      }\n-    }\n-    return std::nullopt;\n-  };\n \n   const std::optional<xla::OpSharding>& sharding = builder->sharding();\n   if (sharding.has_value()) {\n@@ -1342,19 +1327,11 @@ void BuildGetTupleElementsForTupleResults(\n       xla::XlaScopedShardingAssignment scoped_sharding(\n           builder,\n           is_tuple_sharding ? sharding->tuple_shardings(index) : sharding);\n-      // Set the original value for the get-tuple-element.\n-      xla::XlaScopedOriginalValueAssignment original_value(\n-          builder,\n-          get_tuple_element_original_value_proto(static_cast<int64_t>(index)));\n       values[result] = xla::GetTupleElement(tuple, index);\n     }\n   } else {\n     xla::XlaScopedShardingAssignment scoped_sharding(builder, std::nullopt);\n     for (auto [index, result] : llvm::enumerate(op->getResults())) {\n-      // Set the original value for the get-tuple-element.\n-      xla::XlaScopedOriginalValueAssignment original_value(\n-          builder,\n-          get_tuple_element_original_value_proto(static_cast<int64_t>(index)));\n       values[result] = xla::GetTupleElement(tuple, index);\n     }\n   }"
+        },
+        {
+            "sha": "e32d833d0d7c2dcacd3f91d8d1fa62518c6f29ba",
+            "filename": "third_party/xla/xla/hlo/translate/mhlo_to_hlo/tests/export.mlir",
+            "status": "modified",
+            "additions": 21,
+            "deletions": 0,
+            "changes": 21,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ffaaaec04057b73880d5968aa1cffb8196a17acc/third_party%2Fxla%2Fxla%2Fhlo%2Ftranslate%2Fmhlo_to_hlo%2Ftests%2Fexport.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ffaaaec04057b73880d5968aa1cffb8196a17acc/third_party%2Fxla%2Fxla%2Fhlo%2Ftranslate%2Fmhlo_to_hlo%2Ftests%2Fexport.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Ftranslate%2Fmhlo_to_hlo%2Ftests%2Fexport.mlir?ref=ffaaaec04057b73880d5968aa1cffb8196a17acc",
+            "patch": "@@ -3218,6 +3218,27 @@ func.func @main(%arg0: tensor<10xf32>) -> tensor<8xf32> {\n   return %0#0 : tensor<8xf32>\n }\n \n+// -----\n+// CHECK: HloModule\n+// CHECK: ENTRY\n+// CHECK-LITERAL:  %[[CONSTANT:.*]] = s32[] constant(0), origin={{\"c\"}}\n+// CHECK-LITERAL:  %[[ARG0:.*]] = s32[] parameter(0), origin={{\"a\"}}\n+// CHECK-LITERAL:  %[[ARG1:.*]] = s32[] parameter(1), origin={{\"b\"}}\n+// CHECK-LITERAL:  tuple(%[[CONSTANT]], %[[ARG0]], %[[ARG1]]), origin={({\"c\"}, {\"a\"}, {\"b\"})}\n+func.func @main(%arg0: tensor<i32> {mhlo.original_value = \"{{\\22a\\22}}\"}, %arg1: tensor<i32> {mhlo.original_value = \"{{\\22b\\22}}\"}) -> (tensor<i32>) {\n+  %c = stablehlo.constant {mhlo.original_value = \"{{\\22c\\22}}\"} dense<0> : tensor<i32>\n+  %0:2 = stablehlo.while(%iterArg = %c, %iterArg_0 = %arg0) : tensor<i32>, tensor<i32> attributes {mhlo.original_value = \"{({\\22while\\22 {0}}, {\\22while\\22 {1}}, {\\22while\\22 {2}})}\"}\n+  cond {\n+    %1 = stablehlo.compare  LT, %iterArg, %arg1 : (tensor<i32>, tensor<i32>) -> tensor<i1>\n+    stablehlo.return %1 : tensor<i1>\n+  } do {\n+    %1 = stablehlo.add %iterArg, %iterArg_0 : tensor<i32>\n+    stablehlo.return %1, %1: tensor<i32>, tensor<i32>\n+  }\n+  return %0#1 : tensor<i32>\n+}\n+\n+\n // -----\n \n // CHECK: HloModule"
+        },
+        {
+            "sha": "cd03801f9b877f19794ed6188bd5d2287a86c797",
+            "filename": "third_party/xla/xla/hlo/translate/mhlo_to_hlo/translate.cc",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 11,
+            "changes": 21,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ffaaaec04057b73880d5968aa1cffb8196a17acc/third_party%2Fxla%2Fxla%2Fhlo%2Ftranslate%2Fmhlo_to_hlo%2Ftranslate.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ffaaaec04057b73880d5968aa1cffb8196a17acc/third_party%2Fxla%2Fxla%2Fhlo%2Ftranslate%2Fmhlo_to_hlo%2Ftranslate.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Ftranslate%2Fmhlo_to_hlo%2Ftranslate.cc?ref=ffaaaec04057b73880d5968aa1cffb8196a17acc",
+            "patch": "@@ -15,6 +15,7 @@ limitations under the License.\n #include \"xla/hlo/translate/mhlo_to_hlo/translate.h\"\n \n #include <memory>\n+#include <optional>\n #include <utility>\n #include <vector>\n \n@@ -103,6 +104,15 @@ absl::Status ConvertMlirHloToHloViaBuilder(\n   for (mlir::BlockArgument& arg : block.getArguments()) {\n     auto num = arg.getArgNumber();\n     xla::Shape shape = xla::TypeToShape(arg.getType());\n+\n+    std::optional<OriginalValueProto> original_value_proto;\n+    if (auto original_value_attr = main.getArgAttrOfType<mlir::StringAttr>(\n+            num, xla::kMhloOriginalValueAttr)) {\n+      original_value_proto =\n+          xla::ConvertOriginalValue(original_value_attr.getValue());\n+    }\n+    xla::XlaScopedOriginalValueAssignment original_value_assignment(\n+        &builder, original_value_proto);\n     XlaOp argop =\n         xla::Parameter(&builder, num, shape, absl::StrCat(\"Arg_\", num));\n     xla_params.push_back(argop);\n@@ -141,17 +151,6 @@ absl::Status ConvertMlirHloToHloViaBuilder(\n     }\n   }\n \n-  for (int i = 0; i < main.getNumArguments(); ++i) {\n-    if (auto original_value_attr = main.getArgAttrOfType<mlir::StringAttr>(\n-            i, xla::kMhloOriginalValueAttr)) {\n-      *computation.mutable_proto()\n-           ->mutable_computations(0)\n-           ->mutable_instructions(i)\n-           ->mutable_original_value() =\n-          *ConvertOriginalValue(original_value_attr);\n-    }\n-  }\n-\n   auto hlo_module = computation.proto();\n   mlir::StringRef module_name = module.getName() ? *module.getName() : \"main\";\n   hlo_module.set_name(module_name.str());"
+        },
+        {
+            "sha": "c86236f84e88bc6ead7f5e885d6da56280b68b04",
+            "filename": "third_party/xla/xla/hlo/translate/tests/stablehlo.mlir",
+            "status": "modified",
+            "additions": 20,
+            "deletions": 0,
+            "changes": 20,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ffaaaec04057b73880d5968aa1cffb8196a17acc/third_party%2Fxla%2Fxla%2Fhlo%2Ftranslate%2Ftests%2Fstablehlo.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ffaaaec04057b73880d5968aa1cffb8196a17acc/third_party%2Fxla%2Fxla%2Fhlo%2Ftranslate%2Ftests%2Fstablehlo.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Ftranslate%2Ftests%2Fstablehlo.mlir?ref=ffaaaec04057b73880d5968aa1cffb8196a17acc",
+            "patch": "@@ -2000,6 +2000,26 @@ func.func @main(%arg0: tensor<10xf32>) -> tensor<8xf32> {\n   return %0#0 : tensor<8xf32>\n }\n \n+// -----\n+// CHECK-LABEL: HloModule main\n+// CHECK: ENTRY\n+// CHECK-LITERAL:  %[[CONSTANT:.*]] = s32[] constant(0), origin={{\"c\"}}\n+// CHECK-LITERAL:  %[[ARG0:.*]] = s32[] parameter(0), origin={{\"a\"}}\n+// CHECK-LITERAL:  %[[ARG1:.*]] = s32[] parameter(1), origin={{\"b\"}}\n+// CHECK-LITERAL:  tuple(%[[CONSTANT]], %[[ARG0]], %[[ARG1]]), origin={({\"c\"}, {\"a\"}, {\"b\"})}\n+func.func @main(%arg0: tensor<i32> {mhlo.original_value = \"{{\\22a\\22}}\"}, %arg1: tensor<i32> {mhlo.original_value = \"{{\\22b\\22}}\"}) -> (tensor<i32>) {\n+  %c = stablehlo.constant {mhlo.original_value = \"{{\\22c\\22}}\"} dense<0> : tensor<i32>\n+  %0:2 = stablehlo.while(%iterArg = %c, %iterArg_0 = %arg0) : tensor<i32>, tensor<i32> attributes {mhlo.original_value = \"{({\\22while\\22 {0}}, {\\22while\\22 {1}}, {\\22while\\22 {2}})}\"}\n+  cond {\n+    %1 = stablehlo.compare  LT, %iterArg, %arg1 : (tensor<i32>, tensor<i32>) -> tensor<i1>\n+    stablehlo.return %1 : tensor<i1>\n+  } do {\n+    %1 = stablehlo.add %iterArg, %iterArg_0 : tensor<i32>\n+    stablehlo.return %1, %1: tensor<i32>, tensor<i32>\n+  }\n+  return %0#1 : tensor<i32>\n+}\n+\n // -----\n \n // CHECK-LABEL: HloModule main"
+        }
+    ],
+    "stats": {
+        "total": 176,
+        "additions": 142,
+        "deletions": 34
+    }
+}

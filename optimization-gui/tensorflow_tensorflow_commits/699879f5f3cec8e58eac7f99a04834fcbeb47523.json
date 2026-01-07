@@ -1,0 +1,72 @@
+{
+    "author": "ermilovmaxim",
+    "message": "add pcie_bandwidth field to DeviceDescription\n\nPiperOrigin-RevId: 824738638",
+    "sha": "699879f5f3cec8e58eac7f99a04834fcbeb47523",
+    "files": [
+        {
+            "sha": "79b1a239c8475a0a61722f821e4c14a9ebe5e17f",
+            "filename": "third_party/xla/xla/service/gpu/model/gpu_collective_performance_model.cc",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 10,
+            "changes": 15,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/699879f5f3cec8e58eac7f99a04834fcbeb47523/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fmodel%2Fgpu_collective_performance_model.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/699879f5f3cec8e58eac7f99a04834fcbeb47523/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fmodel%2Fgpu_collective_performance_model.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fmodel%2Fgpu_collective_performance_model.cc?ref=699879f5f3cec8e58eac7f99a04834fcbeb47523",
+            "patch": "@@ -112,9 +112,6 @@ struct CudaBandwidthSettings {\n   static constexpr double kSm80NvlinkBandwidth = 20.0;\n   static constexpr double kSm90NvlinkBandwidth = 20.0;\n \n-  // PCIE bandwidth for PCI Gen3 x16\n-  static constexpr double kPciBandwidth = 12.0;\n-\n   // Discount factor for ring algorithm\n   static constexpr double kRingAlgorithmDiscountFactor = 0.92;\n \n@@ -211,9 +208,6 @@ struct RocmBandwidthSettings {\n   static constexpr double kMi200InfinityFabricBandwidth = 75.0;\n   static constexpr double kMi300InfinityFabricBandwidth = 112.0;\n \n-  // PCIe bandwidth for PCI Gen4 x16 (approximate)\n-  static constexpr double kPciBandwidth = 32.0;\n-\n   // Discount factor for ring algorithm (based on ROCm NCCL implementation)\n   static constexpr double kRingAlgorithmDiscountFactor = 0.90;\n \n@@ -321,10 +315,11 @@ absl::Duration ComputeAllreduceTimeImpl(\n       std::max(num_devices, GetMinNumberOfChannels(CollectiveAlgo::RING));\n   int64_t num_channels =\n       std::max(min_nchannels, GetNcclMaxNumChannels(CollectiveAlgo::RING));\n-  int default_threads =\n-      (bw_intra_node * num_channels <= bandwidth_settings.kPciBandwidth)\n-          ? 256\n-          : bandwidth_settings.kLL128NumThreads;\n+  int64_t pcie_bandwidth_gbps =\n+      gpu_device_info.pcie_bandwidth() / 1024 / 1024 / 1024;\n+  int default_threads = (bw_intra_node * num_channels <= pcie_bandwidth_gbps)\n+                            ? 256\n+                            : bandwidth_settings.kLL128NumThreads;\n \n   int warp_size = gpu_device_info.threads_per_warp();\n   int num_threads ="
+        },
+        {
+            "sha": "e66d022a0e04ef760cb7a67f9008895aabf02dcf",
+            "filename": "third_party/xla/xla/stream_executor/cuda/cuda_executor.cc",
+            "status": "modified",
+            "additions": 46,
+            "deletions": 0,
+            "changes": 46,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/699879f5f3cec8e58eac7f99a04834fcbeb47523/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_executor.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/699879f5f3cec8e58eac7f99a04834fcbeb47523/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_executor.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_executor.cc?ref=699879f5f3cec8e58eac7f99a04834fcbeb47523",
+            "patch": "@@ -47,6 +47,7 @@ limitations under the License.\n #include \"third_party/gpus/cuda/include/cuda.h\"\n #include \"third_party/gpus/cuda/include/cuda_runtime_api.h\"\n #include \"third_party/gpus/cuda/include/driver_types.h\"\n+#include \"third_party/gpus/cuda/nvml/include/nvml.h\"\n #include \"xla/backends/gpu/collectives/gpu_collectives.h\"\n #include \"xla/core/collectives/collectives.h\"\n #include \"xla/core/collectives/collectives_registry.h\"\n@@ -690,6 +691,39 @@ absl::StatusOr<CUmulticastObjectProp> CreateMulticastObjectProperties(\n   return multicast_properties;\n }\n \n+absl::StatusOr<int64_t> GetDevicePcieBandwidth(int device_ordinal) {\n+  nvmlDevice_t nvml_device;\n+  nvmlReturn_t result =\n+      nvmlDeviceGetHandleByIndex(device_ordinal, &nvml_device);\n+  if (result != NVML_SUCCESS) {\n+    return absl::InternalError(\n+        absl::StrCat(\"nvmlDeviceGetHandleByIndex failed with \", result));\n+  }\n+\n+  // nvmlDeviceGetPcieSpeed returns wrong information. Verified with\n+  // nvbandwidth.\n+  unsigned int link_gen, link_width;\n+  result = nvmlDeviceGetCurrPcieLinkGeneration(nvml_device, &link_gen);\n+  if (result != NVML_SUCCESS) {\n+    return absl::InternalError(absl::StrCat(\n+        \"nvmlDeviceGetCurrPcieLinkGeneration failed with \", result));\n+  }\n+\n+  result = nvmlDeviceGetCurrPcieLinkWidth(nvml_device, &link_width);\n+  if (result != NVML_SUCCESS) {\n+    return absl::InternalError(\n+        absl::StrCat(\"nvmlDeviceGetCurrPcieLinkWidth failed with \", result));\n+  }\n+\n+  // PCIe v1 single lane speed. 0.25 GB/s\n+  int64_t lane_speed = 0.25 * 1024 * 1024 * 1024;\n+  for (int i = 1; i < link_gen; i++) {\n+    lane_speed *= 2;\n+  }\n+\n+  return lane_speed * link_width;\n+}\n+\n }  // namespace\n \n // Given const GPU memory, returns a libcuda device pointer datatype, suitable\n@@ -1629,6 +1663,18 @@ CudaExecutor::CreateDeviceDescription(int device_ordinal) {\n                               int64_t{mem_bus_width_bits.value()} / 8);\n   }\n \n+  {\n+    absl::StatusOr<int64_t> status_or_bandwidth =\n+        GetDevicePcieBandwidth(device_ordinal);\n+    if (status_or_bandwidth.ok()) {\n+      desc.set_pcie_bandwidth(*status_or_bandwidth);\n+    } else {\n+      LOG(ERROR) << status_or_bandwidth.status().message()\n+                 << \" Assuming PCIe gen 3 x16 bandwidth.\";\n+      status_or_bandwidth = 16LL * 1024 * 1024 * 1024;\n+    }\n+  }\n+\n   {\n     BlockDim block_dim_limit;\n     TF_RETURN_IF_ERROR(FillBlockDimLimit(device, &block_dim_limit));"
+        },
+        {
+            "sha": "44acbdec306594ff3e6031e7b8d9a30e5e91dc81",
+            "filename": "third_party/xla/xla/stream_executor/cuda/cuda_executor_test.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/699879f5f3cec8e58eac7f99a04834fcbeb47523/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_executor_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/699879f5f3cec8e58eac7f99a04834fcbeb47523/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_executor_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_executor_test.cc?ref=699879f5f3cec8e58eac7f99a04834fcbeb47523",
+            "patch": "@@ -64,6 +64,7 @@ TEST(CudaExecutorTest, CreateDeviceDescription) {\n   EXPECT_NE(result->driver_version(), kNullVersion);\n   EXPECT_NE(result->compile_time_toolkit_version(), kNullVersion);\n \n+  EXPECT_GT(result->pcie_bandwidth(), 1024 * 1024);\n   EXPECT_THAT(result->platform_version(), Not(IsEmpty()));\n   EXPECT_THAT(result->name(), Not(IsEmpty()));\n   EXPECT_THAT(result->model_str(), Not(IsEmpty()));"
+        },
+        {
+            "sha": "b97cc01bd0f02b9b83130bde3fef5e69f310762c",
+            "filename": "third_party/xla/xla/stream_executor/device_description.h",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 11,
+            "changes": 22,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/699879f5f3cec8e58eac7f99a04834fcbeb47523/third_party%2Fxla%2Fxla%2Fstream_executor%2Fdevice_description.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/699879f5f3cec8e58eac7f99a04834fcbeb47523/third_party%2Fxla%2Fxla%2Fstream_executor%2Fdevice_description.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fstream_executor%2Fdevice_description.h?ref=699879f5f3cec8e58eac7f99a04834fcbeb47523",
+            "patch": "@@ -154,34 +154,28 @@ class DeviceDescription {\n   // Returns the limit on the total number of threads that can be launched in a\n   // single block; i.e. the limit on x * y * z dimensions of a ThreadDim.\n   // This limit affects what constitutes a legitimate kernel launch request.\n-  const int64_t& threads_per_block_limit() const {\n-    return threads_per_block_limit_;\n-  }\n+  int64_t threads_per_block_limit() const { return threads_per_block_limit_; }\n \n   // Returns the limit on the total number of threads that can be simultaneously\n   // launched on a given multiprocessor.\n-  const int64_t& threads_per_core_limit() const {\n-    return threads_per_core_limit_;\n-  }\n+  int64_t threads_per_core_limit() const { return threads_per_core_limit_; }\n \n   // Returns the number of threads per warp/wavefront.\n   constexpr int64_t threads_per_warp() const { return threads_per_warp_; }\n \n   // Returns the limit on the total number of registers per core.\n-  const int64_t& registers_per_core_limit() const {\n-    return registers_per_core_limit_;\n-  }\n+  int64_t registers_per_core_limit() const { return registers_per_core_limit_; }\n \n   // Returns the limit on the total number of registers that can be\n   // simultaneously used by a block.\n-  const int64_t& registers_per_block_limit() const {\n+  int64_t registers_per_block_limit() const {\n     return registers_per_block_limit_;\n   }\n \n   // Returns the number of address bits available to kernel code running on the\n   // platform. This affects things like the maximum allocation size and perhaps\n   // types used in kernel code such as size_t.\n-  const int64_t& device_address_bits() const { return device_address_bits_; }\n+  int64_t device_address_bits() const { return device_address_bits_; }\n \n   // Returns the device memory size in bytes.\n   int64_t device_memory_size() const { return device_memory_size_; }\n@@ -194,6 +188,9 @@ class DeviceDescription {\n   // host and device.)\n   int64_t memory_bandwidth() const { return memory_bandwidth_; }\n \n+  // Returns the PCIe memory bandwidth in bytes/sec.\n+  int64_t pcie_bandwidth() const { return pcie_bandwidth_; }\n+\n   // Returns the device's core clock rate in GHz.\n   float clock_rate_ghz() const { return clock_rate_ghz_; }\n \n@@ -340,6 +337,7 @@ class DeviceDescription {\n   void set_device_memory_size(int64_t value) { device_memory_size_ = value; }\n   void set_l2_cache_size(int64_t value) { l2_cache_size_ = value; }\n   void set_memory_bandwidth(int64_t value) { memory_bandwidth_ = value; }\n+  void set_pcie_bandwidth(int64_t value) { pcie_bandwidth_ = value; }\n \n   void set_shared_memory_per_core(int64_t value) {\n     shared_memory_per_core_ = value;\n@@ -400,7 +398,9 @@ class DeviceDescription {\n   int64_t device_address_bits_ = kUninitialized<int64_t>;\n   int64_t device_memory_size_ = kUninitialized<int64_t>;\n   int64_t l2_cache_size_ = kUninitialized<int64_t>;\n+\n   int64_t memory_bandwidth_ = kUninitialized<int64_t>;\n+  int64_t pcie_bandwidth_ = kUninitialized<int64_t>;\n \n   // Shared memory limits on a given device.\n   int64_t shared_memory_per_core_ = kUninitialized<int64_t>;"
+        },
+        {
+            "sha": "013c8e793b5b8e9c0ce30ce93173ecc120265ee1",
+            "filename": "third_party/xla/xla/stream_executor/rocm/rocm_executor.cc",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/699879f5f3cec8e58eac7f99a04834fcbeb47523/third_party%2Fxla%2Fxla%2Fstream_executor%2Frocm%2Frocm_executor.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/699879f5f3cec8e58eac7f99a04834fcbeb47523/third_party%2Fxla%2Fxla%2Fstream_executor%2Frocm%2Frocm_executor.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fstream_executor%2Frocm%2Frocm_executor.cc?ref=699879f5f3cec8e58eac7f99a04834fcbeb47523",
+            "patch": "@@ -1121,6 +1121,9 @@ RocmExecutor::CreateDeviceDescription(int device_ordinal) {\n     desc.set_l2_cache_size(prop.l2CacheSize);\n   }\n \n+  // PCIe bandwidth for PCI Gen4 x16 (approximate)\n+  desc.set_pcie_bandwidth(32LL * 1024 * 1024 * 1024);\n+\n   {\n     auto ecc_enabled_or = IsEccEnabled(device);\n     if (!ecc_enabled_or.ok()) {"
+        }
+    ],
+    "stats": {
+        "total": 87,
+        "additions": 66,
+        "deletions": 21
+    }
+}

@@ -1,0 +1,36 @@
+{
+    "author": "sohaibiftikhar",
+    "message": "[XLA:GPU]: Replace holds alternative to use compile time failures.\n\nWhile extending the arguments I realised that the current implementation\ncan fail at runtime on argument extension for KernelArgs. Making it a compile\ntime failure is a safer option.\n\nPiperOrigin-RevId: 805801521",
+    "sha": "268fbcdc9d93dd33a5d6729e2765113da6e85d05",
+    "files": [
+        {
+            "sha": "efbccaf082e9181ed39d7a8892cfb37ec205bfd9",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/268fbcdc9d93dd33a5d6729e2765113da6e85d05/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/268fbcdc9d93dd33a5d6729e2765113da6e85d05/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2FBUILD?ref=268fbcdc9d93dd33a5d6729e2765113da6e85d05",
+            "patch": "@@ -836,6 +836,7 @@ cc_library(\n         \"@com_google_absl//absl/strings:string_view\",\n         \"@com_google_absl//absl/synchronization\",\n         \"@com_google_absl//absl/types:span\",\n+        \"@llvm-project//llvm:Support\",\n     ],\n )\n "
+        },
+        {
+            "sha": "acdc500b115a90f37416beae155559f1503189ef",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/kernel_thunk.cc",
+            "status": "modified",
+            "additions": 30,
+            "deletions": 22,
+            "changes": 52,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/268fbcdc9d93dd33a5d6729e2765113da6e85d05/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fkernel_thunk.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/268fbcdc9d93dd33a5d6729e2765113da6e85d05/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fkernel_thunk.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fkernel_thunk.cc?ref=268fbcdc9d93dd33a5d6729e2765113da6e85d05",
+            "patch": "@@ -31,6 +31,7 @@ limitations under the License.\n #include \"absl/strings/str_format.h\"\n #include \"absl/synchronization/mutex.h\"\n #include \"absl/types/span.h\"\n+#include \"llvm/ADT/STLExtras.h\"\n #include \"xla/backends/gpu/runtime/thunk.h\"\n #include \"xla/backends/gpu/runtime/thunk.pb.h\"\n #include \"xla/codegen/emitters/kernel_arguments.h\"\n@@ -168,30 +169,37 @@ absl::Status KernelThunk::Initialize(const InitializeParams& params) {\n   return absl::OkStatus();\n }\n \n+void PrintBufferContents(se::Stream*, int input_idx, se::TensorMap tensor_map) {\n+  VLOG(100) << \"TENSOR_MAP(\" << input_idx << \") = \";\n+  for (std::byte element : tensor_map.storage) {\n+    VLOG(100) << absl::StrFormat(\"%x \", static_cast<unsigned>(element));\n+  }\n+}\n+\n+void PrintBufferContents(se::Stream* stream, int input_idx,\n+                         se::DeviceMemoryBase buf) {\n+  auto host_buffer = std::make_unique<char[]>(buf.size());\n+  CHECK_OK(stream->Memcpy(host_buffer.get(), buf, buf.size()));\n+  CHECK_OK(stream->BlockHostUntilDone());\n+\n+  std::string buffer_contents;\n+  for (int i = 0; i < buf.size(); ++i) {\n+    absl::StrAppendFormat(&buffer_contents, \"%x \",\n+                          static_cast<unsigned>(host_buffer[i]));\n+  }\n+  VLOG(100) << \"BUF(\" << input_idx << \") = \" << buffer_contents;\n+}\n+\n static void PrintBufferContents(\n     se::Stream* stream, absl::Span<const se::KernelArgument> kernel_args) {\n-  int input_idx = 0;\n-  for (const se::KernelArgument& arg : kernel_args) {\n-    if (std::holds_alternative<se::DeviceMemoryBase>(arg)) {\n-      se::DeviceMemoryBase buf = std::get<se::DeviceMemoryBase>(arg);\n-\n-      auto host_buffer = std::make_unique<char[]>(buf.size());\n-      CHECK_OK(stream->Memcpy(host_buffer.get(), buf, buf.size()));\n-      CHECK_OK(stream->BlockHostUntilDone());\n-\n-      std::string buffer_contents;\n-      for (int i = 0; i < buf.size(); ++i) {\n-        absl::StrAppendFormat(&buffer_contents, \"%x \",\n-                              static_cast<unsigned>(host_buffer[i]));\n-      }\n-      VLOG(100) << \"BUF(\" << input_idx++ << \") = \" << buffer_contents;\n-    } else {\n-      se::TensorMap tensor_map = std::get<se::TensorMap>(arg);\n-      VLOG(100) << \"TENSOR_MAP(\" << input_idx++ << \") = \";\n-      for (std::byte element : tensor_map.storage) {\n-        VLOG(100) << absl::StrFormat(\"%x \", static_cast<unsigned>(element));\n-      }\n-    }\n+  for (const auto& [input_idx, arg] : llvm::enumerate(kernel_args)) {\n+    // pre-cpp-20-compat(P0588R1): Capturing structured bindings in lambdas is\n+    // ill-formed.\n+    std::visit(\n+        [&stream, &input_idx = input_idx](auto const& arg) {\n+          PrintBufferContents(stream, input_idx, arg);\n+        },\n+        arg);\n   }\n }\n "
+        }
+    ],
+    "stats": {
+        "total": 53,
+        "additions": 31,
+        "deletions": 22
+    }
+}

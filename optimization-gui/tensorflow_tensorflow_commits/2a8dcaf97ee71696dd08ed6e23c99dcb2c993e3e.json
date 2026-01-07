@@ -1,0 +1,36 @@
+{
+    "author": "zacmustin",
+    "message": "Optimize `PJRT_Executable_NumOutputs`.\n\nThis function causes significant overhead when enabling the C API because of its repeated calls to `GetOutputShapes`.\n\nIn this change, we rewrite the function to make use of [`PJRT_Executable.out_dimensions_sizes`](https://github.com/openxla/xla/blob/1e5c56807066808cd487159a63691cee7e406df6/xla/pjrt/c/pjrt_c_api_wrapper_impl.h#L157), which is **cached** on `PJRT_Executable`. Therefore, repeated calls to `Execute` become much cheaper. We must, however, make sure `out_dimensions` has been [`Populated`](https://github.com/openxla/xla/blob/1e5c56807066808cd487159a63691cee7e406df6/xla/pjrt/c/pjrt_c_api_wrapper_impl.cc#L172), so we do that in `...NumOutputs`. The new `EnsureExecutableOutputDimensionsPopulated` function eliminates code duplication.\n\n**Alternatives**:\n* *Calculate `NumOutputs` as-is, but cache the result on `PJRT_Executable` in a new `num_outputs` variable:* This is fine but makes `PJRT_Executable` bigger for no real reason, and we don't benefit from the already-cached `out_dimensions` win described above.\n* *Cache `GetOutputShapes` on PJRT_Executable, use that to calculate all output-shape-dependent functions (`PJRT_Executable_OutputDimensions`, `PJRT_Executable_NumOutputs`, `PJRT_Executable_OutputElementTypes`, etc):* Makes `PJRT_Executable` **much** bigger and would require re-writing all these functions to have (arguably) \"too much\" implementation details.\n\nPiperOrigin-RevId: 814095618",
+    "sha": "2a8dcaf97ee71696dd08ed6e23c99dcb2c993e3e",
+    "files": [
+        {
+            "sha": "f032c3eb87cd5e318838efb31f4c779d7a9dd2c2",
+            "filename": "third_party/xla/xla/pjrt/c/pjrt_c_api_gpu_test.cc",
+            "status": "modified",
+            "additions": 14,
+            "deletions": 0,
+            "changes": 14,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/2a8dcaf97ee71696dd08ed6e23c99dcb2c993e3e/third_party%2Fxla%2Fxla%2Fpjrt%2Fc%2Fpjrt_c_api_gpu_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/2a8dcaf97ee71696dd08ed6e23c99dcb2c993e3e/third_party%2Fxla%2Fxla%2Fpjrt%2Fc%2Fpjrt_c_api_gpu_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fc%2Fpjrt_c_api_gpu_test.cc?ref=2a8dcaf97ee71696dd08ed6e23c99dcb2c993e3e",
+            "patch": "@@ -286,6 +286,20 @@ TEST_F(PjrtCApiGpuExecutableTest, GetCompiledMemoryStats) {\n   EXPECT_EQ(ref_stats.host_temp_size_in_bytes, stats.host_temp_size_in_bytes);\n }\n \n+TEST_F(PjrtCApiGpuExecutableTest, GetNumOutputs) {\n+  auto executable = PjrtCApiTestBase::GetExecutable(executable_.get(), api_);\n+  PJRT_Executable_NumOutputs_Args num_outputs_args;\n+  num_outputs_args.struct_size = PJRT_Executable_NumOutputs_Args_STRUCT_SIZE;\n+  num_outputs_args.extension_start = nullptr;\n+  num_outputs_args.executable = executable.get();\n+  LogFatalIfPjrtError(api_->PJRT_Executable_NumOutputs(&num_outputs_args),\n+                      api_);\n+\n+  TF_ASSERT_OK_AND_ASSIGN(auto ref_output_shapes,\n+                          executable.get()->get()->GetOutputShapes());\n+  EXPECT_EQ(num_outputs_args.num_outputs, ref_output_shapes.size());\n+}\n+\n TEST_F(PjrtCApiGpuExecutableTest, GetDeviceAssignment) {\n   PJRT_LoadedExecutable_GetDeviceAssignment_Args args;\n   args.struct_size = PJRT_LoadedExecutable_GetDeviceAssignment_Args_STRUCT_SIZE;"
+        },
+        {
+            "sha": "d582a94d9b1c26a9984df3e65d4efd0ff56df5d2",
+            "filename": "third_party/xla/xla/pjrt/c/pjrt_c_api_wrapper_impl.cc",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 28,
+            "changes": 43,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/2a8dcaf97ee71696dd08ed6e23c99dcb2c993e3e/third_party%2Fxla%2Fxla%2Fpjrt%2Fc%2Fpjrt_c_api_wrapper_impl.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/2a8dcaf97ee71696dd08ed6e23c99dcb2c993e3e/third_party%2Fxla%2Fxla%2Fpjrt%2Fc%2Fpjrt_c_api_wrapper_impl.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fc%2Fpjrt_c_api_wrapper_impl.cc?ref=2a8dcaf97ee71696dd08ed6e23c99dcb2c993e3e",
+            "patch": "@@ -209,6 +209,16 @@ static absl::Status PopulateExecutableOutputDimensions(\n   return absl::OkStatus();\n }\n \n+static absl::Status EnsureExecutableOutputDimensionsPopulated(\n+    PJRT_Executable* executable) {\n+  absl::MutexLock lock(&executable->mutex);\n+  if (!executable->out_dimension_ran) {\n+    TF_RETURN_IF_ERROR(PopulateExecutableOutputDimensions(executable));\n+    executable->out_dimension_ran = true;\n+  }\n+  return absl::OkStatus();\n+}\n+\n static absl::Status PopulateExecutableOutputMemoryKinds(\n     PJRT_Executable* executable) {\n   TF_ASSIGN_OR_RETURN(\n@@ -1476,26 +1486,9 @@ PJRT_Error* PJRT_Executable_NumOutputs(PJRT_Executable_NumOutputs_Args* args) {\n   PJRT_RETURN_IF_ERROR(ActualStructSizeIsGreaterOrEqual(\n       \"PJRT_Executable_NumOutputs_Args\",\n       PJRT_Executable_NumOutputs_Args_STRUCT_SIZE, args->struct_size));\n-  PJRT_ASSIGN_OR_RETURN(std::vector<xla::Shape> output_shapes,\n-                        args->executable->get()->GetOutputShapes());\n-  if (output_shapes.empty()) {\n-    return new PJRT_Error{\n-        xla::InvalidArgument(\"Can't get number of executable outputs, output \"\n-                             \"shapes is empty for executable %s.\",\n-                             args->executable->get()->name())};\n-  }\n-  if (output_shapes.size() != 1) {\n-    return new PJRT_Error{\n-        xla::Unimplemented(\"MPMD execution not supported by PJRT C API (in \"\n-                           \"function PJRT_Executable_NumOutputs).\")};\n-  }\n-  const xla::Shape& shape = output_shapes[0];\n-  if (shape.IsTuple()) {\n-    args->num_outputs = shape.tuple_shapes().size();\n-  } else {\n-    // The output size is 1, as it is not a tuple.\n-    args->num_outputs = 1;\n-  }\n+  PJRT_RETURN_IF_ERROR(\n+      EnsureExecutableOutputDimensionsPopulated(args->executable));\n+  args->num_outputs = args->executable->out_dimension_sizes.size();\n   return nullptr;\n }\n \n@@ -1637,14 +1630,8 @@ PJRT_Error* PJRT_Executable_OutputDimensions(\n       \"PJRT_Executable_OutputDimensions_Args\",\n       PJRT_Executable_OutputDimensions_Args_STRUCT_SIZE, args->struct_size));\n \n-  {\n-    absl::MutexLock lock(args->executable->mutex);\n-    if (!args->executable->out_dimension_ran) {\n-      PJRT_RETURN_IF_ERROR(\n-          PopulateExecutableOutputDimensions(args->executable));\n-      args->executable->out_dimension_ran = true;\n-    }\n-  }\n+  PJRT_RETURN_IF_ERROR(\n+      EnsureExecutableOutputDimensionsPopulated(args->executable));\n \n   args->num_outputs = args->executable->out_dimension_sizes.size();\n   args->dim_sizes = args->executable->out_dimension_sizes.data();"
+        }
+    ],
+    "stats": {
+        "total": 57,
+        "additions": 29,
+        "deletions": 28
+    }
+}

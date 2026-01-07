@@ -1,0 +1,36 @@
+{
+    "author": "tensorflower-gardener",
+    "message": "[XLA:GPU] Precompute peer access capabilities in CudaExecutor initialization.\n\nPiperOrigin-RevId: 845742912",
+    "sha": "3ecff135cca46ba19478718938c7448e457b9226",
+    "files": [
+        {
+            "sha": "938f437ae570620cfaea071070187fc5ad72bc94",
+            "filename": "third_party/xla/xla/stream_executor/cuda/cuda_executor.cc",
+            "status": "modified",
+            "additions": 22,
+            "deletions": 31,
+            "changes": 53,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/3ecff135cca46ba19478718938c7448e457b9226/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_executor.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/3ecff135cca46ba19478718938c7448e457b9226/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_executor.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_executor.cc?ref=3ecff135cca46ba19478718938c7448e457b9226",
+            "patch": "@@ -416,26 +416,6 @@ bool CanEnablePeerAccess(CUdevice from, CUdevice to) {\n   return can_access_peer;\n }\n \n-bool CanEnablePeerAccess(Context* from, Context* to) {\n-  if (from == to) {\n-    return true;  // A context can always access its own memory.\n-  }\n-\n-  auto from_device = DeviceFromContext(from);\n-  if (!from_device.ok()) {\n-    LOG(ERROR) << \"failed to resolve 'from' peer access context to a device: \"\n-               << from_device.status();\n-    return false;\n-  }\n-  auto to_device = DeviceFromContext(to);\n-  if (!to_device.ok()) {\n-    LOG(ERROR) << \"failed to resolve 'to' peer access context to a device: \"\n-               << to_device.status();\n-    return false;\n-  }\n-  return CanEnablePeerAccess(from_device.value(), to_device.value());\n-}\n-\n absl::Status EnablePeerAccess(Context* from, Context* to) {\n   if (from == to) {\n     return absl::OkStatus();  // A context can always access its own\n@@ -1082,6 +1062,17 @@ absl::Status CudaExecutor::Init() {\n   if (numa_node_ == tsl::port::kNUMANoAffinity) {\n     XLA_VLOG_DEVICE(2, device_ordinal()) << \"Could not determine NUMA node\";\n   }\n+\n+  int cuda_device_count = 0;\n+  TF_RETURN_IF_ERROR(cuda::ToStatus(cudaGetDeviceCount(&cuda_device_count)));\n+  for (int i = 0; i < cuda_device_count; ++i) {\n+    if (i == device_ordinal()) {\n+      peer_access_cache_[i] = true;\n+      continue;\n+    }\n+\n+    peer_access_cache_[i] = CanEnablePeerAccess(device_, i);\n+  }\n   return absl::OkStatus();\n }\n \n@@ -1603,27 +1594,27 @@ fft::FftSupport* CudaExecutor::AsFft() {\n   return fft_.get();\n }\n \n-// TODO(468297175): Precalculate peer access in stream executor constructor.\n bool CudaExecutor::CanEnablePeerAccessTo(StreamExecutor* other) {\n   CudaExecutor* cuda_other = static_cast<CudaExecutor*>(other);\n-  return CanEnablePeerAccess(cuda_context_, cuda_other->cuda_context_);\n+  absl::StatusOr<int> to_device = DeviceFromContext(cuda_other->cuda_context_);\n+  if (!to_device.ok()) {\n+    LOG(ERROR) << \"failed to resolve 'to' peer access context to a device: \"\n+               << to_device.status();\n+    return false;\n+  }\n+  return CanEnablePeerAccessTo(*to_device);\n }\n \n bool CudaExecutor::CanEnablePeerAccessTo(int other_device_ordinal) {\n-  if (other_device_ordinal == device_ordinal()) {\n-    // Self-access is always allowed.\n-    return true;\n-  }\n-\n   auto it = peer_access_cache_.find(other_device_ordinal);\n   if (it != peer_access_cache_.end()) {\n     return it->second;\n   }\n \n-  const bool result =\n-      CanEnablePeerAccess(device_ordinal(), other_device_ordinal);\n-  peer_access_cache_[other_device_ordinal] = result;\n-  return result;\n+  LOG(WARNING) << \"Attemping to enable peer access from: \" << device_ordinal()\n+               << \" to: \" << other_device_ordinal\n+               << \" which was not available during initialization.\";\n+  return false;\n }\n \n absl::Status CudaExecutor::EnablePeerAccessTo(StreamExecutor* other) {"
+        },
+        {
+            "sha": "6d9d181703312fbd4759a450fc378126e70cc6e3",
+            "filename": "third_party/xla/xla/stream_executor/cuda/cuda_executor_multigpu_test.cc",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 1,
+            "changes": 16,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/3ecff135cca46ba19478718938c7448e457b9226/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_executor_multigpu_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/3ecff135cca46ba19478718938c7448e457b9226/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_executor_multigpu_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_executor_multigpu_test.cc?ref=3ecff135cca46ba19478718938c7448e457b9226",
+            "patch": "@@ -81,6 +81,21 @@ StreamExecutor* GetGpuExecutor(int64_t device_ordinal) {\n   return platform->ExecutorForDevice(device_ordinal).value();\n }\n \n+TEST(CudaExecutorMultiGpuTest, PeerAccess) {\n+  std::vector<CudaExecutor*> executors = {\n+      static_cast<CudaExecutor*>(GetGpuExecutor(0)),\n+      static_cast<CudaExecutor*>(GetGpuExecutor(1))};\n+\n+  if (!executors[0]->is_multicast_supported()) {\n+    GTEST_SKIP() << \"Test requires multicast support.\";\n+  }\n+  EXPECT_TRUE(executors[0]->CanEnablePeerAccessTo(0));\n+  EXPECT_TRUE(executors[0]->CanEnablePeerAccessTo(1));\n+  EXPECT_TRUE(executors[1]->CanEnablePeerAccessTo(0));\n+  EXPECT_TRUE(executors[1]->CanEnablePeerAccessTo(1));\n+  EXPECT_FALSE(executors[0]->CanEnablePeerAccessTo(3));\n+}\n+\n TEST(CudaExecutorMultiGpuTest, CudaMulticastMemoryResubscriptionFails) {\n   std::vector<CudaExecutor*> executors = {\n       static_cast<CudaExecutor*>(GetGpuExecutor(0)),\n@@ -130,7 +145,6 @@ TEST(CudaExecutorMultiGpuTest, CudaMulticastMemorySubscribeMoreDevices) {\n   EXPECT_THAT(multicast_memory->SubscribeDevice(2),\n               StatusIs(absl::StatusCode::kInvalidArgument,\n                        \"All devices are already subscribed.\"));\n-  ;\n }\n \n TEST(CudaExecutorMultiGpuTest, CudaMulticastMemoryUsingNonVmmMemory) {"
+        }
+    ],
+    "stats": {
+        "total": 69,
+        "additions": 37,
+        "deletions": 32
+    }
+}

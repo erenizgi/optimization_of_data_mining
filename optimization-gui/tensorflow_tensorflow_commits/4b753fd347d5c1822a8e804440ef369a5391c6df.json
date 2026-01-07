@@ -1,0 +1,36 @@
+{
+    "author": "akuegel",
+    "message": "[XLA:GPU] Handle packed element types in sort.\n\nWe need to pass the address when calling the comparison computation. However\nthe unpacking happens when loading the element values. Therefore for packed\ntypes we need to copy to a temporary buffer and pass the address of the buffer.\n\nPiperOrigin-RevId: 842690104",
+    "sha": "4b753fd347d5c1822a8e804440ef369a5391c6df",
+    "files": [
+        {
+            "sha": "9332d9fa5ce937369380fe98d1760718f0cf4a64",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/llvm/sort_util.cc",
+            "status": "modified",
+            "additions": 14,
+            "deletions": 1,
+            "changes": 15,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4b753fd347d5c1822a8e804440ef369a5391c6df/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Fllvm%2Fsort_util.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4b753fd347d5c1822a8e804440ef369a5391c6df/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Fllvm%2Fsort_util.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Fllvm%2Fsort_util.cc?ref=4b753fd347d5c1822a8e804440ef369a5391c6df",
+            "patch": "@@ -35,6 +35,7 @@ limitations under the License.\n #include \"llvm/Support/Casting.h\"\n #include \"xla/backends/gpu/codegen/llvm/parallel_loop_emitter.h\"\n #include \"xla/layout_util.h\"\n+#include \"xla/primitive_util.h\"\n #include \"xla/service/gpu/ir_emission_utils.h\"\n #include \"xla/service/gpu/launch_dimensions.h\"\n #include \"xla/service/gpu/target_util.h\"\n@@ -469,7 +470,19 @@ absl::Status EmitSortInPlace(\n         IrArray::Index keys_index(keys_multi_index,\n                                   values_arrays[operand].GetShape(),\n                                   tiles_index.GetType());\n-        return values_arrays[operand].EmitArrayElementAddress(keys_index, b);\n+        PrimitiveType element_type =\n+            values_arrays[operand].GetShape().element_type();\n+        if (!primitive_util::IsSubByteNonPredType(element_type)) {\n+          return values_arrays[operand].EmitArrayElementAddress(keys_index, b);\n+        }\n+        auto element =\n+            values_arrays[operand].EmitReadArrayElement(keys_index, b);\n+        auto llvm_element_type =\n+            llvm_ir::PrimitiveTypeToIrType(element_type, b->getContext());\n+        llvm::Value* element_buffer = llvm_ir::EmitAllocaAtFunctionEntry(\n+            llvm_element_type, \"element_buffer\", b);\n+        b->CreateStore(element, element_buffer);\n+        return element_buffer;\n       };\n       auto element_address_pointee_type = [&](int64_t operand, llvm::Value*) {\n         return values_arrays[operand].GetElementLlvmType();"
+        },
+        {
+            "sha": "a36504161cae5e52b7dd05dbae19b03e1f38ef73",
+            "filename": "third_party/xla/xla/service/gpu/tests/sorting_test.cc",
+            "status": "modified",
+            "additions": 29,
+            "deletions": 4,
+            "changes": 33,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4b753fd347d5c1822a8e804440ef369a5391c6df/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftests%2Fsorting_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4b753fd347d5c1822a8e804440ef369a5391c6df/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftests%2Fsorting_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftests%2Fsorting_test.cc?ref=4b753fd347d5c1822a8e804440ef369a5391c6df",
+            "patch": "@@ -72,7 +72,8 @@ to_apply=compare\n       kHloTemplate, primitive_util::LowercasePrimitiveTypeName(GetParam()));\n   // We expect that all types except PRED and F8 types are rewritten to a custom\n   // call.\n-  bool rewrite = GetParam() != PRED && !primitive_util::IsF8Type(GetParam());\n+  bool rewrite = GetParam() != PRED && GetParam() != S4 && GetParam() != U4 &&\n+                 !primitive_util::IsF8Type(GetParam());\n   std::string check = rewrite ? \"CHECK: custom-call\" : \"CHECK-NOT: custom-call\";\n   MatchOptimizedHlo(hlo, check);\n   EXPECT_TRUE(RunAndCompare(hlo, ErrorSpec{0, 0}));\n@@ -83,9 +84,9 @@ INSTANTIATE_TEST_SUITE_P(\n     // 4bit types like U4, S4, or F4E2M1FN are currently not supported.\n     // F8E8M0FNU cannot represent NaNs and fails the test below.\n     ::testing::ValuesIn({\n-        PRED,                               // boolean\n-        S8,         S16,    S32,      S64,  // signed\n-        U8,         U16,    U32,      U64,  // unsigned\n+        PRED,                                              // boolean\n+        S4,         S8,     S16,      S32,           S64,  // signed\n+        U4,         U8,     U16,      U32,           U64,  // unsigned\n         F8E5M2,     F8E4M3, F8E4M3FN, F8E4M3B11FNUZ, F8E3M4, F8E5M2FNUZ,\n         F8E4M3FNUZ, F16,    BF16,     F32,           F64  // floating point\n     }),\n@@ -121,6 +122,30 @@ ENTRY TestComputation {\n   EXPECT_TRUE(RunAndCompareNoHloPasses(hlo_text, ErrorSpec{1e-5, 1e-5}));\n }\n \n+TEST_F(SortingTest, PackedElementType) {\n+  const char* hlo_text = R\"(\n+    HloModule module\n+\n+    sorting_computation {\n+      %lhs_update_0 = s4[] parameter(2)\n+      %rhs_update_0 = s4[] parameter(3)\n+      %lhs_permutation = s32[] parameter(4)\n+      %rhs_permutation = s32[] parameter(5)\n+      %lhs_key = s32[] parameter(0)\n+      %rhs_key = s32[] parameter(1)\n+      ROOT %compare.2 = pred[] compare(%lhs_key, %rhs_key), direction=LT\n+    }\n+\n+    ENTRY main {\n+      p0 = s32[16384]{0} parameter(0)\n+      p1 = s4[16384]{0} parameter(1)\n+      iota = s32[16384]{0} iota(), iota_dimension=0\n+      ROOT sort = (s32[16384]{0}, s4[16384]{0}, s32[16384]{0}) sort(p0, p1, iota), dimensions={0}, is_stable=true, to_apply=sorting_computation\n+    }\n+  )\";\n+  EXPECT_TRUE(RunAndCompare(hlo_text, ErrorSpec{1e-5, 1e-5}));\n+}\n+\n // Test that verifies the IgnoreMemorySpace option works correctly\n TEST_F(SortingTest, LayoutsInShapesEqualWithIgnoreMemorySpace) {\n   const char* hlo_text = R\"("
+        }
+    ],
+    "stats": {
+        "total": 48,
+        "additions": 43,
+        "deletions": 5
+    }
+}

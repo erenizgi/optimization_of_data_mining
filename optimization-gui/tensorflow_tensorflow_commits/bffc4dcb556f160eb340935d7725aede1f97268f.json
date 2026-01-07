@@ -1,0 +1,24 @@
+{
+    "author": "tensorflower-gardener",
+    "message": "[SymbolicExpr] Sort terms before calling Canonicalize() methods\n\nPiperOrigin-RevId: 797684984",
+    "sha": "bffc4dcb556f160eb340935d7725aede1f97268f",
+    "files": [
+        {
+            "sha": "91aaf5f222d0d4496a60521f8f776fe2e78ea411",
+            "filename": "third_party/xla/xla/service/gpu/model/experimental/symbolic_expr.cc",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 31,
+            "changes": 47,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/bffc4dcb556f160eb340935d7725aede1f97268f/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fmodel%2Fexperimental%2Fsymbolic_expr.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/bffc4dcb556f160eb340935d7725aede1f97268f/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fmodel%2Fexperimental%2Fsymbolic_expr.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fmodel%2Fexperimental%2Fsymbolic_expr.cc?ref=bffc4dcb556f160eb340935d7725aede1f97268f",
+            "patch": "@@ -199,10 +199,6 @@ std::pair<SymbolicExpr, int64_t> GetBaseAndCoeff(SymbolicExpr expr) {\n       auto [base, coeff] = GetBaseAndCoeff(lhs);\n       return {base, coeff * rhs.GetValue()};\n     }\n-    if (lhs.GetType() == SymbolicExprType::kConstant) {\n-      auto [base, coeff] = GetBaseAndCoeff(rhs);\n-      return {base, coeff * lhs.GetValue()};\n-    }\n   }\n   return {expr, 1};\n }\n@@ -222,14 +218,6 @@ void ExtractTerms(SymbolicExpr expr,\n SymbolicExpr CanonicalizeAdd(SymbolicExpr lhs, SymbolicExpr rhs) {\n   SymbolicExprContext* ctx = lhs.GetContext();\n \n-  // Neutral element\n-  if (lhs.GetType() == SymbolicExprType::kConstant && lhs.GetValue() == 0) {\n-    return rhs;\n-  }\n-  if (rhs.GetType() == SymbolicExprType::kConstant && rhs.GetValue() == 0) {\n-    return lhs;\n-  }\n-\n   // Flattening and term collection\n   llvm::SmallVector<std::pair<SymbolicExpr, int64_t>> terms;\n   ExtractTerms(lhs, terms);\n@@ -281,11 +269,6 @@ SymbolicExpr CanonicalizeAdd(SymbolicExpr lhs, SymbolicExpr rhs) {\n SymbolicExpr CanonicalizeMul(SymbolicExpr lhs, SymbolicExpr rhs) {\n   SymbolicExprContext* ctx = lhs.GetContext();\n \n-  // Commutativity: C * X => X * C\n-  if (lhs.GetType() == SymbolicExprType::kConstant) {\n-    std::swap(lhs, rhs);\n-  }\n-\n   // Neutral Elements\n   if (rhs.GetType() == SymbolicExprType::kConstant) {\n     if (rhs.GetValue() == 0) {\n@@ -312,11 +295,7 @@ SymbolicExpr CanonicalizeMul(SymbolicExpr lhs, SymbolicExpr rhs) {\n     return ((lhs * rhs.GetLHS()) + (lhs * rhs.GetRHS())).Canonicalize();\n   }\n \n-  SymbolicExpr res_lhs = lhs, res_rhs = rhs;\n-  if (res_rhs < res_lhs) {\n-    std::swap(res_lhs, res_rhs);\n-  }\n-  return ctx->CreateBinaryOp(SymbolicExprType::kMul, res_lhs, res_rhs);\n+  return ctx->CreateBinaryOp(SymbolicExprType::kMul, lhs, rhs);\n }\n \n std::optional<int64_t> SubtractAndGetConstDiff(SymbolicExpr lhs,\n@@ -334,9 +313,6 @@ SymbolicExpr CanonicalizeMin(SymbolicExpr lhs, SymbolicExpr rhs) {\n     return (diff.value() <= 0) ? lhs : rhs;\n   }\n \n-  if (rhs < lhs) {\n-    std::swap(lhs, rhs);\n-  }\n   return ctx->CreateBinaryOp(SymbolicExprType::kMin, lhs, rhs);\n }\n \n@@ -346,9 +322,6 @@ SymbolicExpr CanonicalizeMax(SymbolicExpr lhs, SymbolicExpr rhs) {\n     return (diff.value() >= 0) ? lhs : rhs;\n   }\n \n-  if (rhs < lhs) {\n-    std::swap(lhs, rhs);\n-  }\n   return ctx->CreateBinaryOp(SymbolicExprType::kMax, lhs, rhs);\n }\n \n@@ -551,17 +524,29 @@ SymbolicExpr SymbolicExpr::Canonicalize() const {\n   SymbolicExpr lhs = this->GetLHS().Canonicalize();\n   SymbolicExpr rhs = this->GetRHS().Canonicalize();\n \n+  // If both sides are constants, we can evaluate the expression.\n   if (lhs.GetType() == SymbolicExprType::kConstant &&\n       rhs.GetType() == SymbolicExprType::kConstant) {\n     return GetContext()->CreateConstant(\n         SymbolicExpr(GetContext()->CreateBinaryOp(type, lhs, rhs))\n             .Evaluate({}));\n   }\n \n+  // Assure constants are on the RHS for commutative operations.\n+  switch (type) {\n+    case SymbolicExprType::kAdd:\n+    case SymbolicExprType::kMul:\n+    case SymbolicExprType::kMin:\n+    case SymbolicExprType::kMax:\n+      if (rhs < lhs) {\n+        std::swap(lhs, rhs);\n+      }\n+      break;\n+    default:\n+      break;\n+  }\n+\n   switch (type) {\n-    case SymbolicExprType::kConstant:\n-    case SymbolicExprType::kVariable:\n-      return *this;\n     case SymbolicExprType::kAdd:\n       return CanonicalizeAdd(lhs, rhs);\n     case SymbolicExprType::kMul:"
+        }
+    ],
+    "stats": {
+        "total": 47,
+        "additions": 16,
+        "deletions": 31
+    }
+}

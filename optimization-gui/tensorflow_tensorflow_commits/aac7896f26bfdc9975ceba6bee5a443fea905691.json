@@ -1,0 +1,48 @@
+{
+    "author": "sohaibiftikhar",
+    "message": "[XLA:GPU]: Track VMM allocation in cuda_executor.\n\nBefore this change running any test using compute-sanitizer has a non zero\nexit code because of invoking vmm retention API on non VMM pointers.\n\nAfter this change we don't deallocate using the VMM API if it was not tracked\nto be using VMM.\n\nPiperOrigin-RevId: 838893240",
+    "sha": "aac7896f26bfdc9975ceba6bee5a443fea905691",
+    "files": [
+        {
+            "sha": "fa1210ad17df6a1da671a8f457d92c9b87fd0f2d",
+            "filename": "third_party/xla/xla/stream_executor/cuda/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/aac7896f26bfdc9975ceba6bee5a443fea905691/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/aac7896f26bfdc9975ceba6bee5a443fea905691/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2FBUILD?ref=aac7896f26bfdc9975ceba6bee5a443fea905691",
+            "patch": "@@ -1179,6 +1179,7 @@ cc_library(\n         \"@com_google_absl//absl/algorithm:container\",\n         \"@com_google_absl//absl/base\",\n         \"@com_google_absl//absl/base:core_headers\",\n+        \"@com_google_absl//absl/cleanup\",\n         \"@com_google_absl//absl/container:flat_hash_map\",\n         \"@com_google_absl//absl/container:flat_hash_set\",\n         \"@com_google_absl//absl/container:inlined_vector\","
+        },
+        {
+            "sha": "844dc56aec23540bf0cdc0a04acd791c4a8e8ed4",
+            "filename": "third_party/xla/xla/stream_executor/cuda/cuda_executor.cc",
+            "status": "modified",
+            "additions": 36,
+            "deletions": 5,
+            "changes": 41,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/aac7896f26bfdc9975ceba6bee5a443fea905691/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_executor.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/aac7896f26bfdc9975ceba6bee5a443fea905691/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_executor.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_executor.cc?ref=aac7896f26bfdc9975ceba6bee5a443fea905691",
+            "patch": "@@ -32,6 +32,7 @@ limitations under the License.\n #include \"absl/algorithm/container.h\"\n #include \"absl/base/call_once.h\"\n #include \"absl/base/casts.h\"\n+#include \"absl/cleanup/cleanup.h\"\n #include \"absl/container/inlined_vector.h\"\n #include \"absl/log/check.h\"\n #include \"absl/numeric/int128.h\"\n@@ -807,6 +808,17 @@ absl::StatusOr<FabricInfo> GetDeviceFabricInfo(nvmlDevice_t device) {\n \n }  // namespace\n \n+bool CudaExecutor::MemoryTracker::Insert(CUdeviceptr ptr) {\n+  absl::MutexLock lock(mutex_);\n+  auto [it, inserted] = allocated_memory_.insert(ptr);\n+  return inserted;\n+}\n+\n+bool CudaExecutor::MemoryTracker::Remove(CUdeviceptr ptr) {\n+  absl::MutexLock lock(mutex_);\n+  return allocated_memory_.erase(ptr) > 0;\n+}\n+\n // Given const GPU memory, returns a libcuda device pointer datatype, suitable\n // for passing directly to libcuda APIs.\n //\n@@ -921,7 +933,6 @@ absl::StatusOr<void*> CudaExecutor::VmmAllocateMemory(uint64_t bytes) {\n   TF_RETURN_IF_ERROR(cuda::ToStatus(\n       cuMemAddressReserve(&ptr, padded_size, granularity, 0, 0)));\n   TF_RETURN_IF_ERROR(cuda::ToStatus(cuMemMap(ptr, padded_size, 0, handle, 0)));\n-\n   VLOG(3) << \"[\" << device_ordinal() << \"] VMM allocated \" << ptr\n           << \" requested size: \" << bytes << \" padded size: \" << padded_size\n           << \" granularity: \" << granularity;\n@@ -936,10 +947,24 @@ absl::StatusOr<void*> CudaExecutor::VmmAllocateMemory(uint64_t bytes) {\n     }\n   }\n \n+  if (!vmm_memory_tracker_.Insert(ptr)) {\n+    LOG(WARNING) << \"[\" << device_ordinal()\n+                 << \"] VMM memory already tracked: \" << ptr;\n+  }\n   return reinterpret_cast<void*>(ptr);\n }\n \n-absl::Status CudaExecutor::VmmDeallocateMemory(void* ptr) {\n+absl::StatusOr<bool> CudaExecutor::VmmDeallocateMemory(void* ptr) {\n+  CUdeviceptr device_ptr = reinterpret_cast<CUdeviceptr>(ptr);\n+  if (!vmm_memory_tracker_.Remove(device_ptr)) {\n+    return false;\n+  }\n+  bool deletion_completed = false;\n+  absl::Cleanup cleanup = [&]() {\n+    if (!deletion_completed) {\n+      vmm_memory_tracker_.Insert(device_ptr);\n+    }\n+  };\n   if (!is_vmm_supported_) {\n     return absl::InternalError(\"VMM is not supported on this device.\");\n   }\n@@ -953,13 +978,15 @@ absl::Status CudaExecutor::VmmDeallocateMemory(void* ptr) {\n     handle = static_cast<CUmemGenericAllocationHandle>(scoped_handle.handle());\n   }\n   size_t size = 0;\n-  CUdeviceptr device_ptr = reinterpret_cast<CUdeviceptr>(ptr);\n   TF_RETURN_IF_ERROR(\n       cuda::ToStatus(cuMemGetAddressRange(nullptr, &size, device_ptr)));\n+  VLOG(3) << \"[\" << device_ordinal() << \"] VMM deallocated \" << ptr\n+          << \" size: \" << size;\n   TF_RETURN_IF_ERROR(cuda::ToStatus(cuMemUnmap(device_ptr, size)));\n   TF_RETURN_IF_ERROR(cuda::ToStatus(cuMemRelease(handle)));\n   TF_RETURN_IF_ERROR(cuda::ToStatus(cuMemAddressFree(device_ptr, size)));\n-  return absl::OkStatus();\n+  deletion_completed = true;\n+  return true;\n }\n \n absl::StatusOr<void*> CollectiveMemoryAllocate(StreamExecutor* executor,\n@@ -1438,7 +1465,11 @@ void CudaExecutor::Deallocate(DeviceMemoryBase* mem) {\n     // Memory space is always kDevice here, so the only way to check if the\n     // memory was allocated with VMM API is to try to retain the handle with VMM\n     // API (which VmmDeallocateMemory does).\n-    if (!VmmDeallocateMemory(mem->opaque()).ok()) {\n+    auto result = VmmDeallocateMemory(mem->opaque());\n+    if (!result.ok()) {\n+      LOG(WARNING) << \"Failed to deallocate VMM memory handle: \"\n+                   << result.status();\n+    } else if (!result.value()) {  // If it was not allocated with VMM API.\n       DeviceDeallocate(cuda_context_, mem->opaque());\n     }\n   }"
+        },
+        {
+            "sha": "ed9125e3fea600fc0f98e21d62f91c94977a36f6",
+            "filename": "third_party/xla/xla/stream_executor/cuda/cuda_executor.h",
+            "status": "modified",
+            "additions": 20,
+            "deletions": 1,
+            "changes": 21,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/aac7896f26bfdc9975ceba6bee5a443fea905691/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_executor.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/aac7896f26bfdc9975ceba6bee5a443fea905691/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_executor.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_executor.h?ref=aac7896f26bfdc9975ceba6bee5a443fea905691",
+            "patch": "@@ -203,7 +203,10 @@ class CudaExecutor : public GpuExecutor {\n   }\n \n  private:\n-  absl::Status VmmDeallocateMemory(void* ptr);\n+  // Checks if the memory was allocated with VMM API.\n+  // If yes, deallocates the memory and returns true.\n+  // If not, returns false.\n+  absl::StatusOr<bool> VmmDeallocateMemory(void* ptr);\n \n   absl::StatusOr<void*> VmmAllocateMemory(uint64_t bytes);\n \n@@ -281,6 +284,22 @@ class CudaExecutor : public GpuExecutor {\n   absl::flat_hash_map<void*, Stream*> alive_gpu_streams_\n       ABSL_GUARDED_BY(alive_gpu_streams_mu_);\n \n+  class MemoryTracker {\n+   public:\n+    // Adds a pointer to the set of allocated memory. Returns true if the memory\n+    // was not already tracked.\n+    bool Insert(CUdeviceptr ptr);\n+    // Removes a pointer from the set of allocated memory. Returns true if the\n+    // memory was tracked.\n+    bool Remove(CUdeviceptr ptr);\n+\n+   private:\n+    absl::Mutex mutex_;\n+    absl::flat_hash_set<CUdeviceptr> allocated_memory_ ABSL_GUARDED_BY(mutex_);\n+  };\n+  // Memory allocation tracker for VMM memory.\n+  MemoryTracker vmm_memory_tracker_;\n+\n   // CudaContext for this device.\n   CudaContext* cuda_context_;\n "
+        }
+    ],
+    "stats": {
+        "total": 63,
+        "additions": 57,
+        "deletions": 6
+    }
+}

@@ -1,0 +1,96 @@
+{
+    "author": "khasanovaa",
+    "message": "Add de/serializaton of `fake_allocations` in `DynamicSliceThunk`.\n\nPiperOrigin-RevId: 826541399",
+    "sha": "6ff7f9c87f033e8011d8214767ab5c4de04ed2c7",
+    "files": [
+        {
+            "sha": "5d08e43aa7cb84d7e89da44a0a2caffacaceaac8",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/BUILD",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/6ff7f9c87f033e8011d8214767ab5c4de04ed2c7/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/6ff7f9c87f033e8011d8214767ab5c4de04ed2c7/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2FBUILD?ref=6ff7f9c87f033e8011d8214767ab5c4de04ed2c7",
+            "patch": "@@ -2452,6 +2452,7 @@ tf_proto_library(\n         \"//xla:xla_data_proto\",\n         \"//xla/core/host_offloading:host_offloading_executable_proto\",\n         \"//xla/service:buffer_assignment_proto\",\n+        \"//xla/service:hlo_proto\",\n         \"//xla/service/gpu:backend_configs\",\n         \"//xla/service/gpu:gpu_conv_runner_proto\",\n         \"//xla/service/gpu:gpu_norm_runner_proto\",\n@@ -2490,6 +2491,7 @@ cc_library(\n         \":convolution_thunk\",\n         \":copy_thunk\",\n         \":cudnn_thunk\",\n+        \":dynamic_slice_thunk\",\n         \":fft_thunk\",\n         \":gemm_thunk\",\n         \":gpublas_lt_matmul_thunk\","
+        },
+        {
+            "sha": "6f37c3cd13d0a6699e057f882ad39e981c1d2868",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/dynamic_slice_thunk.cc",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 7,
+            "changes": 23,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/6ff7f9c87f033e8011d8214767ab5c4de04ed2c7/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fdynamic_slice_thunk.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/6ff7f9c87f033e8011d8214767ab5c4de04ed2c7/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fdynamic_slice_thunk.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fdynamic_slice_thunk.cc?ref=6ff7f9c87f033e8011d8214767ab5c4de04ed2c7",
+            "patch": "@@ -610,14 +610,19 @@ absl::StatusOr<ThunkProto> DynamicSliceThunk::ToProto() const {\n              ->mutable_offset_as_function_of_indvar_modules_metadata(),\n         offset_as_function_of_indvar_metadata_->ToProto());\n   }\n+\n+  // fake_allocations\n+  for (const auto& fake_allocation : fake_allocations_) {\n+    *dynamic_slice_proto->add_fake_allocations() = fake_allocation.ToProto();\n+  }\n+\n   return proto;\n }\n \n absl::StatusOr<std::unique_ptr<DynamicSliceThunk>> DynamicSliceThunk::FromProto(\n     ThunkInfo thunk_info, const DynamicSliceThunkProto& proto,\n     absl::Span<const BufferAllocation> buffer_allocations,\n-    absl::Span<const BufferAllocation> fake_allocations,\n-    const Deserializer& deserializer) {\n+    const DeserializerWithCustomAllocations& deserializer) {\n   // offset_as_function_of_indvar_metadata\n   std::optional<OffsetAsFunctionOfIndvarModulesMetadata>\n       offset_as_function_of_indvar_metadata;\n@@ -674,20 +679,24 @@ absl::StatusOr<std::unique_ptr<DynamicSliceThunk>> DynamicSliceThunk::FromProto(\n     }\n   }\n \n+  // fake_allocations\n+  std::vector<BufferAllocation> fake_allocations;\n+  for (const auto& fake_allocation_proto : proto.fake_allocations()) {\n+    fake_allocations.push_back(\n+        BufferAllocation::FromProto(fake_allocation_proto));\n+  }\n+\n   // embedded_thunk\n   std::vector<std::unique_ptr<Thunk>> embedded_thunks;\n   for (const auto& thunk_proto : proto.embedded_thunk().thunks()) {\n     TF_ASSIGN_OR_RETURN(std::unique_ptr<Thunk> embedded_thunk,\n-                        deserializer(thunk_proto));\n+                        deserializer(thunk_proto, fake_allocations));\n     embedded_thunks.push_back(std::move(embedded_thunk));\n   }\n \n-  // leave fake_allocations empty, because we manage their lifetime outside\n-  // of this function.\n   return std::make_unique<DynamicSliceThunk>(\n       thunk_info, std::make_unique<ThunkSequence>(std::move(embedded_thunks)),\n-      std::move(arguments),\n-      /*fake_allocations=*/std::vector<BufferAllocation>(), std::move(offsets),\n+      std::move(arguments), std::move(fake_allocations), std::move(offsets),\n       std::move(orig_shapes), std::move(sliced_shapes),\n       std::move(offset_byte_sizes),\n       std::move(offset_as_function_of_indvar_metadata));"
+        },
+        {
+            "sha": "155dd32a8aa8b3ff7a1e08897ebaa9360fd98d2a",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/dynamic_slice_thunk.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 7,
+            "changes": 8,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/6ff7f9c87f033e8011d8214767ab5c4de04ed2c7/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fdynamic_slice_thunk.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/6ff7f9c87f033e8011d8214767ab5c4de04ed2c7/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fdynamic_slice_thunk.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fdynamic_slice_thunk.h?ref=6ff7f9c87f033e8011d8214767ab5c4de04ed2c7",
+            "patch": "@@ -181,17 +181,11 @@ class DynamicSliceThunk : public Thunk {\n   // `buffer_allocations`: the actual buffer allocations; required to parse the\n   // `arguments` (BufferAllocation::Slice) -- the tensors that we are later\n   // slicing from.\n-  // `fake_allocations`: The fake allocations that are used as\n-  // placeholders during creation of the embedded thunk. These are being\n-  // replaced during execution in `ExecuteOnStream` with the actual (dynamic)\n-  // slices. We have to create these outside of this method to manage their\n-  // lifetime correctly.\n   // `deserializer`: The deserializer is used to deserialize the embedded thunk.\n   static absl::StatusOr<std::unique_ptr<DynamicSliceThunk>> FromProto(\n       ThunkInfo thunk_info, const DynamicSliceThunkProto& proto,\n       absl::Span<const BufferAllocation> buffer_allocations,\n-      absl::Span<const BufferAllocation> fake_allocations,\n-      const Deserializer& deserializer);\n+      const DeserializerWithCustomAllocations& deserializer);\n \n   std::optional<const OffsetAsFunctionOfIndvarModulesMetadata*>\n   get_offset_function() const {"
+        },
+        {
+            "sha": "f83e6666eb5459437f2a3693630656eb52acf48c",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/dynamic_slice_thunk_test.cc",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 4,
+            "changes": 9,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/6ff7f9c87f033e8011d8214767ab5c4de04ed2c7/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fdynamic_slice_thunk_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/6ff7f9c87f033e8011d8214767ab5c4de04ed2c7/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fdynamic_slice_thunk_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fdynamic_slice_thunk_test.cc?ref=6ff7f9c87f033e8011d8214767ab5c4de04ed2c7",
+            "patch": "@@ -110,16 +110,17 @@ void CheckProtoRoundTrip(const DynamicSliceThunk& thunk,\n     }\n   }\n \n-  Thunk::Deserializer deserializer =\n-      [&buffer_allocations](const ThunkProto& thunk_proto)\n+  Thunk::DeserializerWithCustomAllocations deserializer =\n+      [](const ThunkProto& thunk_proto,\n+         absl::Span<const BufferAllocation> fake_allocations_span)\n       -> absl::StatusOr<std::unique_ptr<Thunk>> {\n-    return DeserializeThunkProto(thunk_proto, buffer_allocations);\n+    return DeserializeThunkProto(thunk_proto, fake_allocations_span);\n   };\n+\n   TF_ASSERT_OK_AND_ASSIGN(\n       auto thunk_from_proto,\n       DynamicSliceThunk::FromProto(Thunk::ThunkInfo(), proto,\n                                    /*buffer_allocations=*/buffer_allocations,\n-                                   /*fake_allocations=*/fake_allocations_span,\n                                    deserializer));\n   TF_ASSERT_OK_AND_ASSIGN(auto proto_roundtrip, thunk_from_proto->ToProto());\n   auto dynamic_slice_thunk_proto_roundtrip ="
+        },
+        {
+            "sha": "7f2287d4cd111558565c9c26eff9c34ea0027dc7",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/thunk.h",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/6ff7f9c87f033e8011d8214767ab5c4de04ed2c7/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fthunk.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/6ff7f9c87f033e8011d8214767ab5c4de04ed2c7/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fthunk.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fthunk.h?ref=6ff7f9c87f033e8011d8214767ab5c4de04ed2c7",
+            "patch": "@@ -571,6 +571,10 @@ class Thunk {\n       absl::AnyInvocable<absl::StatusOr<std::unique_ptr<Thunk>>(\n           const ThunkProto&) const>;\n \n+  using DeserializerWithCustomAllocations =\n+      absl::AnyInvocable<absl::StatusOr<std::unique_ptr<Thunk>>(\n+          const ThunkProto&, absl::Span<const BufferAllocation>) const>;\n+\n   void add_control_predecessor(const Thunk* control_predecessor) {\n     control_predecessors_.push_back(control_predecessor);\n   }"
+        },
+        {
+            "sha": "156ae1120e40a4f40b38598a05e78b9ee3f7ef76",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/thunk.proto",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/6ff7f9c87f033e8011d8214767ab5c4de04ed2c7/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fthunk.proto",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/6ff7f9c87f033e8011d8214767ab5c4de04ed2c7/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fthunk.proto",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fthunk.proto?ref=6ff7f9c87f033e8011d8214767ab5c4de04ed2c7",
+            "patch": "@@ -24,6 +24,7 @@ import \"xla/service/buffer_assignment.proto\";\n import \"xla/service/gpu/gpu_conv_runner.proto\";\n import \"xla/service/gpu/gpu_norm_runner.proto\";\n import \"xla/service/gpu/launch_dimensions.proto\";\n+import \"xla/service/hlo.proto\";\n import \"xla/stream_executor/gpu/gpu_blas_lt.proto\";\n import \"xla/stream_executor/gpu/tma_metadata.proto\";\n import \"xla/stream_executor/launch_dim.proto\";\n@@ -167,6 +168,7 @@ message DynamicSliceThunkProto {\n   repeated OptionalInt64Proto offset_byte_sizes = 6;\n   optional OffsetAsFunctionOfIndvarModulesMetadataProto\n       offset_as_function_of_indvar_modules_metadata = 7;\n+  repeated BufferAllocationProto fake_allocations = 8;\n }\n \n message MemzeroThunkProto {"
+        },
+        {
+            "sha": "b47370eb95523d9c4e947e7b065c84c5c7f8386f",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/thunk_proto_deserialization.cc",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 0,
+            "changes": 11,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/6ff7f9c87f033e8011d8214767ab5c4de04ed2c7/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fthunk_proto_deserialization.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/6ff7f9c87f033e8011d8214767ab5c4de04ed2c7/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fthunk_proto_deserialization.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fthunk_proto_deserialization.cc?ref=6ff7f9c87f033e8011d8214767ab5c4de04ed2c7",
+            "patch": "@@ -32,6 +32,7 @@ limitations under the License.\n #include \"xla/backends/gpu/runtime/convolution_thunk.h\"\n #include \"xla/backends/gpu/runtime/copy_thunk.h\"\n #include \"xla/backends/gpu/runtime/cudnn_thunk.h\"\n+#include \"xla/backends/gpu/runtime/dynamic_slice_thunk.h\"\n #include \"xla/backends/gpu/runtime/fft_thunk.h\"\n #include \"xla/backends/gpu/runtime/gemm_thunk.h\"\n #include \"xla/backends/gpu/runtime/gpublas_lt_matmul_thunk.h\"\n@@ -167,6 +168,16 @@ absl::StatusOr<std::unique_ptr<Thunk>> DeserializeThunkProto(\n       return Memset32BitValueThunk::FromProto(\n           std::move(thunk_info), thunk_proto.memset32bit_value_thunk(),\n           buffer_allocations);\n+    case ThunkProto::kDynamicSliceThunk: {\n+      auto deserializer =\n+          [](const ThunkProto& thunk_proto,\n+             absl::Span<const BufferAllocation> custom_allocations) {\n+            return DeserializeThunkProto(thunk_proto, custom_allocations);\n+          };\n+      return DynamicSliceThunk::FromProto(std::move(thunk_info),\n+                                          thunk_proto.dynamic_slice_thunk(),\n+                                          buffer_allocations, deserializer);\n+    }\n     default:\n       std::optional<absl::string_view> unsupported_thunk_type =\n           GetStoredThunkTypeName(thunk_proto);"
+        }
+    ],
+    "stats": {
+        "total": 59,
+        "additions": 41,
+        "deletions": 18
+    }
+}

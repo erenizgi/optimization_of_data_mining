@@ -1,0 +1,48 @@
+{
+    "author": "derdrdirk",
+    "message": "[Tensorflow]  Rewrite convolution operation in tensorflow to not use  DoConvole, ConvolveWithAlgorithm and DoPrepareForConvolution. This is in preparation of simplifying DnnSupport in XLA.\n\nPiperOrigin-RevId: 840189094",
+    "sha": "3640756ee346cd58524bf643d4d32f516e5593b1",
+    "files": [
+        {
+            "sha": "284afbec117a33f905433578b956d91747d0419c",
+            "filename": "tensorflow/core/kernels/BUILD",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/3640756ee346cd58524bf643d4d32f516e5593b1/tensorflow%2Fcore%2Fkernels%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/3640756ee346cd58524bf643d4d32f516e5593b1/tensorflow%2Fcore%2Fkernels%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcore%2Fkernels%2FBUILD?ref=3640756ee346cd58524bf643d4d32f516e5593b1",
+            "patch": "@@ -539,6 +539,11 @@ tf_cuda_only_cc_test(\n cc_library(\n     name = \"conv_ops_gpu_hdrs\",\n     hdrs = [\"conv_ops_gpu.h\"],\n+    deps = if_cuda_or_rocm([\n+        \"@local_xla//xla/stream_executor:data_type\",\n+        \"@local_xla//xla/stream_executor:dnn\",\n+        \"//tensorflow/core:framework\",\n+    ]),\n )\n \n cc_library(\n@@ -7191,6 +7196,7 @@ cc_library(\n     textual_hdrs = ANDROID_TEXTUAL_HDRS,\n     visibility = [\"//visibility:public\"],\n     deps = [\n+        \":conv_ops_gpu_hdrs\",\n         \"//tensorflow/core:portable_gif_internal\",\n         \"//tensorflow/core:portable_jpeg_internal\",\n         \"//tensorflow/core:portable_tensorflow_lib_lite\","
+        },
+        {
+            "sha": "bf46cf15a7e4fce0cd4d834f50c8e335272659b6",
+            "filename": "tensorflow/core/kernels/conv_ops_gpu.cc",
+            "status": "modified",
+            "additions": 25,
+            "deletions": 6,
+            "changes": 31,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/3640756ee346cd58524bf643d4d32f516e5593b1/tensorflow%2Fcore%2Fkernels%2Fconv_ops_gpu.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/3640756ee346cd58524bf643d4d32f516e5593b1/tensorflow%2Fcore%2Fkernels%2Fconv_ops_gpu.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcore%2Fkernels%2Fconv_ops_gpu.cc?ref=3640756ee346cd58524bf643d4d32f516e5593b1",
+            "patch": "@@ -383,12 +383,31 @@ StatusOr<AutotuneEntry<se::dnn::ConvOp>> AutotuneUnfusedConv(\n       for (auto miopen_algorithm : algorithms) {\n         auto profile_algorithm = miopen_algorithm.algorithm();\n         se::dnn::ProfileResult profile_result;\n-        auto miopen_launch_status = dnn->ConvolveWithAlgorithm(\n-            stream, kind, input_desc, input_ptr, filter_desc, filter_ptr,\n-            output_desc, output_ptr, conv_desc, &scratch_allocator,\n-            se::dnn::AlgorithmConfig(profile_algorithm,\n-                                     miopen_algorithm.scratch_size()),\n-            &profile_result);\n+        se::dnn::DataType element_type = se::dnn::ToDataType<T>::value;\n+        auto runner_or = dnn->ConvolveRunnerFromDesc(\n+            stream, profile_algorithm, kind, element_type, element_type,\n+            input_desc, filter_desc, output_desc, conv_desc);\n+        if (!runner_or.ok()) {\n+          LOG(WARNING) << runner_or.status();\n+          continue;\n+        }\n+        std::unique_ptr<const se::dnn::ConvRunner> runner =\n+            std::move(runner_or).value();\n+\n+        se::DeviceMemoryBase scratch_memory;\n+        int64_t workspace_size = runner->GetWorkspaceSize();\n+        if (workspace_size > 0) {\n+          auto scratch_or = scratch_allocator.AllocateBytes(workspace_size);\n+          if (!scratch_or.ok()) {\n+            LOG(WARNING) << scratch_or.status();\n+            continue;\n+          }\n+          scratch_memory = scratch_or.value();\n+        }\n+\n+        auto miopen_launch_status =\n+            (*runner)(stream, &profile_result, scratch_memory, input_ptr,\n+                      filter_ptr, output_ptr);\n         if (miopen_launch_status.ok() && profile_result.is_valid()) {\n           results.emplace_back();\n           auto& result = results.back();"
+        },
+        {
+            "sha": "8b9bd81c3d5e764557796a81ef26f9e76f14c4de",
+            "filename": "tensorflow/core/kernels/conv_ops_gpu.h",
+            "status": "modified",
+            "additions": 49,
+            "deletions": 9,
+            "changes": 58,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/3640756ee346cd58524bf643d4d32f516e5593b1/tensorflow%2Fcore%2Fkernels%2Fconv_ops_gpu.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/3640756ee346cd58524bf643d4d32f516e5593b1/tensorflow%2Fcore%2Fkernels%2Fconv_ops_gpu.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcore%2Fkernels%2Fconv_ops_gpu.h?ref=3640756ee346cd58524bf643d4d32f516e5593b1",
+            "patch": "@@ -16,19 +16,34 @@ limitations under the License.\n #ifndef TENSORFLOW_CORE_KERNELS_CONV_OPS_GPU_H_\n #define TENSORFLOW_CORE_KERNELS_CONV_OPS_GPU_H_\n \n+#include <cstdint>\n+#include <memory>\n+#include <utility>\n+#include <vector>\n+\n #if GOOGLE_CUDA || TENSORFLOW_USE_ROCM\n \n #include <tuple>\n-#include <unordered_map>\n \n+#include \"absl/status/status.h\"\n #include \"absl/strings/str_cat.h\"\n-#include \"absl/strings/str_format.h\"\n+#include \"xla/stream_executor/data_type.h\"\n+#include \"xla/stream_executor/device_memory.h\"\n+#include \"xla/stream_executor/dnn.h\"\n+#include \"xla/stream_executor/scratch_allocator.h\"\n+#include \"xla/stream_executor/stream.h\"\n+#include \"xla/tsl/platform/status.h\"\n+#include \"xla/tsl/platform/statusor.h\"\n+#include \"tensorflow/core/framework/allocator.h\"\n #include \"tensorflow/core/framework/op_kernel.h\"\n+#include \"tensorflow/core/framework/tensor.h\"\n+#include \"tensorflow/core/framework/tensor_shape.h\"\n #include \"tensorflow/core/kernels/gpu_utils.h\"\n-#include \"tensorflow/core/lib/gtl/inlined_vector.h\"\n-#include \"tensorflow/core/lib/hash/hash.h\"\n+#include \"tensorflow/core/platform/errors.h\"\n+#include \"tensorflow/core/platform/status.h\"\n+#include \"tensorflow/core/platform/statusor.h\"\n+#include \"tensorflow/core/platform/types.h\"\n #include \"tensorflow/core/util/autotune_maps/conv_parameters.h\"\n-#include \"tensorflow/core/util/tensor_format.h\"\n \n namespace tensorflow {\n \n@@ -199,10 +214,35 @@ Status LaunchAutotunedConv(const AutotuneEntry<se::dnn::ConvOp>& autotune_entry,\n     if (dnn == nullptr) {\n       return absl::InternalError(\"No DNN for stream.\");\n     }\n-    return dnn->ConvolveWithAlgorithm(\n-        stream, kind, input_desc, in_ptr, filter_desc, filter_ptr, output_desc,\n-        out_ptr, conv_desc, scratch_allocator,\n-        autotune_entry.GetAlgorithmConfig(), nullptr);\n+    se::dnn::DataType element_type = se::dnn::ToDataType<T>::value;\n+    const se::dnn::AlgorithmConfig& algo_config =\n+        autotune_entry.GetAlgorithmConfig();\n+    auto algo_desc = algo_config.algorithm();\n+    if (!algo_desc.has_value()) {\n+      return absl::InternalError(\"No algorithm in AlgorithmConfig\");\n+    }\n+\n+    auto runner_or = dnn->ConvolveRunnerFromDesc(\n+        stream, *algo_desc, kind, element_type, element_type, input_desc,\n+        filter_desc, output_desc, conv_desc);\n+    if (!runner_or.ok()) {\n+      return runner_or.status();\n+    }\n+    std::unique_ptr<const se::dnn::ConvRunner> runner =\n+        std::move(runner_or).value();\n+\n+    se::DeviceMemoryBase scratch_memory;\n+    int64_t workspace_size = runner->GetWorkspaceSize();\n+    if (workspace_size > 0) {\n+      auto scratch_or = scratch_allocator->AllocateBytes(workspace_size);\n+      if (!scratch_or.ok()) {\n+        return absl::InternalError(\n+            \"CUDNN failed to allocate the scratch space for the runner\");\n+      }\n+      scratch_memory = scratch_or.value();\n+    }\n+    return (*runner)(stream, nullptr, scratch_memory, in_ptr, filter_ptr,\n+                     out_ptr);\n   }\n }\n "
+        }
+    ],
+    "stats": {
+        "total": 95,
+        "additions": 80,
+        "deletions": 15
+    }
+}

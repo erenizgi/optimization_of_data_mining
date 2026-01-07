@@ -1,0 +1,36 @@
+{
+    "author": "ZixuanJiang",
+    "message": "Refactor shard_map import and export.\n\nPiperOrigin-RevId: 804511153",
+    "sha": "5c93d3d36eaa40ce5e33ffd05a5d3fac5c965bd1",
+    "files": [
+        {
+            "sha": "1f0e17190f387db94cf8c8521203ab1baacc093a",
+            "filename": "third_party/xla/xla/service/spmd/shardy/sdy_round_trip/shard_map_export.cc",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 8,
+            "changes": 10,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/5c93d3d36eaa40ce5e33ffd05a5d3fac5c965bd1/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Fsdy_round_trip%2Fshard_map_export.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/5c93d3d36eaa40ce5e33ffd05a5d3fac5c965bd1/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Fsdy_round_trip%2Fshard_map_export.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Fsdy_round_trip%2Fshard_map_export.cc?ref=5c93d3d36eaa40ce5e33ffd05a5d3fac5c965bd1",
+            "patch": "@@ -51,7 +51,6 @@ namespace sdy {\n \n namespace {\n \n-using ::mlir::MLIRContext;\n using ::mlir::ModuleOp;\n using ::mlir::StringRef;\n using ::mlir::func::CallOp;\n@@ -68,11 +67,10 @@ class SdyRoundTripShardMapExportPass\n \n   void runOnOperation() final {\n     ModuleOp moduleOp = getOperation();\n-    MLIRContext* context = moduleOp.getContext();\n     mlir::SymbolTableCollection symbolTableCollection;\n     mlir::SymbolTable& symbolTable =\n         symbolTableCollection.getSymbolTable(moduleOp);\n-    auto rewriter = mlir::IRRewriter(context);\n+    auto rewriter = mlir::IRRewriter(moduleOp.getContext());\n     moduleOp->walk([&](sdy::ManualComputationOp manualComputation) {\n       rewriter.setInsertionPointToEnd(&moduleOp.getRegion().front());\n       mlir::Location loc = manualComputation.getLoc();\n@@ -87,10 +85,9 @@ class SdyRoundTripShardMapExportPass\n       mlir::StringAttr funcName = symbolTable.insert(funcOp);\n \n       rewriter.setInsertionPoint(manualComputation);\n-      stablehlo::CustomCallOp globalToLocalShape;\n       mlir::ValueRange operands = manualComputation->getOperands();\n       if (!operands.empty()) {\n-        globalToLocalShape = stablehlo::CustomCallOp::create(\n+        auto globalToLocalShape = stablehlo::CustomCallOp::create(\n             rewriter, loc, manualCompBodyArgTypes, operands);\n         globalToLocalShape.setCallTargetName(kGlobalToLocalShapeCallTargetName);\n         // We mark `xla.sdy.GlobalToLocalShape` as side-effecting to avoid\n@@ -114,9 +111,6 @@ class SdyRoundTripShardMapExportPass\n         auto localToGlobalShape = stablehlo::CustomCallOp::create(\n             rewriter, loc, manualComputation.getResultTypes(),\n             callOp->getResults());\n-        // We don't mark `xla.sdy.LocalToGlobalShape` as side-effecting, so if\n-        // any of its results has a dimension of size 0 (i.e. 0 num-elements),\n-        // it will be replaced with a constant of the same shape.\n         localToGlobalShape.setCallTargetName(kLocalToGlobalShapeCallTargetName);\n         // We mark `xla.sdy.LocalToGlobalShape` as side-effecting to avoid\n         // CSE removing it if it has no users."
+        },
+        {
+            "sha": "46f9fe49698fd6826f87ed6ec480d44b470ca921",
+            "filename": "third_party/xla/xla/service/spmd/shardy/stablehlo_round_trip/shard_map_export.cc",
+            "status": "modified",
+            "additions": 19,
+            "deletions": 18,
+            "changes": 37,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/5c93d3d36eaa40ce5e33ffd05a5d3fac5c965bd1/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Fstablehlo_round_trip%2Fshard_map_export.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/5c93d3d36eaa40ce5e33ffd05a5d3fac5c965bd1/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Fstablehlo_round_trip%2Fshard_map_export.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Fstablehlo_round_trip%2Fshard_map_export.cc?ref=5c93d3d36eaa40ce5e33ffd05a5d3fac5c965bd1",
+            "patch": "@@ -236,6 +236,21 @@ void setFuncResultManualAxes(FuncOp funcOp, int64_t resultIndex,\n   }\n }\n \n+// Creates a sharding constraint op. If `createHloShardingConstraints` is true,\n+// creates a `stablehlo.custom_call` op with `call_target_name` equal to\n+// \"Sharding\", otherwise creates a `mhlo.copy` op.\n+Operation* createShardingConstraint(mlir::IRRewriter& rewriter,\n+                                    mlir::Location loc, Value value,\n+                                    bool createHloShardingConstraints) {\n+  if (createHloShardingConstraints) {\n+    auto customCallOp =\n+        CustomCallOp::create(rewriter, loc, value.getType(), value);\n+    customCallOp.setCallTargetName(kShardingCustomCallTargetName);\n+    return customCallOp;\n+  }\n+  return CopyOp::create(rewriter, loc, value);\n+}\n+\n // Converts `op` to the pattern that XLA recognizes.\n //\n // The pattern is:\n@@ -290,15 +305,8 @@ void convertManualComputationOp(\n       fullToShardResults.push_back(globalOperand);\n       continue;\n     }\n-    Operation* shardingConstraint;\n-    if (createHloShardingConstraints) {\n-      auto customCallOp = CustomCallOp::create(\n-          rewriter, loc, globalOperand.getType(), globalOperand);\n-      customCallOp.setCallTargetName(kShardingCustomCallTargetName);\n-      shardingConstraint = customCallOp;\n-    } else {\n-      shardingConstraint = CopyOp::create(rewriter, loc, globalOperand);\n-    }\n+    Operation* shardingConstraint = createShardingConstraint(\n+        rewriter, loc, globalOperand, createHloShardingConstraints);\n     sdy::setShardings(shardingConstraint, inSharding);\n     setNonEmptyManualAxes(shardingConstraint, parentManualAxesAttr);\n \n@@ -356,15 +364,8 @@ void convertManualComputationOp(\n       oldResult.replaceAllUsesWith(localResult);\n       continue;\n     }\n-    Operation* shardingConstraint;\n-    if (createHloShardingConstraints) {\n-      auto customCallOp = CustomCallOp::create(\n-          rewriter, loc, localResult.getType(), localResult);\n-      customCallOp.setCallTargetName(kShardingCustomCallTargetName);\n-      shardingConstraint = customCallOp;\n-    } else {\n-      shardingConstraint = CopyOp::create(rewriter, loc, localResult);\n-    }\n+    Operation* shardingConstraint = createShardingConstraint(\n+        rewriter, loc, localResult, createHloShardingConstraints);\n     sdy::setShardings(shardingConstraint, erasedManualAxisOutShardings.back());\n     setNonEmptyManualAxes(shardingConstraint, regionManualAxesAttr);\n "
+        }
+    ],
+    "stats": {
+        "total": 47,
+        "additions": 21,
+        "deletions": 26
+    }
+}

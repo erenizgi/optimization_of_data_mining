@@ -1,0 +1,144 @@
+{
+    "author": "ezhulenev",
+    "message": "[xla] Add ShapeCanonicalizer pass to share xla::Shape between instructions in HloModule\n\nPiperOrigin-RevId: 800685853",
+    "sha": "948283a2c180981ad9ccecab675b0ecf663334e1",
+    "files": [
+        {
+            "sha": "d0ac65e0e8f7de361acadafe3af9636ef8b51d64",
+            "filename": "third_party/xla/xla/hlo/ir/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/948283a2c180981ad9ccecab675b0ecf663334e1/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/948283a2c180981ad9ccecab675b0ecf663334e1/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2FBUILD?ref=948283a2c180981ad9ccecab675b0ecf663334e1",
+            "patch": "@@ -72,6 +72,7 @@ cc_library(\n         \"//xla:printer\",\n         \"//xla:protobuf_util\",\n         \"//xla:shape_layout\",\n+        \"//xla:shape_pool\",\n         \"//xla:shape_tree\",\n         \"//xla:shape_util\",\n         \"//xla:side_effect_util\","
+        },
+        {
+            "sha": "5fd1b98848cc8cda300f181af4a28f41a3e90839",
+            "filename": "third_party/xla/xla/hlo/ir/hlo_instruction.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/948283a2c180981ad9ccecab675b0ecf663334e1/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_instruction.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/948283a2c180981ad9ccecab675b0ecf663334e1/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_instruction.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_instruction.cc?ref=948283a2c180981ad9ccecab675b0ecf663334e1",
+            "patch": "@@ -4487,6 +4487,7 @@ HloInstruction::HloInstruction(HloOpcode opcode, const Shape& shape)\n       cleaned_up_(false),\n       marked_as_dead_(false),\n       is_root_(false),\n+      shape_is_canonicalized_(false),\n       shape_(std::make_shared<Shape>(shape)),\n       name_(HloOpcodeString(opcode)) {\n   TF_DCHECK_OK(ShapeUtil::ValidateShapeWithOptionalLayout(*shape_));"
+        },
+        {
+            "sha": "8f43ddc1534bc69d136ea741f07cb532711ed00b",
+            "filename": "third_party/xla/xla/hlo/ir/hlo_instruction.h",
+            "status": "modified",
+            "additions": 21,
+            "deletions": 1,
+            "changes": 22,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/948283a2c180981ad9ccecab675b0ecf663334e1/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_instruction.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/948283a2c180981ad9ccecab675b0ecf663334e1/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_instruction.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_instruction.h?ref=948283a2c180981ad9ccecab675b0ecf663334e1",
+            "patch": "@@ -60,11 +60,13 @@ limitations under the License.\n #include \"xla/hlo/ir/ptrvec.h\"\n #include \"xla/layout.h\"\n #include \"xla/literal.h\"\n+#include \"xla/literal_pool.h\"\n #include \"xla/printer.h\"\n #include \"xla/service/hlo.pb.h\"\n #include \"xla/service/mapped_ptr_container_sorter.h\"\n #include \"xla/service/name_uniquer.h\"\n #include \"xla/shape.h\"\n+#include \"xla/shape_pool.h\"\n #include \"xla/shape_util.h\"\n #include \"xla/tsl/lib/gtl/iterator_range.h\"\n #include \"xla/tsl/platform/errors.h\"\n@@ -1216,12 +1218,27 @@ class HloInstruction {\n   // Returns the (mutable) result shape of this instruction.\n   Shape* mutable_shape() {\n     DCHECK(shape_) << \"Instruction shape must be set\";\n-    if (shape_.use_count() > 1) {\n+    if (shape_is_canonicalized_) {\n       shape_ = std::make_shared<Shape>(*shape_);\n+      shape_is_canonicalized_ = false;\n     }\n     return &*shape_;\n   }\n \n+  // Canonicalize instruction shape using the given shape pool.\n+  bool Canonicalize(ShapePool* shape_pool) {\n+    DCHECK(shape_) << \"Instruction shape must be set\";\n+    if (shape_pool) {\n+      std::shared_ptr<Shape> canonical = shape_pool->GetCanonicalShape(shape_);\n+      shape_is_canonicalized_ = true;\n+      if (canonical != shape_) {\n+        shape_ = std::move(canonical);\n+        return true;\n+      }\n+    }\n+    return false;\n+  }\n+\n   // Returns the ith operand to this instruction.\n   const HloInstruction* operand(int64_t i) const;\n \n@@ -2660,6 +2677,9 @@ class HloInstruction {\n   // True if this instruction is the root of a computation.\n   bool is_root_ : 1;\n \n+  // True if the shape of this instruction has been canonicalized.\n+  bool shape_is_canonicalized_ : 1;\n+\n   // Instruction operands.\n   InstructionVector operands_;\n "
+        },
+        {
+            "sha": "951539af21a01c2f01a5064db20a68f534435c85",
+            "filename": "third_party/xla/xla/hlo/transforms/BUILD",
+            "status": "modified",
+            "additions": 34,
+            "deletions": 0,
+            "changes": 34,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/948283a2c180981ad9ccecab675b0ecf663334e1/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/948283a2c180981ad9ccecab675b0ecf663334e1/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2FBUILD?ref=948283a2c180981ad9ccecab675b0ecf663334e1",
+            "patch": "@@ -442,6 +442,40 @@ xla_cc_test(\n     ],\n )\n \n+cc_library(\n+    name = \"shape_canonicalizer\",\n+    srcs = [\"shape_canonicalizer.cc\"],\n+    hdrs = [\"shape_canonicalizer.h\"],\n+    deps = [\n+        \"//xla:shape_pool\",\n+        \"//xla/hlo/ir:hlo\",\n+        \"//xla/hlo/pass:hlo_pass\",\n+        \"//xla/tsl/platform:errors\",\n+        \"@com_google_absl//absl/container:flat_hash_set\",\n+        \"@com_google_absl//absl/log\",\n+        \"@com_google_absl//absl/status\",\n+        \"@com_google_absl//absl/status:statusor\",\n+        \"@com_google_absl//absl/strings:string_view\",\n+    ],\n+)\n+\n+xla_cc_test(\n+    name = \"shape_canonicalizer_test\",\n+    srcs = [\"shape_canonicalizer_test.cc\"],\n+    deps = [\n+        \":shape_canonicalizer\",\n+        \"//xla:shape_pool\",\n+        \"//xla/hlo/ir:hlo\",\n+        \"//xla/hlo/parser:hlo_parser\",\n+        \"//xla/hlo/testlib:hlo_hardware_independent_test_base\",\n+        \"//xla/tsl/platform:statusor\",\n+        \"//xla/tsl/platform:test\",\n+        \"@com_google_absl//absl/strings:string_view\",\n+        \"@com_google_googletest//:gtest\",\n+        \"@com_google_googletest//:gtest_main\",\n+    ],\n+)\n+\n cc_library(\n     name = \"operand_upcaster\",\n     srcs = [\"operand_upcaster.cc\"],"
+        },
+        {
+            "sha": "5d555bcf873e6aa0979c2c2495939d5796faa73a",
+            "filename": "third_party/xla/xla/hlo/transforms/shape_canonicalizer.cc",
+            "status": "added",
+            "additions": 66,
+            "deletions": 0,
+            "changes": 66,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/948283a2c180981ad9ccecab675b0ecf663334e1/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fshape_canonicalizer.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/948283a2c180981ad9ccecab675b0ecf663334e1/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fshape_canonicalizer.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fshape_canonicalizer.cc?ref=948283a2c180981ad9ccecab675b0ecf663334e1",
+            "patch": "@@ -0,0 +1,66 @@\n+/* Copyright 2025 The OpenXLA Authors.\n+\n+Licensed under the Apache License, Version 2.0 (the \"License\");\n+you may not use this file except in compliance with the License.\n+You may obtain a copy of the License at\n+\n+    http://www.apache.org/licenses/LICENSE-2.0\n+\n+Unless required by applicable law or agreed to in writing, software\n+distributed under the License is distributed on an \"AS IS\" BASIS,\n+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+See the License for the specific language governing permissions and\n+limitations under the License.\n+==============================================================================*/\n+\n+#include \"xla/hlo/transforms/shape_canonicalizer.h\"\n+\n+#include <cstddef>\n+\n+#include \"absl/container/flat_hash_set.h\"\n+#include \"absl/log/log.h\"\n+#include \"absl/status/status.h\"\n+#include \"absl/status/statusor.h\"\n+#include \"absl/strings/string_view.h\"\n+#include \"xla/hlo/ir/dfs_hlo_visitor.h\"\n+#include \"xla/hlo/ir/dfs_hlo_visitor_with_default.h\"\n+#include \"xla/hlo/ir/hlo_instruction.h\"\n+#include \"xla/shape_pool.h\"\n+#include \"xla/tsl/platform/errors.h\"\n+\n+namespace xla {\n+namespace {\n+\n+class ShapeCanonicalizerVisitor : public DfsHloRewriteVisitor {\n+ public:\n+  explicit ShapeCanonicalizerVisitor(ShapePool* shape_pool)\n+      : shape_pool_(shape_pool) {}\n+\n+  absl::Status DefaultAction(HloInstruction* hlo) final {\n+    MarkAsMaybeChanged(hlo->Canonicalize(shape_pool_));\n+    return absl::OkStatus();\n+  }\n+\n+ private:\n+  ShapePool* shape_pool_;\n+};\n+\n+}  // namespace\n+\n+ShapeCanonicalizer::ShapeCanonicalizer(ShapePool* shape_pool)\n+    : shape_pool_(shape_pool) {}\n+\n+absl::StatusOr<bool> ShapeCanonicalizer::Run(\n+    HloModule* module,\n+    const absl::flat_hash_set<absl::string_view>& execution_threads) {\n+  // Every time we canonicalize shapes in a module, we garbage collect expired\n+  // shapes from the pool.\n+  size_t num_erased = shape_pool_->GarbageCollect();\n+  VLOG(3) << \"Garbage collected \" << num_erased << \" expired shapes\";\n+\n+  ShapeCanonicalizerVisitor visitor(shape_pool_);\n+  TF_RETURN_IF_ERROR(module->entry_computation()->Accept(&visitor));\n+  return visitor.changed();\n+}\n+\n+}  // namespace xla"
+        },
+        {
+            "sha": "1d2efb1f3849ca57efc352628eb63fd5e737eb1d",
+            "filename": "third_party/xla/xla/hlo/transforms/shape_canonicalizer.h",
+            "status": "added",
+            "additions": 50,
+            "deletions": 0,
+            "changes": 50,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/948283a2c180981ad9ccecab675b0ecf663334e1/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fshape_canonicalizer.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/948283a2c180981ad9ccecab675b0ecf663334e1/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fshape_canonicalizer.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fshape_canonicalizer.h?ref=948283a2c180981ad9ccecab675b0ecf663334e1",
+            "patch": "@@ -0,0 +1,50 @@\n+/* Copyright 2025 The OpenXLA Authors.\n+\n+Licensed under the Apache License, Version 2.0 (the \"License\");\n+you may not use this file except in compliance with the License.\n+You may obtain a copy of the License at\n+\n+    http://www.apache.org/licenses/LICENSE-2.0\n+\n+Unless required by applicable law or agreed to in writing, software\n+distributed under the License is distributed on an \"AS IS\" BASIS,\n+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+See the License for the specific language governing permissions and\n+limitations under the License.\n+==============================================================================*/\n+\n+#ifndef XLA_HLO_TRANSFORMS_SHAPE_CANONICALIZER_H_\n+#define XLA_HLO_TRANSFORMS_SHAPE_CANONICALIZER_H_\n+\n+#include \"absl/container/flat_hash_set.h\"\n+#include \"absl/status/statusor.h\"\n+#include \"absl/strings/string_view.h\"\n+#include \"xla/hlo/ir/hlo_module.h\"\n+#include \"xla/hlo/pass/hlo_pass_interface.h\"\n+#include \"xla/shape_pool.h\"\n+\n+namespace xla {\n+\n+// Canonicalizes HLO instructions shapes in the HLO module using the given shape\n+// pool. Most of the instructions in the HLO module has the same shape, and by\n+// sharing shapes we can reduce the memory usage of the HLO module.\n+class ShapeCanonicalizer : public HloModulePass {\n+ public:\n+  class Visitor;\n+\n+  explicit ShapeCanonicalizer(ShapePool* shape_pool);\n+\n+  using HloPassInterface::Run;\n+  absl::StatusOr<bool> Run(\n+      HloModule* module,\n+      const absl::flat_hash_set<absl::string_view>& execution_threads) override;\n+\n+  absl::string_view name() const override { return \"shape-canonicalizer\"; }\n+\n+ protected:\n+  ShapePool* shape_pool_;\n+};\n+\n+}  // namespace xla\n+\n+#endif  // XLA_HLO_TRANSFORMS_SHAPE_CANONICALIZER_H_"
+        },
+        {
+            "sha": "ca3913cbf934f8cd9ff8a3574089c33d3b4eec31",
+            "filename": "third_party/xla/xla/hlo/transforms/shape_canonicalizer_test.cc",
+            "status": "added",
+            "additions": 63,
+            "deletions": 0,
+            "changes": 63,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/948283a2c180981ad9ccecab675b0ecf663334e1/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fshape_canonicalizer_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/948283a2c180981ad9ccecab675b0ecf663334e1/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fshape_canonicalizer_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fshape_canonicalizer_test.cc?ref=948283a2c180981ad9ccecab675b0ecf663334e1",
+            "patch": "@@ -0,0 +1,63 @@\n+/* Copyright 2024 The OpenXLA Authors.\n+\n+Licensed under the Apache License, Version 2.0 (the \"License\");\n+you may not use this file except in compliance with the License.\n+You may obtain a copy of the License at\n+\n+    http://www.apache.org/licenses/LICENSE-2.0\n+\n+Unless required by applicable law or agreed to in writing, software\n+distributed under the License is distributed on an \"AS IS\" BASIS,\n+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+See the License for the specific language governing permissions and\n+limitations under the License.\n+==============================================================================*/\n+\n+#include \"xla/hlo/transforms/shape_canonicalizer.h\"\n+\n+#include <gtest/gtest.h>\n+#include \"absl/strings/string_view.h\"\n+#include \"xla/hlo/ir/hlo_casting_utils.h\"\n+#include \"xla/hlo/ir/hlo_instructions.h\"\n+#include \"xla/hlo/parser/hlo_parser.h\"\n+#include \"xla/hlo/testlib/hlo_hardware_independent_test_base.h\"\n+#include \"xla/shape_pool.h\"\n+#include \"xla/tsl/platform/statusor.h\"\n+\n+namespace xla {\n+namespace {\n+\n+class ShapeCanonicalizerTest : public HloHardwareIndependentTestBase {};\n+\n+TEST_F(ShapeCanonicalizerTest, Canonicalize) {\n+  absl::string_view hlo_string = R\"(\n+    HloModule m\n+\n+    ENTRY %entry {\n+      ROOT %c0 = f32[4] constant({1.0, 2.0, 3.0, 4.0})\n+    }\n+  )\";\n+\n+  TF_ASSERT_OK_AND_ASSIGN(auto module0,\n+                          ParseAndReturnVerifiedModule(hlo_string));\n+  TF_ASSERT_OK_AND_ASSIGN(auto module1,\n+                          ParseAndReturnVerifiedModule(hlo_string));\n+\n+  ShapePool shape_pool;\n+  ShapeCanonicalizer shape_canonicalizer(&shape_pool);\n+\n+  EXPECT_FALSE(shape_canonicalizer.Run(module0.get()).value());\n+  EXPECT_TRUE(shape_canonicalizer.Run(module1.get()).value());\n+\n+  auto* c0 = Cast<HloConstantInstruction>(\n+      module0->entry_computation()->root_instruction());\n+  auto* c1 = Cast<HloConstantInstruction>(\n+      module1->entry_computation()->root_instruction());\n+\n+  // We compare instruction shape pointers for equality, as we expect them to\n+  // point to the same object in the shape pool.\n+  EXPECT_EQ(&c0->shape(), &c1->shape());\n+}\n+\n+}  // namespace\n+}  // namespace xla"
+        },
+        {
+            "sha": "600a0d1c5fbd44a445a3c765c1a94e0ec1c9ea2c",
+            "filename": "third_party/xla/xla/service/buffer_assignment.cc",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 5,
+            "changes": 15,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/948283a2c180981ad9ccecab675b0ecf663334e1/third_party%2Fxla%2Fxla%2Fservice%2Fbuffer_assignment.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/948283a2c180981ad9ccecab675b0ecf663334e1/third_party%2Fxla%2Fxla%2Fservice%2Fbuffer_assignment.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fbuffer_assignment.cc?ref=948283a2c180981ad9ccecab675b0ecf663334e1",
+            "patch": "@@ -293,12 +293,17 @@ absl::Status BufferAllocation::AddAssignment(const HloValue& buffer,\n   assigned_buffers_.emplace(&buffer, offset_size);\n   // For debugging purposes, store the assigned memory space in the\n   // instruction's layout.\n-  for (HloPosition position : buffer.positions()) {\n-    Shape* shape = ShapeUtil::GetMutableSubshape(\n-        position.instruction->mutable_shape(), position.index);\n-    if (shape->has_layout()) {\n-      shape->mutable_layout()->set_memory_space(buffer.color());\n+  for (const HloPosition& position : buffer.positions()) {\n+    const Shape& shape =\n+        ShapeUtil::GetSubshape(position.instruction->shape(), position.index);\n+    if (!shape.has_layout() ||\n+        shape.layout().memory_space() == buffer.color()) {\n+      continue;\n     }\n+\n+    Shape* mutable_shape = ShapeUtil::GetMutableSubshape(\n+        position.instruction->mutable_shape(), position.index);\n+    mutable_shape->mutable_layout()->set_memory_space(buffer.color());\n   }\n   return absl::OkStatus();\n }"
+        },
+        {
+            "sha": "95e3a926e54ecd0ab6af9495f261fac057a650bf",
+            "filename": "third_party/xla/xla/service/cpu/BUILD",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/948283a2c180981ad9ccecab675b0ecf663334e1/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/948283a2c180981ad9ccecab675b0ecf663334e1/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2FBUILD?ref=948283a2c180981ad9ccecab675b0ecf663334e1",
+            "patch": "@@ -214,6 +214,7 @@ cc_library(\n         \"//xla:literal\",\n         \"//xla:literal_pool\",\n         \"//xla:protobuf_util\",\n+        \"//xla:shape_pool\",\n         \"//xla:shape_util\",\n         \"//xla:status_macros\",\n         \"//xla:types\",\n@@ -248,6 +249,7 @@ cc_library(\n         \"//xla/hlo/pass:hlo_pass_pipeline\",\n         \"//xla/hlo/transforms:literal_canonicalizer\",\n         \"//xla/hlo/transforms:operand_upcaster\",\n+        \"//xla/hlo/transforms:shape_canonicalizer\",\n         \"//xla/hlo/transforms:while_loop_trip_count_annotator\",\n         \"//xla/hlo/transforms/expanders:bitcast_dtypes_expander\",\n         \"//xla/hlo/transforms/expanders:cholesky_expander\","
+        },
+        {
+            "sha": "fc6a759e251eb45b6005f8880b8e0ef6e7dd9e63",
+            "filename": "third_party/xla/xla/service/cpu/cpu_compiler.cc",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/948283a2c180981ad9ccecab675b0ecf663334e1/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fcpu_compiler.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/948283a2c180981ad9ccecab675b0ecf663334e1/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fcpu_compiler.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fcpu_compiler.cc?ref=948283a2c180981ad9ccecab675b0ecf663334e1",
+            "patch": "@@ -131,6 +131,7 @@ limitations under the License.\n #include \"xla/hlo/transforms/expanders/stochastic_convert_decomposer.h\"\n #include \"xla/hlo/transforms/literal_canonicalizer.h\"\n #include \"xla/hlo/transforms/operand_upcaster.h\"\n+#include \"xla/hlo/transforms/shape_canonicalizer.h\"\n #include \"xla/hlo/transforms/simplifiers/algebraic_simplifier.h\"\n #include \"xla/hlo/transforms/simplifiers/batch_dot_simplification.h\"\n #include \"xla/hlo/transforms/simplifiers/broadcast_canonicalizer.h\"\n@@ -223,6 +224,7 @@ limitations under the License.\n #include \"xla/service/while_loop_invariant_code_motion.h\"\n #include \"xla/service/while_loop_simplifier.h\"\n #include \"xla/shape.h\"\n+#include \"xla/shape_pool.h\"\n #include \"xla/shape_util.h\"\n #include \"xla/status_macros.h\"\n #include \"xla/stream_executor/host/host_platform_id.h\"\n@@ -846,6 +848,9 @@ absl::Status CpuCompiler::RunHloPassesThroughLayoutAssn(\n   pipeline.AddPass<SubByteNormalization>(\n       SubByteNormalization::SET_ELEMENT_SIZE);\n \n+  // Canonicalize all shapes in the module.\n+  pipeline.AddPass<ShapeCanonicalizer>(ShapePool::Default());\n+\n   // Finally canonicalize all literals larger than 1024 bytes in the module to\n   // reuse the same literal across multiple HLO modules.\n   pipeline.AddPass<LiteralCanonicalizer>(LiteralPool::Default(),"
+        },
+        {
+            "sha": "49a6d292ded1c60b3eb80d64827eb701be208918",
+            "filename": "third_party/xla/xla/shape_pool.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/948283a2c180981ad9ccecab675b0ecf663334e1/third_party%2Fxla%2Fxla%2Fshape_pool.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/948283a2c180981ad9ccecab675b0ecf663334e1/third_party%2Fxla%2Fxla%2Fshape_pool.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fshape_pool.cc?ref=948283a2c180981ad9ccecab675b0ecf663334e1",
+            "patch": "@@ -28,7 +28,7 @@ limitations under the License.\n namespace xla {\n \n ShapePool* ShapePool::Default() {\n-  absl::NoDestructor<ShapePool> pool;\n+  static absl::NoDestructor<ShapePool> pool;\n   return &*pool;\n }\n "
+        }
+    ],
+    "stats": {
+        "total": 261,
+        "additions": 254,
+        "deletions": 7
+    }
+}

@@ -1,0 +1,72 @@
+{
+    "author": "WillFroom",
+    "message": "[XLA:CPU] Use the legacy concatenate emitter for single instructions.\n\nPiperOrigin-RevId: 814722452",
+    "sha": "d05adb4d7350f3e4786ae711eb582ce76c579b8d",
+    "files": [
+        {
+            "sha": "3179b0a355fdb8b9fc742a163beb0763325efcfa",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/elemental/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/d05adb4d7350f3e4786ae711eb582ce76c579b8d/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Felemental%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/d05adb4d7350f3e4786ae711eb582ce76c579b8d/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Felemental%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Felemental%2FBUILD?ref=d05adb4d7350f3e4786ae711eb582ce76c579b8d",
+            "patch": "@@ -38,6 +38,7 @@ cc_library(\n         \"//xla/service/llvm_ir:ir_array\",\n         \"//xla/tsl/platform:errors\",\n         \"//xla/tsl/platform:statusor\",\n+        \"@com_google_absl//absl/algorithm:container\",\n         \"@com_google_absl//absl/log\",\n         \"@com_google_absl//absl/status\",\n         \"@com_google_absl//absl/status:statusor\","
+        },
+        {
+            "sha": "f740dac374d1751b33775a44635618f0ec6d8a58",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/elemental/concatenate_kernel_emitter.cc",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 11,
+            "changes": 24,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/d05adb4d7350f3e4786ae711eb582ce76c579b8d/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Felemental%2Fconcatenate_kernel_emitter.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/d05adb4d7350f3e4786ae711eb582ce76c579b8d/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Felemental%2Fconcatenate_kernel_emitter.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Felemental%2Fconcatenate_kernel_emitter.cc?ref=d05adb4d7350f3e4786ae711eb582ce76c579b8d",
+            "patch": "@@ -15,9 +15,12 @@ limitations under the License.\n \n #include \"xla/backends/cpu/codegen/elemental/concatenate_kernel_emitter.h\"\n \n+#include <cstdint>\n+#include <functional>\n #include <memory>\n #include <utility>\n \n+#include \"absl/algorithm/container.h\"\n #include \"absl/log/log.h\"\n #include \"absl/status/status.h\"\n #include \"absl/status/statusor.h\"\n@@ -48,13 +51,6 @@ limitations under the License.\n namespace xla::cpu {\n \n static absl::Status CanDoFastConcatenate(const HloInstruction* concatenate) {\n-  if (!concatenate->backend_config<BackendConfig>()\n-           ->outer_dimension_partitions()\n-           .empty()) {\n-    return absl::Status(\n-        absl::StatusCode::kFailedPrecondition,\n-        \"Cannot generate memcpy-based concat for the parallel CPU backend\");\n-  }\n   const Shape& output_shape = concatenate->shape();\n   for (auto* op : concatenate->operands()) {\n     if (!LayoutUtil::Equal(op->shape().layout(), output_shape.layout())) {\n@@ -88,6 +84,11 @@ ConcatenateKernelEmitter::EmitKernelDefinition() {\n     return Internal(\"HloModule is null\");\n   }\n \n+  const auto& backend_config = instr_->backend_config<BackendConfig>();\n+  const auto& partitions = backend_config->outer_dimension_partitions();\n+  auto total_workgroups =\n+      absl::c_accumulate(partitions, 1, std::multiplies<int64_t>());\n+\n   KernelApiIrBuilder kernel_api_ir_builder(\n       *ctx,\n       KernelApiIrBuilder::Options::FromHloModuleConfig(hlo_module->config()));\n@@ -105,12 +106,13 @@ ConcatenateKernelEmitter::EmitKernelDefinition() {\n       kernel_prototype.function->getEntryBlock().getTerminator());\n \n   llvm_ir::IrArray output_array = kernel_prototype.results[0];\n-  TF_RETURN_IF_ERROR(EmitFastConcatenate(instr_, kernel_prototype.arguments,\n-                                         output_array, llvm_module.get(),\n-                                         ir_builder));\n+  TF_RETURN_IF_ERROR(EmitFastConcatenate(\n+      instr_, kernel_prototype.arguments, output_array, llvm_module.get(),\n+      ir_builder, kernel_prototype.workgroup_id.x, total_workgroups));\n \n   LlvmIrKernelSource source(std::move(ctx), std::move(llvm_module));\n-  KernelSpec spec(kernel_prototype.function->getName(), NumWorkGroups(),\n+  KernelSpec spec(kernel_prototype.function->getName(),\n+                  NumWorkGroups{static_cast<uint64_t>(total_workgroups)},\n                   std::move(kernel_prototype.argument_buffers),\n                   std::move(kernel_prototype.result_buffers),\n                   std::move(kernel_prototype.invariant_arguments));"
+        },
+        {
+            "sha": "0751dc4767e6b1e4e29a3f80ed6eb0b27b0cf89b",
+            "filename": "third_party/xla/xla/service/cpu/fusion_wrapper.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/d05adb4d7350f3e4786ae711eb582ce76c579b8d/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Ffusion_wrapper.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/d05adb4d7350f3e4786ae711eb582ce76c579b8d/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Ffusion_wrapper.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Ffusion_wrapper.cc?ref=d05adb4d7350f3e4786ae711eb582ce76c579b8d",
+            "patch": "@@ -37,7 +37,6 @@ bool FusionWrapper::MustWrapInstruction(HloOpcode opcode) {\n     case HloOpcode::kClz:\n     case HloOpcode::kCompare:\n     case HloOpcode::kComplex:\n-    case HloOpcode::kConcatenate:\n     case HloOpcode::kConvert:\n     case HloOpcode::kCos:\n     case HloOpcode::kDivide:\n@@ -88,6 +87,7 @@ bool FusionWrapper::MustWrapInstruction(HloOpcode opcode) {\n     // The following ops are supported but the performance is not as good as the\n     // non-fusion path.\n     // TODO(willfroom): Remove this once the performance is improved.\n+    case HloOpcode::kConcatenate:\n     case HloOpcode::kDynamicUpdateSlice:\n     case HloOpcode::kTranspose:\n     case HloOpcode::kDot:"
+        },
+        {
+            "sha": "349de8c42351ebaf12af9637c65708d42c36d066",
+            "filename": "third_party/xla/xla/service/cpu/ir_emitter.cc",
+            "status": "modified",
+            "additions": 44,
+            "deletions": 2,
+            "changes": 46,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/d05adb4d7350f3e4786ae711eb582ce76c579b8d/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fir_emitter.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/d05adb4d7350f3e4786ae711eb582ce76c579b8d/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fir_emitter.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fir_emitter.cc?ref=d05adb4d7350f3e4786ae711eb582ce76c579b8d",
+            "patch": "@@ -2944,11 +2944,15 @@ absl::Status EmitFastConcatenate(\n     const HloInstruction* instr,\n     absl::Span<const llvm_ir::IrArray> source_arrays,\n     const llvm_ir::IrArray& target_array, llvm::Module* module,\n-    llvm::IRBuilderBase& b) {\n+    llvm::IRBuilderBase& b, llvm::Value* workgroup_id, int64_t num_workgroups) {\n   // We split the dimensions into three categories: the dimension over which we\n   // are concatenating (concat_dim), the dimensions that are minor to it\n   // (inner_dims) and the dimensions that are major to it (outer_dims).\n \n+  if (workgroup_id != nullptr && num_workgroups <= 0) {\n+    return absl::UnimplementedError(\"Missing number of workgroups\");\n+  }\n+\n   auto* concatenate = Cast<HloConcatenateInstruction>(instr);\n   const Shape& output_shape = concatenate->shape();\n   int64_t concat_dim = concatenate->concatenate_dimension();\n@@ -2962,8 +2966,46 @@ absl::Status EmitFastConcatenate(\n                                   output_min2maj.end());\n \n   llvm_ir::ForLoopNest loops(IrName(concatenate), &b);\n+\n+  bool has_workgroup_id = workgroup_id != nullptr;\n+  bool has_multiple_workers = num_workgroups > 1;\n+  bool has_outer_dims = !outer_dims.empty();\n+  bool is_parallel = has_workgroup_id && has_multiple_workers && has_outer_dims;\n+\n+  llvm::Value* workgroup_ind_var = nullptr;\n+  if (is_parallel) {\n+    int64_t outer_dim_size = output_shape.dimensions(outer_dims.back());\n+    int64_t workgroup_size = CeilOfRatio(outer_dim_size, num_workgroups);\n+    llvm::Value* workgroup_size_value =\n+        llvm::ConstantInt::get(b.getInt64Ty(), workgroup_size);\n+    llvm::Value* constant_1 = llvm::ConstantInt::get(b.getInt64Ty(), 1);\n+    llvm::Value* constant_dim_size =\n+        llvm::ConstantInt::get(b.getInt64Ty(), outer_dim_size);\n+    llvm::Value* workgroup_start_idx =\n+        b.CreateMul(workgroup_id, workgroup_size_value);\n+    llvm::Value* workgroup_end_idx = b.CreateBinaryIntrinsic(\n+        llvm::Intrinsic::smin,\n+        b.CreateMul(b.CreateAdd(workgroup_id, constant_1),\n+                    workgroup_size_value),\n+        constant_dim_size);\n+\n+    auto workgroup_loop =\n+        loops.AddLoop(\"workgroup\", workgroup_start_idx, workgroup_end_idx);\n+    workgroup_ind_var = workgroup_loop->GetIndVarValue();\n+  }\n+\n   std::vector<llvm::Value*> target_multi_index =\n-      loops.AddLoopsForShapeOnDimensions(output_shape, outer_dims, \"concat\");\n+      loops.AddLoopsForShapeOnDimensions(\n+          output_shape,\n+          workgroup_ind_var\n+              ? absl::MakeSpan(outer_dims).first(outer_dims.size() - 1)\n+              : absl::MakeSpan(outer_dims),\n+          \"concat\");\n+\n+  if (workgroup_ind_var) {\n+    target_multi_index[outer_dims.back()] = workgroup_ind_var;\n+  }\n+\n   absl::c_replace(target_multi_index, static_cast<llvm::Value*>(nullptr),\n                   static_cast<llvm::Value*>(b.getInt64(0)));\n   llvm_ir::IrArray::Index target_index(target_multi_index, output_shape,"
+        },
+        {
+            "sha": "7adbb96f12c078192e07fef6bbfc41a78e919378",
+            "filename": "third_party/xla/xla/service/cpu/ir_emitter.h",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/d05adb4d7350f3e4786ae711eb582ce76c579b8d/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fir_emitter.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/d05adb4d7350f3e4786ae711eb582ce76c579b8d/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fir_emitter.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fir_emitter.h?ref=d05adb4d7350f3e4786ae711eb582ce76c579b8d",
+            "patch": "@@ -868,7 +868,8 @@ absl::Status EmitFastConcatenate(\n     const HloInstruction* instr,\n     absl::Span<const llvm_ir::IrArray> source_arrays,\n     const llvm_ir::IrArray& target_array, llvm::Module* module,\n-    llvm::IRBuilderBase& b);\n+    llvm::IRBuilderBase& b, llvm::Value* workgroup_id = nullptr,\n+    int64_t num_workgroups = -1);\n \n // For each called computation called by the instruction, determines if that\n // computation calls a custom-call function, either directly or transitively."
+        }
+    ],
+    "stats": {
+        "total": 76,
+        "additions": 61,
+        "deletions": 15
+    }
+}

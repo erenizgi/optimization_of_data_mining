@@ -1,0 +1,36 @@
+{
+    "author": "WillFroom",
+    "message": "[XLA:CPU] Lower unsupported vector lengths via scalar approximations.\n\nThis is needed to get the same numerics as the scalar loop emitters as some vector lengths are not supported. It isn't optimal but it works.\n\nPiperOrigin-RevId: 842623172",
+    "sha": "30f2159b4beaf0d4f4d2f8c9fb99e4d5d71ca426",
+    "files": [
+        {
+            "sha": "a42af497a0d317c3e8e872d5d294285c6d4bf79a",
+            "filename": "third_party/xla/xla/codegen/emitters/transforms/lower_xla_intrinsic_lib.cc",
+            "status": "modified",
+            "additions": 34,
+            "deletions": 9,
+            "changes": 43,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/30f2159b4beaf0d4f4d2f8c9fb99e4d5d71ca426/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftransforms%2Flower_xla_intrinsic_lib.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/30f2159b4beaf0d4f4d2f8c9fb99e4d5d71ca426/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftransforms%2Flower_xla_intrinsic_lib.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftransforms%2Flower_xla_intrinsic_lib.cc?ref=30f2159b4beaf0d4f4d2f8c9fb99e4d5d71ca426",
+            "patch": "@@ -213,27 +213,52 @@ class LowerIntrinsicPattern : public mlir::OpRewritePattern<Op> {\n \n   mlir::LogicalResult matchAndRewrite(\n       Op op, mlir::PatternRewriter& rewriter) const override {\n-    if (auto vec_type = mlir::dyn_cast<mlir::VectorType>(op.getType());\n-        vec_type && vec_type.getRank() != 1) {\n+    auto vec_type = mlir::dyn_cast<mlir::VectorType>(op.getType());\n+    if (vec_type && vec_type.getRank() != 1) {\n       // These will later be converted to loops of 1D vectors but will then miss\n       // the XLA intrinsic lowering.\n       op->emitWarning() << \"Missed XLA intrinsic lowering as vector rank != 1.\";\n       return rewriter.notifyMatchFailure(op, \"Vector rank is not 1.\");\n     }\n     Type type = Type::TypeFromIrType(op.getType());\n+    Type scalar_type =\n+        Type::TypeFromIrType(mlir::getElementTypeOrSelf(op.getType()));\n     mlir::StringAttr features =\n         module_op_->getAttrOfType<mlir::StringAttr>(\"mhlo.cpu_features\");\n     const std::string features_str = !features ? \"\" : features.getValue().str();\n-    if (!Intrinsic::IsSupported(features_str, type)) {\n+    bool is_supported = Intrinsic::IsSupported(features_str, type);\n+    bool scalar_supported = Intrinsic::IsSupported(features_str, scalar_type);\n+    if (!is_supported && !scalar_supported) {\n       return rewriter.notifyMatchFailure(op, \"unsupported type\");\n     }\n-    mlir::ImplicitLocOpBuilder b(op.getLoc(), rewriter);\n \n-    auto intrinsic_decl =\n-        Intrinsic::GetOrInsertDeclaration(rewriter, module_op_, type);\n-    auto call_op =\n-        b.create<mlir::func::CallOp>(intrinsic_decl, op.getOperand());\n-    rewriter.replaceOp(op, call_op->getResults());\n+    if (is_supported) {\n+      auto intrinsic_decl =\n+          Intrinsic::GetOrInsertDeclaration(rewriter, module_op_, type);\n+      rewriter.replaceOpWithNewOp<mlir::func::CallOp>(op, intrinsic_decl,\n+                                                      op.getOperand());\n+    } else {\n+      // If the element type is supported but not the vector type, then we\n+      // decompose the vector op into a sequence of scalar ops. This is not\n+      // optimal in that we could split into the largest possible supported\n+      // vectorized ops, but it works for now.\n+      auto intrinsic_decl =\n+          Intrinsic::GetOrInsertDeclaration(rewriter, module_op_, scalar_type);\n+\n+      llvm::SmallVector<mlir::Value> scalar_results;\n+      scalar_results.reserve(vec_type.getNumElements());\n+      for (int64_t idx = 0; idx != vec_type.getNumElements(); ++idx) {\n+        mlir::Value scalar_value = mlir::vector::ExtractOp::create(\n+            rewriter, op.getLoc(), op.getOperand(), idx);\n+        mlir::Value scalar_result =\n+            mlir::func::CallOp::create(rewriter, op.getLoc(), intrinsic_decl,\n+                                       scalar_value)\n+                .getResult(0);\n+        scalar_results.push_back(scalar_result);\n+      }\n+      rewriter.replaceOpWithNewOp<mlir::vector::FromElementsOp>(op, vec_type,\n+                                                                scalar_results);\n+    }\n     return mlir::success();\n   }\n "
+        },
+        {
+            "sha": "937ac8206ddde16877b37fb73ecb7117850b7852",
+            "filename": "third_party/xla/xla/codegen/emitters/transforms/tests/lower_xla_intrinsic_lib.mlir",
+            "status": "modified",
+            "additions": 17,
+            "deletions": 1,
+            "changes": 18,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/30f2159b4beaf0d4f4d2f8c9fb99e4d5d71ca426/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftransforms%2Ftests%2Flower_xla_intrinsic_lib.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/30f2159b4beaf0d4f4d2f8c9fb99e4d5d71ca426/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftransforms%2Ftests%2Flower_xla_intrinsic_lib.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftransforms%2Ftests%2Flower_xla_intrinsic_lib.mlir?ref=30f2159b4beaf0d4f4d2f8c9fb99e4d5d71ca426",
+            "patch": "@@ -146,4 +146,20 @@ module {\n // CHECK-LABEL: @local_xla.rsqrt.f64\n // CHECK-NOT: math.rsqrt\n // CHECK: %[[RSQRT_CALL:.*]] = call @local_xla.rsqrt.f64\n-// CHECK: return %[[RSQRT_CALL]]\n\\ No newline at end of file\n+// CHECK: return %[[RSQRT_CALL]]\n+\n+// -----\n+\n+// Use a vector length of 3 as we know that will never be supported.\n+func.func @rsqrt_unsupported_vector_size(%arg0: vector<3xf32>) -> vector<3xf32> {\n+  // CHECK: %[[IN0:.*]] = vector.extract %arg0[0]\n+  // CHECK: %[[RSQRT0:.*]] = call @local_xla.rsqrt.f32(%[[IN0]])\n+  // CHECK: %[[IN1:.*]] = vector.extract %arg0[1]\n+  // CHECK: %[[RSQRT1:.*]] = call @local_xla.rsqrt.f32(%[[IN1]])\n+  // CHECK: %[[IN2:.*]] = vector.extract %arg0[2]\n+  // CHECK: %[[RSQRT2:.*]] = call @local_xla.rsqrt.f32(%[[IN2]])\n+  // CHECK: %[[RESULT:.*]] = vector.from_elements %[[RSQRT0]], %[[RSQRT1]], %[[RSQRT2]]\n+  %ret = math.rsqrt %arg0 : vector<3xf32>\n+  // CHECK: return %[[RESULT]]\n+  return %ret : vector<3xf32>\n+}"
+        }
+    ],
+    "stats": {
+        "total": 61,
+        "additions": 51,
+        "deletions": 10
+    }
+}

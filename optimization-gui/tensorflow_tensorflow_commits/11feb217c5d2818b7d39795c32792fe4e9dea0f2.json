@@ -1,0 +1,36 @@
+{
+    "author": "tensorflower-gardener",
+    "message": "Test HLO with fdo-profile info.\n\nPiperOrigin-RevId: 806306990",
+    "sha": "11feb217c5d2818b7d39795c32792fe4e9dea0f2",
+    "files": [
+        {
+            "sha": "1e0732dc343994d7ef4f1bb8111abe0ada1defcc",
+            "filename": "third_party/xla/xla/service/gpu/gpu_compiler.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/11feb217c5d2818b7d39795c32792fe4e9dea0f2/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_compiler.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/11feb217c5d2818b7d39795c32792fe4e9dea0f2/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_compiler.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_compiler.cc?ref=11feb217c5d2818b7d39795c32792fe4e9dea0f2",
+            "patch": "@@ -374,7 +374,7 @@ class GpuThunkAotCompilationResult : public AotCompilationResult {\n     CompilationResultProto proto;\n     *proto.mutable_hlo_module_with_config() = hlo_module->ToProtoWithConfig();\n     *proto.mutable_buffer_assignment() = buffer_assignment->ToProto();\n-    proto.set_asm_text(std::string(asm_text));\n+    proto.set_asm_text(asm_text);\n     proto.set_binary(binary.data(), binary.size());\n     proto.mutable_dnn_compiled_graphs()->insert(dnn_compiled_graphs.cbegin(),\n                                                 dnn_compiled_graphs.cend());"
+        },
+        {
+            "sha": "46a429750732025d8e06da43ac5793f21efc9c79",
+            "filename": "third_party/xla/xla/service/gpu/gpu_compiler_test.cc",
+            "status": "modified",
+            "additions": 72,
+            "deletions": 9,
+            "changes": 81,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/11feb217c5d2818b7d39795c32792fe4e9dea0f2/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_compiler_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/11feb217c5d2818b7d39795c32792fe4e9dea0f2/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_compiler_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_compiler_test.cc?ref=11feb217c5d2818b7d39795c32792fe4e9dea0f2",
+            "patch": "@@ -1296,15 +1296,78 @@ ENTRY main {\n })\";\n   auto module = ParseAndReturnVerifiedModule(hlo_text).value();\n \n-  std::unique_ptr<Executable> executable =\n-      backend()\n-          .compiler()\n-          ->RunBackend(std::move(module), backend().default_stream_executor(),\n-                       {/*device_allocator=*/nullptr,\n-                        /*thread_pool=*/nullptr,\n-                        /*layout_canonicalization_callback=*/{},\n-                        /*is_autotuning_compilation=*/false})\n-          .value();\n+  TF_ASSERT_OK_AND_ASSIGN(\n+      std::unique_ptr<Executable> executable,\n+      backend().compiler()->RunBackend(std::move(module),\n+                                       backend().default_stream_executor(),\n+                                       {/*device_allocator=*/nullptr,\n+                                        /*thread_pool=*/nullptr,\n+                                        /*layout_canonicalization_callback=*/{},\n+                                        /*is_autotuning_compilation=*/false}));\n+  std::unique_ptr<GpuExecutable> gpu_exec(\n+      static_cast<GpuExecutable*>(executable.release()));\n+\n+  EXPECT_THAT(gpu_exec->GetThunk().thunks(),\n+              ::testing::ElementsAre(ThunkKindIs(Thunk::kWaitForStreams),\n+                                     ThunkKindIs(Thunk::kSequential),\n+                                     ThunkKindIs(Thunk::kWaitForStreams)));\n+\n+  // Within the sequential thunk, there should only be a single gemm\n+  // thunk with an explicitly set execution stream id.\n+  auto sequential_thunk =\n+      static_cast<SequentialThunk*>(gpu_exec->GetThunk().thunks()[1].get());\n+  EXPECT_EQ(sequential_thunk->thunks().size(), 1);\n+  EXPECT_THAT(sequential_thunk->thunks(),\n+              ::testing::ElementsAre(ThunkKindIs(Thunk::kGemm)));\n+  // Ensure the gemm is run on the explicitly set stream.\n+  EXPECT_EQ(sequential_thunk->thunks()[0]->execution_stream_id(), 1);\n+}\n+\n+TEST_F(GpuCompilerTest, StreamAnnotationThunkTestFDO) {\n+  constexpr absl::string_view hlo_text = R\"(\n+HloModule composite\n+\n+async_call {\n+  p0 = f32[32,32] parameter(0)\n+  p1 = f32[32,32] parameter(1)\n+  gemm = (f32[32,32], s8[8192]) custom-call(p0, p1), custom_call_target=\"__cublas$gemm\",\n+    backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\n+      \"gemm_backend_config\":{\"alpha_real\":1,\"alpha_imag\":0,\"beta\":0,\n+      \"dot_dimension_numbers\":\n+        {\"lhs_contracting_dimensions\":[\"1\"],\"rhs_contracting_dimensions\":[\"0\"]},\n+      \"precision_config\":{\"operand_precision\":[\"DEFAULT\",\"DEFAULT\"]},\n+      \"lhs_stride\":\"1024\",\"rhs_stride\":\"1024\"}}\n+  ROOT get-tuple-element = f32[32,32] get-tuple-element(gemm), index=0\n+}, execution_thread=\"explicit\"\n+\n+ENTRY main {\n+  p0 = f32[32,32] parameter(0)\n+  p1 = f32[32,32] parameter(1)\n+  call-start = ((f32[32,32], f32[32,32]), f32[32,32]) call-start(p0, p1),\n+    to_apply=async_call,\n+    frontend_attributes={_xla_stream_annotation=\"1\"}\n+  ROOT call-done = f32[32,32]{1,0} call-done(call-start),\n+    frontend_attributes={_xla_stream_annotation=\"1\"},\n+    backend_config={\"operation_queue_id\":\"0\"}\n+})\";\n+\n+  const absl::string_view fdo_profile = R\"pb(\n+    costs { name: \"cp\" cost_us: 100.0 }\n+  )pb\";\n+\n+  HloModuleConfig config = GetModuleConfigForTest(1, 1);  // Default values.\n+  config.set_fdo_profile(fdo_profile);\n+\n+  auto module = ParseAndReturnVerifiedModule(hlo_text, config).value();\n+\n+  TF_ASSERT_OK_AND_ASSIGN(\n+      std::unique_ptr<Executable> executable,\n+      backend().compiler()->RunBackend(std::move(module),\n+                                       backend().default_stream_executor(),\n+                                       {/*device_allocator=*/nullptr,\n+                                        /*thread_pool=*/nullptr,\n+                                        /*layout_canonicalization_callback=*/{},\n+                                        /*is_autotuning_compilation=*/false}));\n   std::unique_ptr<GpuExecutable> gpu_exec(\n       static_cast<GpuExecutable*>(executable.release()));\n "
+        }
+    ],
+    "stats": {
+        "total": 83,
+        "additions": 73,
+        "deletions": 10
+    }
+}

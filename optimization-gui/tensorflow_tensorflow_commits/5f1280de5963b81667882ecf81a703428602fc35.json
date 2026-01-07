@@ -1,0 +1,36 @@
+{
+    "author": "vsytch",
+    "message": "Revert 86cd8b4\n\nReverts 86cd8b43ae536725abe549e1b94918f457d035ba\n\nPiperOrigin-RevId: 804495434",
+    "sha": "5f1280de5963b81667882ecf81a703428602fc35",
+    "files": [
+        {
+            "sha": "e23f510182259f9076f935d88395c510a09b5b2b",
+            "filename": "tensorflow/compiler/mlir/tensorflow/ir/tf_ops.td",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 6,
+            "changes": 12,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/5f1280de5963b81667882ecf81a703428602fc35/tensorflow%2Fcompiler%2Fmlir%2Ftensorflow%2Fir%2Ftf_ops.td",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/5f1280de5963b81667882ecf81a703428602fc35/tensorflow%2Fcompiler%2Fmlir%2Ftensorflow%2Fir%2Ftf_ops.td",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcompiler%2Fmlir%2Ftensorflow%2Fir%2Ftf_ops.td?ref=5f1280de5963b81667882ecf81a703428602fc35",
+            "patch": "@@ -3212,12 +3212,12 @@ def TF_XlaSparseActivationsUnstackOp : TF_Op<\"XlaSparseActivationsUnstack\", [Pur\n     conversion, stacking and optionally interleaving of the embedding\n     activations, while also offloading this work to SparseCore.\n \n-    The op assumes its operand is in SparseCore layout, while also being F32.\n-    The output is a tuple of tensors in TensorCore layout, in any data type.\n+    The op assumes its operand is in SparseCore layout.\n+    The output is a tuple of tensors in TensorCore layout.\n   }];\n \n   let arguments = (ins\n-    TF_Float32Tensor:$stacked_activations,\n+    TF_Tensor:$stacked_activations,\n \n     ConfinedAttr<I64Attr, [IntMinValue<1>]>:$num_tables,\n     ConfinedAttr<I64ArrayAttr, [ArrayMinCount<1>]>:$sample_counts,\n@@ -3236,8 +3236,8 @@ def TF_XlaSparseGradientsStackOp : TF_Op<\"XlaSparseGradientsStack\", [Pure]> {\n     unstacking and optionally interleaving of the embedding gradients, while\n     also offloading this work to SparseCore.\n \n-    The op assumes its operands are in TensoreCore layout and in any data type.\n-    The output is in SparseCore layout and is expected to be F32.\n+    The op assumes its operands are in TensoreCore layout.\n+    The output is in SparseCore layout.\n   }];\n \n   let arguments = (ins\n@@ -3248,7 +3248,7 @@ def TF_XlaSparseGradientsStackOp : TF_Op<\"XlaSparseGradientsStack\", [Pure]> {\n   );\n \n   let results = (outs\n-    TF_Float32Tensor:$stacked_gradients\n+    TF_Tensor:$stacked_gradients\n   );\n }\n #endif // TF_OPS"
+        },
+        {
+            "sha": "fb288f967bc6ed8da960d3949e6dda69923a4555",
+            "filename": "tensorflow/core/tpu/ops/sparse_core_ops.cc",
+            "status": "modified",
+            "additions": 25,
+            "deletions": 7,
+            "changes": 32,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/5f1280de5963b81667882ecf81a703428602fc35/tensorflow%2Fcore%2Ftpu%2Fops%2Fsparse_core_ops.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/5f1280de5963b81667882ecf81a703428602fc35/tensorflow%2Fcore%2Ftpu%2Fops%2Fsparse_core_ops.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcore%2Ftpu%2Fops%2Fsparse_core_ops.cc?ref=5f1280de5963b81667882ecf81a703428602fc35",
+            "patch": "@@ -963,12 +963,21 @@ REGISTER_OP(\"XlaSparseActivationsUnstack\")\n             absl::StrFormat(\"Invalid number of features. Expected: %d, got: %d\",\n                             num_tables, features.size()));\n       }\n+      DataType input_dtype;\n+      TF_RETURN_IF_ERROR(c->GetAttr(\"input_dtype\", &input_dtype));\n+      if (input_dtype == DT_BFLOAT16) {\n+        return absl::InvalidArgumentError(absl::StrFormat(\n+            \"Unsupported input dtype for stacked activations: %s\",\n+            DataType_Name(input_dtype)));\n+      }\n       DataType dtype;\n-      TF_RETURN_IF_ERROR(c->GetAttr(\"input_dtype\", &dtype));\n-      if (dtype != DT_FLOAT) {\n-        return absl::InvalidArgumentError(\n-            absl::StrFormat(\"Unsupported dtype for stacked activations: %s\",\n-                            DataType_Name(dtype)));\n+      TF_RETURN_IF_ERROR(c->GetAttr(\"dtype\", &dtype));\n+      // If conversion is requested, only allow f32 -> bf16.\n+      if (input_dtype != dtype &&\n+          !(input_dtype == DT_FLOAT && dtype == DT_BFLOAT16)) {\n+        return absl::InvalidArgumentError(absl::StrFormat(\n+            \"Unsupported dtype conversion for stacked activations: %s -> %s\",\n+            DataType_Name(input_dtype), DataType_Name(dtype)));\n       }\n       for (int i = 0; i < num_tables; ++i) {\n         shape_inference::ShapeHandle unstacked_activation_shape =\n@@ -999,12 +1008,21 @@ REGISTER_OP(\"XlaSparseGradientsStack\")\n         features[i] = c->Value(c->Dim(c->input(i), 1));\n         total_sample_count += c->Value(c->Dim(c->input(i), 0));\n       }\n+      DataType input_dtype;\n+      TF_RETURN_IF_ERROR(c->GetAttr(\"input_dtype\", &input_dtype));\n       DataType dtype;\n       TF_RETURN_IF_ERROR(c->GetAttr(\"dtype\", &dtype));\n-      if (dtype != DT_FLOAT) {\n+      if (dtype == DT_BFLOAT16) {\n         return absl::InvalidArgumentError(\n             absl::StrFormat(\"Unsupported dtype for stacked gradients: %s\",\n-                            DataType_Name(dtype)));\n+                            DataType_Name(input_dtype)));\n+      }\n+      // If conversion is requested, only allow bf16 -> f32.\n+      if (input_dtype != dtype &&\n+          !(input_dtype == DT_BFLOAT16 && dtype == DT_FLOAT)) {\n+        return absl::InvalidArgumentError(absl::StrFormat(\n+            \"Unsupported dtype conversion for stacked gradients: %s -> %s\",\n+            DataType_Name(input_dtype), DataType_Name(dtype)));\n       }\n       int padded_feature = xla::RoundUpTo(*absl::c_max_element(features), 8);\n       shape_inference::ShapeHandle stacked_gradients_shape ="
+        }
+    ],
+    "stats": {
+        "total": 44,
+        "additions": 31,
+        "deletions": 13
+    }
+}

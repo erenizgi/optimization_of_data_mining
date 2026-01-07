@@ -1,0 +1,36 @@
+{
+    "author": "hawkinsp",
+    "message": "[PJRT] Add a ExecuteChunk method that allows the user to execute a single chunk of the transpose only.\n\nThe current Execute() method executes all the chunks at one time. This refactoring is in preparation for software pipelining transposes with DMAs. Execute() now calls ExecuteChunk() for each chunk.\n\nPiperOrigin-RevId: 846743899",
+    "sha": "162efc7b6cf6eae703db2a06cf2989d752654cb8",
+    "files": [
+        {
+            "sha": "91aa71119141cecf4a20c00057163c5a65533b4b",
+            "filename": "third_party/xla/xla/pjrt/transpose.cc",
+            "status": "modified",
+            "additions": 50,
+            "deletions": 47,
+            "changes": 97,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/162efc7b6cf6eae703db2a06cf2989d752654cb8/third_party%2Fxla%2Fxla%2Fpjrt%2Ftranspose.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/162efc7b6cf6eae703db2a06cf2989d752654cb8/third_party%2Fxla%2Fxla%2Fpjrt%2Ftranspose.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Ftranspose.cc?ref=162efc7b6cf6eae703db2a06cf2989d752654cb8",
+            "patch": "@@ -442,6 +442,49 @@ struct uint128 {\n };\n static_assert(sizeof(uint128) == 16, \"uint128 should be 16 bytes in size\");\n \n+void TransposePlan::ExecuteChunk(int chunk_id, const void* a, void* b) const {\n+  if (num_elems_ == 0) {\n+    return;\n+  }\n+  tsl::profiler::TraceMe traceme(\"Transpose::ExecuteChunk\", /*level=*/2);\n+\n+  absl::Span<Node const> nodes = nodes_[chunk_id];\n+  const char* ac = static_cast<const char*>(a) + input_offset_bytes_[chunk_id];\n+  char* bc = static_cast<char*>(b) + output_offset_bytes_[chunk_id];\n+\n+  if (inner_kernel_is_memcpy_) {\n+    DCHECK(transformation_ == Transformation::kNone);\n+    // Memcpy-based plans all assume element size 1 (i.e., bytes).\n+    TransposeConstStride1(ac, bc, nodes.data());\n+    return;\n+  }\n+\n+  switch (elem_size_in_bytes_) {\n+    case 1:\n+      ExecuteTyped<uint8_t, Transformation::kNone>(ac, bc, nodes);\n+      break;\n+    case 2:\n+      ExecuteTyped<uint16_t, Transformation::kNone>(ac, bc, nodes);\n+      break;\n+    case 4:\n+      if (transformation_ == Transformation::kNone) {\n+        ExecuteTyped<uint32_t, Transformation::kNone>(ac, bc, nodes);\n+      } else {\n+        DCHECK(transformation_ == Transformation::kF64ToEf57);\n+        ExecuteTyped<uint32_t, Transformation::kF64ToEf57>(ac, bc, nodes);\n+      }\n+      break;\n+    case 8:\n+      ExecuteTyped<uint64_t, Transformation::kNone>(ac, bc, nodes);\n+      break;\n+    case 16:\n+      ExecuteTyped<uint128, Transformation::kNone>(ac, bc, nodes);\n+      break;\n+    default:\n+      LOG(FATAL) << \"Unimplemented element size \" << elem_size_in_bytes_;\n+  }\n+}\n+\n void TransposePlan::Execute(\n     const void* a, void* b,\n     std::optional<absl::FunctionRef<void(std::function<void(void)>)>>\n@@ -451,59 +494,19 @@ void TransposePlan::Execute(\n   }\n   tsl::profiler::TraceMe traceme(\"Transpose::Execute\", /*level=*/2);\n \n-  auto execute_by_type = [&](int chunk_id) {\n-    const char* ac =\n-        static_cast<const char*>(a) + input_offset_bytes_[chunk_id];\n-    char* bc = static_cast<char*>(b) + output_offset_bytes_[chunk_id];\n-\n-    absl::Span<Node const> nodes = nodes_[chunk_id];\n-    if (inner_kernel_is_memcpy_) {\n-      DCHECK(transformation_ == Transformation::kNone);\n-      // Memcpy-based plans all assume element size 1 (i.e., bytes).\n-      TransposeConstStride1(ac, bc, nodes.data());\n-      return;\n-    }\n-\n-    switch (elem_size_in_bytes_) {\n-      case 1:\n-        ExecuteTyped<uint8_t, Transformation::kNone>(ac, bc, nodes);\n-        break;\n-      case 2:\n-        ExecuteTyped<uint16_t, Transformation::kNone>(ac, bc, nodes);\n-        break;\n-      case 4:\n-        if (transformation_ == Transformation::kNone) {\n-          ExecuteTyped<uint32_t, Transformation::kNone>(ac, bc, nodes);\n-        } else {\n-          DCHECK(transformation_ == Transformation::kF64ToEf57);\n-          ExecuteTyped<uint32_t, Transformation::kF64ToEf57>(ac, bc, nodes);\n-        }\n-        break;\n-      case 8:\n-        ExecuteTyped<uint64_t, Transformation::kNone>(ac, bc, nodes);\n-        break;\n-      case 16:\n-        ExecuteTyped<uint128, Transformation::kNone>(ac, bc, nodes);\n-        break;\n-      default:\n-        LOG(FATAL) << \"Unimplemented element size \" << elem_size_in_bytes_;\n-    }\n-  };\n-\n-  if (!schedule_work || nodes_.size() <= 1) {\n-    for (int i = 0; i < nodes_.size(); ++i) {\n-      execute_by_type(i);\n+  if (!schedule_work || Parallelism() <= 1) {\n+    for (int i = 0; i < Parallelism(); ++i) {\n+      ExecuteChunk(i, a, b);\n     }\n   } else {\n-    absl::BlockingCounter counter(nodes_.size() - 1);\n-    for (int i = 1; i < nodes_.size(); ++i) {\n+    absl::BlockingCounter counter(Parallelism() - 1);\n+    for (size_t i = 1; i < nodes_.size(); ++i) {\n       (*schedule_work)([&, i]() {\n-        execute_by_type(i);\n+        ExecuteChunk(i, a, b);\n         counter.DecrementCount();\n       });\n     }\n-    // Run the first chunk inline in this thread.\n-    execute_by_type(0);\n+    ExecuteChunk(0, a, b);\n     counter.Wait();\n   }\n }"
+        },
+        {
+            "sha": "d6dea32e6c97c6e6e70679b5a228a4eae9a98759",
+            "filename": "third_party/xla/xla/pjrt/transpose.h",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/162efc7b6cf6eae703db2a06cf2989d752654cb8/third_party%2Fxla%2Fxla%2Fpjrt%2Ftranspose.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/162efc7b6cf6eae703db2a06cf2989d752654cb8/third_party%2Fxla%2Fxla%2Fpjrt%2Ftranspose.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Ftranspose.h?ref=162efc7b6cf6eae703db2a06cf2989d752654cb8",
+            "patch": "@@ -124,6 +124,12 @@ class TransposePlan {\n                std::optional<absl::FunctionRef<void(std::function<void(void)>)>>\n                    schedule_work = std::nullopt) const;\n \n+  // Executes a single chunk of the transposition. To perform a complete\n+  // transposition, call ExecuteChunk for each chunk ID from 0 to Parallelism()\n+  // - 1. It is legal to call ExecuteChunk for independent chunks in parallel.\n+  // This is useful for callers that want to manage their own threading.\n+  void ExecuteChunk(int chunk_id, const void* a, void* b) const;\n+\n   // Returns a human-readable description of the plan.\n   std::string ToString() const;\n "
+        }
+    ],
+    "stats": {
+        "total": 103,
+        "additions": 56,
+        "deletions": 47
+    }
+}

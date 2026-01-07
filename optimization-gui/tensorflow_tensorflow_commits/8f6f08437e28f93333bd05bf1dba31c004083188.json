@@ -1,0 +1,48 @@
+{
+    "author": "tensorflower-gardener",
+    "message": "[XLA:Original Value] Fix bugs in original value tracking\n\n1. When recovery table is serialized, the shape index is not considered in comparator, which causes original arrays with different shape index to be squashed into one\n\n2. When sharding doesn't change the shape, no recovery computation is needed.\n\n3. When deriving placeholder original array, the old shape index is used so that it's more consistent. This change is not significant. Using whatever shape index does not affect correctness.\n\nPiperOrigin-RevId: 813047161",
+    "sha": "8f6f08437e28f93333bd05bf1dba31c004083188",
+    "files": [
+        {
+            "sha": "e4c433751d875b1525b5d87ccdff04f29219e58e",
+            "filename": "third_party/xla/xla/hlo/ir/hlo_module.cc",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 2,
+            "changes": 7,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/8f6f08437e28f93333bd05bf1dba31c004083188/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_module.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/8f6f08437e28f93333bd05bf1dba31c004083188/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_module.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_module.cc?ref=8f6f08437e28f93333bd05bf1dba31c004083188",
+            "patch": "@@ -1470,7 +1470,10 @@ std::string HloModule::GetFingerprint128(const HloPrintOptions& options) const {\n \n struct OriginalArrayComparator {\n   bool operator()(const OriginalArray& lhs, const OriginalArray& rhs) const {\n-    return lhs.instruction_name < rhs.instruction_name;\n+    if (lhs.instruction_name != rhs.instruction_name) {\n+      return lhs.instruction_name < rhs.instruction_name;\n+    }\n+    return lhs.shape_index < rhs.shape_index;\n   }\n };\n \n@@ -1637,7 +1640,7 @@ void HloModule::OriginalValueRecoveryTable::AddRecoveryComputation(\n       new_original_array->emplace(\n           OriginalArray{GetOriginalValuePlaceholderInstructionName(\n                             old_original_array->instruction_name),\n-                        shape_index});\n+                        old_original_array->shape_index});\n     }\n     table_.emplace(\n         *old_original_array,"
+        },
+        {
+            "sha": "105d1c9eb11afc58a7827d9d23ea866ea721bdcb",
+            "filename": "third_party/xla/xla/service/spmd/BUILD",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 1,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/8f6f08437e28f93333bd05bf1dba31c004083188/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/8f6f08437e28f93333bd05bf1dba31c004083188/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2FBUILD?ref=8f6f08437e28f93333bd05bf1dba31c004083188",
+            "patch": "@@ -56,7 +56,6 @@ cc_library(\n         \"//xla/hlo/parser:hlo_lexer\",\n         \"//xla/hlo/pass:hlo_pass\",\n         \"//xla/hlo/pass:hlo_pass_pipeline\",\n-        \"//xla/hlo/transforms/simplifiers:flatten_call_graph\",\n         \"//xla/hlo/transforms/simplifiers:hlo_dce\",\n         \"//xla/hlo/transforms/simplifiers:tuple_simplifier\",\n         \"//xla/hlo/utils:hlo_query\","
+        },
+        {
+            "sha": "ad5f84484bcce5dd17598d7011a4110c64b993a1",
+            "filename": "third_party/xla/xla/service/spmd/spmd_partitioner.cc",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 2,
+            "changes": 10,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/8f6f08437e28f93333bd05bf1dba31c004083188/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fspmd_partitioner.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/8f6f08437e28f93333bd05bf1dba31c004083188/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fspmd_partitioner.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fspmd_partitioner.cc?ref=8f6f08437e28f93333bd05bf1dba31c004083188",
+            "patch": "@@ -52,7 +52,6 @@ limitations under the License.\n #include \"xla/hlo/ir/hlo_sharding.h\"\n #include \"xla/hlo/ir/tile_assignment.h\"\n #include \"xla/hlo/pass/hlo_pass_pipeline.h\"\n-#include \"xla/hlo/transforms/simplifiers/flatten_call_graph.h\"\n #include \"xla/hlo/transforms/simplifiers/hlo_dce.h\"\n #include \"xla/hlo/transforms/simplifiers/tuple_simplifier.h\"\n #include \"xla/hlo/utils/hlo_query.h\"\n@@ -6176,7 +6175,14 @@ void SpmdPartitioningVisitor::SetPartitionedHlo(\n         hlo, partitioned_hlo.hlo(),\n         [&](const ShapeIndex& index, const OriginalArray& old_original_array,\n             const xla::Shape& old_array_shape,\n-            const xla::Shape& new_array_shape) {\n+            const xla::Shape& new_array_shape)\n+            -> std::optional<std::unique_ptr<HloModule>> {\n+          if (ShapeUtil::Compatible(old_array_shape, new_array_shape)) {\n+            // If the shapes are the same, nothing is sharded so we return\n+            // nullptr to indicate identity recovery module. This may happen\n+            // for scalars in tuples.\n+            return nullptr;\n+          }\n           SpmdBuilder builder(\"recovery_computation\", nullptr);\n           auto* param =\n               builder.AddInstruction(xla::HloInstruction::CreateParameter("
+        }
+    ],
+    "stats": {
+        "total": 18,
+        "additions": 13,
+        "deletions": 5
+    }
+}

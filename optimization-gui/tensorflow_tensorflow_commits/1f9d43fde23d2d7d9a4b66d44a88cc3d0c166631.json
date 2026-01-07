@@ -1,0 +1,84 @@
+{
+    "author": "vwbaker",
+    "message": "Extract register spill information from ptxas log\n\nPiperOrigin-RevId: 838777589",
+    "sha": "1f9d43fde23d2d7d9a4b66d44a88cc3d0c166631",
+    "files": [
+        {
+            "sha": "d68809e309b4bc333b390afe3bcafb576ced4074",
+            "filename": "third_party/xla/xla/stream_executor/BUILD",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/1f9d43fde23d2d7d9a4b66d44a88cc3d0c166631/third_party%2Fxla%2Fxla%2Fstream_executor%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/1f9d43fde23d2d7d9a4b66d44a88cc3d0c166631/third_party%2Fxla%2Fxla%2Fstream_executor%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fstream_executor%2FBUILD?ref=1f9d43fde23d2d7d9a4b66d44a88cc3d0c166631",
+            "patch": "@@ -962,6 +962,12 @@ cc_library(\n     ],\n )\n \n+cc_library(\n+    name = \"kernel_stats\",\n+    hdrs = [\"kernel_stats.h\"],\n+    deps = [\"@com_google_absl//absl/container:flat_hash_map\"],\n+)\n+\n xla_cc_test(\n     name = \"kernel_args_test\",\n     srcs = [\"kernel_args_test.cc\"],"
+        },
+        {
+            "sha": "444aaf31ff6a2041dfd70592ad3c1576539ff02f",
+            "filename": "third_party/xla/xla/stream_executor/cuda/BUILD",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/1f9d43fde23d2d7d9a4b66d44a88cc3d0c166631/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/1f9d43fde23d2d7d9a4b66d44a88cc3d0c166631/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2FBUILD?ref=1f9d43fde23d2d7d9a4b66d44a88cc3d0c166631",
+            "patch": "@@ -798,13 +798,15 @@ cc_library(\n     hdrs = [\"ptx_compiler_helpers.h\"],\n     deps = [\n         \":cuda_compute_capability\",\n+        \"//xla/stream_executor:kernel_stats\",\n         \"//xla/stream_executor:semantic_version\",\n         \"@com_google_absl//absl/base\",\n         \"@com_google_absl//absl/log\",\n         \"@com_google_absl//absl/status\",\n         \"@com_google_absl//absl/status:statusor\",\n         \"@com_google_absl//absl/strings\",\n         \"@com_google_absl//absl/strings:str_format\",\n+        \"@com_googlesource_code_re2//:re2\",\n     ],\n )\n \n@@ -813,6 +815,7 @@ xla_cc_test(\n     srcs = [\"ptx_compiler_helpers_test.cc\"],\n     deps = [\n         \":ptx_compiler_helpers\",\n+        \"//xla/stream_executor:kernel_stats\",\n         \"@com_google_absl//absl/status\",\n         \"@com_google_absl//absl/status:status_matchers\",\n         \"@com_google_absl//absl/strings:string_view\","
+        },
+        {
+            "sha": "6f8078b348d108a6e897ddcf7665dd2e9a44e6db",
+            "filename": "third_party/xla/xla/stream_executor/cuda/ptx_compiler_helpers.cc",
+            "status": "modified",
+            "additions": 22,
+            "deletions": 0,
+            "changes": 22,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/1f9d43fde23d2d7d9a4b66d44a88cc3d0c166631/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fptx_compiler_helpers.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/1f9d43fde23d2d7d9a4b66d44a88cc3d0c166631/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fptx_compiler_helpers.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fptx_compiler_helpers.cc?ref=1f9d43fde23d2d7d9a4b66d44a88cc3d0c166631",
+            "patch": "@@ -27,7 +27,9 @@ limitations under the License.\n #include \"absl/strings/str_format.h\"\n #include \"absl/strings/str_split.h\"\n #include \"absl/strings/string_view.h\"\n+#include \"re2/re2.h\"\n #include \"xla/stream_executor/cuda/cuda_compute_capability.h\"\n+#include \"xla/stream_executor/kernel_stats.h\"\n #include \"xla/stream_executor/semantic_version.h\"\n \n namespace stream_executor {\n@@ -91,6 +93,26 @@ absl::StatusOr<int> GetLatestPtxIsaVersionFromUnsupportedVersionErrorLog(\n   return major * 10 + minor;\n }\n \n+ModuleStats ExtractModuleStatsFromLog(absl::string_view log) {\n+  // Reads the log for registers spilled and adds up the count. An example of\n+  // this line is:\n+  // \"Registers are spilled to local memory in function 'rr', 1080 bytes spill\n+  // stores, 968 bytes spill loads\"\n+  static constexpr LazyRE2 kSpillRegex{\n+      R\"(function\\s+'(\\w+)',\\s*(\\d+)\\s+bytes\\s+spill\\s+stores,\\s*(\\d+)\\s+bytes\\s+spill\\s+loads)\"};\n+  ModuleStats kernel_stats_map;\n+\n+  int spill_stores = 0;\n+  int spill_loads = 0;\n+  absl::string_view function_name;\n+  absl::string_view search_log = log;\n+  while (RE2::FindAndConsume(&search_log, *kSpillRegex, &function_name,\n+                             &spill_stores, &spill_loads)) {\n+    kernel_stats_map[function_name] = {spill_stores, spill_loads};\n+  }\n+  return kernel_stats_map;\n+}\n+\n absl::Status CreateErrorFromPTXASLog(absl::string_view log,\n                                      absl::string_view architecture,\n                                      bool cancel_if_reg_spill) {"
+        },
+        {
+            "sha": "acfc0bfbad8b0598089ab916822e7eca33117af9",
+            "filename": "third_party/xla/xla/stream_executor/cuda/ptx_compiler_helpers.h",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 0,
+            "changes": 8,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/1f9d43fde23d2d7d9a4b66d44a88cc3d0c166631/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fptx_compiler_helpers.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/1f9d43fde23d2d7d9a4b66d44a88cc3d0c166631/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fptx_compiler_helpers.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fptx_compiler_helpers.h?ref=1f9d43fde23d2d7d9a4b66d44a88cc3d0c166631",
+            "patch": "@@ -19,6 +19,7 @@ limitations under the License.\n #include \"absl/status/statusor.h\"\n #include \"absl/strings/string_view.h\"\n #include \"xla/stream_executor/cuda/cuda_compute_capability.h\"\n+#include \"xla/stream_executor/kernel_stats.h\"\n #include \"xla/stream_executor/semantic_version.h\"\n \n namespace stream_executor {\n@@ -56,6 +57,13 @@ void WarnIfBadPtxasVersion(absl::string_view method,\n absl::StatusOr<int> GetLatestPtxIsaVersionFromUnsupportedVersionErrorLog(\n     absl::string_view error_log);\n \n+// Extracts the module stats from the ptxas log.\n+//\n+// Example: \"Registers are spilled to local memory in function 'rr', 1080 bytes\n+// spill stores, 968 bytes spill loads\" will return:\n+// ModuleStats{ KernelStats{\"rr\", {1080, 968}} }\n+ModuleStats ExtractModuleStatsFromLog(absl::string_view log);\n+\n }  // namespace stream_executor\n \n #endif  // XLA_STREAM_EXECUTOR_CUDA_PTX_COMPILER_HELPERS_H_"
+        },
+        {
+            "sha": "f42e6480bff790785668b3658c47ff69e66e5441",
+            "filename": "third_party/xla/xla/stream_executor/cuda/ptx_compiler_helpers_test.cc",
+            "status": "modified",
+            "additions": 27,
+            "deletions": 1,
+            "changes": 28,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/1f9d43fde23d2d7d9a4b66d44a88cc3d0c166631/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fptx_compiler_helpers_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/1f9d43fde23d2d7d9a4b66d44a88cc3d0c166631/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fptx_compiler_helpers_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fptx_compiler_helpers_test.cc?ref=1f9d43fde23d2d7d9a4b66d44a88cc3d0c166631",
+            "patch": "@@ -20,6 +20,7 @@ limitations under the License.\n #include \"absl/status/status.h\"\n #include \"absl/status/status_matchers.h\"\n #include \"absl/strings/string_view.h\"\n+#include \"xla/stream_executor/kernel_stats.h\"\n \n namespace stream_executor {\n namespace {\n@@ -49,7 +50,15 @@ ptxas fatal   : Ptx assembly aborted due to errors\n \n constexpr absl::string_view kPtxasLogRegisterSpillWarning = R\"(\n // Something in the log before the warning.\n-ptxas warning : Registers are spilled to local memory in function '__kernel', 8 bytes spill stores, 8 bytes spill loads\n+ptxas warning : Registers are spilled to local memory in function '__kernel', 18 bytes spill stores, 8 bytes spill loads\n+// Something in the log after the warning.\n+)\";\n+\n+constexpr absl::string_view kPtxasLogMultipleKernelsSpillingRegisters = R\"(\n+// Something in the log before the warning.\n+ptxas warning : Registers are spilled to local memory in function '__kernel', 18 bytes spill stores, 8 bytes spill loads\n+// Log log log.\n+ptxas warning : Registers are spilled to local memory in function '__kernel2', 1024 bytes spill stores, 1099 bytes spill loads\n // Something in the log after the warning.\n )\";\n \n@@ -106,5 +115,22 @@ TEST(PtxCompilerHelpersTest, IsPtxRegisterAllocationErrorStatus) {\n   EXPECT_FALSE(IsPtxRegisterAllocationError(absl::OkStatus()));\n }\n \n+TEST(PtxCompilerHelpersTest, ModuleStatsAreCorrectlyExtractedFromLog) {\n+  ModuleStats kernel_stats_map =\n+      ExtractModuleStatsFromLog(kPtxasLogRegisterSpillWarning);\n+  EXPECT_EQ(kernel_stats_map.size(), 1);\n+  EXPECT_EQ(kernel_stats_map[\"__kernel\"].store_bytes_spilled, 18);\n+  EXPECT_EQ(kernel_stats_map[\"__kernel\"].load_bytes_spilled, 8);\n+  kernel_stats_map =\n+      ExtractModuleStatsFromLog(kPtxasLogMultipleKernelsSpillingRegisters);\n+  EXPECT_EQ(kernel_stats_map.size(), 2);\n+  EXPECT_EQ(kernel_stats_map[\"__kernel\"].store_bytes_spilled, 18);\n+  EXPECT_EQ(kernel_stats_map[\"__kernel\"].load_bytes_spilled, 8);\n+  EXPECT_EQ(kernel_stats_map[\"__kernel2\"].store_bytes_spilled, 1024);\n+  EXPECT_EQ(kernel_stats_map[\"__kernel2\"].load_bytes_spilled, 1099);\n+  kernel_stats_map = ExtractModuleStatsFromLog(kPtxasLogSuccessfulCompilation);\n+  EXPECT_EQ(kernel_stats_map.size(), 0);\n+}\n+\n }  // namespace\n }  // namespace stream_executor"
+        },
+        {
+            "sha": "ff5fd64b35c5b3a5125052b271eddd7ece8b4397",
+            "filename": "third_party/xla/xla/stream_executor/kernel_stats.h",
+            "status": "added",
+            "additions": 34,
+            "deletions": 0,
+            "changes": 34,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/1f9d43fde23d2d7d9a4b66d44a88cc3d0c166631/third_party%2Fxla%2Fxla%2Fstream_executor%2Fkernel_stats.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/1f9d43fde23d2d7d9a4b66d44a88cc3d0c166631/third_party%2Fxla%2Fxla%2Fstream_executor%2Fkernel_stats.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fstream_executor%2Fkernel_stats.h?ref=1f9d43fde23d2d7d9a4b66d44a88cc3d0c166631",
+            "patch": "@@ -0,0 +1,34 @@\n+/* Copyright 2025 The OpenXLA Authors.\n+\n+Licensed under the Apache License, Version 2.0 (the \"License\");\n+you may not use this file except in compliance with the License.\n+You may obtain a copy of the License at\n+\n+    http://www.apache.org/licenses/LICENSE-2.0\n+\n+Unless required by applicable law or agreed to in writing, software\n+distributed under the License is distributed on an \"AS IS\" BASIS,\n+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+See the License for the specific language governing permissions and\n+limitations under the License.\n+==============================================================================*/\n+\n+#ifndef XLA_STREAM_EXECUTOR_KERNEL_STATS_H_\n+#define XLA_STREAM_EXECUTOR_KERNEL_STATS_H_\n+\n+#include <string>\n+\n+#include \"absl/container/flat_hash_map.h\"\n+\n+// Stats about a single kernel.\n+struct KernelStats {\n+  // The number of spilled register bytes in the kernel for stores.\n+  int store_bytes_spilled = 0;\n+  // The number of spilled register bytes in the kernel for loads.\n+  int load_bytes_spilled = 0;\n+};\n+\n+// Map from a function/kernel name to its kernel stats.\n+using ModuleStats = absl::flat_hash_map<std::string, KernelStats>;\n+\n+#endif  // XLA_STREAM_EXECUTOR_KERNEL_STATS_H_"
+        }
+    ],
+    "stats": {
+        "total": 101,
+        "additions": 100,
+        "deletions": 1
+    }
+}

@@ -1,0 +1,84 @@
+{
+    "author": "loislo",
+    "message": "[XLA:GPU] Add reference CuBLAS config to the list of configs for the ScaledDot.\n\nWe need the reference cublas implementation for the speed comparison and for the numeric check by autotuner. The cuBLAS config in autotuner requires the scaled-dot to regular dot rewrite in the extractor.\n\nPiperOrigin-RevId: 810981263",
+    "sha": "35edeecf2b999f2a5e92e5231684a230e9d78561",
+    "files": [
+        {
+            "sha": "0f31843a14b6f8da399f132fc28a99b26b18a509",
+            "filename": "third_party/xla/xla/debug_options_flags.cc",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/35edeecf2b999f2a5e92e5231684a230e9d78561/third_party%2Fxla%2Fxla%2Fdebug_options_flags.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/35edeecf2b999f2a5e92e5231684a230e9d78561/third_party%2Fxla%2Fxla%2Fdebug_options_flags.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fdebug_options_flags.cc?ref=35edeecf2b999f2a5e92e5231684a230e9d78561",
+            "patch": "@@ -2536,6 +2536,12 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,\n           &DebugOptions::set_xla_gpu_experimental_use_raft_select_k),\n       debug_options->xla_gpu_experimental_use_raft_select_k(),\n       \"If true, use the raft::matrix::select_k implementation of TopK.\"));\n+  flag_list->push_back(tsl::Flag(\n+      \"xla_gpu_experimental_scaled_dot_with_triton\",\n+      bool_setter_for(\n+          &DebugOptions::set_xla_gpu_experimental_scaled_dot_with_triton),\n+      debug_options->xla_gpu_experimental_scaled_dot_with_triton(),\n+      \"If true, use the Triton emitter for scaled dot.\"));\n }  // NOLINT(readability/fn_size)\n \n // Allocates flag_values and flag_objects; this function must not be called more"
+        },
+        {
+            "sha": "7a764157ec07809e7097325db8c7c8e04d06faf8",
+            "filename": "third_party/xla/xla/service/gpu/autotuning/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/35edeecf2b999f2a5e92e5231684a230e9d78561/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/35edeecf2b999f2a5e92e5231684a230e9d78561/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2FBUILD?ref=35edeecf2b999f2a5e92e5231684a230e9d78561",
+            "patch": "@@ -167,6 +167,7 @@ cc_library(\n         \"//xla/service/gpu/transforms:gemm_rewriter\",\n         \"//xla/service/gpu/transforms:nest_gemm_fusion\",\n         \"//xla/service/gpu/transforms:priority_fusion\",\n+        \"//xla/service/gpu/transforms:scaled_dot_rewriter\",\n         \"//xla/stream_executor:device_description\",\n         \"//xla/stream_executor:device_memory\",\n         \"//xla/stream_executor:device_memory_allocator\","
+        },
+        {
+            "sha": "2f7b48fe63c2fff7576b9bb4ed27dfca2a03caaf",
+            "filename": "third_party/xla/xla/service/gpu/autotuning/gemm_fusion_autotuner.cc",
+            "status": "modified",
+            "additions": 40,
+            "deletions": 3,
+            "changes": 43,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/35edeecf2b999f2a5e92e5231684a230e9d78561/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fgemm_fusion_autotuner.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/35edeecf2b999f2a5e92e5231684a230e9d78561/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fgemm_fusion_autotuner.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fgemm_fusion_autotuner.cc?ref=35edeecf2b999f2a5e92e5231684a230e9d78561",
+            "patch": "@@ -82,6 +82,7 @@ limitations under the License.\n #include \"xla/service/gpu/transforms/gemm_rewriter.h\"\n #include \"xla/service/gpu/transforms/nest_gemm_fusion.h\"\n #include \"xla/service/gpu/transforms/priority_fusion.h\"\n+#include \"xla/service/gpu/transforms/scaled_dot_rewriter.h\"\n #include \"xla/service/hlo_cost_analysis.h\"\n #include \"xla/service/hlo_graph_dumper.h\"\n #include \"xla/service/hlo_module_config.h\"\n@@ -336,6 +337,10 @@ absl::StatusOr<std::unique_ptr<HloModule>> CublasGemmAutotuneExtractor(\n \n   auto* dot = hlo_query::GetFirstInstructionWithOpcode(\n       *new_module->entry_computation(), HloOpcode::kDot);\n+  if (dot == nullptr) {\n+    dot = hlo_query::GetFirstInstructionWithOpcode(\n+        *new_module->entry_computation(), HloOpcode::kScaledDot);\n+  }\n   // Substitute algorithms, which are not supported by cuBLAS for the check, but\n   // don't use cuBlas in the end. This assumes that the substituting algorithm\n   // has result which are close enough for the check in this file.\n@@ -348,12 +353,14 @@ absl::StatusOr<std::unique_ptr<HloModule>> CublasGemmAutotuneExtractor(\n   for (GemmRewriterOptions::DType dtype :\n        {GemmRewriterOptions::DType::kFp8Only,\n         GemmRewriterOptions::DType::kNonFp8Only}) {\n+    ScaledDotRewriter scaled_dot_rewriter;\n     GemmRewriter gemm_rewriter(config.GetGpuComputeCapability(),\n                                toolkit_version, GemmRewriterOptions{dtype});\n     DotAlgorithmRewriter dot_algorithm_rewriter;\n     PriorityFusion fusion_pass(\n         /*thread_pool=*/nullptr, gpu_device_info, PriorityFusionOptions(),\n         mlir_context);\n+    TF_RETURN_IF_ERROR(scaled_dot_rewriter.Run(new_module.get()).status());\n     TF_RETURN_IF_ERROR(dot_algorithm_rewriter.Run(new_module.get()).status());\n     TF_RETURN_IF_ERROR(gemm_rewriter.Run(new_module.get()).status());\n     TF_RETURN_IF_ERROR(fusion_pass.Run(new_module.get()).status());\n@@ -552,10 +559,34 @@ std::string Serialize(const BackendConfig& config) {\n   return ConfigToString(config);\n }\n \n+bool IsScaledDotFusion(const HloInstruction* fusion_instr) {\n+  if (fusion_instr->fusion_kind() != HloInstruction::FusionKind::kCustom) {\n+    return false;\n+  }\n+  auto config = fusion_instr->backend_config<GpuBackendConfig>();\n+  if (!config.ok()) {\n+    return false;\n+  }\n+  if (config->fusion_backend_config().kind() != kTritonScaledDotFusionKind) {\n+    return false;\n+  }\n+  return true;\n+}\n+\n absl::Status RewriteGemmFusionToCall(HloInstruction* fusion_instr) {\n   // Falling back to cuBLAS: Converting the fusion to a Call, so that it\n   // can be inlined back again.\n   tsl::profiler::TraceMe traceme(\"RewriteGemmFusionToCall\");\n+\n+  if (IsScaledDotFusion(fusion_instr)) {\n+    ScaledDotRewriter rewriter;\n+    TF_ASSIGN_OR_RETURN(bool changed,\n+                        rewriter.RewriteComputation(\n+                            fusion_instr->fused_instructions_computation()));\n+    if (!changed) {\n+      return absl::InternalError(\"Failed to rewrite scaled dot fusion to dot.\");\n+    }\n+  }\n   HloComputation* const computation = fusion_instr->parent();\n   HloInstruction* const call =\n       computation->AddInstruction(HloInstruction::CreateCall(\n@@ -726,7 +757,7 @@ absl::Status GemmFusionAutotunerRewriterVisitor::HandleFusion(\n \n   // Autotune result has a cuDNN fusion.\n   CHECK(autotune_result.has_algorithm());\n-  fusion_backend_config.set_kind(std::string(kCuDnnFusionKind));\n+  fusion_backend_config.set_kind(kCuDnnFusionKind);\n   fusion_backend_config.mutable_cudnn_fusion_config()->set_plan_id(\n       autotune_result.algorithm().algo_id());\n   TF_RETURN_IF_ERROR(fusion_instr->set_backend_config(gpu_config));\n@@ -901,9 +932,15 @@ absl::StatusOr<std::vector<BackendConfig>>\n GemmFusionAutotunerImpl::GenerateScaledDotConfigs(\n     const HloFusionInstruction& fusion, const HloScaledDotInstruction* dot) {\n   std::vector<BackendConfig> configs;\n+\n+  if (!debug_options_.xla_gpu_experimental_disable_binary_libraries()) {\n+    // Add cuBLAS reference config, if available.\n+    configs.push_back(CuBlasConfig{});\n+  }\n+\n   // TODO(b/436988479): fine tune the search space.\n-  for (int block_m = 32; block_m <= 128; block_m *= 2) {\n-    for (int block_n = 32; block_n <= 128; block_n *= 2) {\n+  for (int block_m = 16; block_m <= 256; block_m *= 2) {\n+    for (int block_n = 16; block_n <= 256; block_n *= 2) {\n       configs.push_back(TritonGemmConfig(block_m, block_n,\n                                          /*block_k=*/128, /*split_k=*/1,\n                                          /*num_stages=*/1,"
+        },
+        {
+            "sha": "3281c7808f455c35ea439ebc9b2b179837b9677b",
+            "filename": "third_party/xla/xla/service/gpu/autotuning/gemm_fusion_autotuner_test.cc",
+            "status": "modified",
+            "additions": 33,
+            "deletions": 0,
+            "changes": 33,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/35edeecf2b999f2a5e92e5231684a230e9d78561/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fgemm_fusion_autotuner_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/35edeecf2b999f2a5e92e5231684a230e9d78561/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fgemm_fusion_autotuner_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fgemm_fusion_autotuner_test.cc?ref=35edeecf2b999f2a5e92e5231684a230e9d78561",
+            "patch": "@@ -1760,6 +1760,39 @@ TEST_F(GemmFusionAutotunerTest, ScaledDotConfigsAreGenerated) {\n   EXPECT_GT(blackwell_configs_set.size(), 0);\n }\n \n+TEST_F(GemmFusionAutotunerTest, ScaledDotConfigsHaveCuBlasFallback) {\n+  if (isRocm()) {\n+    GTEST_SKIP() << \"Not supported on ROCm.\";\n+  }\n+\n+  std::unique_ptr<VerifiedHloModule> module = ParseAndReturnVerifiedModule(R\"(\n+    HloModule module\n+\n+    fusion_computation {\n+      p0 = f32[1024,1024] parameter(0)\n+      p0_scale = f32[1024,8] parameter(1)\n+      p1 = f32[1024,1024] parameter(2)\n+      p1_scale = f32[8,1024] parameter(3)\n+      ROOT r = f32[1024,1024] scaled-dot(p0, p0_scale, p1, p1_scale),\n+        lhs_contracting_dims={1}, rhs_contracting_dims={0}\n+    }\n+\n+    ENTRY e {\n+      p0 = f32[1024,1024] parameter(0)\n+      p0_scale = f32[1024,8] parameter(1)\n+      p1 = f32[1024,1024] parameter(2)\n+      p1_scale = f32[8,1024] parameter(3)\n+      ROOT r = f32[1024,1024] fusion(p0, p0_scale, p1, p1_scale),\n+        kind=kCustom, calls=fusion_computation\n+    })\")\n+                                                  .value();\n+\n+  auto configs = GetPossibleMatmulAutotuneConfigs(*module);\n+  EXPECT_TRUE(hasCublasConfig(configs.value()))\n+      << \"There should be at least one config with cublas fallback for \"\n+         \"scaled-dot.\";\n+}\n+\n // TODO(b/315957220): Remove the experimental flags once TMA is enabled by\n // default.\n class GemmFusionAutotunerEnableTma : public GemmFusionAutotunerTest {"
+        },
+        {
+            "sha": "19ce90e22fd5749967165f5c7512faf8551dedc2",
+            "filename": "third_party/xla/xla/service/gpu/transforms/scaled_dot_rewriter.cc",
+            "status": "modified",
+            "additions": 26,
+            "deletions": 16,
+            "changes": 42,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/35edeecf2b999f2a5e92e5231684a230e9d78561/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fscaled_dot_rewriter.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/35edeecf2b999f2a5e92e5231684a230e9d78561/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fscaled_dot_rewriter.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fscaled_dot_rewriter.cc?ref=35edeecf2b999f2a5e92e5231684a230e9d78561",
+            "patch": "@@ -30,6 +30,7 @@ limitations under the License.\n #include \"xla/hlo/ir/hlo_instructions.h\"\n #include \"xla/hlo/ir/hlo_module.h\"\n #include \"xla/hlo/ir/hlo_opcode.h\"\n+#include \"xla/layout_util.h\"\n #include \"xla/primitive_util.h\"\n #include \"xla/shape.h\"\n #include \"xla/tsl/platform/errors.h\"\n@@ -128,10 +129,12 @@ HloInstruction* BroadcastAndReshape(HloInstruction* scale,\n     }\n   }\n   Shape new_scales_shape(scale_shape.element_type(), shape_dims);\n+  LayoutUtil::SetToDefaultLayout(&new_scales_shape);\n   HloInstruction* new_scales = computation->AddInstruction(\n       HloInstruction::CreateBroadcast(new_scales_shape, scale, broadcast_dims));\n   Shape reshaped_scales_shape(scale_shape.element_type(),\n                               operand_shape.dimensions());\n+  LayoutUtil::SetToDefaultLayout(&reshaped_scales_shape);\n   return computation->AddInstruction(\n       HloInstruction::CreateReshape(reshaped_scales_shape, new_scales));\n }\n@@ -159,26 +162,33 @@ absl::StatusOr<HloInstruction*> Dequantize(HloInstruction* dot,\n }\n }  // namespace\n \n+absl::StatusOr<bool> ScaledDotRewriter::RewriteComputation(\n+    HloComputation* computation) {\n+  bool changed = false;\n+  for (HloInstruction* instruction : computation->MakeInstructionPostOrder()) {\n+    if (instruction->opcode() != HloOpcode::kScaledDot) {\n+      continue;\n+    }\n+    changed = true;\n+    HloScaledDotInstruction* dot = Cast<HloScaledDotInstruction>(instruction);\n+    TF_ASSIGN_OR_RETURN(HloInstruction * lhs, Dequantize(dot, 0, 1, \"LHS\"));\n+    TF_ASSIGN_OR_RETURN(HloInstruction * rhs, Dequantize(dot, 2, 3, \"RHS\"));\n+\n+    TF_RETURN_IF_ERROR(dot->ReplaceAllUsesWith(\n+        computation->AddInstruction(HloInstruction::CreateDot(\n+            dot->shape(), lhs, rhs, dot->dot_dimension_numbers(),\n+            dot->precision_config()))));\n+    TF_RETURN_IF_ERROR(computation->RemoveInstruction(dot));\n+  }\n+  return changed;\n+}\n+\n absl::StatusOr<bool> ScaledDotRewriter::Run(\n     HloModule* module, const absl::flat_hash_set<absl::string_view>&) {\n   bool changed = false;\n   for (HloComputation* computation : module->MakeNonfusionComputations()) {\n-    for (HloInstruction* instruction :\n-         computation->MakeInstructionPostOrder()) {\n-      if (instruction->opcode() != HloOpcode::kScaledDot) {\n-        continue;\n-      }\n-      changed = true;\n-      HloScaledDotInstruction* dot = Cast<HloScaledDotInstruction>(instruction);\n-      TF_ASSIGN_OR_RETURN(HloInstruction * lhs, Dequantize(dot, 0, 1, \"LHS\"));\n-      TF_ASSIGN_OR_RETURN(HloInstruction * rhs, Dequantize(dot, 2, 3, \"RHS\"));\n-\n-      TF_RETURN_IF_ERROR(dot->ReplaceAllUsesWith(\n-          computation->AddInstruction(HloInstruction::CreateDot(\n-              dot->shape(), lhs, rhs, dot->dot_dimension_numbers(),\n-              dot->precision_config()))));\n-      TF_RETURN_IF_ERROR(computation->RemoveInstruction(dot));\n-    }\n+    TF_ASSIGN_OR_RETURN(bool result, RewriteComputation(computation));\n+    changed |= result;\n   }\n   return changed;\n }"
+        },
+        {
+            "sha": "587acf8b781864bf9809f7f5ca0664a103f0e4f6",
+            "filename": "third_party/xla/xla/service/gpu/transforms/scaled_dot_rewriter.h",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/35edeecf2b999f2a5e92e5231684a230e9d78561/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fscaled_dot_rewriter.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/35edeecf2b999f2a5e92e5231684a230e9d78561/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fscaled_dot_rewriter.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fscaled_dot_rewriter.h?ref=35edeecf2b999f2a5e92e5231684a230e9d78561",
+            "patch": "@@ -36,6 +36,8 @@ class ScaledDotRewriter : public HloModulePass {\n   absl::StatusOr<bool> Run(\n       HloModule* module,\n       const absl::flat_hash_set<absl::string_view>& execution_threads) override;\n+\n+  absl::StatusOr<bool> RewriteComputation(HloComputation* computation);\n };\n \n }  // namespace gpu"
+        }
+    ],
+    "stats": {
+        "total": 127,
+        "additions": 108,
+        "deletions": 19
+    }
+}

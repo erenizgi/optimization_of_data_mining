@@ -1,0 +1,36 @@
+{
+    "author": "tensorflower-gardener",
+    "message": "Fix what appears to be a bug in BufferAssignment::CombineTempAllocations\n\nIt looks like the code intends to update the BufferAllocation associated with the color if we exceed the size threshold.\n\nHowever, emplace does not modify the map if the key is already existing.\n\nPiperOrigin-RevId: 813723804",
+    "sha": "a7b9a622193f352aec77682c0625a2815ec4ec09",
+    "files": [
+        {
+            "sha": "d0dc04d98f626eca745f3448508b8c6b2bb62e44",
+            "filename": "third_party/xla/xla/service/buffer_assignment.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a7b9a622193f352aec77682c0625a2815ec4ec09/third_party%2Fxla%2Fxla%2Fservice%2Fbuffer_assignment.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a7b9a622193f352aec77682c0625a2815ec4ec09/third_party%2Fxla%2Fxla%2Fservice%2Fbuffer_assignment.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fbuffer_assignment.cc?ref=a7b9a622193f352aec77682c0625a2815ec4ec09",
+            "patch": "@@ -726,7 +726,7 @@ absl::Status BufferAssignment::CombineTempAllocations(\n       VLOG(1) << \"Due to size constraint, reset temp allocation for color \"\n               << color << \" to: \" << temp_allocation;\n       combined_allocations.push_back(std::move(temp_allocation));\n-      combined_allocation_map.emplace(color, &combined_allocations.back());\n+      combined_it->second = &combined_allocations.back();\n       continue;\n     }\n "
+        },
+        {
+            "sha": "94e09dda7958075a82caea2fc0b8c4df03aa3591",
+            "filename": "third_party/xla/xla/service/buffer_assignment_test.cc",
+            "status": "modified",
+            "additions": 74,
+            "deletions": 0,
+            "changes": 74,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a7b9a622193f352aec77682c0625a2815ec4ec09/third_party%2Fxla%2Fxla%2Fservice%2Fbuffer_assignment_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a7b9a622193f352aec77682c0625a2815ec4ec09/third_party%2Fxla%2Fxla%2Fservice%2Fbuffer_assignment_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fbuffer_assignment_test.cc?ref=a7b9a622193f352aec77682c0625a2815ec4ec09",
+            "patch": "@@ -2068,6 +2068,80 @@ TEST_F(BufferAssignmentTest, OneTempAllocation) {\n   }\n }\n \n+TEST_F(BufferAssignmentTest, TempAllocationLimitResetsBuffer) {\n+  // Test that temporary buffers are combined into allocations up to the limit\n+  // specified by xla_multiheap_size_constraint_per_heap.\n+  auto builder = HloComputation::Builder(TestName());\n+  Shape shape_10x10 = ShapeUtil::MakeShape(F32, {10, 10});\n+  Shape shape_40x10 = ShapeUtil::MakeShape(F32, {40, 10});\n+\n+  auto param_a = builder.AddInstruction(\n+      HloInstruction::CreateParameter(0, shape_10x10, \"param_a\"));\n+  auto param_b = builder.AddInstruction(\n+      HloInstruction::CreateParameter(1, shape_10x10, \"param_b\"));\n+  auto param_c = builder.AddInstruction(\n+      HloInstruction::CreateParameter(2, shape_10x10, \"param_c\"));\n+  auto param_d = builder.AddInstruction(\n+      HloInstruction::CreateParameter(3, shape_10x10, \"param_d\"));\n+  auto param_e = builder.AddInstruction(\n+      HloInstruction::CreateParameter(4, shape_10x10, \"param_e\"));\n+  DotDimensionNumbers dot_dnums;\n+  dot_dnums.add_lhs_contracting_dimensions(1);\n+  dot_dnums.add_rhs_contracting_dimensions(0);\n+  PrecisionConfig precision_config;\n+  precision_config.mutable_operand_precision()->Resize(\n+      2, PrecisionConfig::DEFAULT);\n+  auto dot_ab = builder.AddInstruction(HloInstruction::CreateDot(\n+      shape_10x10, param_a, param_b, dot_dnums, precision_config));\n+  auto dot_bc = builder.AddInstruction(HloInstruction::CreateDot(\n+      shape_10x10, param_b, param_c, dot_dnums, precision_config));\n+  auto dot_cd = builder.AddInstruction(HloInstruction::CreateDot(\n+      shape_10x10, param_c, param_d, dot_dnums, precision_config));\n+  auto dot_de = builder.AddInstruction(HloInstruction::CreateDot(\n+      shape_10x10, param_d, param_e, dot_dnums, precision_config));\n+  builder.AddInstruction(HloInstruction::CreateConcatenate(\n+      shape_40x10, {dot_ab, dot_bc, dot_cd, dot_de}, 0));\n+\n+  // Run buffer assignment with alignment=1.\n+  auto module = CreateNewVerifiedModule();\n+  module->AddEntryComputation(builder.Build());\n+  module->mutable_config()\n+      .mutable_debug_options()\n+      .set_xla_multiheap_size_constraint_per_heap(801);\n+  auto assignment = RunBufferAssignment(module.get(), /*alignment=*/1);\n+\n+  // 5 params allocations, 1 output, and 2 temp allocations.\n+  // Dots are size 400. 400+400=800 < 801, so two dots fit in one allocation.\n+  // The next dot comes: 800+400=1200 >= 801, so we reset to a new allocation.\n+  // The new allocation takes 400, and 400+400=800 < 801 for the next dot.\n+  // So we expect 2 allocations of size 800.\n+  EXPECT_EQ(8, assignment->Allocations().size());\n+\n+  BufferAllocation::Slice slice_ab =\n+      assignment->GetUniqueTopLevelSlice(dot_ab).value();\n+  BufferAllocation::Slice slice_bc =\n+      assignment->GetUniqueTopLevelSlice(dot_bc).value();\n+  BufferAllocation::Slice slice_cd =\n+      assignment->GetUniqueTopLevelSlice(dot_cd).value();\n+  BufferAllocation::Slice slice_de =\n+      assignment->GetUniqueTopLevelSlice(dot_de).value();\n+\n+  EXPECT_EQ(400, slice_ab.size());\n+  EXPECT_EQ(400, slice_bc.size());\n+  EXPECT_EQ(400, slice_cd.size());\n+  EXPECT_EQ(400, slice_de.size());\n+\n+  EXPECT_EQ(800, slice_ab.allocation()->size());\n+  EXPECT_EQ(800, slice_bc.allocation()->size());\n+  EXPECT_EQ(800, slice_cd.allocation()->size());\n+  EXPECT_EQ(800, slice_de.allocation()->size());\n+\n+  absl::flat_hash_set<const BufferAllocation*> allocs = {\n+      slice_ab.allocation(), slice_bc.allocation(), slice_cd.allocation(),\n+      slice_de.allocation()};\n+  EXPECT_EQ(allocs.size(), 2);\n+}\n+\n TEST_F(BufferAssignmentTest, TrivialPeakBuffers) {\n   // paramscalar -(bc)- (mul) -- (add) -- (sub)\n   //                     /        /        /"
+        }
+    ],
+    "stats": {
+        "total": 76,
+        "additions": 75,
+        "deletions": 1
+    }
+}

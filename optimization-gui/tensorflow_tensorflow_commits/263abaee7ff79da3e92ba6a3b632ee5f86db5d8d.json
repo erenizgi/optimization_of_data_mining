@@ -1,0 +1,48 @@
+{
+    "author": "majiddadashi",
+    "message": "Allow tflite interpreter to receive i4 tensor\n\nThe data needs to be placed in i8 numpy container and it's automatically packed into i4 tensors.\n\nPiperOrigin-RevId: 824685124",
+    "sha": "263abaee7ff79da3e92ba6a3b632ee5f86db5d8d",
+    "files": [
+        {
+            "sha": "ccf2bf2b61651e99c3a0b55374d34d17047a82ba",
+            "filename": "tensorflow/lite/python/interpreter_wrapper/interpreter_wrapper.cc",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 1,
+            "changes": 7,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/263abaee7ff79da3e92ba6a3b632ee5f86db5d8d/tensorflow%2Flite%2Fpython%2Finterpreter_wrapper%2Finterpreter_wrapper.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/263abaee7ff79da3e92ba6a3b632ee5f86db5d8d/tensorflow%2Flite%2Fpython%2Finterpreter_wrapper%2Finterpreter_wrapper.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Flite%2Fpython%2Finterpreter_wrapper%2Finterpreter_wrapper.cc?ref=263abaee7ff79da3e92ba6a3b632ee5f86db5d8d",
+            "patch": "@@ -615,7 +615,12 @@ PyObject* InterpreterWrapper::SetTensor(int tensor_index, PyObject* value,\n   TfLiteTensor* tensor =\n       interpreter_->subgraph(subgraph_index)->tensor(tensor_index);\n \n-  if (python_utils::TfLiteTypeFromPyArray(array) != tensor->type) {\n+  if (tensor->type == kTfLiteInt4) {\n+    return python_utils::SetInt4Tensor(tensor, array, tensor_index);\n+  }\n+\n+  TfLiteType incoming_type = python_utils::TfLiteTypeFromPyArray(array);\n+  if (incoming_type != tensor->type) {\n     PyErr_Format(PyExc_ValueError,\n                  \"Cannot set tensor:\"\n                  \" Got value of type %s\""
+        },
+        {
+            "sha": "44203e9f146ddae124856d10787baf22d225e6cb",
+            "filename": "tensorflow/lite/python/interpreter_wrapper/numpy.cc",
+            "status": "modified",
+            "additions": 65,
+            "deletions": 0,
+            "changes": 65,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/263abaee7ff79da3e92ba6a3b632ee5f86db5d8d/tensorflow%2Flite%2Fpython%2Finterpreter_wrapper%2Fnumpy.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/263abaee7ff79da3e92ba6a3b632ee5f86db5d8d/tensorflow%2Flite%2Fpython%2Finterpreter_wrapper%2Fnumpy.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Flite%2Fpython%2Finterpreter_wrapper%2Fnumpy.cc?ref=263abaee7ff79da3e92ba6a3b632ee5f86db5d8d",
+            "patch": "@@ -13,10 +13,13 @@ See the License for the specific language governing permissions and\n limitations under the License.\n ==============================================================================*/\n \n+#include <cstddef>\n+#include <cstdint>\n #include <memory>\n \n #define TFLITE_IMPORT_NUMPY  // See numpy.h for explanation.\n #include \"tensorflow/lite/core/c/c_api_types.h\"\n+#include \"tensorflow/lite/core/c/common.h\"\n #include \"tensorflow/lite/python/interpreter_wrapper/numpy.h\"\n \n namespace tflite {\n@@ -220,5 +223,67 @@ bool FillStringBufferWithPyArray(PyObject* value,\n   return false;\n }\n \n+// Helper function to pack int8 numpy array data into an INT4 tensor.\n+PyObject* SetInt4Tensor(TfLiteTensor* tensor, PyArrayObject* array,\n+                        int tensor_index) {\n+  TfLiteType incoming_type = TfLiteTypeFromPyArray(array);\n+  if (incoming_type != kTfLiteInt8) {\n+    PyErr_Format(PyExc_ValueError,\n+                 \"Cannot set tensor:\"\n+                 \" Expected a numpy array of int8 for INT4 input \"\n+                 \"%d, name: %s, but got %s\",\n+                 tensor_index, tensor->name, TfLiteTypeGetName(incoming_type));\n+    return nullptr;\n+  }\n+\n+  size_t num_elements = 1;\n+  for (int i = 0; i < tensor->dims->size; ++i) {\n+    num_elements *= tensor->dims->data[i];\n+  }\n+  size_t expected_packed_bytes = (num_elements + 1) / 2;\n+  size_t actual_numpy_bytes = PyArray_NBYTES(array);\n+\n+  if (actual_numpy_bytes != num_elements) {\n+    PyErr_Format(PyExc_ValueError,\n+                 \"Cannot set tensor:\"\n+                 \" Numpy array for INT4 input %d, name: %s, has %zu bytes, \"\n+                 \"but expected %zu bytes for %zu elements\",\n+                 tensor_index, tensor->name, actual_numpy_bytes, num_elements,\n+                 num_elements);\n+    return nullptr;\n+  }\n+\n+  if (tensor->data.raw == nullptr && tensor->bytes) {\n+    PyErr_Format(PyExc_ValueError,\n+                 \"Cannot set tensor:\"\n+                 \" Tensor is unallocated. Try calling allocate_tensors()\"\n+                 \" first for input %d, name: %s\",\n+                 tensor_index, tensor->name);\n+    return nullptr;\n+  }\n+\n+  // Pack the int8 array into int4\n+  uint8_t* packed_data = reinterpret_cast<uint8_t*>(tensor->data.raw);\n+  int8_t* numpy_data = reinterpret_cast<int8_t*>(PyArray_DATA(array));\n+  for (size_t i = 0; i < expected_packed_bytes; ++i) {\n+    int8_t first_nibble = numpy_data[2 * i];\n+    int8_t second_nibble =\n+        (2 * i + 1 < num_elements) ? numpy_data[2 * i + 1] : 0;\n+    if ((first_nibble < -8 || first_nibble > 7) ||\n+        (second_nibble < -8 || second_nibble > 7)) {\n+      PyErr_Format(PyExc_ValueError,\n+                   \"Cannot set tensor:\"\n+                   \" Values for INT4 input must be between -8 and 7.\");\n+      return nullptr;\n+    }\n+    // Pack the two int8 values into a single byte. The first nibble\n+    // occupies the lower 4 bits and the second nibble occupies the upper 4\n+    // bits. We mask the first nibble with 0x0F to ensure only the lower 4\n+    // bits are used, handling potential sign extension in the int8 value.\n+    packed_data[i] = (first_nibble & 0x0F) | (second_nibble << 4);\n+  }\n+  Py_RETURN_NONE;\n+}\n+\n }  // namespace python_utils\n }  // namespace tflite"
+        },
+        {
+            "sha": "d543a758c14e4dcb03c73ff8e66e709dfe72fe26",
+            "filename": "tensorflow/lite/python/interpreter_wrapper/numpy.h",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/263abaee7ff79da3e92ba6a3b632ee5f86db5d8d/tensorflow%2Flite%2Fpython%2Finterpreter_wrapper%2Fnumpy.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/263abaee7ff79da3e92ba6a3b632ee5f86db5d8d/tensorflow%2Flite%2Fpython%2Finterpreter_wrapper%2Fnumpy.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Flite%2Fpython%2Finterpreter_wrapper%2Fnumpy.h?ref=263abaee7ff79da3e92ba6a3b632ee5f86db5d8d",
+            "patch": "@@ -72,6 +72,10 @@ TfLiteType TfLiteTypeFromPyArray(PyArrayObject* array);\n bool FillStringBufferWithPyArray(PyObject* value,\n                                  DynamicBuffer* dynamic_buffer);\n \n+// Helper function to pack int8 numpy array data into an INT4 tensor.\n+PyObject* SetInt4Tensor(TfLiteTensor* tensor, PyArrayObject* array,\n+                        int tensor_index);\n+\n }  // namespace python_utils\n }  // namespace tflite\n "
+        }
+    ],
+    "stats": {
+        "total": 76,
+        "additions": 75,
+        "deletions": 1
+    }
+}

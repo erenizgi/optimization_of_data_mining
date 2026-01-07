@@ -1,0 +1,36 @@
+{
+    "author": "tensorflower-gardener",
+    "message": "[Autotuner] Fission proxy backend should return empty config set, when fusion has no instruction supported by the underlying codegen backend.\n\nPiperOrigin-RevId: 834219339",
+    "sha": "1734e23a2a477a4cd6639a8da3320005885e5b97",
+    "files": [
+        {
+            "sha": "09d2a5a756dc8890c1f6d5c733f739e7cc00e37d",
+            "filename": "third_party/xla/xla/backends/gpu/autotuner/fission_backend.cc",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 4,
+            "changes": 12,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/1734e23a2a477a4cd6639a8da3320005885e5b97/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Ffission_backend.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/1734e23a2a477a4cd6639a8da3320005885e5b97/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Ffission_backend.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Ffission_backend.cc?ref=1734e23a2a477a4cd6639a8da3320005885e5b97",
+            "patch": "@@ -81,9 +81,13 @@ FissionBackend::GetSupportedConfigs(const HloInstruction& instr) {\n   }\n   TF_ASSIGN_OR_RETURN(std::unique_ptr<HloModule> hlo_module,\n                       GetFissionedAndRewrittenModule(instr));\n-  TF_ASSIGN_OR_RETURN(HloInstruction * supported_instr,\n-                      FindFirstSupportedInstruction(hlo_module.get()));\n-  return codegen_backend_->GetSupportedConfigs(*supported_instr);\n+  absl::StatusOr<HloInstruction*> supported_instr =\n+      FindFirstSupportedInstruction(hlo_module.get());\n+  if (supported_instr.status().code() == absl::StatusCode::kNotFound) {\n+    return std::vector<std::unique_ptr<BackendConfig>>();\n+  }\n+  TF_RETURN_IF_ERROR(supported_instr.status());\n+  return codegen_backend_->GetSupportedConfigs(**supported_instr);\n \n   return std::vector<std::unique_ptr<BackendConfig>>();\n }\n@@ -155,7 +159,7 @@ absl::StatusOr<HloInstruction*> FissionBackend::FindFirstSupportedInstruction(\n     }\n   }\n   if (supported_instructions.empty()) {\n-    return absl::InvalidArgumentError(\"No supported instructions found.\");\n+    return absl::NotFoundError(\"No supported instructions found.\");\n   }\n   if (supported_instructions.size() > 1) {\n     LOG(WARNING) << \"Backend \" << name()"
+        },
+        {
+            "sha": "0b907f00619b3d21c3adfff7318eda3a8c2b0687",
+            "filename": "third_party/xla/xla/backends/gpu/autotuner/fission_backend_test.cc",
+            "status": "modified",
+            "additions": 27,
+            "deletions": 0,
+            "changes": 27,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/1734e23a2a477a4cd6639a8da3320005885e5b97/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Ffission_backend_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/1734e23a2a477a4cd6639a8da3320005885e5b97/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Ffission_backend_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Ffission_backend_test.cc?ref=1734e23a2a477a4cd6639a8da3320005885e5b97",
+            "patch": "@@ -72,6 +72,23 @@ const char kTritonFusionHlo[] = R\"(\n       backend_config={\"fusion_backend_config\":{\"kind\":\"__triton_gemm\"}}\n   })\";\n \n+const char kUnsupportedFusionHlo[] = R\"(\n+  HloModule module\n+  computation {\n+    p0 = bf16[1024,1024]{1,0} parameter(0)\n+    convert0 = f32[1024,1024]{1,0} convert(p0)\n+    p1 = s8[1024,1024]{1,0} parameter(1)\n+    convert1 = f32[1024,1024]{1,0} convert(p1)\n+    ROOT add = f32[1024,1024]{1,0} add(convert0, convert1)\n+  }\n+\n+  ENTRY main {\n+    p0 = bf16[1024,1024]{1,0} parameter(0)\n+    p1 = s8[1024,1024]{1,0} parameter(1)\n+    ROOT fusion = f32[1024,1024]{1,0} fusion(p0, p1),\n+      kind=kCustom, calls=computation\n+  })\";\n+\n class CublasFissionTest : public HloHardwareIndependentTestBase {\n  protected:\n   DebugOptions debug_options_;\n@@ -128,6 +145,16 @@ TEST_F(CublasFissionTest, GetSupportedConfigs) {\n   EXPECT_THAT(configs, IsOkAndHolds(testing::SizeIs(1)));\n }\n \n+TEST_F(CublasFissionTest, GetSupportedConfigsForUnsupportedInstruction) {\n+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,\n+                          ParseAndReturnVerifiedModule(kUnsupportedFusionHlo));\n+  HloInstruction* unsupported_instr =\n+      module->entry_computation()->root_instruction();\n+  absl::StatusOr<std::vector<std::unique_ptr<BackendConfig>>> configs =\n+      fission_backend_->GetSupportedConfigs(*unsupported_instr);\n+  EXPECT_THAT(configs, IsOkAndHolds(testing::IsEmpty()));\n+}\n+\n TEST_F(CublasFissionTest, GetDefaultConfig) {\n   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,\n                           ParseAndReturnVerifiedModule(kTritonFusionHlo));"
+        }
+    ],
+    "stats": {
+        "total": 39,
+        "additions": 35,
+        "deletions": 4
+    }
+}

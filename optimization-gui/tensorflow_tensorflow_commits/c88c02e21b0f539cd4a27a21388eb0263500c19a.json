@@ -1,0 +1,60 @@
+{
+    "author": "alekstheod",
+    "message": "PR #32475: [ROCm] Prepare asan builds to be rbe compatible, include sanitizer ignore lists as data dpependency\n\nImported from GitHub PR https://github.com/openxla/xla/pull/32475\n\n📝 Summary of Changes\nMake asan builds hermetic so they can be used with rbe\n\n🎯 Justification\nAdd sanitizer ignore lists as a dependency to run_under script so they are available in rbe worker\n\n🚀 Kind of Contribution\nPlease remove what does not apply: 🐛 Bug Fix, ♻️ Cleanup\n\n📊 Benchmark (for Performance Improvements)\nnot relevant\n\n🧪 Unit Tests:\nnot relevant\n\n🧪 Execution Tests:\nnot relevant\n\nCopybara import of the project:\n\n--\ncae2ea8d4808c161becb80602fba605ba08a4bd5 by Alexandros Theodoridis <atheodor@amd.com>:\n\nAdjust ci script to include asan ignore list as deps\n\nMerging this change closes #32475\n\nPiperOrigin-RevId: 818658730",
+    "sha": "c88c02e21b0f539cd4a27a21388eb0263500c19a",
+    "files": [
+        {
+            "sha": "5b63729938ac424214f8a01299c04c24c4439b03",
+            "filename": "third_party/xla/build_tools/rocm/BUILD",
+            "status": "modified",
+            "additions": 63,
+            "deletions": 0,
+            "changes": 63,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/c88c02e21b0f539cd4a27a21388eb0263500c19a/third_party%2Fxla%2Fbuild_tools%2Frocm%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/c88c02e21b0f539cd4a27a21388eb0263500c19a/third_party%2Fxla%2Fbuild_tools%2Frocm%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fbuild_tools%2Frocm%2FBUILD?ref=c88c02e21b0f539cd4a27a21388eb0263500c19a",
+            "patch": "@@ -13,7 +13,70 @@\n # limitations under the License.\n # ============================================================================\n \n+load(\"@bazel_skylib//rules:common_settings.bzl\", \"string_flag\")\n+load(\"@rules_shell//shell:sh_binary.bzl\", \"sh_binary\")\n+\n package(\n     # copybara:uncomment default_applicable_licenses = [\"//tensorflow:license\"],\n     default_visibility = [\"//visibility:public\"],\n )\n+\n+string_flag(\n+    name = \"sanitizer\",\n+    build_setting_default = \"none\",\n+    values = [\n+        \"none\",\n+        \"asan\",\n+        \"tsan\",\n+    ],\n+)\n+\n+config_setting(\n+    name = \"asan\",\n+    flag_values = {\"//build_tools/rocm:sanitizer\": \"asan\"},\n+)\n+\n+config_setting(\n+    name = \"tsan\",\n+    flag_values = {\"//build_tools/rocm:sanitizer\": \"tsan\"},\n+)\n+\n+filegroup(\n+    name = \"sanitizer_ignore_lists\",\n+    srcs = select({\n+        \":asan\": [\n+            \"asan_ignore_list.txt\",\n+            \"lsan_ignore_list.txt\",\n+        ],\n+        \":tsan\": [\"tsan_ignore_list.txt\"],\n+        \"//conditions:default\": [],\n+    }),\n+    visibility = [\"//visibility:public\"],\n+)\n+\n+genrule(\n+    name = \"san_wrapper_script\",\n+    srcs = [\":sanitizer_ignore_lists\"],\n+    outs = [\"san_wrapper.sh\"],\n+    cmd = \"\"\"\n+      echo '#!/bin/bash' > $@\n+      echo 'exec \"$$@\"' >> $@\n+      chmod +x $@\n+    \"\"\",\n+)\n+\n+# this wrapper ensures the test target\n+# take into account any changes in the ignore list files\n+sh_binary(\n+    name = \"sanitizer_wrapper\",\n+    srcs = [\":san_wrapper_script\"],\n+    data = [\":sanitizer_ignore_lists\"],\n+    visibility = [\"//visibility:public\"],\n+)\n+\n+sh_binary(\n+    name = \"parallel_gpu_execute\",\n+    srcs = [\"parallel_gpu_execute.sh\"],\n+    data = [\":sanitizer_ignore_lists\"],\n+    visibility = [\"//visibility:public\"],\n+)"
+        },
+        {
+            "sha": "867c8557a971e41d0fb6bc91557eeb42d5465061",
+            "filename": "third_party/xla/build_tools/rocm/parallel_gpu_execute.sh",
+            "status": "added",
+            "additions": 83,
+            "deletions": 0,
+            "changes": 83,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/c88c02e21b0f539cd4a27a21388eb0263500c19a/third_party%2Fxla%2Fbuild_tools%2Frocm%2Fparallel_gpu_execute.sh",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/c88c02e21b0f539cd4a27a21388eb0263500c19a/third_party%2Fxla%2Fbuild_tools%2Frocm%2Fparallel_gpu_execute.sh",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fbuild_tools%2Frocm%2Fparallel_gpu_execute.sh?ref=c88c02e21b0f539cd4a27a21388eb0263500c19a",
+            "patch": "@@ -0,0 +1,83 @@\n+#!/usr/bin/env bash\n+# Copyright 2016 The TensorFlow Authors. All Rights Reserved.\n+#\n+# Licensed under the Apache License, Version 2.0 (the \"License\");\n+# you may not use this file except in compliance with the License.\n+# You may obtain a copy of the License at\n+#\n+#     http://www.apache.org/licenses/LICENSE-2.0\n+#\n+# Unless required by applicable law or agreed to in writing, software\n+# distributed under the License is distributed on an \"AS IS\" BASIS,\n+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+# See the License for the specific language governing permissions and\n+# limitations under the License.\n+# ==============================================================================\n+#\n+#\n+# A script to run multiple GPU tests in parallel controlled with an environment\n+# variable.\n+#\n+# Required environment variables:\n+#     TF_GPU_COUNT = Number of GPUs available.\n+\n+TF_GPU_COUNT=$(lspci | grep -e 'controller' -e 'accelerators' | grep 'AMD/ATI' | wc -l)\n+TF_TESTS_PER_GPU=${TF_TESTS_PER_GPU:-8}\n+\n+# This function is used below in rlocation to check that a path is absolute\n+function is_absolute {\n+  [[ \"$1\" = /* ]] || [[ \"$1\" =~ ^[a-zA-Z]:[/\\\\].* ]]\n+}\n+\n+export TF_PER_DEVICE_MEMORY_LIMIT_MB=${TF_PER_DEVICE_MEMORY_LIMIT_MB:-4096}\n+\n+# *******************************************************************\n+#         This section of the script is needed to\n+#         make things work on windows under msys.\n+# *******************************************************************\n+RUNFILES_MANIFEST_FILE=\"${TEST_SRCDIR}/MANIFEST\"\n+function rlocation() {\n+  if is_absolute \"$1\" ; then\n+    # If the file path is already fully specified, simply return it.\n+    echo \"$1\"\n+  elif [[ -e \"$TEST_SRCDIR/$1\" ]]; then\n+    # If the file exists in the $TEST_SRCDIR then just use it.\n+    echo \"$TEST_SRCDIR/$1\"\n+  elif [[ -e \"$RUNFILES_MANIFEST_FILE\" ]]; then\n+    # If a runfiles manifest file exists then use it.\n+    echo \"$(grep \"^$1 \" \"$RUNFILES_MANIFEST_FILE\" | sed 's/[^ ]* //')\"\n+  fi\n+}\n+\n+TEST_BINARY=\"$(rlocation $TEST_WORKSPACE/${1#./})\"\n+shift\n+# *******************************************************************\n+\n+mkdir -p /var/lock\n+# Try to acquire any of the TF_GPU_COUNT * TF_TESTS_PER_GPU\n+# slots to run a test at.\n+#\n+# Prefer to allocate 1 test per GPU over 4 tests on 1 GPU.\n+# So, we iterate over TF_TESTS_PER_GPU first.\n+for j in `seq 0 $((TF_TESTS_PER_GPU-1))`; do\n+  for i in `seq 0 $((TF_GPU_COUNT-1))`; do\n+    exec {lock_fd}>/var/lock/gpulock${i}_${j} || exit 1\n+    if flock -n \"$lock_fd\";\n+    then\n+      (\n+        # This export only works within the brackets, so it is isolated to one\n+        # single command.\n+        export CUDA_VISIBLE_DEVICES=$i\n+        export HIP_VISIBLE_DEVICES=$i\n+        echo \"Running test $TEST_BINARY $* on GPU $CUDA_VISIBLE_DEVICES\"\n+        \"$TEST_BINARY\" $@\n+      )\n+      return_code=$?\n+      flock -u \"$lock_fd\"\n+      exit $return_code\n+    fi\n+  done\n+done\n+\n+echo \"Cannot find a free GPU to run the test $* on, exiting with failure...\"\n+exit 1"
+        },
+        {
+            "sha": "1a8684b29cfd0c9248deba828e6cecff32a7026f",
+            "filename": "third_party/xla/build_tools/rocm/rocm_xla.bazelrc",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/c88c02e21b0f539cd4a27a21388eb0263500c19a/third_party%2Fxla%2Fbuild_tools%2Frocm%2Frocm_xla.bazelrc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/c88c02e21b0f539cd4a27a21388eb0263500c19a/third_party%2Fxla%2Fbuild_tools%2Frocm%2Frocm_xla.bazelrc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fbuild_tools%2Frocm%2Frocm_xla.bazelrc?ref=c88c02e21b0f539cd4a27a21388eb0263500c19a",
+            "patch": "@@ -1,4 +1,5 @@\n # Test-related settings.\n+try-import /usertools/rocm.bazelrc\n \n build:rocm_dev --remote_upload_local_results=false\n build:rocm_dev --remote_cache=\"https://wardite.cluster.engflow.com\"\n@@ -25,3 +26,7 @@ build:tsan --copt -fno-omit-frame-pointer\n build:tsan --linkopt -fsanitize=thread\n build:tsan --linkopt -g\n build:tsan --//build_tools/rocm:sanitizer=tsan\n+\n+build:asan --test_env=ASAN_OPTIONS=suppressions=build_tools/rocm/asan_ignore_list.txt\n+build:asan --test_env=LSAN_OPTIONS=suppressions=build_tools/rocm/lsan_ignore_list.txt\n+build:asan --//build_tools/rocm:sanitizer=asan"
+        },
+        {
+            "sha": "c94032eb5f48c41dcdf179fbf5ad6e8e30107a34",
+            "filename": "third_party/xla/build_tools/rocm/run_xla_ci_build.sh",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 17,
+            "changes": 21,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/c88c02e21b0f539cd4a27a21388eb0263500c19a/third_party%2Fxla%2Fbuild_tools%2Frocm%2Frun_xla_ci_build.sh",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/c88c02e21b0f539cd4a27a21388eb0263500c19a/third_party%2Fxla%2Fbuild_tools%2Frocm%2Frun_xla_ci_build.sh",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fbuild_tools%2Frocm%2Frun_xla_ci_build.sh?ref=c88c02e21b0f539cd4a27a21388eb0263500c19a",
+            "patch": "@@ -18,29 +18,16 @@\n set -e\n set -x\n \n-CONFIG=$1\n-DISK_CACHE_PATH=$2\n-\n-ASAN_ARGS=()\n-if [[ $CONFIG == \"rocm_ci_hermetic\" ]]; then\n-\tASAN_ARGS+=(\"--test_env=ASAN_OPTIONS=suppressions=$(realpath $(dirname $0))/asan_ignore_list.txt\")\n-\tASAN_ARGS+=(\"--test_env=LSAN_OPTIONS=suppressions=$(realpath $(dirname $0))/lsan_ignore_list.txt\")\n-\tASAN_ARGS+=(\"--config=asan\")\n-fi\n-\n-bazel --bazelrc=/usertools/rocm.bazelrc test \\\n-\t--config=${CONFIG} \\\n-\t--config=xla_cpp \\\n-\t--disk_cache=${DISK_CACHE_PATH} \\\n+SCRIPT_DIR=$(dirname $0)\n+bazel --bazelrc=\"$SCRIPT_DIR/rocm_xla.bazelrc\" test \\\n+\t\"$@\" \\\n \t--test_tag_filters=gpu,requires-gpu-amd,-requires-gpu-nvidia,-requires-gpu-intel,-no_oss,-oss_excluded,-oss_serial,-no_gpu,-no_rocm,-requires-gpu-sm60,-requires-gpu-sm60-only,-requires-gpu-sm70,-requires-gpu-sm70-only,-requires-gpu-sm80,-requires-gpu-sm80-only,-requires-gpu-sm86,-requires-gpu-sm86-only,-requires-gpu-sm89,-requires-gpu-sm89-only,-requires-gpu-sm90,-requires-gpu-sm90-only \\\n \t--build_tag_filters=gpu,requires-gpu-amd,-requires-gpu-nvidia,-requires-gpu-intel,-no_oss,-oss_excluded,-oss_serial,-no_gpu,-no_rocm,-requires-gpu-sm60,-requires-gpu-sm60-only,-requires-gpu-sm70,-requires-gpu-sm70-only,-requires-gpu-sm80,-requires-gpu-sm80-only,-requires-gpu-sm86,-requires-gpu-sm86-only,-requires-gpu-sm89,-requires-gpu-sm89-only,-requires-gpu-sm90,-requires-gpu-sm90-only \\\n \t--profile=/tf/pkg/profile.json.gz \\\n \t--keep_going \\\n \t--test_env=TF_TESTS_PER_GPU=1 \\\n-\t--test_env=TF_GPU_COUNT=2 \\\n \t--action_env=XLA_FLAGS=--xla_gpu_force_compilation_parallelism=16 \\\n \t--action_env=XLA_FLAGS=--xla_gpu_enable_llvm_module_compilation_parallelism=true \\\n \t--test_output=errors \\\n \t--local_test_jobs=2 \\\n-\t--run_under=//tools/ci_build/gpu_build:parallel_gpu_execute \\\n-\t\"${ASAN_ARGS[@]}\"\n+\t--run_under=//tools/ci_build/gpu_build:parallel_gpu_execute"
+        }
+    ],
+    "stats": {
+        "total": 172,
+        "additions": 155,
+        "deletions": 17
+    }
+}

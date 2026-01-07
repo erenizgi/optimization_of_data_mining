@@ -1,0 +1,36 @@
+{
+    "author": "mooskagh",
+    "message": "[XLA:GPU] In tf2xla, only add operand precision when any of operands or result is F32.\n\nPiperOrigin-RevId: 830403864",
+    "sha": "88209a9ebc708076639a714f1405aa616be39db2",
+    "files": [
+        {
+            "sha": "72bd28f2b47a8c30282205c4f3c6175fb7e13540",
+            "filename": "tensorflow/compiler/tf2xla/tf2xla_test.cc",
+            "status": "modified",
+            "additions": 33,
+            "deletions": 4,
+            "changes": 37,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/88209a9ebc708076639a714f1405aa616be39db2/tensorflow%2Fcompiler%2Ftf2xla%2Ftf2xla_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/88209a9ebc708076639a714f1405aa616be39db2/tensorflow%2Fcompiler%2Ftf2xla%2Ftf2xla_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcompiler%2Ftf2xla%2Ftf2xla_test.cc?ref=88209a9ebc708076639a714f1405aa616be39db2",
+            "patch": "@@ -140,23 +140,23 @@ TEST(ConvertGraphDefToXla, Sum) {\n       ConvertGraphDefToXla(graph_def, config, client, &computation)));\n }\n \n-GraphDef EinsumGraph() {\n+GraphDef EinsumGraph(DataType dtype = DT_FLOAT) {\n   GraphDef graph_def;\n   NodeDef* x = graph_def.add_node();\n   x->set_name(\"x\");\n   x->set_op(\"Placeholder\");\n-  (*x->mutable_attr())[\"dtype\"] = TypeAttrValue(DT_FLOAT);\n+  (*x->mutable_attr())[\"dtype\"] = TypeAttrValue(dtype);\n   NodeDef* y = graph_def.add_node();\n   y->set_name(\"y\");\n   y->set_op(\"Placeholder\");\n-  (*y->mutable_attr())[\"dtype\"] = TypeAttrValue(DT_FLOAT);\n+  (*y->mutable_attr())[\"dtype\"] = TypeAttrValue(dtype);\n   NodeDef* einsum = graph_def.add_node();\n   einsum->set_name(\"einsum\");\n   einsum->set_op(\"Einsum\");\n   einsum->add_input(\"x\");\n   einsum->add_input(\"y\");\n   (*einsum->mutable_attr())[\"equation\"] = StringAttrValue(\"ij,jk->ik\");\n-  (*einsum->mutable_attr())[\"T\"] = TypeAttrValue(DT_FLOAT);\n+  (*einsum->mutable_attr())[\"T\"] = TypeAttrValue(dtype);\n   (*einsum->mutable_attr())[\"N\"] = IntAttrValue(2);\n   return graph_def;\n }\n@@ -233,6 +233,35 @@ TEST_F(ConvertGraphDefToXlaWithTF32Disabled,\n   EXPECT_EQ(num_dots, 1);\n }\n \n+TEST_F(ConvertGraphDefToXlaWithTF32Disabled,\n+       EinsumIsConvertedToDotWithDefaultPrecisionIfNotF32) {\n+  GraphDef graph_def = EinsumGraph(DT_BFLOAT16);\n+  tf2xla::Config config = EinsumConfig();\n+\n+  xla::LocalClient* client = xla::ClientLibrary::LocalClientOrDie();\n+  xla::XlaComputation computation;\n+  TF_EXPECT_OK(ConvertGraphDefToXla(graph_def, config, client, &computation));\n+\n+  int num_dots = 0;\n+  const xla::HloModuleProto& module_proto = computation.proto();\n+  for (const xla::HloComputationProto& computation_proto :\n+       module_proto.computations()) {\n+    for (const xla::HloInstructionProto& instruction_proto :\n+         computation_proto.instructions()) {\n+      if (instruction_proto.opcode() == \"dot\") {\n+        num_dots++;\n+        ASSERT_EQ(instruction_proto.precision_config().operand_precision_size(),\n+                  2);\n+        EXPECT_EQ(instruction_proto.precision_config().operand_precision(0),\n+                  xla::PrecisionConfig::DEFAULT);\n+        EXPECT_EQ(instruction_proto.precision_config().operand_precision(1),\n+                  xla::PrecisionConfig::DEFAULT);\n+      }\n+    }\n+  }\n+  EXPECT_EQ(num_dots, 1);\n+}\n+\n GraphDef Conv2DGraph() {\n   GraphDef graph_def;\n   NodeDef* x = graph_def.add_node();"
+        },
+        {
+            "sha": "5088badf28e9cb06a807ce09bc65bdf0e364f26c",
+            "filename": "tensorflow/compiler/tf2xla/xla_compiler.cc",
+            "status": "modified",
+            "additions": 32,
+            "deletions": 8,
+            "changes": 40,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/88209a9ebc708076639a714f1405aa616be39db2/tensorflow%2Fcompiler%2Ftf2xla%2Fxla_compiler.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/88209a9ebc708076639a714f1405aa616be39db2/tensorflow%2Fcompiler%2Ftf2xla%2Fxla_compiler.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcompiler%2Ftf2xla%2Fxla_compiler.cc?ref=88209a9ebc708076639a714f1405aa616be39db2",
+            "patch": "@@ -17,6 +17,7 @@ limitations under the License.\n \n #include <algorithm>\n #include <array>\n+#include <cstdint>\n #include <map>\n #include <memory>\n #include <numeric>\n@@ -1457,29 +1458,52 @@ class DummyStackTrace : public AbstractStackTrace {\n };\n \n namespace {\n+const xla::HloInstructionProto* FindInstructionById(\n+    const xla::HloComputationProto& computation, int64_t id) {\n+  auto iter =\n+      absl::c_find_if(computation.instructions(),\n+                      [id](const xla::HloInstructionProto& instruction) {\n+                        return instruction.id() == id;\n+                      });\n+  if (iter == computation.instructions().end()) {\n+    return nullptr;\n+  }\n+  return &(*iter);\n+}\n+\n+bool ShouldAddPrecisionToInstruction(\n+    const xla::HloInstructionProto& instruction,\n+    const xla::HloComputationProto& computation) {\n+  static constexpr std::array<absl::string_view, 2> kOpsPossiblyUsingTF32 = {\n+      \"dot\", \"convolution\"};\n+  if (!absl::c_linear_search(kOpsPossiblyUsingTF32, instruction.opcode())) {\n+    return false;\n+  }\n+  if (instruction.shape().element_type() == xla::F32) {\n+    return true;\n+  }\n+  return absl::c_any_of(instruction.operand_ids(), [&](int64_t operand_id) {\n+    const xla::HloInstructionProto* operand =\n+        FindInstructionById(computation, operand_id);\n+    return operand && operand->shape().element_type() == xla::F32;\n+  });\n+}\n \n // Add precisions configs to the HLO module to avoid TensorFloat32 computations\n // in XLA.\n //\n // Some operations, such as Einsum are converted through MlirXlaOpKernel, which\n // doesn't set the precisions, so we set them all here.\n //\n-// TODO(tdanyluk): We may want to restrict this logic to only set the operand\n-// precision for F32 operands. (Historically, it was set without regard to\n-// operand type in other parts of TF2XLA.)\n void IncreasePrecisionsToAvoidTF32(xla::HloModuleProto& module) {\n-  static constexpr std::array<absl::string_view, 2> kOpsPossiblyUsingTF32 = {\n-      \"dot\", \"convolution\"};\n-\n   xla::PrecisionConfig precision_config;\n   precision_config.add_operand_precision(xla::PrecisionConfig::HIGHEST);\n   precision_config.add_operand_precision(xla::PrecisionConfig::HIGHEST);\n \n   for (xla::HloComputationProto& computation : *module.mutable_computations()) {\n     for (xla::HloInstructionProto& instruction :\n          *computation.mutable_instructions()) {\n-      if (absl::c_find(kOpsPossiblyUsingTF32, instruction.opcode()) !=\n-          kOpsPossiblyUsingTF32.end()) {\n+      if (ShouldAddPrecisionToInstruction(instruction, computation)) {\n         *instruction.mutable_precision_config() = precision_config;\n       }\n     }"
+        }
+    ],
+    "stats": {
+        "total": 77,
+        "additions": 65,
+        "deletions": 12
+    }
+}

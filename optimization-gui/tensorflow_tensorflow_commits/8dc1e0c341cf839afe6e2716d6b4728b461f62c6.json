@@ -1,0 +1,36 @@
+{
+    "author": "olegshyshkov",
+    "message": "`element_type` of tuple shape is TUPLE, which is not a sub-byte type itself, so we would not normalize all-to-all with tuple output and crash later in the thunk emitter.\n\nPiperOrigin-RevId: 837558691",
+    "sha": "8dc1e0c341cf839afe6e2716d6b4728b461f62c6",
+    "files": [
+        {
+            "sha": "cb0477bf19b9a9bee58f1f746fb0e47f89b59b17",
+            "filename": "third_party/xla/xla/service/gpu/gpu_float_support.cc",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 4,
+            "changes": 16,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/8dc1e0c341cf839afe6e2716d6b4728b461f62c6/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_float_support.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/8dc1e0c341cf839afe6e2716d6b4728b461f62c6/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_float_support.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_float_support.cc?ref=8dc1e0c341cf839afe6e2716d6b4728b461f62c6",
+            "patch": "@@ -16,18 +16,18 @@ limitations under the License.\n #include \"xla/service/gpu/gpu_float_support.h\"\n \n #include <utility>\n-#include <variant>\n \n #include \"absl/algorithm/container.h\"\n #include \"absl/log/check.h\"\n #include \"absl/log/log.h\"\n #include \"xla/backends/gpu/codegen/triton/support.h\"\n #include \"xla/hlo/ir/hlo_instruction.h\"\n-#include \"xla/hlo/ir/hlo_instructions.h\"\n #include \"xla/hlo/ir/hlo_opcode.h\"\n #include \"xla/primitive_util.h\"\n #include \"xla/service/collective_ops_utils.h\"\n #include \"xla/service/float_support.h\"\n+#include \"xla/shape.h\"\n+#include \"xla/shape_util.h\"\n #include \"xla/stream_executor/cuda/cuda_compute_capability.h\"\n #include \"xla/stream_executor/device_description.h\"\n #include \"xla/xla_data.pb.h\"\n@@ -57,9 +57,17 @@ bool GpuFloatSupport::SupportsMixedPrecisions(const HloInstruction& hlo) const {\n   }\n }\n \n+bool IsAnySubByteNonPredType(const Shape& shape) {\n+  bool result = false;\n+  ShapeUtil::ForEachSubshape(\n+      shape, [&](const Shape& subshape, const ShapeIndex& /*index*/) {\n+        result |= primitive_util::IsSubByteNonPredType(subshape.element_type());\n+      });\n+  return result;\n+}\n+\n bool GpuFloatSupport::IsSupported(const HloInstruction& hlo) const {\n-  if (IsCollective(&hlo) &&\n-      primitive_util::IsSubByteNonPredType(hlo.shape().element_type())) {\n+  if (IsCollective(&hlo) && IsAnySubByteNonPredType(hlo.shape())) {\n     return false;\n   }\n   switch (hlo.opcode()) {"
+        },
+        {
+            "sha": "f464b670a57701ed425473a452630b78235736a0",
+            "filename": "third_party/xla/xla/service/gpu/gpu_float_support_test.cc",
+            "status": "modified",
+            "additions": 29,
+            "deletions": 0,
+            "changes": 29,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/8dc1e0c341cf839afe6e2716d6b4728b461f62c6/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_float_support_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/8dc1e0c341cf839afe6e2716d6b4728b461f62c6/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_float_support_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_float_support_test.cc?ref=8dc1e0c341cf839afe6e2716d6b4728b461f62c6",
+            "patch": "@@ -510,5 +510,34 @@ TEST_F(FloatSupportTest, ScaledDotIsIgnored) {\n       Normalize(module.get(), se::GpuComputeCapability{cc}, BF16, F32));\n }\n \n+TEST_F(FloatSupportTest, AllToAllSplitDimensionS4IsNormalized) {\n+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(R\"(\n+    HloModule m\n+\n+    ENTRY main {\n+      p0 = s4[128,128]{1,0:E(4)} parameter(0)\n+      ROOT r = s4[128,128]{1,0:E(4)} all-to-all(p0), replica_groups={{0,1}}, dimensions={0}\n+    }\n+  )\"));\n+  EXPECT_TRUE(Normalize(\n+      module.get(),\n+      se::GpuComputeCapability{se::CudaComputeCapability::Hopper()}, S4, S8));\n+}\n+\n+TEST_F(FloatSupportTest, AllToAllTupleShapeS4IsNormalized) {\n+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(R\"(\n+    HloModule m\n+\n+    ENTRY main {\n+      p0 = s4[128,128]{1,0:E(4)} parameter(0)\n+      p1 = s4[128,128]{1,0:E(4)} parameter(1)\n+      ROOT r = (s4[128,128]{1,0:E(4)}, s4[128,128]{1,0:E(4)}) all-to-all(p0, p1), replica_groups={{0,1}}\n+    }\n+  )\"));\n+  EXPECT_TRUE(Normalize(\n+      module.get(),\n+      se::GpuComputeCapability{se::CudaComputeCapability::Hopper()}, S4, S8));\n+}\n+\n }  // namespace\n }  // namespace xla::gpu"
+        }
+    ],
+    "stats": {
+        "total": 45,
+        "additions": 41,
+        "deletions": 4
+    }
+}

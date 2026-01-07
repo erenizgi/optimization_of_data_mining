@@ -1,0 +1,36 @@
+{
+    "author": "basioli-k",
+    "message": "[XLA:CPU] Migrate unoptimized HLO snapshot dumping to MLIR API.\n\nThis is how users are exposed to this feature so this is what's supposed to be tested.\n\nPiperOrigin-RevId: 816675571",
+    "sha": "0ad9ed0a89eb91fd74acc52f9e0454b834335ee5",
+    "files": [
+        {
+            "sha": "2abd7ba157859801d05bd4e8e18074b623d74fa1",
+            "filename": "third_party/xla/xla/pjrt/cpu/BUILD",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/0ad9ed0a89eb91fd74acc52f9e0454b834335ee5/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/0ad9ed0a89eb91fd74acc52f9e0454b834335ee5/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2FBUILD?ref=0ad9ed0a89eb91fd74acc52f9e0454b834335ee5",
+            "patch": "@@ -251,6 +251,7 @@ xla_cc_test(\n         \"//xla/ffi:ffi_api\",\n         \"//xla/hlo/builder:xla_computation\",\n         \"//xla/hlo/parser:hlo_parser\",\n+        \"//xla/mlir_hlo\",\n         \"//xla/pjrt:host_memory_spaces\",\n         \"//xla/pjrt:pjrt_client\",\n         \"//xla/pjrt:pjrt_executable\",\n@@ -274,6 +275,9 @@ xla_cc_test(\n         \"@com_google_absl//absl/strings\",\n         \"@com_google_absl//absl/synchronization\",\n         \"@com_google_googletest//:gtest\",\n+        \"@llvm-project//mlir:FuncDialect\",\n+        \"@llvm-project//mlir:IR\",\n+        \"@llvm-project//mlir:Parser\",\n         \"@local_tsl//tsl/platform:path\",\n     ],\n )"
+        },
+        {
+            "sha": "befeb9c5be200a4be1925bf461919567fa481dd3",
+            "filename": "third_party/xla/xla/pjrt/cpu/cpu_client_test.cc",
+            "status": "modified",
+            "additions": 18,
+            "deletions": 10,
+            "changes": 28,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/0ad9ed0a89eb91fd74acc52f9e0454b834335ee5/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fcpu_client_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/0ad9ed0a89eb91fd74acc52f9e0454b834335ee5/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fcpu_client_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fcpu_client_test.cc?ref=0ad9ed0a89eb91fd74acc52f9e0454b834335ee5",
+            "patch": "@@ -16,6 +16,8 @@ limitations under the License.\n #include <array>\n \n #include \"absl/status/status_matchers.h\"\n+#include \"mlir/IR/BuiltinOps.h\"\n+#include \"mlir/IR/MLIRContext.h\"\n #include \"xla/pjrt/plugin/xla_cpu/cpu_memory.h\"\n #ifndef _WIN32\n #include <unistd.h>\n@@ -36,12 +38,15 @@ limitations under the License.\n #include \"absl/status/status.h\"\n #include \"absl/strings/string_view.h\"\n #include \"absl/synchronization/notification.h\"\n+#include \"mlir/Dialect/Func/IR/FuncOps.h\"\n+#include \"mlir/Parser/Parser.h\"\n #include \"xla/ffi/ffi.h\"\n #include \"xla/ffi/ffi_api.h\"\n #include \"xla/hlo/builder/xla_computation.h\"\n #include \"xla/hlo/parser/hlo_parser.h\"\n #include \"xla/literal.h\"\n #include \"xla/literal_util.h\"\n+#include \"xla/mlir_hlo/mhlo/IR/hlo_ops.h\"\n #include \"xla/pjrt/cpu/cpu_client.h\"\n #include \"xla/pjrt/host_memory_spaces.h\"\n #include \"xla/pjrt/pjrt_client.h\"\n@@ -291,20 +296,18 @@ TEST(PjRtCpuClientTest, HloSnapshot) {\n }\n \n TEST(PjRtCpuClientTest, UnoptimizedHloSnapshot) {\n-  static constexpr char kProgram[] = R\"(\n-    HloModule add\n-    ENTRY add {\n-      x = f32[3,2] parameter(0)\n-      y = f32[3,2] parameter(1)\n-      ROOT add = f32[3,2] add(x, y)\n+  static constexpr absl::string_view kProgram = R\"(\n+    module {\n+      func.func @main(%arg0: tensor<3x2xf32>, %arg1: tensor<3x2xf32>) -> tensor<3x2xf32> {\n+        %0 = mhlo.add %arg0, %arg1 : tensor<3x2xf32>\n+        return %0 : tensor<3x2xf32>\n+      }\n     })\";\n \n   CpuClientOptions cpu_options;\n   cpu_options.cpu_device_count = 1;\n   TF_ASSERT_OK_AND_ASSIGN(auto client,\n                           GetPjRtCpuClient(std::move(cpu_options)));\n-  TF_ASSERT_OK_AND_ASSIGN(auto hlo_module,\n-                          ParseAndReturnUnverifiedModule(kProgram, {}));\n \n   std::string dir =\n       tsl::io::JoinPath(tsl::testing::TmpDir(), \"UnoptimizedHloSnapshot\");\n@@ -313,9 +316,14 @@ TEST(PjRtCpuClientTest, UnoptimizedHloSnapshot) {\n   debug_opts->set_xla_dump_to(dir);\n   debug_opts->set_xla_dump_hlo_snapshots(true);\n   debug_opts->set_xla_dump_hlo_unoptimized_snapshots(true);\n-  XlaComputation xla_computation(hlo_module->ToProto());\n+\n+  mlir::MLIRContext context;\n+  context.loadDialect<mlir::func::FuncDialect, mlir::mhlo::MhloDialect>();\n+  auto mlir_module =\n+      mlir::parseSourceString<mlir::ModuleOp>(kProgram, &context);\n+\n   TF_ASSERT_OK_AND_ASSIGN(auto pjrt_executable,\n-                          client->CompileAndLoad(xla_computation, options));\n+                          client->CompileAndLoad(mlir_module.get(), options));\n \n   std::vector<float> data1{1.0, 2.0, 3.0, 4.0, 5.0, 6.0};\n   std::vector<float> data2{10.0, 20.0, 30.0, 40.0, 50.0, 60.0};"
+        }
+    ],
+    "stats": {
+        "total": 32,
+        "additions": 22,
+        "deletions": 10
+    }
+}

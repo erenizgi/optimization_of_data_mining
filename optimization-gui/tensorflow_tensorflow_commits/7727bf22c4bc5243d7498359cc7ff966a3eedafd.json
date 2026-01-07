@@ -1,0 +1,36 @@
+{
+    "author": "mkuperst",
+    "message": "[XLA] Make iteration limit configurable in HloPassFix.\n\nPiperOrigin-RevId: 808563149",
+    "sha": "7727bf22c4bc5243d7498359cc7ff966a3eedafd",
+    "files": [
+        {
+            "sha": "85a6508fd46e4d4d5c5ec7e0eae9331a4fe0d222",
+            "filename": "third_party/xla/xla/hlo/pass/hlo_pass_fix.h",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 4,
+            "changes": 19,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/7727bf22c4bc5243d7498359cc7ff966a3eedafd/third_party%2Fxla%2Fxla%2Fhlo%2Fpass%2Fhlo_pass_fix.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/7727bf22c4bc5243d7498359cc7ff966a3eedafd/third_party%2Fxla%2Fxla%2Fhlo%2Fpass%2Fhlo_pass_fix.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fpass%2Fhlo_pass_fix.h?ref=7727bf22c4bc5243d7498359cc7ff966a3eedafd",
+            "patch": "@@ -18,6 +18,7 @@ limitations under the License.\n \n #include <cstddef>\n #include <cstdint>\n+#include <memory>\n #include <type_traits>\n \n #include \"absl/container/flat_hash_set.h\"\n@@ -35,14 +36,21 @@ limitations under the License.\n namespace xla {\n \n // Do an HLO pass to a fix point.\n-template <typename Pass, int kIterationLimit = 25>\n+template <typename Pass>\n class HloPassFix : public Pass {\n  public:\n   static_assert(std::is_base_of<HloPassInterface, Pass>::value,\n                 \"Pass must be a subclass of HloPassInterface\");\n   using RunState = HloPassInterface::RunState;\n   template <typename... Args>\n   explicit HloPassFix(Args&&... args) : Pass(args...) {}\n+  template <typename... Args>\n+  static std::unique_ptr<HloPassFix> Create(int iteration_limit,\n+                                            Args&&... args) {\n+    auto pass = std::make_unique<HloPassFix>(args...);\n+    pass->iteration_limit_ = iteration_limit;\n+    return pass;\n+  }\n \n   absl::Status RunOnChangedComputations(\n       HloModule* module, RunState* outer_run_state,\n@@ -81,7 +89,7 @@ class HloPassFix : public Pass {\n       changed |= changed_this_iteration;\n       VLOG(3) << \"changed_this_iteration: \" << changed_this_iteration;\n       ++iteration_count;\n-      if (iteration_count == kIterationLimit) {\n+      if (iteration_count == iteration_limit_) {\n         const DebugOptions& debug_options =\n             module_group->module(0).config().debug_options();\n         if (debug_options\n@@ -131,12 +139,12 @@ class HloPassFix : public Pass {\n               << \" changed_this_iteration: \"\n               << !run_state->changed_this_iteration.empty();\n       run_state->IncrementIteration();\n-      if (run_state->iteration == kIterationLimit) {\n+      if (run_state->iteration == iteration_limit_) {\n         const DebugOptions& debug_options = module->config().debug_options();\n         if (debug_options\n                 .xla_unsupported_crash_on_hlo_pass_fix_max_iterations()) {\n           LOG(FATAL) << \"Unexpectedly high number of iterations \"\n-                     << kIterationLimit << \" in HLO pass '\" << Pass::name()\n+                     << iteration_limit_ << \" in HLO pass '\" << Pass::name()\n                      << \"' for module '\" << module->name() << \"'\";\n         }\n         VLOG(1) << \"Unexpectedly high number of iterations in HLO passes '\"\n@@ -176,6 +184,9 @@ class HloPassFix : public Pass {\n     }\n     return absl::OkStatus();\n   }\n+\n+  static constexpr int kDefaultIterationLimit = 25;\n+  int iteration_limit_ = kDefaultIterationLimit;\n };\n \n }  // namespace xla"
+        },
+        {
+            "sha": "7c83d87c34ca83640fd873f4c274743a5462af43",
+            "filename": "third_party/xla/xla/hlo/pass/hlo_pass_fix_test.cc",
+            "status": "modified",
+            "additions": 45,
+            "deletions": 0,
+            "changes": 45,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/7727bf22c4bc5243d7498359cc7ff966a3eedafd/third_party%2Fxla%2Fxla%2Fhlo%2Fpass%2Fhlo_pass_fix_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/7727bf22c4bc5243d7498359cc7ff966a3eedafd/third_party%2Fxla%2Fxla%2Fhlo%2Fpass%2Fhlo_pass_fix_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fpass%2Fhlo_pass_fix_test.cc?ref=7727bf22c4bc5243d7498359cc7ff966a3eedafd",
+            "patch": "@@ -137,6 +137,51 @@ TEST_F(HloPassFixTest, RunModuleToFixedPoint) {\n   EXPECT_EQ(root->literal().GetFirstElement<int32_t>(), 0);\n }\n \n+TEST_F(HloPassFixTest, RunModuleToDefaultEarlyExit) {\n+  constexpr absl::string_view kModule = R\"(\n+    HloModule Converges\n+\n+    ENTRY main {\n+      ROOT c = s32[] constant(30)\n+    }\n+  )\";\n+\n+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,\n+                          ParseAndReturnVerifiedModule(kModule));\n+\n+  HloPassFix<DecrementPositiveConstants> pass;\n+  TF_ASSERT_OK_AND_ASSIGN(bool changed, pass.Run(module.get()));\n+  // TODO(b/395958361): HloPassFix lies about whether it changed the module if\n+  // it terminates due to hitting the iteration limit.\n+  EXPECT_FALSE(changed);\n+  HloInstruction* root = module->entry_computation()->root_instruction();\n+  ASSERT_EQ(root->opcode(), HloOpcode::kConstant);\n+  EXPECT_EQ(root->literal().GetFirstElement<int32_t>(), 5);\n+}\n+\n+TEST_F(HloPassFixTest, RunModuleToNonDefaultEarlyExit) {\n+  constexpr absl::string_view kModule = R\"(\n+    HloModule Converges\n+\n+    ENTRY main {\n+      ROOT c = s32[] constant(30)\n+    }\n+  )\";\n+\n+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,\n+                          ParseAndReturnVerifiedModule(kModule));\n+\n+  auto pass = HloPassFix<DecrementPositiveConstants>::Create(\n+      /*iteration_limit=*/10);\n+  TF_ASSERT_OK_AND_ASSIGN(bool changed, pass->Run(module.get()));\n+  // TODO(b/395958361): HloPassFix lies about whether it changed the module if\n+  // it terminates due to hitting the iteration limit.\n+  EXPECT_FALSE(changed);\n+  HloInstruction* root = module->entry_computation()->root_instruction();\n+  ASSERT_EQ(root->opcode(), HloOpcode::kConstant);\n+  EXPECT_EQ(root->literal().GetFirstElement<int32_t>(), 20);\n+}\n+\n TEST_F(HloPassFixTest, RunModuleGroupToFixedPoint) {\n   constexpr absl::string_view kModule0 = R\"(\n     HloModule First"
+        }
+    ],
+    "stats": {
+        "total": 64,
+        "additions": 60,
+        "deletions": 4
+    }
+}

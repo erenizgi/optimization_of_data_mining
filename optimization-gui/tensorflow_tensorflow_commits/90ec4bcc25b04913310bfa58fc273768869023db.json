@@ -1,0 +1,24 @@
+{
+    "author": "sohaibiftikhar",
+    "message": "[XLA:GPU]: Emit Sort in a separate llvm module.\n\nPiperOrigin-RevId: 837023456",
+    "sha": "90ec4bcc25b04913310bfa58fc273768869023db",
+    "files": [
+        {
+            "sha": "3031f041a7e577769c632cdef37b153f360a5ec9",
+            "filename": "third_party/xla/xla/service/gpu/thunk_emitter.cc",
+            "status": "modified",
+            "additions": 22,
+            "deletions": 8,
+            "changes": 30,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/90ec4bcc25b04913310bfa58fc273768869023db/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fthunk_emitter.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/90ec4bcc25b04913310bfa58fc273768869023db/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fthunk_emitter.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fthunk_emitter.cc?ref=90ec4bcc25b04913310bfa58fc273768869023db",
+            "patch": "@@ -1792,7 +1792,7 @@ absl::Status ThunkEmitter::EmitSort(const HloSortInstruction* sort) {\n   const uint64_t kMaxThreadsPerBlock =\n       ir_emitter_context_->gpu_device_info().threads_per_block_limit();\n   // Choose the tile size based on actual amount of elements to sort, the amount\n-  // of shared memory avaiable, and the maximum number of threads per block.\n+  // of shared memory available, and the maximum number of threads per block.\n   uint64_t tile_size =\n       std::min(std::min(kMaxThreadsPerBlock * kUnrollFactor,\n                         max_tile_size_fitting_into_shared_memory),\n@@ -1839,6 +1839,18 @@ absl::Status ThunkEmitter::EmitSort(const HloSortInstruction* sort) {\n   LaunchDimensions tiled_launch_dimensions(num_blocks, kThreadsPerBlock);\n   VLOG(2) << absl::StreamFormat(\"%s launch dims: %d blocks, %d threads/block\",\n                                 op_name, num_blocks, kThreadsPerBlock);\n+  auto local_llvm_module =\n+      CreateLocalLLVMModule(op_name, ir_emitter_context_->llvm_module());\n+  // Copy of the main context with the local module.\n+  IrEmitterContext local_ir_emitter_context(\n+      &ir_emitter_context_->hlo_module(),\n+      &ir_emitter_context_->buffer_assignment(),\n+      &ir_emitter_context_->execution_stream_assignment(),\n+      std::string(ir_emitter_context_->platform_name()),\n+      ir_emitter_context_->gpu_device_info(),\n+      ir_emitter_context_->mlir_context(), local_llvm_module.get(),\n+      ir_emitter_context_->llvm_module_constants(),\n+      ir_emitter_context_->emit_kernels());\n   auto emit_kernel = [&](absl::Span<const int64_t> xor_masks) {\n     VLOG(2) << absl::StreamFormat(\n         \"%s uses kernel for xor masks [%s]\", op_name,\n@@ -1848,10 +1860,9 @@ absl::Status ThunkEmitter::EmitSort(const HloSortInstruction* sort) {\n     LaunchDimensions launch_dimensions = xor_masks.size() > 1\n                                              ? tiled_launch_dimensions\n                                              : standard_launch_dimensions;\n-    TF_ASSIGN_OR_RETURN(\n-        std::vector<llvm_ir::IrArray> ir_arrays,\n-        BuildKernelThunkForNonFusionOp(ir_emitter_context_->llvm_module(), sort,\n-                                       launch_dimensions));\n+    TF_ASSIGN_OR_RETURN(std::vector<llvm_ir::IrArray> ir_arrays,\n+                        BuildKernelThunkForNonFusionOp(\n+                            local_llvm_module.get(), sort, launch_dimensions));\n \n     // The first `operand_count()` elements of `ir_arrays` are the input\n     // operands and the rest are the output arrays. Inputs are aliases with\n@@ -1868,9 +1879,9 @@ absl::Status ThunkEmitter::EmitSort(const HloSortInstruction* sort) {\n                              : standard_num_iterations_in_sort_dim,\n         tile_size, kUnrollFactor,\n         [&](absl::Span<llvm::Value* const> operands, llvm::Value* output) {\n-          return CallNestedComputation(&b_, *ir_emitter_context_,\n-                                       ir_emitter_context_->llvm_module(),\n-                                       *comparator, operands, output);\n+          return CallNestedComputation(&b_, local_ir_emitter_context,\n+                                       local_llvm_module.get(), *comparator,\n+                                       operands, output);\n         });\n   };\n   std::vector<int64_t> xor_masks;\n@@ -1896,6 +1907,9 @@ absl::Status ThunkEmitter::EmitSort(const HloSortInstruction* sort) {\n   if (!xor_masks.empty()) {\n     TF_RETURN_IF_ERROR(emit_kernel(xor_masks));\n   }\n+  TF_RET_CHECK(!llvm::Linker::linkModules(\n+      *ir_emitter_context_->llvm_module(), std::move(local_llvm_module),\n+      llvm::Linker::Flags::OverrideFromSrc));\n   return absl::OkStatus();\n }\n "
+        }
+    ],
+    "stats": {
+        "total": 30,
+        "additions": 22,
+        "deletions": 8
+    }
+}

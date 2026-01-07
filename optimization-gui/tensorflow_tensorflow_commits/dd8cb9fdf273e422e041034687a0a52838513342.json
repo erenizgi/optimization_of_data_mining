@@ -1,0 +1,180 @@
+{
+    "author": "tensorflower-gardener",
+    "message": "Skip setting async thread for embedded computations to make compile time faster. Move CallContext into hlo_opcode since it's based on opcode and to avoid circular dependency.\n\nAnd skip_async_execution_thread_overwrite is no longer needed, removed.\n\nPiperOrigin-RevId: 798413636",
+    "sha": "dd8cb9fdf273e422e041034687a0a52838513342",
+    "files": [
+        {
+            "sha": "ebb261fa7983ea2159f8b2d1897ec782090449ab",
+            "filename": "third_party/xla/xla/hlo/ir/hlo_instruction.cc",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 3,
+            "changes": 10,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/dd8cb9fdf273e422e041034687a0a52838513342/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_instruction.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/dd8cb9fdf273e422e041034687a0a52838513342/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_instruction.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_instruction.cc?ref=dd8cb9fdf273e422e041034687a0a52838513342",
+            "patch": "@@ -5902,10 +5902,14 @@ void HloInstruction::set_async_execution_thread(\n }\n \n void HloInstruction::set_called_computations_execution_thread(\n-    absl::string_view async_execution_thread,\n-    bool skip_async_execution_thread_overwrite) {\n+    absl::string_view async_execution_thread) {\n+  if (GetInstructionCallContext(this->opcode()) == CallContext::kEmbedded) {\n+    // There is no need to set the thread name for embedded computations\n+    // recursively, because they cannot be executed asynchronously.\n+    return;\n+  }\n   Cast<HloCallableInstruction>(this)->RecursivelySetComputationsThreadName(\n-      async_execution_thread, skip_async_execution_thread_overwrite);\n+      async_execution_thread);\n }\n \n std::optional<int> HloInstruction::cross_program_prefetch_index() const {"
+        },
+        {
+            "sha": "fb6c4ddadf2e2227d16cc527d7e1764e605c721a",
+            "filename": "third_party/xla/xla/hlo/ir/hlo_instruction.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/dd8cb9fdf273e422e041034687a0a52838513342/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_instruction.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/dd8cb9fdf273e422e041034687a0a52838513342/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_instruction.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_instruction.h?ref=dd8cb9fdf273e422e041034687a0a52838513342",
+            "patch": "@@ -2391,8 +2391,7 @@ class HloInstruction {\n   // Delegates to\n   // HloCallableInstruction::RecursivelySetComputationsThreadName().\n   void set_called_computations_execution_thread(\n-      absl::string_view async_execution_thread,\n-      bool skip_async_execution_thread_overwrite);\n+      absl::string_view async_execution_thread);\n \n   // Delegates to HloCopyStartInstruction::is_cross_program_prefetch_index().\n   std::optional<int> cross_program_prefetch_index() const;"
+        },
+        {
+            "sha": "380fccfd5eeef65823cd9e9306ecade5a255c987",
+            "filename": "third_party/xla/xla/hlo/ir/hlo_instructions.cc",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 16,
+            "changes": 24,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/dd8cb9fdf273e422e041034687a0a52838513342/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_instructions.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/dd8cb9fdf273e422e041034687a0a52838513342/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_instructions.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_instructions.cc?ref=dd8cb9fdf273e422e041034687a0a52838513342",
+            "patch": "@@ -112,22 +112,17 @@ void PrintPrecisionConfig(HloInstruction::AttributePrinter& printer,\n }\n \n void SetThreadName(HloComputation* called_computation,\n-                   absl::string_view execution_thread,\n-                   bool skip_async_execution_thread_overwrite) {\n+                   absl::string_view execution_thread) {\n   called_computation->SetExecutionThread(execution_thread);\n   for (HloInstruction* instr : called_computation->instructions()) {\n     if (instr->IsAsynchronous()) {\n-      if (!skip_async_execution_thread_overwrite) {\n-        // Set async instruction thread name and also recursively set async\n-        // computations.\n-        instr->set_async_execution_thread(execution_thread);\n-      }\n-      continue;\n+      // Set async instruction thread name and also recursively set async\n+      // computations.\n+      instr->set_async_execution_thread(execution_thread);\n     }\n     for (HloComputation* nested_called_computation :\n          instr->called_computations()) {\n-      SetThreadName(nested_called_computation, execution_thread,\n-                    skip_async_execution_thread_overwrite);\n+      SetThreadName(nested_called_computation, execution_thread);\n     }\n   }\n }\n@@ -423,8 +418,7 @@ HloInstruction* HloAsyncStartInstruction::AddCallOperand(\n void HloAsyncStartInstruction::set_async_execution_thread(\n     absl::string_view async_execution_thread) {\n   async_execution_thread_ = std::string(async_execution_thread);\n-  SetThreadName(async_wrapped_computation(), async_execution_thread,\n-                /*skip_async_execution_thread_overwrite=*/false);\n+  SetThreadName(async_wrapped_computation(), async_execution_thread);\n }\n \n HloInstructionProto HloAsyncStartInstruction::ToProto() const {\n@@ -2181,11 +2175,9 @@ HloCallableInstruction::GetOrCloneCalledComputations(\n }\n \n void HloCallableInstruction::RecursivelySetComputationsThreadName(\n-    absl::string_view execution_thread,\n-    bool skip_async_execution_thread_overwrite) {\n+    absl::string_view execution_thread) {\n   for (HloComputation* comp : called_computations()) {\n-    SetThreadName(comp, execution_thread,\n-                  skip_async_execution_thread_overwrite);\n+    SetThreadName(comp, execution_thread);\n   }\n }\n "
+        },
+        {
+            "sha": "a1f7694a6921ec2370ea4d213f4ef61e361297e4",
+            "filename": "third_party/xla/xla/hlo/ir/hlo_instructions.h",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 6,
+            "changes": 10,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/dd8cb9fdf273e422e041034687a0a52838513342/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_instructions.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/dd8cb9fdf273e422e041034687a0a52838513342/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_instructions.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_instructions.h?ref=dd8cb9fdf273e422e041034687a0a52838513342",
+            "patch": "@@ -1432,12 +1432,10 @@ class HloCallableInstruction : public HloInstruction {\n   HloInstruction* called_computation_root() const;\n \n   // Recursively sets all nested called computation to have thread name as\n-  // `execution_thread`. if `skip_async_execution_thread_overwrite` is true,\n-  // skip overwrite async instruction and its comptuations thread name\n-  // overwriting.\n-  void RecursivelySetComputationsThreadName(\n-      absl::string_view execution_thread,\n-      bool skip_async_execution_thread_overwrite);\n+  // `execution_thread`. Embedded computation (as opposed to ControlFlow)\n+  // computations thread name overwriting is skipped since callsite decides the\n+  // thread name.\n+  void RecursivelySetComputationsThreadName(absl::string_view execution_thread);\n \n   static bool ClassOf(const HloInstruction* hlo) {\n     return hlo->opcode() == HloOpcode::kFusion ||"
+        },
+        {
+            "sha": "09fdaa298987f1e3df3568b7a9b7b1cf87558c94",
+            "filename": "third_party/xla/xla/hlo/ir/hlo_opcode.cc",
+            "status": "modified",
+            "additions": 44,
+            "deletions": 0,
+            "changes": 44,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/dd8cb9fdf273e422e041034687a0a52838513342/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_opcode.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/dd8cb9fdf273e422e041034687a0a52838513342/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_opcode.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_opcode.cc?ref=dd8cb9fdf273e422e041034687a0a52838513342",
+            "patch": "@@ -17,6 +17,7 @@ limitations under the License.\n \n #include <cstdint>\n #include <optional>\n+#include <ostream>\n #include <string>\n \n #include \"absl/container/flat_hash_map.h\"\n@@ -62,4 +63,47 @@ std::optional<int8_t> HloOpcodeArity(HloOpcode opcode) {\n   }\n }\n \n+std::string CallContextToString(CallContext context) {\n+  switch (context) {\n+    case CallContext::kNone:\n+      return \"kNone\";\n+    case CallContext::kControlFlow:\n+      return \"kControlFlow\";\n+    case CallContext::kEmbedded:\n+      return \"kEmbedded\";\n+    case CallContext::kBoth:\n+      return \"kBoth\";\n+  }\n+}\n+\n+std::ostream& operator<<(std::ostream& out, const CallContext& context) {\n+  out << CallContextToString(context);\n+  return out;\n+}\n+\n+CallContext GetInstructionCallContext(HloOpcode opcode) {\n+  switch (opcode) {\n+    case HloOpcode::kCall:\n+    case HloOpcode::kConditional:\n+    case HloOpcode::kWhile:\n+    case HloOpcode::kAsyncStart:\n+    case HloOpcode::kAsyncUpdate:\n+    case HloOpcode::kAsyncDone:\n+      return CallContext::kControlFlow;\n+    case HloOpcode::kAllReduce:\n+    case HloOpcode::kReduceScatter:\n+    case HloOpcode::kAllReduceStart:\n+    case HloOpcode::kMap:\n+    case HloOpcode::kReduce:\n+    case HloOpcode::kReduceWindow:\n+    case HloOpcode::kScatter:\n+    case HloOpcode::kSelectAndScatter:\n+    case HloOpcode::kSort:\n+    case HloOpcode::kFusion:\n+    case HloOpcode::kCustomCall:\n+      return CallContext::kEmbedded;\n+    default:\n+      return CallContext::kNone;\n+  }\n+}\n }  // namespace xla"
+        },
+        {
+            "sha": "c7fe2de3774ed29ff2cdb21804ca7dbeb1353775",
+            "filename": "third_party/xla/xla/hlo/ir/hlo_opcode.h",
+            "status": "modified",
+            "additions": 24,
+            "deletions": 0,
+            "changes": 24,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/dd8cb9fdf273e422e041034687a0a52838513342/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_opcode.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/dd8cb9fdf273e422e041034687a0a52838513342/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_opcode.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_opcode.h?ref=dd8cb9fdf273e422e041034687a0a52838513342",
+            "patch": "@@ -237,6 +237,30 @@ static_assert(HloOpcodeCount() < 256,\n               \"HloOpcode is a uint8_t. You need to increase its size before \"\n               \"adding new op codes.\");\n \n+// The context in which a computation is called by another computation. This is\n+// decided by the opcode of the callsite instruction.\n+enum class CallContext : std::uint8_t {\n+  // In an embedded call context, the body of the function cannot allocate\n+  // buffers.\n+  kEmbedded,\n+\n+  // A control flow call context can allocate buffers.\n+  kControlFlow,\n+\n+  // A computation is called from both an embedded and control flow context.\n+  kBoth,\n+\n+  // During call graph construction kNone is used to indicate that the context\n+  // has not been determined. This is the top value for the context\n+  // lattice. After construction, no call sites or call graph nodes should have\n+  // this value.\n+  kNone\n+};\n+\n+std::string CallContextToString(CallContext context);\n+std::ostream& operator<<(std::ostream& out, const CallContext& context);\n+\n+CallContext GetInstructionCallContext(HloOpcode opcode);\n }  // namespace xla\n \n #endif  // XLA_HLO_IR_HLO_OPCODE_H_"
+        },
+        {
+            "sha": "9a1a3795492d4c74c9c201b22a1aa73ddab37956",
+            "filename": "third_party/xla/xla/hlo/ir/hlo_opcode_test.cc",
+            "status": "modified",
+            "additions": 38,
+            "deletions": 0,
+            "changes": 38,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/dd8cb9fdf273e422e041034687a0a52838513342/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_opcode_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/dd8cb9fdf273e422e041034687a0a52838513342/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_opcode_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_opcode_test.cc?ref=dd8cb9fdf273e422e041034687a0a52838513342",
+            "patch": "@@ -57,6 +57,44 @@ TEST_P(HloOpcodeTestP, OpcodePropertiesNew) {\n   }\n }\n \n+TEST_F(HloOpcodeTestP, ControlFlowCallContext) {\n+  EXPECT_EQ(CallContext::kControlFlow,\n+            GetInstructionCallContext(HloOpcode::kCall));\n+  EXPECT_EQ(CallContext::kControlFlow,\n+            GetInstructionCallContext(HloOpcode::kConditional));\n+  EXPECT_EQ(CallContext::kControlFlow,\n+            GetInstructionCallContext(HloOpcode::kWhile));\n+  EXPECT_EQ(CallContext::kControlFlow,\n+            GetInstructionCallContext(HloOpcode::kAsyncStart));\n+  EXPECT_EQ(CallContext::kControlFlow,\n+            GetInstructionCallContext(HloOpcode::kAsyncUpdate));\n+  EXPECT_EQ(CallContext::kControlFlow,\n+            GetInstructionCallContext(HloOpcode::kAsyncDone));\n+}\n+\n+TEST_F(HloOpcodeTestP, EmbeddedCallContext) {\n+  EXPECT_EQ(CallContext::kEmbedded,\n+            GetInstructionCallContext(HloOpcode::kAllReduce));\n+  EXPECT_EQ(CallContext::kEmbedded,\n+            GetInstructionCallContext(HloOpcode::kReduceScatter));\n+  EXPECT_EQ(CallContext::kEmbedded,\n+            GetInstructionCallContext(HloOpcode::kAllReduceStart));\n+  EXPECT_EQ(CallContext::kEmbedded, GetInstructionCallContext(HloOpcode::kMap));\n+  EXPECT_EQ(CallContext::kEmbedded,\n+            GetInstructionCallContext(HloOpcode::kReduce));\n+  EXPECT_EQ(CallContext::kEmbedded,\n+            GetInstructionCallContext(HloOpcode::kReduceWindow));\n+  EXPECT_EQ(CallContext::kEmbedded,\n+            GetInstructionCallContext(HloOpcode::kScatter));\n+  EXPECT_EQ(CallContext::kEmbedded,\n+            GetInstructionCallContext(HloOpcode::kSelectAndScatter));\n+  EXPECT_EQ(CallContext::kEmbedded,\n+            GetInstructionCallContext(HloOpcode::kSort));\n+  EXPECT_EQ(CallContext::kEmbedded,\n+            GetInstructionCallContext(HloOpcode::kFusion));\n+  EXPECT_EQ(CallContext::kEmbedded,\n+            GetInstructionCallContext(HloOpcode::kCustomCall));\n+}\n INSTANTIATE_TEST_SUITE_P(HloOpcodeTestSuite, HloOpcodeTestP,\n                          testing::ValuesIn(GetAllCodes()));\n "
+        },
+        {
+            "sha": "335cbf942f3ee90ffa3ea3cc9c7656472953829c",
+            "filename": "third_party/xla/xla/service/call_graph.cc",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 44,
+            "changes": 44,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/dd8cb9fdf273e422e041034687a0a52838513342/third_party%2Fxla%2Fxla%2Fservice%2Fcall_graph.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/dd8cb9fdf273e422e041034687a0a52838513342/third_party%2Fxla%2Fxla%2Fservice%2Fcall_graph.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fcall_graph.cc?ref=dd8cb9fdf273e422e041034687a0a52838513342",
+            "patch": "@@ -38,50 +38,6 @@ namespace xla {\n using absl::StrAppendFormat;\n using absl::StrCat;\n \n-std::string CallContextToString(CallContext context) {\n-  switch (context) {\n-    case CallContext::kNone:\n-      return \"kNone\";\n-    case CallContext::kControlFlow:\n-      return \"kControlFlow\";\n-    case CallContext::kEmbedded:\n-      return \"kEmbedded\";\n-    case CallContext::kBoth:\n-      return \"kBoth\";\n-  }\n-}\n-\n-std::ostream& operator<<(std::ostream& out, const CallContext& context) {\n-  out << CallContextToString(context);\n-  return out;\n-}\n-\n-CallContext GetInstructionCallContext(HloOpcode opcode) {\n-  switch (opcode) {\n-    case HloOpcode::kCall:\n-    case HloOpcode::kConditional:\n-    case HloOpcode::kWhile:\n-    case HloOpcode::kAsyncStart:\n-    case HloOpcode::kAsyncUpdate:\n-    case HloOpcode::kAsyncDone:\n-      return CallContext::kControlFlow;\n-    case HloOpcode::kAllReduce:\n-    case HloOpcode::kReduceScatter:\n-    case HloOpcode::kAllReduceStart:\n-    case HloOpcode::kMap:\n-    case HloOpcode::kReduce:\n-    case HloOpcode::kReduceWindow:\n-    case HloOpcode::kScatter:\n-    case HloOpcode::kSelectAndScatter:\n-    case HloOpcode::kSort:\n-    case HloOpcode::kFusion:\n-    case HloOpcode::kCustomCall:\n-      return CallContext::kEmbedded;\n-    default:\n-      return CallContext::kNone;\n-  }\n-}\n-\n std::string CallSite::ToString() const {\n   return StrCat(\n       instruction()->name(), \" calls in context \","
+        },
+        {
+            "sha": "8535fe64597bd866ed760f866110171e9283ecd1",
+            "filename": "third_party/xla/xla/service/call_graph.h",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 25,
+            "changes": 25,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/dd8cb9fdf273e422e041034687a0a52838513342/third_party%2Fxla%2Fxla%2Fservice%2Fcall_graph.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/dd8cb9fdf273e422e041034687a0a52838513342/third_party%2Fxla%2Fxla%2Fservice%2Fcall_graph.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fcall_graph.h?ref=dd8cb9fdf273e422e041034687a0a52838513342",
+            "patch": "@@ -20,7 +20,6 @@ limitations under the License.\n \n #include <cstdint>\n #include <memory>\n-#include <ostream>\n #include <string>\n #include <utility>\n #include <vector>\n@@ -41,30 +40,6 @@ limitations under the License.\n \n namespace xla {\n \n-// The context in which a computation is called by another computation.\n-enum class CallContext {\n-  // In an embedded call context, the body of the function cannot allocate\n-  // buffers.\n-  kEmbedded,\n-\n-  // A control flow call context can allocate buffers.\n-  kControlFlow,\n-\n-  // A computation is called from both an embedded and control flow context.\n-  kBoth,\n-\n-  // During call graph construction kNone is used to indicate that the context\n-  // has not been determined. This is the top value for the context\n-  // lattice. After construction, no call sites or call graph nodes should have\n-  // this value.\n-  kNone\n-};\n-\n-std::string CallContextToString(CallContext context);\n-std::ostream& operator<<(std::ostream& out, const CallContext& context);\n-\n-CallContext GetInstructionCallContext(HloOpcode opcode);\n-\n // Represents an HLO instruction which calls one or more computations.\n class CallSite {\n  public:"
+        },
+        {
+            "sha": "01b10f035eaa80bdba7eb0555109567bd202ac50",
+            "filename": "third_party/xla/xla/service/gpu/transforms/priority_fusion.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/dd8cb9fdf273e422e041034687a0a52838513342/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fpriority_fusion.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/dd8cb9fdf273e422e041034687a0a52838513342/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fpriority_fusion.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fpriority_fusion.cc?ref=dd8cb9fdf273e422e041034687a0a52838513342",
+            "patch": "@@ -1305,8 +1305,7 @@ HloInstruction* PriorityFusion::Fuse(HloInstruction* producer,\n   }\n \n   fusion_instruction->set_called_computations_execution_thread(\n-      computation->execution_thread(),\n-      /*skip_async_execution_thread_overwrite=*/false);\n+      computation->execution_thread());\n \n   if (HloPredicateIsOp<HloOpcode::kFusion>(producer)) {\n     if (use_multi_output_fusion) {"
+        },
+        {
+            "sha": "9390db1dbc6c8e157c401634fd9d0ada70465bf3",
+            "filename": "third_party/xla/xla/service/hlo_instruction_test.cc",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 4,
+            "changes": 8,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/dd8cb9fdf273e422e041034687a0a52838513342/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_instruction_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/dd8cb9fdf273e422e041034687a0a52838513342/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_instruction_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_instruction_test.cc?ref=dd8cb9fdf273e422e041034687a0a52838513342",
+            "patch": "@@ -2172,18 +2172,18 @@ TEST_F(HloInstructionTest, CanonicalStringificationFusion) {\n   computation->SetExecutionThread(kParallelThreadName);\n   HloInstruction* fusion = computation->CreateFusionInstruction(\n       {dot, reshape}, HloInstruction::FusionKind::kLoop);\n-  fusion->set_called_computations_execution_thread(\n-      kParallelThreadName,\n-      /*skip_async_execution_thread_overwrite*/ false);\n+  fusion->set_called_computations_execution_thread(kParallelThreadName);\n \n+  // Fusion is embedded call context, so the execution thread is not printed.\n+  // here.\n   const std::string expected_fusion =\n       R\"(f32[5,20]{1,0} fusion(f32[5,10]{1,0}, f32[20,10]{1,0}), kind=kLoop, calls=\n {\n   tmp_0 = f32[5,10]{1,0} parameter(0)\n   tmp_1 = f32[20,10]{1,0} parameter(1)\n   tmp_2 = f32[10,20]{1,0} transpose(f32[20,10]{1,0} tmp_1), dimensions={1,0}\n   ROOT tmp_3 = f32[5,20]{1,0} dot(f32[5,10]{1,0} tmp_0, f32[10,20]{1,0} tmp_2), lhs_contracting_dims={1}, rhs_contracting_dims={0}\n-}, execution_thread=\"parallel_thread\")\";\n+})\";\n   EXPECT_EQ(fusion->ToString(options), expected_fusion);\n }\n "
+        },
+        {
+            "sha": "090e87269b8e5dc4a8caa461bd23963c2fc12eed",
+            "filename": "third_party/xla/xla/service/hlo_verifier.cc",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 4,
+            "changes": 14,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/dd8cb9fdf273e422e041034687a0a52838513342/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_verifier.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/dd8cb9fdf273e422e041034687a0a52838513342/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_verifier.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_verifier.cc?ref=dd8cb9fdf273e422e041034687a0a52838513342",
+            "patch": "@@ -1721,10 +1721,13 @@ absl::Status CheckCallableInstructionThreadName(\n     const HloInstruction* instruction) {\n   for (const HloComputation* computation : instruction->called_computations()) {\n     if (instruction->parent() != nullptr) {\n-      if (instruction->parent()->execution_thread() !=\n-          computation->execution_thread()) {\n+      if (xla::GetInstructionCallContext(instruction->opcode()) !=\n+              CallContext::kEmbedded &&\n+          instruction->parent()->execution_thread() !=\n+              computation->execution_thread()) {\n         return Internal(\n-            \"callable instruction %s expects parent computation thread name \"\n+            \"Non-Embedded context callable instruction %s expects parent \"\n+            \"computation thread name \"\n             \"same as called computation's thread name (%s vs %s).\",\n             instruction->ToString(), instruction->parent()->execution_thread(),\n             computation->execution_thread());\n@@ -3226,10 +3229,13 @@ class InstructionVerifier : public DfsHloVisitorWithDefault {\n \n     if (opts_.verify_call_nested_computation_thread_name &&\n         instruction->has_to_apply() &&\n+        xla::GetInstructionCallContext(instruction->opcode()) !=\n+            xla::CallContext::kEmbedded &&\n         instruction->to_apply()->execution_thread() !=\n             instruction->parent()->execution_thread()) {\n       return Internal(\n-          \"%s top_apply computation execution thread does not match (%s vs %s)\",\n+          \"Non-Embedded context callable instruction %s to_apply computation \"\n+          \"execution thread does not match (%s vs %s)\",\n           instruction->name(), instruction->to_apply()->execution_thread(),\n           instruction->parent()->execution_thread());\n     }"
+        },
+        {
+            "sha": "b39ce3a4e31b79ddeb0156b0522f51125d6f7541",
+            "filename": "third_party/xla/xla/service/hlo_verifier_test.cc",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 47,
+            "changes": 59,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/dd8cb9fdf273e422e041034687a0a52838513342/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_verifier_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/dd8cb9fdf273e422e041034687a0a52838513342/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_verifier_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_verifier_test.cc?ref=dd8cb9fdf273e422e041034687a0a52838513342",
+            "patch": "@@ -219,8 +219,9 @@ TEST_F(HloVerifierTest, CheckCallThreadMismatch) {\n           .status();\n   ASSERT_FALSE(status.ok());\n   EXPECT_THAT(status.message(),\n-              HasSubstr(\"mycall top_apply computation execution thread does \"\n-                        \"not match (parallel_thread vs main)\"));\n+              HasSubstr(\"Non-Embedded context callable instruction mycall \"\n+                        \"to_apply computation execution thread does not match \"\n+                        \"(parallel_thread vs main)\"));\n }\n \n TEST_F(HloVerifierTest, CheckCallOperandOutputAliasing) {\n@@ -2302,61 +2303,27 @@ TEST_F(HloVerifierTest, FusionShapeVerifier) {\n               HasSubstr(\"Fused computation shape\"));\n }\n \n-TEST_F(HloVerifierTest, FusionThreadVerifier) {\n+TEST_F(HloVerifierTest, CallThreadVerifier) {\n   const char* const kModuleStr = R\"(\n   HloModule test\n \n-  fused_computation {\n+  called_computation {\n     ROOT p0 = f32[8,12] parameter(0)\n   }, execution_thread=\"parallel_thread\"\n \n   ENTRY entry {\n     p0 = f32[8,12] parameter(0)\n-    ROOT out = f32[8,12] fusion(p0), kind=kInput, calls=fused_computation\n+    ROOT out = f32[8,12] call(p0), to_apply=called_computation\n   }\n   )\";\n   TF_ASSERT_OK_AND_ASSIGN(auto module,\n                           ParseAndReturnUnverifiedModule(kModuleStr));\n-  EXPECT_THAT(verifier().Run(module.get()).status().message(),\n-              HasSubstr(\"expects parent computation thread name same as called \"\n-                        \"computation's thread name\"));\n-}\n-\n-TEST_F(HloVerifierTest, FusionNestedComputationThreadVerifier) {\n-  const char* const kModuleStr = R\"(\n-  HloModule test\n-\n-  add {\n-    lhs = f32[] parameter(0)\n-    rhs = f32[] parameter(1)\n-    ROOT add = f32[] add(lhs, rhs)\n-  }, execution_thread=\"parallel_thread\"\n-\n-  fused_computation {\n-    p0 = f32[8,12] parameter(0)\n-    p1 = f32[8,12] parameter(1)\n-    crs0 = f32[8,12] all-reduce(p1), replica_groups={}, to_apply=add\n-    ROOT result = add(p0, crs0)\n-  }\n-\n-  ENTRY entry {\n-    p0 = f32[8,12] parameter(0)\n-    p1 = f32[8,12] parameter(1)\n-    ROOT out = f32[8,12] fusion(p0, p1), kind=kInput, calls=fused_computation\n-  }\n-  )\";\n-  TF_ASSERT_OK_AND_ASSIGN(auto module,\n-                          ParseAndReturnUnverifiedModule(kModuleStr));\n-\n-  auto status =\n+  EXPECT_THAT(\n       HloVerifier{HloVerifierOpts{}.VerifyCallNestedComputationThreadName()}\n           .Run(module.get())\n-          .status();\n-  ASSERT_FALSE(status.ok());\n-  EXPECT_THAT(\n-      status.message(),\n-      HasSubstr(\"crs0 top_apply computation execution thread does not match \"\n-                \"(parallel_thread vs main)\"));\n+          .status()\n+          .message(),\n+      HasSubstr(\"to_apply computation execution thread does not match\"));\n }\n \n TEST_F(HloVerifierTest, AllReduceVerifier) {\n@@ -3090,10 +3057,8 @@ TEST_F(HloVerifierTest, VerifyCustomCallThread) {\n       HloVerifier{HloVerifierOpts{}.VerifyCallNestedComputationThreadName()}\n           .Run(module.get())\n           .status();\n-  ASSERT_FALSE(status.ok());\n-  EXPECT_THAT(status.message(),\n-              HasSubstr(\"custom top_apply computation execution thread does \"\n-                        \"not match (parallel_thread vs main)\"));\n+  // Embedded call context computation thread name is not checked.\n+  ASSERT_TRUE(status.ok());\n }\n \n TEST_F(HloVerifierTest, CheckWhileThread) {"
+        },
+        {
+            "sha": "2d4cc30082babba2c7587c7bd7380aacf6730c51",
+            "filename": "third_party/xla/xla/service/instruction_fusion.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/dd8cb9fdf273e422e041034687a0a52838513342/third_party%2Fxla%2Fxla%2Fservice%2Finstruction_fusion.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/dd8cb9fdf273e422e041034687a0a52838513342/third_party%2Fxla%2Fxla%2Fservice%2Finstruction_fusion.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Finstruction_fusion.cc?ref=dd8cb9fdf273e422e041034687a0a52838513342",
+            "patch": "@@ -796,8 +796,7 @@ HloInstruction* InstructionFusion::AddFusionInstruction(\n     TF_CHECK_OK(computation->ReplaceInstruction(consumer, fusion_instruction));\n   }\n   fusion_instruction->set_called_computations_execution_thread(\n-      computation->execution_thread(),\n-      /*skip_async_execution_thread_overwrite=*/false);\n+      computation->execution_thread());\n   return fusion_instruction;\n }\n "
+        }
+    ],
+    "stats": {
+        "total": 309,
+        "additions": 154,
+        "deletions": 155
+    }
+}

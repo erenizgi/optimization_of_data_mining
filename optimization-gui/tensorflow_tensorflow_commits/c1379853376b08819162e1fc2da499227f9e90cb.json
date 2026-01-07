@@ -1,0 +1,36 @@
+{
+    "author": "nvgrw",
+    "message": "Fix equality comparison of literals on the slow path.\n\nLiteral equality comparisons have a fast path and a slow path. The fast path\ninvolves using memcmp to compare the raw bytes in the underlying buffers. We\ntake the fast path when we know that the underlying data is structured the same\nway, i.e. the shape and layout are identical.\n\nIf literals under comparison have different layouts but the same shapes, we take\na slow path. The data is still the same, it is just arranged differently. To\nmake this comparison, the code looks at each element individually, mapping\nequivalent logical locations to their physical locations. When comparing values\non this path, prior to this change, the code used `operator==`. This is wrong.\n\nNot only does this cause different code to run, but the semantics are different\ntoo. The example that led me to discover this was the fact that in C++ the\nfloating point values 0.0f and -0.0f are considered equal. In binary however,\nthey have distinct representations.\n\nIf the equality operator is not consistent, this can create baffling behavior.\nFor example, AbslHashValue for Literals is implemented in a similar manner --\nelements are located at their physical location and hashed according to the\nunderlying binary representation (i.e. 0.0f and -0.0f are distinct). This makes\nthis hash implementation invalid for use Abseil containers. Equality and hash\ncodes must be consistent or else this is a fatal error.\n\nPiperOrigin-RevId: 840318062",
+    "sha": "c1379853376b08819162e1fc2da499227f9e90cb",
+    "files": [
+        {
+            "sha": "93905067d96e51d89872ca2c76ec9e2f79bea54c",
+            "filename": "third_party/xla/xla/literal.cc",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 1,
+            "changes": 16,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/c1379853376b08819162e1fc2da499227f9e90cb/third_party%2Fxla%2Fxla%2Fliteral.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/c1379853376b08819162e1fc2da499227f9e90cb/third_party%2Fxla%2Fxla%2Fliteral.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fliteral.cc?ref=c1379853376b08819162e1fc2da499227f9e90cb",
+            "patch": "@@ -1916,7 +1916,21 @@ template <typename NativeT>\n bool LiteralBase::Piece::EqualElementsInternal(\n     const LiteralBase::Piece& other, std::vector<int64_t>* multi_index) const {\n   if (multi_index->size() == subshape().dimensions().size()) {\n-    return (Get<NativeT>(*multi_index) == other.Get<NativeT>(*multi_index));\n+    const NativeT value = Get<NativeT>(*multi_index);\n+    const NativeT other_value = other.Get<NativeT>(*multi_index);\n+    // The EqualElements function uses memcmp to compare two literals that have\n+    // the same shape (including the layout!). This can be seen as a \"fast path\"\n+    // comparison. This function on the other hand performs an elementwise\n+    // comparison and is for cases where shapes or layouts differ.\n+    //\n+    // Instead of operator==(), we use memcmp so that the comparison of\n+    // individual elements is consistent with the fast path.\n+    //\n+    // This also ensures consistency for hashing, as the hash of a literal is\n+    // also computed on the underlying data rather than logical equivalence. If\n+    // this were not the case, 0.0f and -0.0f would continue to have different\n+    // hash values even though in C++ they are considered equal.\n+    return memcmp(&value, &other_value, sizeof(NativeT)) == 0;\n   }\n   for (int64_t i = 0; i < GetDynamicSize(multi_index->size()); ++i) {\n     multi_index->push_back(i);"
+        },
+        {
+            "sha": "4147d6bd1ada360bbd88103a873261ac70a50d03",
+            "filename": "third_party/xla/xla/literal_test.cc",
+            "status": "modified",
+            "additions": 50,
+            "deletions": 0,
+            "changes": 50,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/c1379853376b08819162e1fc2da499227f9e90cb/third_party%2Fxla%2Fxla%2Fliteral_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/c1379853376b08819162e1fc2da499227f9e90cb/third_party%2Fxla%2Fxla%2Fliteral_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fliteral_test.cc?ref=c1379853376b08819162e1fc2da499227f9e90cb",
+            "patch": "@@ -560,6 +560,56 @@ TEST_F(LiteralUtilTest, DifferentLayoutInEquality) {\n   EXPECT_FALSE(colmajor.Equal(rowmajor, true));\n }\n \n+TEST_F(LiteralUtilTest, LogicalInequalityFastPath) {\n+  TF_ASSERT_OK_AND_ASSIGN(\n+      Literal a,\n+      Literal::Make(ShapeUtil::MakeShapeWithDenseLayout(F32, {2, 2}, {1, 0})));\n+  a.Set<float>({0, 0}, 1.0);\n+  a.Set<float>({0, 1}, 2.0);\n+  a.Set<float>({1, 0}, 0.0);\n+  a.Set<float>({1, 1}, 4.0);\n+\n+  TF_ASSERT_OK_AND_ASSIGN(\n+      Literal b,\n+      Literal::Make(ShapeUtil::MakeShapeWithDenseLayout(F32, {2, 2}, {1, 0})));\n+  b.Set<float>({0, 0}, 1.0);\n+  b.Set<float>({0, 1}, 2.0);\n+  b.Set<float>({1, 0}, -0.0);\n+  b.Set<float>({1, 1}, 4.0);\n+\n+  EXPECT_FALSE(a.Equal(b, true));\n+  EXPECT_FALSE(b.Equal(a, true));\n+  EXPECT_FALSE(a.Equal(b, false));\n+  EXPECT_FALSE(b.Equal(a, false));\n+}\n+\n+TEST_F(LiteralUtilTest, LogicalInequalitySlowPath) {\n+  // This test is similar to the above test, but these literals are compared\n+  // using the slow path because their layouts are different. This test ensures\n+  // that comparisons using the fast and slow path are equivalent.\n+\n+  TF_ASSERT_OK_AND_ASSIGN(\n+      Literal a,\n+      Literal::Make(ShapeUtil::MakeShapeWithDenseLayout(F32, {2, 2}, {0, 1})));\n+  a.Set<float>({0, 0}, 1.0);\n+  a.Set<float>({0, 1}, 2.0);\n+  a.Set<float>({1, 0}, 0.0);\n+  a.Set<float>({1, 1}, 4.0);\n+\n+  TF_ASSERT_OK_AND_ASSIGN(\n+      Literal b,\n+      Literal::Make(ShapeUtil::MakeShapeWithDenseLayout(F32, {2, 2}, {1, 0})));\n+  b.Set<float>({0, 0}, 1.0);\n+  b.Set<float>({0, 1}, 2.0);\n+  b.Set<float>({1, 0}, -0.0);\n+  b.Set<float>({1, 1}, 4.0);\n+\n+  EXPECT_FALSE(a.Equal(b, true));\n+  EXPECT_FALSE(b.Equal(a, true));\n+  EXPECT_FALSE(a.Equal(b, false));\n+  EXPECT_FALSE(b.Equal(a, false));\n+}\n+\n TEST_F(LiteralUtilTest, CreateWithoutLayout) {\n   Shape default_layout_shape = ShapeUtil::MakeShape(F32, {2, 1});\n   Shape no_layout_shape = default_layout_shape;"
+        }
+    ],
+    "stats": {
+        "total": 66,
+        "additions": 65,
+        "deletions": 1
+    }
+}

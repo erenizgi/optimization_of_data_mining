@@ -1,0 +1,60 @@
+{
+    "author": "EusebioDM",
+    "message": "Move GpuNormConfig creation from the IR Emitter to the `NormThunk` construction\n\nThis is refractor in preparation for the [de]serialization of the `NormThunk`. We want to [de]serialize based on the `GpuNormDescriptor` instead of the `GpuNormConfig`, but for that we need to keep a reference of the `GpuNormDescriptor` in the Thunk.\n\nConsidered creating the `GpuNormConfig` on the fly when needed, but in that case we'd need to create it during the `ExecuteOnStream` method, which IIUC we want to avoid for performance reasons.\n\nPiperOrigin-RevId: 816583437",
+    "sha": "b886faac6aeb1d709488de4bef0898144d6205ec",
+    "files": [
+        {
+            "sha": "29dfabbe765663a2d6b021a509092e15f464d294",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/BUILD",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b886faac6aeb1d709488de4bef0898144d6205ec/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b886faac6aeb1d709488de4bef0898144d6205ec/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2FBUILD?ref=b886faac6aeb1d709488de4bef0898144d6205ec",
+            "patch": "@@ -1547,7 +1547,9 @@ cc_library(\n         \"//xla/tsl/platform:statusor\",\n         \"@com_google_absl//absl/base:core_headers\",\n         \"@com_google_absl//absl/container:flat_hash_map\",\n+        \"@com_google_absl//absl/memory\",\n         \"@com_google_absl//absl/status\",\n+        \"@com_google_absl//absl/status:statusor\",\n         \"@com_google_absl//absl/synchronization\",\n     ],\n )"
+        },
+        {
+            "sha": "4289e6c214f69950b9d8a844871053fa9a319981",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/norm_thunk.cc",
+            "status": "modified",
+            "additions": 25,
+            "deletions": 0,
+            "changes": 25,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b886faac6aeb1d709488de4bef0898144d6205ec/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fnorm_thunk.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b886faac6aeb1d709488de4bef0898144d6205ec/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fnorm_thunk.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fnorm_thunk.cc?ref=b886faac6aeb1d709488de4bef0898144d6205ec",
+            "patch": "@@ -17,8 +17,11 @@ limitations under the License.\n \n #include <memory>\n #include <optional>\n+#include <utility>\n \n+#include \"absl/memory/memory.h\"\n #include \"absl/status/status.h\"\n+#include \"absl/status/statusor.h\"\n #include \"absl/synchronization/mutex.h\"\n #include \"xla/backends/gpu/runtime/thunk.h\"\n #include \"xla/service/buffer_assignment.h\"\n@@ -33,7 +36,28 @@ limitations under the License.\n namespace xla {\n namespace gpu {\n \n+absl::StatusOr<std::unique_ptr<NormThunk>> NormThunk::Create(\n+    ThunkInfo thunk_info, GpuNormDescriptor descriptor,\n+    BufferAllocation::Slice x_slice, BufferAllocation::Slice scale_slice,\n+    BufferAllocation::Slice y_or_dx_slice,\n+    std::optional<BufferAllocation::Slice> bias_slice,\n+    std::optional<BufferAllocation::Slice> expectation_slice,\n+    std::optional<BufferAllocation::Slice> norm_factor_slice,\n+    std::optional<BufferAllocation::Slice> dy_slice,\n+    std::optional<BufferAllocation::Slice> dscale_slice,\n+    std::optional<BufferAllocation::Slice> dbias_slice,\n+    BufferAllocation::Slice scratch_slice) {\n+  TF_ASSIGN_OR_RETURN(GpuNormConfig config, GpuNormConfig::For(descriptor));\n+\n+  // Can't use make_unique because the constructor is private. go/totw/134\n+  return absl::WrapUnique(new NormThunk(\n+      thunk_info, std::move(config), std::move(descriptor), x_slice,\n+      scale_slice, y_or_dx_slice, bias_slice, expectation_slice,\n+      norm_factor_slice, dy_slice, dscale_slice, dbias_slice, scratch_slice));\n+}\n+\n NormThunk::NormThunk(ThunkInfo thunk_info, GpuNormConfig config,\n+                     GpuNormDescriptor descriptor,\n                      BufferAllocation::Slice x_slice,\n                      BufferAllocation::Slice scale_slice,\n                      BufferAllocation::Slice y_or_dx_slice,\n@@ -55,6 +79,7 @@ NormThunk::NormThunk(ThunkInfo thunk_info, GpuNormConfig config,\n       dscale_buffer_(dscale_slice),\n       dbias_buffer_(dbias_slice),\n       scratch_buffer_(scratch_slice),\n+      descriptor_(descriptor),\n       config_(config) {}\n \n NormRunner& NormThunk::GetOrCreateRunner("
+        },
+        {
+            "sha": "12808d012a49d0d8b5effd54279db2d400baf0c0",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/norm_thunk.h",
+            "status": "modified",
+            "additions": 23,
+            "deletions": 9,
+            "changes": 32,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b886faac6aeb1d709488de4bef0898144d6205ec/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fnorm_thunk.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b886faac6aeb1d709488de4bef0898144d6205ec/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fnorm_thunk.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fnorm_thunk.h?ref=b886faac6aeb1d709488de4bef0898144d6205ec",
+            "patch": "@@ -22,6 +22,7 @@ limitations under the License.\n #include \"absl/base/thread_annotations.h\"\n #include \"absl/container/flat_hash_map.h\"\n #include \"absl/status/status.h\"\n+#include \"absl/status/statusor.h\"\n #include \"absl/synchronization/mutex.h\"\n #include \"xla/backends/gpu/runtime/thunk.h\"\n #include \"xla/service/buffer_assignment.h\"\n@@ -34,9 +35,28 @@ namespace gpu {\n \n class NormThunk : public Thunk {\n  public:\n+  static absl::StatusOr<std::unique_ptr<NormThunk>> Create(\n+      ThunkInfo thunk_info, GpuNormDescriptor descriptor,\n+      BufferAllocation::Slice x, BufferAllocation::Slice scale,\n+      BufferAllocation::Slice y_or_dx,\n+      std::optional<BufferAllocation::Slice> bias,\n+      std::optional<BufferAllocation::Slice> expectation,\n+      std::optional<BufferAllocation::Slice> norm_factor,\n+      std::optional<BufferAllocation::Slice> dy,\n+      std::optional<BufferAllocation::Slice> dscale,\n+      std::optional<BufferAllocation::Slice> dbias,\n+      BufferAllocation::Slice scratch);\n+\n+  NormThunk(const NormThunk&) = delete;\n+  NormThunk& operator=(const NormThunk&) = delete;\n+\n+  absl::Status ExecuteOnStream(const ExecuteParams& params) override;\n+  absl::Status Initialize(const InitializeParams& params) override;\n+\n+ private:\n   NormThunk(ThunkInfo thunk_info, GpuNormConfig config,\n-            BufferAllocation::Slice x, BufferAllocation::Slice scale,\n-            BufferAllocation::Slice y_or_dx,\n+            GpuNormDescriptor descriptor, BufferAllocation::Slice x,\n+            BufferAllocation::Slice scale, BufferAllocation::Slice y_or_dx,\n             std::optional<BufferAllocation::Slice> bias,\n             std::optional<BufferAllocation::Slice> expectation,\n             std::optional<BufferAllocation::Slice> norm_factor,\n@@ -45,13 +65,6 @@ class NormThunk : public Thunk {\n             std::optional<BufferAllocation::Slice> dbias,\n             BufferAllocation::Slice scratch);\n \n-  NormThunk(const NormThunk&) = delete;\n-  NormThunk& operator=(const NormThunk&) = delete;\n-\n-  absl::Status ExecuteOnStream(const ExecuteParams& params) override;\n-  absl::Status Initialize(const InitializeParams& params) override;\n-\n- private:\n   BufferAllocation::Slice x_buffer_;\n   BufferAllocation::Slice scale_buffer_;\n   BufferAllocation::Slice y_or_dx_buffer_;\n@@ -64,6 +77,7 @@ class NormThunk : public Thunk {\n   BufferAllocation::Slice scratch_buffer_;\n   NormRunner& GetOrCreateRunner(const stream_executor::Stream*);\n \n+  GpuNormDescriptor descriptor_;\n   GpuNormConfig config_;\n   absl::Mutex mu_;\n   absl::flat_hash_map<const stream_executor::Stream*,"
+        },
+        {
+            "sha": "8866e141a883cf274821a2f94f7dd9859b44f2b0",
+            "filename": "third_party/xla/xla/service/gpu/ir_emitter_unnested.cc",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 8,
+            "changes": 16,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b886faac6aeb1d709488de4bef0898144d6205ec/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fir_emitter_unnested.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b886faac6aeb1d709488de4bef0898144d6205ec/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fir_emitter_unnested.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fir_emitter_unnested.cc?ref=b886faac6aeb1d709488de4bef0898144d6205ec",
+            "patch": "@@ -1001,14 +1001,14 @@ absl::Status IrEmitterUnnested::EmitNormThunk(\n     descriptor.dbias_shape = ShapeUtil::GetSubshape(instr->shape(), {2});\n   }\n \n-  TF_ASSIGN_OR_RETURN(GpuNormConfig config, GpuNormConfig::For(descriptor));\n-\n-  auto thunk = std::make_unique<NormThunk>(\n-      Thunk::ThunkInfo::WithProfileAnnotation(\n-          instr, ir_emitter_context_->GetNextThunkId()),\n-      std::move(config), x_slice, scale_slice, y_or_dx_slice, bias_slice,\n-      expectation_slice, norm_factor_slice, dy_slice, dscale_slice, dbias_slice,\n-      scratch_slice);\n+  TF_ASSIGN_OR_RETURN(\n+      std::unique_ptr<NormThunk> thunk,\n+      NormThunk::Create(Thunk::ThunkInfo::WithProfileAnnotation(\n+                            instr, ir_emitter_context_->GetNextThunkId()),\n+                        std::move(descriptor), x_slice, scale_slice,\n+                        y_or_dx_slice, bias_slice, expectation_slice,\n+                        norm_factor_slice, dy_slice, dscale_slice, dbias_slice,\n+                        scratch_slice));\n   AddThunkToThunkSequence(std::move(thunk));\n   return absl::OkStatus();\n }"
+        }
+    ],
+    "stats": {
+        "total": 75,
+        "additions": 58,
+        "deletions": 17
+    }
+}

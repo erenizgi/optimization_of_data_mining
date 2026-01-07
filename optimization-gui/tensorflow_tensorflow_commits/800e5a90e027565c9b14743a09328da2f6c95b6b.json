@@ -1,0 +1,72 @@
+{
+    "author": "pifon2a",
+    "message": "[XLA:GPU] Relax tile size restriction for the last operand of concat.\n\nWe should be able to tile concat(s32[128],s32[16]) by 32, because the last\noperand will just be padded and we still never read from the both operands in a\nsingle block.\n\nPiperOrigin-RevId: 831532329",
+    "sha": "800e5a90e027565c9b14743a09328da2f6c95b6b",
+    "files": [
+        {
+            "sha": "0bf55057c012ba1d68b34b5a8878215cabda2294",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/fusion_emitter.cc",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 9,
+            "changes": 18,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/800e5a90e027565c9b14743a09328da2f6c95b6b/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/800e5a90e027565c9b14743a09328da2f6c95b6b/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter.cc?ref=800e5a90e027565c9b14743a09328da2f6c95b6b",
+            "patch": "@@ -1007,30 +1007,30 @@ absl::StatusOr<TensorValue> EmitConcatenate(\n   // prologue of reductions.\n   SmallVector<int64_t> padded_tile_sizes =\n       GetPaddedTileSizes(tiled_concatenate.tile_sizes());\n-  int64_t concatenate_dimension_tile_size =\n-      padded_tile_sizes[concatenate_dimension];\n+  int64_t concat_dim_tile_size = padded_tile_sizes[concatenate_dimension];\n \n-  for (const TiledHloInstruction* operand : tiled_concatenate.operands()) {\n+  int64_t num_operands = tiled_concatenate.operands().size();\n+  for (const auto [index, operand] :\n+       llvm::enumerate(tiled_concatenate.operands())) {\n     if (operand->hlo()->opcode() != HloOpcode::kFusion) {\n       // Sanity check: all operands should be nested fusions.\n       return absl::FailedPreconditionError(\n           \"Expected concatenate operands to be nested fusions.\");\n     }\n \n-    int64_t operand_concatenate_dimension_size =\n-        tiled_concatenate.hlo()->shape().dimensions(concatenate_dimension);\n+    int64_t operand_concat_dim_size =\n+        operand->hlo()->shape().dimensions(concatenate_dimension);\n \n-    if (operand_concatenate_dimension_size % concatenate_dimension_tile_size !=\n-        0) {\n+    if (index != num_operands - 1 &&\n+        operand_concat_dim_size % concat_dim_tile_size != 0) {\n       // Sanity check: concatenation dimension should be divisible by the tile\n       // size for each operand. This is not a fundamental limitation, but this\n       // lowering will emit incorrect code if this does not hold---so we gate\n       // against it explicitly.\n       return absl::FailedPreconditionError(absl::StrCat(\n           \"Expected the tile size of the concatenation dimension of operand \",\n           operand->ToString(), \"to divide the dimension size exactly, but got\",\n-          operand_concatenate_dimension_size, \" % \",\n-          concatenate_dimension_tile_size, \" != 0\"));\n+          operand_concat_dim_size, \" % \", concat_dim_tile_size, \" != 0\"));\n     }\n   }\n   TF_ASSIGN_OR_RETURN("
+        },
+        {
+            "sha": "2d73efd23fa573145858f42fea4b00c846c0f974",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/fusion_emitter_device_test.cc",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 6,
+            "changes": 13,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/800e5a90e027565c9b14743a09328da2f6c95b6b/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter_device_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/800e5a90e027565c9b14743a09328da2f6c95b6b/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter_device_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter_device_test.cc?ref=800e5a90e027565c9b14743a09328da2f6c95b6b",
+            "patch": "@@ -3844,13 +3844,13 @@ nest1 {\n }\n \n nest2 {\n-  ROOT p0 = s32[128] parameter(0)\n+  ROOT p0 = s32[25] parameter(0)\n }\n \n concatenate_fusion {\n   p0 = s32[128] parameter(0)\n   p1 = s32[128] parameter(1)\n-  p2 = s32[128] parameter(2)\n+  p2 = s32[25] parameter(2)\n \n   fusion0 = s32[128] fusion(p0), kind=kCustom, calls=nest0, backend_config={\n     \"fusion_backend_config\":{\n@@ -3868,7 +3868,7 @@ concatenate_fusion {\n         \"num_warps\":\"1\",\n         \"num_ctas\":\"1\",\n         \"num_stages\":\"1\"}}}\n-  fusion2 = s32[128] fusion(p2), kind=kCustom, calls=nest2, backend_config={\n+  fusion2 = s32[25] fusion(p2), kind=kCustom, calls=nest2, backend_config={\n     \"fusion_backend_config\":{\n       \"kind\":\"__triton_nested_gemm_fusion\",\n       \"block_level_fusion_config\":{\n@@ -3877,14 +3877,15 @@ concatenate_fusion {\n         \"num_ctas\":\"1\",\n         \"num_stages\":\"1\"}}}\n \n-  ROOT concatenate = s32[384] concatenate(fusion0, fusion1, fusion2), dimensions={0}\n+  ROOT concatenate = s32[281] concatenate(fusion0, fusion1, fusion2),\n+    dimensions={0}\n }\n \n ENTRY main {\n   p0 = s32[128] parameter(0)\n   p1 = s32[128] parameter(1)\n-  p2 = s32[128] parameter(2)\n-  ROOT fusion = s32[384] fusion(p0, p1, p2), kind=kCustom,\n+  p2 = s32[25] parameter(2)\n+  ROOT fusion = s32[281] fusion(p0, p1, p2), kind=kCustom,\n     calls=concatenate_fusion, backend_config={\n     \"fusion_backend_config\":{\n       \"kind\":\"__triton_nested_gemm_fusion\","
+        },
+        {
+            "sha": "a80ea2c1fd0e6401a085d87b0d8b429d7beb1437",
+            "filename": "third_party/xla/xla/codegen/tiling/symbolic_tile_analysis.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/800e5a90e027565c9b14743a09328da2f6c95b6b/third_party%2Fxla%2Fxla%2Fcodegen%2Ftiling%2Fsymbolic_tile_analysis.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/800e5a90e027565c9b14743a09328da2f6c95b6b/third_party%2Fxla%2Fxla%2Fcodegen%2Ftiling%2Fsymbolic_tile_analysis.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fcodegen%2Ftiling%2Fsymbolic_tile_analysis.cc?ref=800e5a90e027565c9b14743a09328da2f6c95b6b",
+            "patch": "@@ -1350,6 +1350,7 @@ absl::StatusOr<bool> SymbolicTileAnalysis::ParametersSatisfyConstraints(\n   const ConstraintExpression& constraints = tiling_specification_.constraints();\n   CHECK(constraints.is_satisfiable());  // Crash OK\n \n+  tiling_specification_.constraints().ToString();\n   TF_ASSIGN_OR_RETURN(FlatTiling flat_tiling_parameters,\n                       tiling.Flatten(tiling_specification_));\n "
+        },
+        {
+            "sha": "687efa7637c1ec8ca6c22c9f553206bb49f0eb70",
+            "filename": "third_party/xla/xla/service/gpu/model/triton_emitter_constraints.cc",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 1,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/800e5a90e027565c9b14743a09328da2f6c95b6b/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fmodel%2Ftriton_emitter_constraints.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/800e5a90e027565c9b14743a09328da2f6c95b6b/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fmodel%2Ftriton_emitter_constraints.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fmodel%2Ftriton_emitter_constraints.cc?ref=800e5a90e027565c9b14743a09328da2f6c95b6b",
+            "patch": "@@ -162,7 +162,11 @@ TritonEmitterConstraints::DeriveCustomConstraints(\n       ConstraintExpression divisibility_constraints =\n           ConstraintExpression::GetAlwaysSatisfied();\n \n-      for (const HloInstruction* operand : hlo->operands()) {\n+      // The last operand of the concat does not require the divisibility\n+      // constraint.\n+      for (int operand_id = 0; operand_id < hlo->operand_count() - 1;\n+           ++operand_id) {\n+        const HloInstruction* operand = hlo->operand(operand_id);\n         AffineExpr operand_concat_dimension = mlir::getAffineConstantExpr(\n             operand->shape().dimensions(concatenate_dimension_index), ctx);\n         ConstraintExpression::Constraint divisibility_constraint{"
+        },
+        {
+            "sha": "771b809a7dee0f279101897f1237218deb709edc",
+            "filename": "third_party/xla/xla/service/gpu/model/triton_emitter_constraints_test.cc",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 6,
+            "changes": 12,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/800e5a90e027565c9b14743a09328da2f6c95b6b/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fmodel%2Ftriton_emitter_constraints_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/800e5a90e027565c9b14743a09328da2f6c95b6b/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fmodel%2Ftriton_emitter_constraints_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fmodel%2Ftriton_emitter_constraints_test.cc?ref=800e5a90e027565c9b14743a09328da2f6c95b6b",
+            "patch": "@@ -280,15 +280,15 @@ TEST_F(TritonEmitterConstraintsTest,\n concatenate {\n   p0 = bf16[8] parameter(0)\n   p1 = bf16[8] parameter(1)\n-  p2 = bf16[8] parameter(2)\n-  ROOT concatenate = bf16[24] concatenate(p0, p1, p2), dimensions={0}\n+  p2 = bf16[4] parameter(2)\n+  ROOT concatenate = bf16[20] concatenate(p0, p1, p2), dimensions={0}\n }\n \n ENTRY main {\n   p0 = bf16[8] parameter(0)\n   p1 = bf16[8] parameter(1)\n-  p2 = bf16[8] parameter(2)\n-  ROOT fusion = bf16[24] fusion(p0, p1, p2),\n+  p2 = bf16[4] parameter(2)\n+  ROOT fusion = bf16[20] fusion(p0, p1, p2),\n     kind=kCustom, calls=concatenate, backend_config={\"fusion_backend_config\":{\n       \"kind\":\"__triton_nested_gemm_fusion\"}}\n })\"));\n@@ -322,9 +322,9 @@ ENTRY main {\n                   Tiling({{fusion_root, FlatTiling({16})}})),\n               absl_testing::IsOkAndHolds(false));\n \n-  // However, (4,) is valid and should still work.\n+  // However, (8,) is valid and should still work.\n   EXPECT_THAT(analysis_with_triton_constraints->ParametersSatisfyConstraints(\n-                  Tiling({{fusion_root, FlatTiling({4})}})),\n+                  Tiling({{fusion_root, FlatTiling({8})}})),\n               absl_testing::IsOkAndHolds(true));\n }\n "
+        }
+    ],
+    "stats": {
+        "total": 50,
+        "additions": 28,
+        "deletions": 22
+    }
+}

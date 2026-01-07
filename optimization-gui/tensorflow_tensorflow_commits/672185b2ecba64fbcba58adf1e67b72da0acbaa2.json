@@ -1,0 +1,48 @@
+{
+    "author": "tensorflower-gardener",
+    "message": "Do constant folding in symbolic expression creation\n\nThis change force constant folding for all binary operations on symbolic expressions. Previously, constant folding was handled ad-hoc for Add and Mul. By centralizing it, all binary operations on two constant symbolic expressions will now be folded into a single constant expression.\n\nThe tests are updated to reflect this change, including a new test case specifically for constant folding across various binary operations.\n\nThis is fixing an IndexingMap::Evaluate crash :)\n\nPiperOrigin-RevId: 834332041",
+    "sha": "672185b2ecba64fbcba58adf1e67b72da0acbaa2",
+    "files": [
+        {
+            "sha": "818f53fd0d0d2d3f9a15cb89ebea2a2c4d176a98",
+            "filename": "third_party/xla/xla/hlo/analysis/symbolic_expr.cc",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 9,
+            "changes": 16,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/672185b2ecba64fbcba58adf1e67b72da0acbaa2/third_party%2Fxla%2Fxla%2Fhlo%2Fanalysis%2Fsymbolic_expr.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/672185b2ecba64fbcba58adf1e67b72da0acbaa2/third_party%2Fxla%2Fxla%2Fhlo%2Fanalysis%2Fsymbolic_expr.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fanalysis%2Fsymbolic_expr.cc?ref=672185b2ecba64fbcba58adf1e67b72da0acbaa2",
+            "patch": "@@ -229,11 +229,6 @@ SymbolicExpr BasicAddSimplify(SymbolicExpr lhs, SymbolicExpr rhs) {\n   if (lhs.GetType() == SymbolicExprType::kConstant && lhs.GetValue() == 0) {\n     return rhs;\n   }\n-  if (lhs.GetType() == SymbolicExprType::kConstant &&\n-      rhs.GetType() == SymbolicExprType::kConstant) {\n-    return CreateSymbolicConstant(lhs.GetValue() + rhs.GetValue(),\n-                                  lhs.GetContext());\n-  }\n   return CreateSymbolicBinaryOp(SymbolicExprType::kAdd, lhs, rhs,\n                                 lhs.GetContext());\n }\n@@ -304,9 +299,6 @@ SymbolicExpr SimplifyMulByConstantRHS(SymbolicExpr lhs, SymbolicExpr rhs) {\n   if (rhs_val == 1) {\n     return lhs;  // x * 1 = x\n   }\n-  if (lhs.GetType() == SymbolicExprType::kConstant) {\n-    return CreateSymbolicConstant(lhs.GetValue() * rhs_val, ctx);\n-  }\n \n   // Associativity: (X * C1) * C2 => X * (C1 * C2)\n   if (lhs.GetType() == SymbolicExprType::kMul &&\n@@ -1015,7 +1007,13 @@ SymbolicExpr CreateSymbolicBinaryOp(SymbolicExprType type, SymbolicExpr lhs,\n         type != SymbolicExprType::kVariable && lhs && rhs)\n       << \"We expect a binary operation and two symbolic expressions as \"\n          \"children.\";\n-  return GetOrCreateSymbolicExpr(type, 0, lhs, rhs, mlir_context);\n+  auto result = GetOrCreateSymbolicExpr(type, 0, lhs, rhs, mlir_context);\n+  // Basic constant folding.\n+  if (lhs.GetType() == SymbolicExprType::kConstant &&\n+      rhs.GetType() == SymbolicExprType::kConstant) {\n+    return CreateSymbolicConstant(result.Evaluate({}), mlir_context);\n+  }\n+  return result;\n }\n \n llvm::SmallVector<SymbolicExpr> CreateSymbolicConstantExprs("
+        },
+        {
+            "sha": "f9ac2bc49bd4a24afe431b528a961710d5549c40",
+            "filename": "third_party/xla/xla/hlo/analysis/symbolic_expr_test.cc",
+            "status": "modified",
+            "additions": 19,
+            "deletions": 0,
+            "changes": 19,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/672185b2ecba64fbcba58adf1e67b72da0acbaa2/third_party%2Fxla%2Fxla%2Fhlo%2Fanalysis%2Fsymbolic_expr_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/672185b2ecba64fbcba58adf1e67b72da0acbaa2/third_party%2Fxla%2Fxla%2Fhlo%2Fanalysis%2Fsymbolic_expr_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fanalysis%2Fsymbolic_expr_test.cc?ref=672185b2ecba64fbcba58adf1e67b72da0acbaa2",
+            "patch": "@@ -39,7 +39,10 @@ struct SymbolicExprTest : public ::testing::Test {\n   mlir::MLIRContext ctx;\n   SymbolicExpr v0 = CreateSymbolicVariable(0, &ctx);\n   SymbolicExpr v1 = CreateSymbolicVariable(1, &ctx);\n+  SymbolicExpr c1 = CreateSymbolicConstant(1, &ctx);\n+  SymbolicExpr c3 = CreateSymbolicConstant(3, &ctx);\n   SymbolicExpr c2 = CreateSymbolicConstant(2, &ctx);\n+  SymbolicExpr c5 = CreateSymbolicConstant(5, &ctx);\n };\n \n TEST_F(SymbolicExprTest, CreateAndPrint) {\n@@ -82,6 +85,22 @@ TEST_F(SymbolicExprTest, ParseAndPrint_Invalid) {\n                \"Failed to parse expression\");\n }\n \n+TEST_F(SymbolicExprTest, ConstantFolding) {\n+  // Expressions are simplified at creation if possible.\n+  EXPECT_EQ(c2 + c3, c5);\n+  EXPECT_EQ(c5 - c2, c3);\n+  EXPECT_EQ(c2 * c3, CreateSymbolicConstant(6, &ctx));\n+  EXPECT_EQ(c5 / c2, c2);\n+  EXPECT_EQ(c5 % c2, c1);\n+  EXPECT_EQ(c5.floorDiv(c2), c2);\n+  EXPECT_EQ(c5.ceilDiv(c2), c3);\n+  EXPECT_EQ(c2.min(c5), c2);\n+  EXPECT_EQ(c5.min(c2), c2);\n+  EXPECT_EQ(c2.max(c5), c5);\n+  EXPECT_EQ(c5.max(c2), c5);\n+  EXPECT_EQ(((c2 + c3) * c2).ceilDiv(c5), c2);\n+}\n+\n TEST_F(SymbolicExprTest, Evaluate) {\n   SymbolicExpr expr = (((v0 + 42) * v1.min(2).max(0)) / 2).ceilDiv(2);\n "
+        },
+        {
+            "sha": "cd495a847848aaec60bbe8859c103d9f3bffcad3",
+            "filename": "third_party/xla/xla/hlo/analysis/symbolic_map_converter_test.cc",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/672185b2ecba64fbcba58adf1e67b72da0acbaa2/third_party%2Fxla%2Fxla%2Fhlo%2Fanalysis%2Fsymbolic_map_converter_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/672185b2ecba64fbcba58adf1e67b72da0acbaa2/third_party%2Fxla%2Fxla%2Fhlo%2Fanalysis%2Fsymbolic_map_converter_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fanalysis%2Fsymbolic_map_converter_test.cc?ref=672185b2ecba64fbcba58adf1e67b72da0acbaa2",
+            "patch": "@@ -85,8 +85,8 @@ TEST_F(SymbolicMapConverterTest, SymbolicToAffineNestedFailure) {\n   SymbolicExpr c1 = CreateSymbolicConstant(1, &context_);\n   SymbolicExpr c2 = CreateSymbolicConstant(2, &context_);\n \n-  // d0 + max(c1, c2). max is not representable in AffineExpr.\n-  SymbolicExpr nested_max_expr = d0 + c1.max(c2);\n+  // max(d0, c2) + c1. max is not representable in AffineExpr.\n+  SymbolicExpr nested_max_expr = d0.max(c2) + c1;\n \n   // This should not crash and should return a null AffineMap.\n   AffineMap affine_map = SymbolicMapToAffineMap("
+        }
+    ],
+    "stats": {
+        "total": 39,
+        "additions": 28,
+        "deletions": 11
+    }
+}

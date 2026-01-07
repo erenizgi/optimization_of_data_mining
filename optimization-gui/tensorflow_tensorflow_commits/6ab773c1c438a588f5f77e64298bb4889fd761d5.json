@@ -1,0 +1,48 @@
+{
+    "author": "jcai19",
+    "message": "[XLA][Numerics][HLO Value Tracking] Support original values for more cases in while loop simplifier pass\n\nThis updates the original value of a while loop if induction variables are merged into the input tuple.\n\nPiperOrigin-RevId: 828136554",
+    "sha": "6ab773c1c438a588f5f77e64298bb4889fd761d5",
+    "files": [
+        {
+            "sha": "a9aa09cda835e824e71808d33af5511651ed349b",
+            "filename": "third_party/xla/xla/service/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/6ab773c1c438a588f5f77e64298bb4889fd761d5/third_party%2Fxla%2Fxla%2Fservice%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/6ab773c1c438a588f5f77e64298bb4889fd761d5/third_party%2Fxla%2Fxla%2Fservice%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2FBUILD?ref=6ab773c1c438a588f5f77e64298bb4889fd761d5",
+            "patch": "@@ -2819,6 +2819,7 @@ cc_library(\n         \":call_inliner\",\n         \":hlo_creation_utils\",\n         \":pattern_matcher\",\n+        \":while_util\",\n         \"//xla:comparison_util\",\n         \"//xla:literal_util\",\n         \"//xla:shape_util\","
+        },
+        {
+            "sha": "55c260fb08571dbd4a2fcbd008406c6520507c71",
+            "filename": "third_party/xla/xla/service/while_loop_simplifier.cc",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 0,
+            "changes": 12,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/6ab773c1c438a588f5f77e64298bb4889fd761d5/third_party%2Fxla%2Fxla%2Fservice%2Fwhile_loop_simplifier.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/6ab773c1c438a588f5f77e64298bb4889fd761d5/third_party%2Fxla%2Fxla%2Fservice%2Fwhile_loop_simplifier.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fwhile_loop_simplifier.cc?ref=6ab773c1c438a588f5f77e64298bb4889fd761d5",
+            "patch": "@@ -46,6 +46,7 @@ limitations under the License.\n #include \"xla/service/call_inliner.h\"\n #include \"xla/service/hlo_creation_utils.h\"\n #include \"xla/service/pattern_matcher.h\"\n+#include \"xla/service/while_util.h\"\n #include \"xla/shape.h\"\n #include \"xla/shape_util.h\"\n #include \"xla/status_macros.h\"\n@@ -1454,6 +1455,8 @@ static absl::StatusOr<HloInstruction*> TryMergeInductionVariables(\n           add_binary_op(elem_shape, HloOpcode::kMultiply,\n                         add_gte(instr, *trip_counter),\n                         add_new_instr(induction_vars.at(i)->Clone()))));\n+      // Copy the original value of the induction variable to its replacement.\n+      tuple_elems.back()->CopyOriginalValue(while_body_root->operand(i));\n     }\n     return HloInstruction::CreateTuple(tuple_elems);\n   };\n@@ -1547,6 +1550,15 @@ static absl::StatusOr<HloInstruction*> TryMergeInductionVariables(\n       module->AddEmbeddedComputation(std::move(new_while_body)),\n       get_new_while_init(while_init)));\n   new_while->CopyBackendConfigFrom(while_op);\n+  if (auto original_value = while_init->original_value()) {\n+    new_while->while_init()->set_original_value(original_value);\n+  }\n+  if (auto original_value = while_op->original_value()) {\n+    new_while->set_original_value(original_value);\n+  }\n+  if (added_trip_counter) {\n+    AppendToWhileLoopOriginalValue(new_while, {});\n+  }\n   CopyFrontendAttributes(while_op, new_while);\n   CopyMetadata(while_op, new_while);\n   TF_RETURN_IF_ERROR(computation->ReplaceWithNewInstruction("
+        },
+        {
+            "sha": "24202035575301b2061db5725cbbbb0db665182a",
+            "filename": "third_party/xla/xla/service/while_loop_simplifier_test.cc",
+            "status": "modified",
+            "additions": 67,
+            "deletions": 0,
+            "changes": 67,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/6ab773c1c438a588f5f77e64298bb4889fd761d5/third_party%2Fxla%2Fxla%2Fservice%2Fwhile_loop_simplifier_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/6ab773c1c438a588f5f77e64298bb4889fd761d5/third_party%2Fxla%2Fxla%2Fservice%2Fwhile_loop_simplifier_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fwhile_loop_simplifier_test.cc?ref=6ab773c1c438a588f5f77e64298bb4889fd761d5",
+            "patch": "@@ -1581,5 +1581,72 @@ TEST_F(WhileLoopSimplifierTest, FlattenNestedTupleWithOriginalValue) {\n             R\"(({\"a\"}, {\"b\"}, {\"c\"}, {\"d\"}))\");\n }\n \n+const char* const kSimpleMergeInductionVariablesModuleWithOriginalValue = R\"(\n+  HloModule Test\n+  Body {\n+    param = (TYPE[], TYPE[], TYPE[]) parameter(0)\n+\n+    a = TYPE[] get-tuple-element(param), index=0\n+    one = TYPE[] constant(1)\n+    a1 = TYPE[] add(a, one), origin={{\"induction_var_0\"}}\n+\n+    b = TYPE[] get-tuple-element(param), index=1\n+    negone = TYPE[] constant(-1)\n+    b1 = TYPE[] add(b, negone), origin={{\"induction_var_1\"}}\n+\n+    c = TYPE[] add(a, b)\n+\n+    ROOT tuple = (TYPE[], TYPE[], TYPE[]) tuple(a1,b1,c)\n+  }\n+  Cond {\n+    param = (TYPE[], TYPE[], TYPE[]) parameter(0)\n+    a = TYPE[] get-tuple-element(param), index=0\n+    b = TYPE[] get-tuple-element(param), index=1\n+    sum = TYPE[] power(a, b)\n+    ten = TYPE[] constant(10)\n+    ROOT cond = pred[] compare(sum, ten), direction=LT\n+  }\n+  ENTRY Loop {\n+    a = TYPE[] constant(10)\n+    b = TYPE[] constant(100)\n+    c = TYPE[] constant(0)\n+    init = (TYPE[], TYPE[], TYPE[]) tuple(a,b,c), origin={({\"a\"}, {\"b\"}, {\"c\"})}\n+    while = (TYPE[], TYPE[], TYPE[]) while(init), condition=Cond, body=Body, origin={({\"while\" {0}}, {\"while\" {1}}, {\"while\" {2}})}\n+\n+    a1 = TYPE[] get-tuple-element(while), index=0\n+    b1 = TYPE[] get-tuple-element(while), index=1\n+    c1 = TYPE[] get-tuple-element(while), index=2\n+    sum = TYPE[] add(a1, b1)\n+    ROOT sum.1 = TYPE[] add(sum, c1)\n+  })\";\n+\n+TEST_F(WhileLoopSimplifierTest, MergeInductionVariablesWithOriginalValue) {\n+  std::string hlo_string = absl::StrReplaceAll(\n+      kSimpleMergeInductionVariablesModuleWithOriginalValue, {{\"TYPE\", \"s32\"}});\n+  TF_ASSERT_OK_AND_ASSIGN(auto module,\n+                          ParseAndReturnVerifiedModule(hlo_string));\n+  TF_ASSERT_OK_AND_ASSIGN(bool changed,\n+                          WhileLoopSimplifier().Run(module.get()));\n+  EXPECT_TRUE(changed);\n+  HloInstruction* while_instr = FindFirstWhile(module.get());\n+  ASSERT_NE(while_instr->original_value(), nullptr);\n+  EXPECT_EQ(while_instr->original_value()->ToString(),\n+            R\"(({\"while\" {0}}, {\"while\" {1}}, {\"while\" {2}}, {}))\");\n+  HloInstruction* while_init = while_instr->while_init();\n+  ASSERT_NE(while_init->original_value(), nullptr);\n+  EXPECT_EQ(while_init->original_value()->ToString(),\n+            R\"(({\"a\"}, {\"b\"}, {\"c\"}, {}))\");\n+  const HloInstruction* add =\n+      module->entry_computation()->root_instruction()->operand(0);\n+  const HloInstruction* induction_var_0 = add->operand(0);\n+  ASSERT_NE(induction_var_0->original_value(), nullptr);\n+  EXPECT_EQ(induction_var_0->original_value()->ToString(),\n+            R\"({\"induction_var_0\"})\");\n+  const HloInstruction* induction_var_1 = add->operand(1);\n+  ASSERT_NE(induction_var_1->original_value(), nullptr);\n+  EXPECT_EQ(induction_var_1->original_value()->ToString(),\n+            R\"({\"induction_var_1\"})\");\n+}\n+\n }  // namespace\n }  // namespace xla"
+        }
+    ],
+    "stats": {
+        "total": 80,
+        "additions": 80,
+        "deletions": 0
+    }
+}

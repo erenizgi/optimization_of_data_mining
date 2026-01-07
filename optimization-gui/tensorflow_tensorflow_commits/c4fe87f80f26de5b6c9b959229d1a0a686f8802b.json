@@ -1,0 +1,108 @@
+{
+    "author": "vksnk",
+    "message": "Plumb initial YNNPACK support of convolution operator.\n\nThis is currently limited to F32, VALID, no dilation convolutions.\n\nPiperOrigin-RevId: 842774858",
+    "sha": "c4fe87f80f26de5b6c9b959229d1a0a686f8802b",
+    "files": [
+        {
+            "sha": "381ea0c970b50351989bcaf85dccd5346f31bb0d",
+            "filename": "third_party/xla/xla/backends/cpu/transforms/library_matcher.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/c4fe87f80f26de5b6c9b959229d1a0a686f8802b/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Ftransforms%2Flibrary_matcher.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/c4fe87f80f26de5b6c9b959229d1a0a686f8802b/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Ftransforms%2Flibrary_matcher.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Ftransforms%2Flibrary_matcher.h?ref=c4fe87f80f26de5b6c9b959229d1a0a686f8802b",
+            "patch": "@@ -45,6 +45,7 @@ class LibraryMatcher {\n           break;\n         // Not intended to be used by LibraryMatcher.\n         case DebugOptions::LIBRARY_FUSION_TYPE_INDIVIDUAL_DOT:\n+        case DebugOptions::LIBRARY_FUSION_TYPE_INDIVIDUAL_CONVOLUTION:\n           break;\n         case DebugOptions::LIBRARY_FUSION_TYPE_REDUCE:\n           fuse_reduce_ = true;"
+        },
+        {
+            "sha": "c8d05b933591e3ee592b9667a3ded3932c8f2abe",
+            "filename": "third_party/xla/xla/backends/cpu/transforms/ynn_matcher.h",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 1,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/c4fe87f80f26de5b6c9b959229d1a0a686f8802b/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Ftransforms%2Fynn_matcher.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/c4fe87f80f26de5b6c9b959229d1a0a686f8802b/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Ftransforms%2Fynn_matcher.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Ftransforms%2Fynn_matcher.h?ref=c4fe87f80f26de5b6c9b959229d1a0a686f8802b",
+            "patch": "@@ -43,7 +43,8 @@ class YnnMatcher : public LibraryMatcher {\n     static const absl::NoDestructor<absl::flat_hash_set<HloOpcode>>\n         kSupportedOps{[]() {\n           absl::flat_hash_set<HloOpcode> supported_ops{\n-              HloOpcode::kDot, HloOpcode::kReduce, HloOpcode::kConstant};\n+              HloOpcode::kDot, HloOpcode::kReduce, HloOpcode::kConstant,\n+              HloOpcode::kConvolution};\n           for (const auto& [op, _] : GetYnnUnaryOpMap()) {\n             supported_ops.insert(op);\n           }\n@@ -65,6 +66,9 @@ class YnnMatcher : public LibraryMatcher {\n     if (instr->opcode() == HloOpcode::kReduce) {\n       return IsReduceOpOffloadedToYnn(instr);\n     }\n+    if (instr->opcode() == HloOpcode::kConvolution) {\n+      return IsConvolutionOpSupportedByYnn(instr);\n+    }\n     if (instr->IsConstant()) {\n       return IsConstantSupportedByYnn(instr);\n     }"
+        },
+        {
+            "sha": "790e9f62c610e515bd3167bcdfbee12318e999d3",
+            "filename": "third_party/xla/xla/backends/cpu/ynn_emitter.cc",
+            "status": "modified",
+            "additions": 121,
+            "deletions": 0,
+            "changes": 121,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/c4fe87f80f26de5b6c9b959229d1a0a686f8802b/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fynn_emitter.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/c4fe87f80f26de5b6c9b959229d1a0a686f8802b/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fynn_emitter.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fynn_emitter.cc?ref=c4fe87f80f26de5b6c9b959229d1a0a686f8802b",
+            "patch": "@@ -19,6 +19,7 @@ limitations under the License.\n #include <cstddef>\n #include <cstdint>\n #include <memory>\n+#include <numeric>\n #include <utility>\n #include <vector>\n \n@@ -368,6 +369,30 @@ static ynn_status DefineBatchMatrixMultiply(ynn_subgraph_t subgraph,\n                         YNN_INVALID_VALUE_ID, &output_id, /*flags=*/0);\n }\n \n+static ynn_status DefineConvolution(\n+    ynn_subgraph_t subgraph, uint32_t input1_id, uint32_t input2_id,\n+    uint32_t output_id, const std::vector<int32_t>& stencil_axes,\n+    const std::vector<int32_t> new_axes,\n+    const std::vector<size_t>& stencil_dims,\n+    const std::vector<size_t>& stencil_strides,\n+    const std::vector<size_t>& stencil_dilations) {\n+  uint32_t padding_id = YNN_INVALID_VALUE_ID;\n+  uint32_t stencil_id = YNN_INVALID_VALUE_ID;\n+\n+  // Make a stenciled view of the input [n, h, w, ci] -> [n, h, w, kh, kw, ci].\n+  ynn_status status = ynn_define_stencil_copy(\n+      subgraph, /*num_stencils=*/stencil_dims.size(), stencil_axes.data(),\n+      new_axes.data(), stencil_dims.data(), stencil_strides.data(),\n+      stencil_dilations.data(), input1_id, padding_id, &stencil_id,\n+      /*flags=*/0);\n+  if (status != ynn_status_success) {\n+    return status;\n+  }\n+  return ynn_define_dot(subgraph, /*num_k_dims=*/stencil_dims.size() + 1,\n+                        stencil_id, input2_id, YNN_INVALID_VALUE_ID, &output_id,\n+                        /*flags=*/0);\n+}\n+\n static absl::StatusOr<YnnSubgraph> EmitYnnDotSubgraph(\n     const HloDotInstruction* dot,\n     std::vector<std::unique_ptr<Literal>>& literals,\n@@ -442,6 +467,92 @@ static absl::StatusOr<YnnSubgraph> EmitYnnDotSubgraph(\n   return subgraph;\n }\n \n+static absl::StatusOr<YnnSubgraph> EmitYnnConvolutionSubgraph(\n+    const HloConvolutionInstruction* conv,\n+    std::vector<std::unique_ptr<Literal>>& literals,\n+    absl::Span<const se::DeviceAddressBase> arguments_buffers) {\n+  TF_ASSIGN_OR_RETURN(\n+      YnnSubgraph subgraph, CreateYnnSubgraph([&](ynn_subgraph_t* subgraph) {\n+        return ynn_create_subgraph(\n+            /*external_value_ids=*/3,\n+            YnnFlags(conv->GetModule()->config().debug_options()), subgraph);\n+      }));\n+\n+  uint32_t lhs_id = 0;\n+  uint32_t rhs_id = 1;\n+  uint32_t out_id = 2;\n+\n+  const HloInstruction* lhs = conv->operand(0);\n+  const HloInstruction* rhs = conv->operand(1);\n+\n+  const Shape& lhs_shape = lhs->shape();\n+  const Shape& rhs_shape = rhs->shape();\n+  const Shape& out_shape = conv->shape();\n+\n+  auto dims = [](absl::Span<const int64_t> dims) -> std::vector<size_t> {\n+    return {dims.begin(), dims.end()};\n+  };\n+\n+  std::vector<size_t> lhs_dims = dims(lhs_shape.dimensions());\n+  std::vector<size_t> rhs_dims = dims(rhs_shape.dimensions());\n+  std::vector<size_t> out_dims = dims(out_shape.dimensions());\n+\n+  TF_ASSIGN_OR_RETURN(ynn_type ynn_lhs_type, YnnType(lhs_shape.element_type()));\n+  TF_ASSIGN_OR_RETURN(ynn_type ynn_rhs_type, YnnType(rhs_shape.element_type()));\n+  TF_ASSIGN_OR_RETURN(ynn_type ynn_out_type, YnnType(out_shape.element_type()));\n+\n+  const uint32_t input_tensor_flags = YNN_VALUE_FLAG_EXTERNAL_INPUT;\n+  YNN_RETURN_IF_ERROR(ynn_define_tensor_value(\n+      subgraph.get(), ynn_lhs_type, lhs_dims.size(), lhs_dims.data(),\n+      /*data=*/nullptr,\n+      /*zero_point_id=*/YNN_INVALID_VALUE_ID,\n+      /*scale_id=*/YNN_INVALID_VALUE_ID, input_tensor_flags, &lhs_id));\n+\n+  YNN_RETURN_IF_ERROR(ynn_define_tensor_value(\n+      subgraph.get(), ynn_rhs_type, rhs_dims.size(), rhs_dims.data(),\n+      /*data=*/nullptr,\n+      /*zero_point_id=*/YNN_INVALID_VALUE_ID,\n+      /*scale_id=*/YNN_INVALID_VALUE_ID, input_tensor_flags, &rhs_id));\n+\n+  const uint32_t output_tensor_flags = YNN_VALUE_FLAG_EXTERNAL_OUTPUT;\n+  YNN_RETURN_IF_ERROR(ynn_define_tensor_value(\n+      subgraph.get(), ynn_out_type, out_dims.size(), out_dims.data(),\n+      /*data=*/nullptr,\n+      /*zero_point_id=*/YNN_INVALID_VALUE_ID,\n+      /*scale_id=*/YNN_INVALID_VALUE_ID, output_tensor_flags, &out_id));\n+\n+  Window conv_window = conv->window();\n+  int conv_window_dims_size = conv_window.dimensions_size();\n+\n+  ConvolutionDimensionNumbers conv_dimensions =\n+      conv->convolution_dimension_numbers();\n+\n+  std::vector<int32_t> stencil_axes(conv_window_dims_size);\n+  std::vector<int32_t> new_axes(conv_window_dims_size);\n+  std::vector<size_t> stencil_dims(conv_window_dims_size);\n+  std::vector<size_t> stencil_strides(conv_window_dims_size);\n+  std::vector<size_t> stencil_dilations(conv_window_dims_size);\n+\n+  for (size_t i = 0; i < conv_window.dimensions_size(); ++i) {\n+    stencil_axes[i] = conv_dimensions.input_spatial_dimensions(i);\n+    stencil_dims[i] = conv_window.dimensions(i).size();\n+    stencil_strides[i] = conv_window.dimensions(i).stride();\n+    stencil_dilations[i] = 1;\n+  }\n+\n+  std::iota(new_axes.begin(), new_axes.end(), lhs_dims.size() - 1);\n+\n+  YNN_RETURN_IF_ERROR(DefineConvolution(subgraph.get(), lhs_id, rhs_id, out_id,\n+                                        stencil_axes, new_axes, stencil_dims,\n+                                        stencil_strides, stencil_dilations));\n+\n+  ynn_status status = ynn_optimize_subgraph(\n+      subgraph.get(), /*threadpool=*/nullptr, /*flags=*/0);\n+  TF_RETURN_IF_ERROR(YnnStatusToStatus(status));\n+\n+  return subgraph;\n+}\n+\n absl::StatusOr<absl::AnyInvocable<absl::StatusOr<YnnSubgraph>(\n     absl::Span<const se::DeviceAddressBase> arguments_buffers)>>\n EmitYnnFusionBuilder(const HloComputation* computation) {\n@@ -478,4 +589,14 @@ EmitYnnDotBuilder(const HloDotInstruction* dot, bool capture_rhs) {\n       };\n }\n \n+absl::StatusOr<absl::AnyInvocable<absl::StatusOr<YnnSubgraph>(\n+    absl::Span<const se::DeviceAddressBase> arguments_buffers)>>\n+EmitYnnConvolutionBuilder(const HloConvolutionInstruction* conv) {\n+  return\n+      [conv, literals = std::vector<std::unique_ptr<Literal>>()](\n+          absl::Span<const se::DeviceAddressBase> arguments_buffers) mutable {\n+        return EmitYnnConvolutionSubgraph(conv, literals, arguments_buffers);\n+      };\n+}\n+\n }  // namespace xla::cpu"
+        },
+        {
+            "sha": "b1b767e51a44e9c99e1c1a7c42e229eaa3aed6ee",
+            "filename": "third_party/xla/xla/backends/cpu/ynn_emitter.h",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/c4fe87f80f26de5b6c9b959229d1a0a686f8802b/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fynn_emitter.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/c4fe87f80f26de5b6c9b959229d1a0a686f8802b/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fynn_emitter.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fynn_emitter.h?ref=c4fe87f80f26de5b6c9b959229d1a0a686f8802b",
+            "patch": "@@ -33,6 +33,10 @@ absl::StatusOr<absl::AnyInvocable<absl::StatusOr<YnnSubgraph>(\n     absl::Span<const se::DeviceAddressBase> arguments_buffers)>>\n EmitYnnDotBuilder(const HloDotInstruction* dot, bool capture_rhs);\n \n+absl::StatusOr<absl::AnyInvocable<absl::StatusOr<YnnSubgraph>(\n+    absl::Span<const se::DeviceAddressBase> arguments_buffers)>>\n+EmitYnnConvolutionBuilder(const HloConvolutionInstruction* conv);\n+\n }  // namespace xla::cpu\n \n #endif  // XLA_BACKENDS_CPU_YNN_EMITTER_H_"
+        },
+        {
+            "sha": "43cbf1a4749c8136f4b6cab6fe1fe3faecc4b032",
+            "filename": "third_party/xla/xla/backends/cpu/ynn_support.cc",
+            "status": "modified",
+            "additions": 73,
+            "deletions": 0,
+            "changes": 73,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/c4fe87f80f26de5b6c9b959229d1a0a686f8802b/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fynn_support.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/c4fe87f80f26de5b6c9b959229d1a0a686f8802b/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fynn_support.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fynn_support.cc?ref=c4fe87f80f26de5b6c9b959229d1a0a686f8802b",
+            "patch": "@@ -273,6 +273,79 @@ bool IsReduceOpOffloadedToYnn(const HloInstruction* hlo) {\n   }\n }\n \n+bool IsConvolutionOpSupportedByYnn(const HloInstruction* instr) {\n+  CHECK_EQ(instr->opcode(), HloOpcode::kConvolution);\n+  const HloConvolutionInstruction* conv =\n+      Cast<HloConvolutionInstruction>(instr);\n+  // Stores tuple of allowed (input, output) dtypes.\n+  static const absl::NoDestructor<absl::flat_hash_set<\n+      std::tuple<PrimitiveType, PrimitiveType, PrimitiveType>>>\n+      kAllowedTypes({\n+          {F32, F32, F32},\n+      });\n+\n+  PrimitiveType lhs_dtype = conv->operand(0)->shape().element_type();\n+  PrimitiveType rhs_dtype = conv->operand(1)->shape().element_type();\n+  PrimitiveType out_dtype = conv->shape().element_type();\n+  if (!kAllowedTypes->contains({lhs_dtype, rhs_dtype, out_dtype})) {\n+    return false;\n+  }\n+\n+  ConvolutionDimensionNumbers conv_dimensions =\n+      conv->convolution_dimension_numbers();\n+\n+  // Make sure that this layout is supported.\n+  if (conv_dimensions.input_feature_dimension() != 3 ||\n+      conv_dimensions.output_feature_dimension() != 3) {\n+    return false;\n+  }\n+\n+  if (conv_dimensions.kernel_input_feature_dimension() != 2 ||\n+      conv_dimensions.kernel_output_feature_dimension() != 3) {\n+    return false;\n+  }\n+\n+  if (conv_dimensions.input_spatial_dimensions_size() != 2 ||\n+      conv_dimensions.kernel_spatial_dimensions_size() != 2 ||\n+      conv_dimensions.output_spatial_dimensions_size() != 2) {\n+    return false;\n+  }\n+\n+  if (conv_dimensions.input_spatial_dimensions(0) != 1 ||\n+      conv_dimensions.input_spatial_dimensions(1) != 2 ||\n+      conv_dimensions.kernel_spatial_dimensions(0) != 0 ||\n+      conv_dimensions.kernel_spatial_dimensions(1) != 1 ||\n+      conv_dimensions.output_spatial_dimensions(0) != 1 ||\n+      conv_dimensions.output_spatial_dimensions(1) != 2) {\n+    return false;\n+  }\n+\n+  Window window = conv->window();\n+\n+  // Only support 2D convolution.\n+  if (window.dimensions_size() != 2) {\n+    return false;\n+  }\n+\n+  // Only VALID padding for now.\n+  if ((window.dimensions(0).padding_low() != 0) ||\n+      (window.dimensions(0).padding_high() != 0) ||\n+      (window.dimensions(1).padding_low() != 0) ||\n+      (window.dimensions(1).padding_high() != 0)) {\n+    return false;\n+  }\n+\n+  // No dilation for now.\n+  if ((window.dimensions(0).window_dilation() != 1) ||\n+      (window.dimensions(1).window_dilation() != 1) ||\n+      (window.dimensions(0).base_dilation() != 1) ||\n+      (window.dimensions(1).base_dilation() != 1)) {\n+    return false;\n+  }\n+\n+  return true;\n+}\n+\n uint32_t YnnFlags(const DebugOptions& debug_options) {\n   uint32_t flags = 0;\n   if (!debug_options.xla_cpu_enable_platform_dependent_math()) {"
+        },
+        {
+            "sha": "f7352adfe4164b72ed2581d74b95cab6d4782846",
+            "filename": "third_party/xla/xla/backends/cpu/ynn_support.h",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/c4fe87f80f26de5b6c9b959229d1a0a686f8802b/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fynn_support.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/c4fe87f80f26de5b6c9b959229d1a0a686f8802b/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fynn_support.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fynn_support.h?ref=c4fe87f80f26de5b6c9b959229d1a0a686f8802b",
+            "patch": "@@ -71,6 +71,9 @@ bool IsReduceOpSupportedByYnn(const HloInstruction* hlo);\n // Returns true if the reduce op will be offloaded to YNNPACK.\n bool IsReduceOpOffloadedToYnn(const HloInstruction* hlo);\n \n+// Returns true if the convolution op is supported by YNNPACK.\n+bool IsConvolutionOpSupportedByYnn(const HloInstruction* instr);\n+\n // Convert XLA options to YNNPACK flags.\n uint32_t YnnFlags(const DebugOptions& debug_options);\n "
+        },
+        {
+            "sha": "5b91a6c097c6d87427dc998ebf54c0a464c383a9",
+            "filename": "third_party/xla/xla/service/cpu/thunk_emitter.cc",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 0,
+            "changes": 16,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/c4fe87f80f26de5b6c9b959229d1a0a686f8802b/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fthunk_emitter.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/c4fe87f80f26de5b6c9b959229d1a0a686f8802b/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fthunk_emitter.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fthunk_emitter.cc?ref=c4fe87f80f26de5b6c9b959229d1a0a686f8802b",
+            "patch": "@@ -770,6 +770,17 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitConvolutionThunk(\n       /*supported_types=*/\n       {PRED, S8, U8, S16, U16, S32, U32, S64, U64, F16, F32, F64, C64, C128}));\n \n+#ifdef XLA_YNNPACK\n+  const bool use_ynn = absl::c_linear_search(\n+      hlo_module_config_.debug_options().xla_cpu_experimental_ynn_fusion_type(),\n+      DebugOptions::LIBRARY_FUSION_TYPE_INDIVIDUAL_CONVOLUTION);\n+  if (use_ynn) {\n+    if (IsConvolutionOpSupportedByYnn(instruction)) {\n+      return EmitYnnFusionThunk(instruction);\n+    }\n+  }\n+#endif  // XLA_YNNPACK\n+\n   // TODO(tonywy): Add PotentiallyImplementedAsMKLConvolution to support\n   // different data layouts.\n   if (PotentiallyImplementedAsEigenConvolution(*instruction,\n@@ -1564,6 +1575,11 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitYnnFusionThunk(\n     if (capture_rhs) {\n       captured_arguments_ids = kCapturedIds;\n     }\n+  } else if (instruction->opcode() == HloOpcode::kConvolution) {\n+    const HloConvolutionInstruction* conv =\n+        Cast<HloConvolutionInstruction>(instruction);\n+    // Construct YNNPACK subgraph builder from the convolution instruction.\n+    TF_ASSIGN_OR_RETURN(builder, EmitYnnConvolutionBuilder(conv));\n   } else {\n     auto* fusion = Cast<HloFusionInstruction>(instruction);\n     const HloComputation* computation ="
+        },
+        {
+            "sha": "bb3123dfef01377984c1d0ce051e188f36c9461d",
+            "filename": "third_party/xla/xla/xla.proto",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/c4fe87f80f26de5b6c9b959229d1a0a686f8802b/third_party%2Fxla%2Fxla%2Fxla.proto",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/c4fe87f80f26de5b6c9b959229d1a0a686f8802b/third_party%2Fxla%2Fxla%2Fxla.proto",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fxla.proto?ref=c4fe87f80f26de5b6c9b959229d1a0a686f8802b",
+            "patch": "@@ -180,6 +180,7 @@ message DebugOptions {\n     LIBRARY_FUSION_TYPE_ELTWISE = 2;\n     LIBRARY_FUSION_TYPE_REDUCE = 3;\n     LIBRARY_FUSION_TYPE_INDIVIDUAL_DOT = 4;\n+    LIBRARY_FUSION_TYPE_INDIVIDUAL_CONVOLUTION = 5;\n   }\n \n   enum XnnGraphFusionMode {"
+        }
+    ],
+    "stats": {
+        "total": 225,
+        "additions": 224,
+        "deletions": 1
+    }
+}

@@ -1,0 +1,72 @@
+{
+    "author": "tensorflower-gardener",
+    "message": "Add support for 1D slot variables in `TPUEmbedding` `CustomOptimizer`.\n\nThis change allows users to specify the dimensionality of slot variables used by a `CustomOptimizer` via the new slot_dims argument in the `CustomOptimizer` constructor. Each element in slot_dims can be set to `1` or `2`, corresponding to the desired rank of the slot variable.\n\nA value of `2` (the default) creates a slot variable with the same shape as the embedding table (`[vocabulary_size, embedding_dim]`).\nA value of `1` creates a 1D slot variable with shape `[vocabulary_size]`.\nThis enables more memory-efficient custom optimizer implementations where certain slots do not need to match the embedding dimension.\n\nPiperOrigin-RevId: 805163920",
+    "sha": "4916c9ffd73be1de50726979fd88067455c52b82",
+    "files": [
+        {
+            "sha": "50e86ba0198602352df73ad7980582acf64e3fc1",
+            "filename": "tensorflow/core/tpu/kernels/sparse_core_xla_ops.cc",
+            "status": "modified",
+            "additions": 38,
+            "deletions": 8,
+            "changes": 46,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4916c9ffd73be1de50726979fd88067455c52b82/tensorflow%2Fcore%2Ftpu%2Fkernels%2Fsparse_core_xla_ops.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4916c9ffd73be1de50726979fd88067455c52b82/tensorflow%2Fcore%2Ftpu%2Fkernels%2Fsparse_core_xla_ops.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcore%2Ftpu%2Fkernels%2Fsparse_core_xla_ops.cc?ref=4916c9ffd73be1de50726979fd88067455c52b82",
+            "patch": "@@ -843,18 +843,38 @@ class XlaSparseDenseMatmulGradWithCsrInputOp : public XlaOpKernel {\n \n     std::vector<XlaCompiler::Argument> arguments(num_arguments);\n \n-    // For tables and slot variables, we use the derived type and the shape is\n-    // {1, feature_width}.\n+    // Tables and slot variables are passed as single-row slices.\n+    // 2D vars [R, C] -> shape [1, C], 1D vars [R] -> shape [1].\n     xla::PrimitiveType table_primitive_type;\n     OP_REQUIRES_OK(\n         ctx, DataTypeToPrimitiveType(table_dtype_, &table_primitive_type));\n \n     for (int32_t i = 0; i < num_arguments; ++i) {\n       arguments[i].kind = XlaCompiler::Argument::kParameter;\n-      if (i > 0 && i < tables_inputs.size() + 1) {\n-        arguments[i].type = table_dtype_;\n+      if (i == 0) {\n+        arguments[i].type = DT_FLOAT;\n         arguments[i].shape =\n-            xla::ShapeUtil::MakeShape(table_primitive_type, {1, feature_width});\n+            xla::ShapeUtil::MakeShape(xla::F32, {1, feature_width});\n+        continue;\n+      }\n+      const int32_t table_idx = i - 1;\n+      if (table_idx >= 0 &&\n+          table_idx < static_cast<int32_t>(tables_inputs.size())) {\n+        arguments[i].type = table_dtype_;\n+        const TensorShape& ts = tables_shapes[table_idx];\n+        if (ts.dims() == 2) {\n+          const int64_t cols = ts.dim_size(1);\n+          arguments[i].shape =\n+              xla::ShapeUtil::MakeShape(table_primitive_type, {1, cols});\n+        } else if (ts.dims() == 1) {\n+          arguments[i].shape =\n+              xla::ShapeUtil::MakeShape(table_primitive_type, {1});\n+        } else {\n+          OP_REQUIRES(ctx, false,\n+                      absl::InvalidArgumentError(absl::StrCat(\n+                          \"Table/slot variable rank must be 1 or 2, got \",\n+                          ts.dims(), \" for argument index \", i)));\n+        }\n       } else {\n         arguments[i].type = DT_FLOAT;\n         arguments[i].shape =\n@@ -884,9 +904,19 @@ class XlaSparseDenseMatmulGradWithCsrInputOp : public XlaOpKernel {\n \n     xla_tables_shapes.reserve(tables_shapes.size());\n     for (const auto& table_shape : tables_shapes) {\n-      xla_tables_shapes.push_back(xla::ShapeUtil::MakeShape(\n-          table_primitive_type,\n-          {table_shape.dim_size(0), table_shape.dim_size(1)}));\n+      if (table_shape.dims() == 2) {\n+        xla_tables_shapes.push_back(xla::ShapeUtil::MakeShape(\n+            table_primitive_type,\n+            {table_shape.dim_size(0), table_shape.dim_size(1)}));\n+      } else if (table_shape.dims() == 1) {\n+        xla_tables_shapes.push_back(xla::ShapeUtil::MakeShape(\n+            table_primitive_type, {table_shape.dim_size(0)}));\n+      } else {\n+        OP_REQUIRES(ctx, false,\n+                    absl::InvalidArgumentError(absl::StrCat(\n+                        \"Table/slot variable rank must be 1 or 2, got \",\n+                        table_shape.dims())));\n+      }\n     }\n \n     xla::Shape tables_shape = xla::ShapeUtil::MakeTupleShape(xla_tables_shapes);"
+        },
+        {
+            "sha": "91d5ac7f735ac45c03e51b23bcc12a106c3304f1",
+            "filename": "tensorflow/core/tpu/ops/sparse_core_ops.cc",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4916c9ffd73be1de50726979fd88067455c52b82/tensorflow%2Fcore%2Ftpu%2Fops%2Fsparse_core_ops.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4916c9ffd73be1de50726979fd88067455c52b82/tensorflow%2Fcore%2Ftpu%2Fops%2Fsparse_core_ops.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcore%2Ftpu%2Fops%2Fsparse_core_ops.cc?ref=4916c9ffd73be1de50726979fd88067455c52b82",
+            "patch": "@@ -656,10 +656,11 @@ REGISTER_OP(\"XlaSparseDenseMatmulGradWithCsrInput\")\n     .Attr(\"num_sparsecores_per_device: int = -1\")\n     .Attr(\"T : {int32, float32} = DT_FLOAT\")\n     .SetShapeFn([](shape_inference::InferenceContext* c) -> absl::Status {\n+      // Each table/slot variable may be 1D or 2D.\n       int num_tables;\n       TF_RETURN_IF_ERROR(c->GetAttr(\"N\", &num_tables));\n       for (int i = 0; i < num_tables; ++i) {\n-        c->set_output(i, c->input(5));\n+        c->set_output(i, c->input(5 + i));\n       }\n       return absl::OkStatus();\n     });"
+        },
+        {
+            "sha": "befbda9507e0030a17f97364914547684343745e",
+            "filename": "tensorflow/python/tpu/tpu_embedding_v2_utils.py",
+            "status": "modified",
+            "additions": 23,
+            "deletions": 2,
+            "changes": 25,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4916c9ffd73be1de50726979fd88067455c52b82/tensorflow%2Fpython%2Ftpu%2Ftpu_embedding_v2_utils.py",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4916c9ffd73be1de50726979fd88067455c52b82/tensorflow%2Fpython%2Ftpu%2Ftpu_embedding_v2_utils.py",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fpython%2Ftpu%2Ftpu_embedding_v2_utils.py?ref=4916c9ffd73be1de50726979fd88067455c52b82",
+            "patch": "@@ -321,6 +321,7 @@ def __init__(\n       slot_names: Optional[List[str]] = None,\n       slot_initializers: Optional[List[init_ops_v2.Initializer]] = None,\n       hyperparameters: Optional[List[Union[float, Callable[[], float]]]] = None,\n+      slot_dims: Optional[List[int]] = None,\n   ) -> Any:\n     super().__init__(  # pytype: disable=wrong-arg-types\n         learning_rate,\n@@ -333,12 +334,11 @@ def __init__(\n         slot_variable_creation_fn=None,\n         low_dimensional_packing_status=False,\n     )\n-    # We need to convert the slot names and initializers to tuples to make\n-    # them hashable.\n     self._slot_names_attr = tuple(slot_names if slot_names else ())\n     self._slot_initializers_attr = tuple(\n         slot_initializers if slot_initializers else ()\n     )\n+    self._slot_dims_attr = tuple(slot_dims if slot_dims else ())\n     num_slot_names = len(self._slot_names_attr)\n     num_slot_initializers = len(self._slot_initializers_attr)\n     if num_slot_names != num_slot_initializers:\n@@ -347,6 +347,18 @@ def __init__(\n           \" the number of slot_initializers\"\n           f\" ({num_slot_initializers}).\"\n       )\n+    if self._slot_dims_attr:\n+      if len(self._slot_dims_attr) != num_slot_names:\n+        raise ValueError(\n+            f\"The number of slot_dims ({len(self._slot_dims_attr)}) must match \"\n+            f\"the number of slot_names ({num_slot_names}).\"\n+        )\n+      for i, dim in enumerate(self._slot_dims_attr):\n+        if dim not in (1, 2):\n+          raise ValueError(\n+              f\"Unsupported slot dim '{dim}' for slot\"\n+              f\" '{self._slot_names_attr[i]}'. Only 1D and 2D are supported.\"\n+          )\n     self._hyperparameters = tuple(hyperparameters if hyperparameters else ())\n     self._custom_computation = custom_computation\n \n@@ -376,6 +388,15 @@ def hyperparameters(self) -> Tuple[Union[float, Callable[[], float]], ...]:\n   def custom_computation(self) -> core.ConcreteFunction:\n     return self._custom_computation\n \n+  @property\n+  def slot_dims(self) -> Tuple[int, ...]:\n+    \"\"\"Optional per-slot dimensions metadata for variable creation.\n+\n+    Each entry corresponds to the same-index item in `slot_names`. This is\n+    consumed by the embedding layer when creating slot variables.\n+    \"\"\"\n+    return self._slot_dims_attr\n+\n \n @tf_export(\"tpu.experimental.embedding.SGD\")\n class SGD(_Optimizer):"
+        },
+        {
+            "sha": "cfda86e57a858d3e7fad08ab797888bfe3c9f754",
+            "filename": "tensorflow/tools/api/golden/v1/tensorflow.tpu.experimental.embedding.-custom-optimizer.pbtxt",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 1,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4916c9ffd73be1de50726979fd88067455c52b82/tensorflow%2Ftools%2Fapi%2Fgolden%2Fv1%2Ftensorflow.tpu.experimental.embedding.-custom-optimizer.pbtxt",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4916c9ffd73be1de50726979fd88067455c52b82/tensorflow%2Ftools%2Fapi%2Fgolden%2Fv1%2Ftensorflow.tpu.experimental.embedding.-custom-optimizer.pbtxt",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Ftools%2Fapi%2Fgolden%2Fv1%2Ftensorflow.tpu.experimental.embedding.-custom-optimizer.pbtxt?ref=4916c9ffd73be1de50726979fd88067455c52b82",
+            "patch": "@@ -12,8 +12,12 @@ tf_class {\n     name: \"hyperparameters\"\n     mtype: \"<type \\'property\\'>\"\n   }\n+  member {\n+    name: \"slot_dims\"\n+    mtype: \"<type \\'property\\'>\"\n+  }\n   member_method {\n     name: \"__init__\"\n-    argspec: \"args=[\\'self\\', \\'custom_computation\\', \\'learning_rate\\', \\'slot_names\\', \\'slot_initializers\\', \\'hyperparameters\\'], varargs=None, keywords=None, defaults=[\\'0.01\\', \\'None\\', \\'None\\', \\'None\\'], \"\n+    argspec: \"args=[\\'self\\', \\'custom_computation\\', \\'learning_rate\\', \\'slot_names\\', \\'slot_initializers\\', \\'hyperparameters\\', \\'slot_dims\\'], varargs=None, keywords=None, defaults=[\\'0.01\\', \\'None\\', \\'None\\', \\'None\\', \\'None\\'], \"\n   }\n }"
+        },
+        {
+            "sha": "cfda86e57a858d3e7fad08ab797888bfe3c9f754",
+            "filename": "tensorflow/tools/api/golden/v2/tensorflow.tpu.experimental.embedding.-custom-optimizer.pbtxt",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 1,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4916c9ffd73be1de50726979fd88067455c52b82/tensorflow%2Ftools%2Fapi%2Fgolden%2Fv2%2Ftensorflow.tpu.experimental.embedding.-custom-optimizer.pbtxt",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4916c9ffd73be1de50726979fd88067455c52b82/tensorflow%2Ftools%2Fapi%2Fgolden%2Fv2%2Ftensorflow.tpu.experimental.embedding.-custom-optimizer.pbtxt",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Ftools%2Fapi%2Fgolden%2Fv2%2Ftensorflow.tpu.experimental.embedding.-custom-optimizer.pbtxt?ref=4916c9ffd73be1de50726979fd88067455c52b82",
+            "patch": "@@ -12,8 +12,12 @@ tf_class {\n     name: \"hyperparameters\"\n     mtype: \"<type \\'property\\'>\"\n   }\n+  member {\n+    name: \"slot_dims\"\n+    mtype: \"<type \\'property\\'>\"\n+  }\n   member_method {\n     name: \"__init__\"\n-    argspec: \"args=[\\'self\\', \\'custom_computation\\', \\'learning_rate\\', \\'slot_names\\', \\'slot_initializers\\', \\'hyperparameters\\'], varargs=None, keywords=None, defaults=[\\'0.01\\', \\'None\\', \\'None\\', \\'None\\'], \"\n+    argspec: \"args=[\\'self\\', \\'custom_computation\\', \\'learning_rate\\', \\'slot_names\\', \\'slot_initializers\\', \\'hyperparameters\\', \\'slot_dims\\'], varargs=None, keywords=None, defaults=[\\'0.01\\', \\'None\\', \\'None\\', \\'None\\', \\'None\\'], \"\n   }\n }"
+        }
+    ],
+    "stats": {
+        "total": 86,
+        "additions": 73,
+        "deletions": 13
+    }
+}

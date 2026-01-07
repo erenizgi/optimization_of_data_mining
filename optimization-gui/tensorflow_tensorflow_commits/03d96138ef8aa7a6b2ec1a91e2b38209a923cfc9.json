@@ -1,0 +1,84 @@
+{
+    "author": "WillFroom",
+    "message": "[XLA:CPU][XTile] Create our own elementwise fusion pass.\n\nThe linalg one is deprecated and has some additional patterns that we don't want where it expands reshapes etc which don't play well with our vectorization (as it introduces extra unit-dim dimensions)\n\nPiperOrigin-RevId: 833696744",
+    "sha": "03d96138ef8aa7a6b2ec1a91e2b38209a923cfc9",
+    "files": [
+        {
+            "sha": "491056125604fbf37eb0f440d92d998ca5f053e1",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/fusion_compiler.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/03d96138ef8aa7a6b2ec1a91e2b38209a923cfc9/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ffusion_compiler.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/03d96138ef8aa7a6b2ec1a91e2b38209a923cfc9/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ffusion_compiler.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ffusion_compiler.cc?ref=03d96138ef8aa7a6b2ec1a91e2b38209a923cfc9",
+            "patch": "@@ -320,7 +320,7 @@ static void AddTiledOptimizationPasses(mlir::OpPassManager& pm) {\n   pm.addPass(CreateTensorOpsToVectorPass());\n \n   pm.addPass(mlir::createConvertElementwiseToLinalgPass());\n-  pm.addPass(mlir::createLinalgElementwiseOpFusionPass());\n+  pm.addPass(CreateFuseElementwisePass());\n \n   AddBufferizationPasses(pm);\n "
+        },
+        {
+            "sha": "ae2d724c0c4c93869287716d04153493ddfcb5d5",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/tiled/transforms/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/03d96138ef8aa7a6b2ec1a91e2b38209a923cfc9/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/03d96138ef8aa7a6b2ec1a91e2b38209a923cfc9/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2FBUILD?ref=03d96138ef8aa7a6b2ec1a91e2b38209a923cfc9",
+            "patch": "@@ -48,6 +48,7 @@ cc_library(\n cc_library(\n     name = \"passes\",\n     srcs = [\n+        \"fuse_elementwise_pass.cc\",\n         \"linalg_elementwise_to_vector_pass.cc\",\n         \"lower_xtile_entry.cc\",\n         \"memref_copy_to_loops.cc\","
+        },
+        {
+            "sha": "d8248ebea93845a413569674478722472a048cd6",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/tiled/transforms/fuse_elementwise_pass.cc",
+            "status": "added",
+            "additions": 73,
+            "deletions": 0,
+            "changes": 73,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/03d96138ef8aa7a6b2ec1a91e2b38209a923cfc9/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ffuse_elementwise_pass.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/03d96138ef8aa7a6b2ec1a91e2b38209a923cfc9/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ffuse_elementwise_pass.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ffuse_elementwise_pass.cc?ref=03d96138ef8aa7a6b2ec1a91e2b38209a923cfc9",
+            "patch": "@@ -0,0 +1,73 @@\n+/* Copyright 2025 The OpenXLA Authors.\n+\n+Licensed under the Apache License, Version 2.0 (the \"License\");\n+you may not use this file except in compliance with the License.\n+You may obtain a copy of the License at\n+\n+    http://www.apache.org/licenses/LICENSE-2.0\n+\n+Unless required by applicable law or agreed to in writing, software\n+distributed under the License is distributed on an \"AS IS\" BASIS,\n+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+See the License for the specific language governing permissions and\n+limitations under the License.\n+==============================================================================*/\n+\n+#include <cassert>\n+#include <memory>\n+#include <utility>\n+\n+#include \"mlir/Dialect/LLVMIR/LLVMDialect.h\"  // IWYU pragma: keep\n+#include \"mlir/Dialect/Linalg/Transforms/Transforms.h\"\n+#include \"mlir/Dialect/Vector/IR/VectorOps.h\"\n+#include \"mlir/IR/AffineExpr.h\"\n+#include \"mlir/IR/BuiltinAttributes.h\"\n+#include \"mlir/IR/MLIRContext.h\"\n+#include \"mlir/IR/PatternMatch.h\"\n+#include \"mlir/IR/Value.h\"\n+#include \"mlir/Pass/Pass.h\"\n+#include \"mlir/Support/LLVM.h\"\n+#include \"mlir/Transforms/GreedyPatternRewriteDriver.h\"\n+#include \"xla/backends/cpu/codegen/tiled/transforms/passes.h\"\n+\n+namespace xla::cpu {\n+\n+#define GEN_PASS_DEF_FUSEELEMENTWISEPASS\n+#include \"xla/backends/cpu/codegen/tiled/transforms/passes.h.inc\"\n+\n+namespace {\n+\n+class FuseElementwisePass\n+    : public impl::FuseElementwisePassBase<FuseElementwisePass> {\n+ public:\n+  using FuseElementwisePassBase::FuseElementwisePassBase;\n+\n+  void runOnOperation() override {\n+    mlir::MLIRContext* context = &getContext();\n+    mlir::RewritePatternSet patterns(context);\n+\n+    // Only fuse op with one use.\n+    mlir::linalg::ControlFusionFn fuse_control_fn =\n+        [](mlir::OpOperand* fused_operand) {\n+          mlir::Operation* producer = fused_operand->get().getDefiningOp();\n+          return producer && producer->hasOneUse();\n+        };\n+\n+    mlir::linalg::populateElementwiseOpsFusionPatterns(patterns,\n+                                                       fuse_control_fn);\n+\n+    if (mlir::failed(\n+            mlir::applyPatternsGreedily(getOperation(), std::move(patterns)))) {\n+      signalPassFailure();\n+      return;\n+    }\n+  }\n+};\n+\n+}  // namespace\n+\n+std::unique_ptr<mlir::Pass> CreateFuseElementwisePass() {\n+  return std::make_unique<FuseElementwisePass>();\n+}\n+\n+}  // namespace xla::cpu"
+        },
+        {
+            "sha": "cd0652209904d5b1caa53e1965fcb0e9c9d44301",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/tiled/transforms/passes.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/03d96138ef8aa7a6b2ec1a91e2b38209a923cfc9/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Fpasses.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/03d96138ef8aa7a6b2ec1a91e2b38209a923cfc9/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Fpasses.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Fpasses.h?ref=03d96138ef8aa7a6b2ec1a91e2b38209a923cfc9",
+            "patch": "@@ -39,6 +39,7 @@ std::unique_ptr<mlir::Pass> CreateLowerXTileEntryPass();\n std::unique_ptr<mlir::Pass> CreateShloToVectorPass();\n std::unique_ptr<mlir::Pass> CreateTensorOpsToVectorPass();\n std::unique_ptr<mlir::Pass> CreateMemrefCopyToLoopsPass();\n+std::unique_ptr<mlir::Pass> CreateFuseElementwisePass();\n \n #define GEN_PASS_REGISTRATION\n #include \"xla/backends/cpu/codegen/tiled/transforms/passes.h.inc\""
+        },
+        {
+            "sha": "c7bd00bca9b42cf461a5324cc2f6b1b30476d2ab",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/tiled/transforms/passes.td",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 0,
+            "changes": 10,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/03d96138ef8aa7a6b2ec1a91e2b38209a923cfc9/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Fpasses.td",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/03d96138ef8aa7a6b2ec1a91e2b38209a923cfc9/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Fpasses.td",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Fpasses.td?ref=03d96138ef8aa7a6b2ec1a91e2b38209a923cfc9",
+            "patch": "@@ -77,3 +77,13 @@ def MemrefCopyToLoopsPass : Pass<\"xtile-cpu-memref-copy-to-loops\",\n     \"::mlir::memref::MemRefDialect\",\n   ];\n }\n+\n+def FuseElementwisePass : Pass<\"xtile-cpu-fuse-elementwise\"> {\n+  let summary = \"Fuse linalg elementwise ops.\";\n+\n+  let description = [{\n+    This pass fuses multiple linalg elementwise ops into linalg elementwise ops\n+    that contain multiple instructions. This allows for fewer matrializations\n+    and fewer temporary allocations in bufferization.\n+  }];\n+}"
+        },
+        {
+            "sha": "b9adea8741e8cc4d3a215caaa3da576d0b1ed8ea",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/tiled/transforms/tests/fuse_elementwise.mlir",
+            "status": "added",
+            "additions": 23,
+            "deletions": 0,
+            "changes": 23,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/03d96138ef8aa7a6b2ec1a91e2b38209a923cfc9/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Ffuse_elementwise.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/03d96138ef8aa7a6b2ec1a91e2b38209a923cfc9/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Ffuse_elementwise.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Ffuse_elementwise.mlir?ref=03d96138ef8aa7a6b2ec1a91e2b38209a923cfc9",
+            "patch": "@@ -0,0 +1,23 @@\n+// RUN: fusion_compiler_opt %s -split-input-file  \\\n+// RUN:   -linalg-generalize-named-ops -xtile-cpu-fuse-elementwise | FileCheck %s\n+\n+func.func @elementwise_add_to_vector(\n+    %lhs : tensor<8x1024xf32>,\n+    %rhs : tensor<8x1024xf32>) -> tensor<8x1024xf32> {\n+  %out = tensor.empty() : tensor<8x1024xf32>\n+\n+  %intermediate = linalg.elementwise kind=#linalg.elementwise_kind<mul>\n+    ins(%lhs, %rhs : tensor<8x1024xf32>, tensor<8x1024xf32>)\n+    outs(%out : tensor<8x1024xf32>) -> tensor<8x1024xf32>\n+  %result = linalg.elementwise kind=#linalg.elementwise_kind<add>\n+    ins(%intermediate, %rhs : tensor<8x1024xf32>, tensor<8x1024xf32>)\n+    outs(%out : tensor<8x1024xf32>) -> tensor<8x1024xf32>\n+  return %result : tensor<8x1024xf32>\n+}\n+\n+// CHECK: linalg.generic\n+// CHECK:    (%[[LHS:.*]]: f32, %[[RHS:.*]]: f32, %[[OUT:.*]]: f32):\n+// CHECK:       %[[MUL:.*]] = arith.mulf %[[LHS]], %[[RHS]] : f32\n+// CHECK:       %[[RES:.*]] = arith.addf %[[MUL]], %[[RHS]] : f32\n+// CHECK:       linalg.yield %[[RES]] : f32\n+// CHECK:     }"
+        }
+    ],
+    "stats": {
+        "total": 110,
+        "additions": 109,
+        "deletions": 1
+    }
+}

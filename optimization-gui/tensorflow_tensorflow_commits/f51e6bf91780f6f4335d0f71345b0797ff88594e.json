@@ -1,0 +1,60 @@
+{
+    "author": "tensorflower-gardener",
+    "message": "[XLA:Original Value] Improve OriginalValue tracking in MultiOutputFusion.\n\nThis change enhances the propagation and merging of `OriginalValue` metadata during the `MultiOutputFusion` pass:\n\n1.  **Handles Synthetic/Empty Values:** Properly clears `OriginalValue` on the fusion node when attempting to fuse instructions where at least one has a synthetic origin or both have empty origins, as a clear merging strategy isn't defined for these cases.\n2.  **Preserves Origins on Swap:** Ensures `OriginalValue` from both instructions are correctly captured *before* any potential swap in the `Fuse` function, so the merged `OriginalValue` accurately reflects the inputs, regardless of fusion order.\n3.  **Shape Compatibility Checks:** Introduces `OriginalValue::IsCompatibleWith` (which uses `TupleTree::IsStructurallyCompatible`) to add CHECKs verifying that an instruction's `OriginalValue` remains consistent with its Shape during the fusion process.\n4.  **Propagation in New Fusions:** Ensures `OriginalValue` is copied over when a single instruction is wrapped in a new fusion node via `CreateFusionCandidate`.\n\nThese changes increase the robustness and correctness of original value tracking through complex multi-output fusion transformations. New unit tests in `multi_output_fusion_test.cc` cover the handling of synthetic values and the instruction swap scenario.\n\nPiperOrigin-RevId: 807975819",
+    "sha": "f51e6bf91780f6f4335d0f71345b0797ff88594e",
+    "files": [
+        {
+            "sha": "dde23a03da0800eb09bfcfaa2be2b56e9b642468",
+            "filename": "third_party/xla/xla/hlo/ir/hlo_original_value.cc",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f51e6bf91780f6f4335d0f71345b0797ff88594e/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_original_value.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f51e6bf91780f6f4335d0f71345b0797ff88594e/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_original_value.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_original_value.cc?ref=f51e6bf91780f6f4335d0f71345b0797ff88594e",
+            "patch": "@@ -299,4 +299,11 @@ OriginalValue::EmptyOriginalValueTupleTree() {\n   return *kEmptyTupleTree;\n }\n \n+bool OriginalValue::IsCompatibleWith(const Shape& shape) const {\n+  if (is_synthetic_call()) {\n+    return true;\n+  }\n+  return tree().IsStructurallyCompatible(shape);\n+}\n+\n }  // namespace xla"
+        },
+        {
+            "sha": "f46356cec022e11eba3420fef64eb26956fa7dcd",
+            "filename": "third_party/xla/xla/hlo/ir/hlo_original_value.h",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 0,
+            "changes": 11,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f51e6bf91780f6f4335d0f71345b0797ff88594e/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_original_value.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f51e6bf91780f6f4335d0f71345b0797ff88594e/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_original_value.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_original_value.h?ref=f51e6bf91780f6f4335d0f71345b0797ff88594e",
+            "patch": "@@ -117,6 +117,17 @@ class OriginalValue {\n     return mutable_tree()->leaves();\n   }\n \n+  bool IsEmpty() const {\n+    if (is_synthetic_call()) {\n+      return true;\n+    }\n+    return std::all_of(\n+        tree().leaves().begin(), tree().leaves().end(),\n+        [](const auto& pair) { return !pair.second.has_value(); });\n+  }\n+\n+  bool IsCompatibleWith(const Shape& shape) const;\n+\n   bool operator==(const OriginalValue& other) const;\n \n   bool operator!=(const OriginalValue& other) const {"
+        },
+        {
+            "sha": "a919a3c2e4f037ea335ea5640c425ca7e253fe33",
+            "filename": "third_party/xla/xla/service/multi_output_fusion.cc",
+            "status": "modified",
+            "additions": 57,
+            "deletions": 17,
+            "changes": 74,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f51e6bf91780f6f4335d0f71345b0797ff88594e/third_party%2Fxla%2Fxla%2Fservice%2Fmulti_output_fusion.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f51e6bf91780f6f4335d0f71345b0797ff88594e/third_party%2Fxla%2Fxla%2Fservice%2Fmulti_output_fusion.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fmulti_output_fusion.cc?ref=f51e6bf91780f6f4335d0f71345b0797ff88594e",
+            "patch": "@@ -87,49 +87,88 @@ absl::StatusOr<bool> MultiOutputFusion::Run(\n }\n \n namespace {\n-void SetOriginalValue(HloInstruction* remaining, HloInstruction* fused,\n-                      const Shape& remaining_shape, const Shape& fused_shape) {\n-  auto remaining_ov = remaining->original_value();\n-  auto fused_ov = fused->original_value();\n-  if (remaining_ov == nullptr && fused_ov == nullptr) {\n-    return;\n+\n+// Returns the original value that can be used for multi output fusion. The\n+// placeholder is just to provide a matching tuple tree of empty original arrays\n+// for the fusion logic in `SetOriginalValueOnFusedInstruction` to correctly\n+// populate the fused original value.\n+std::shared_ptr<OriginalValue> GetOriginalValueOrPlaceholder(\n+    HloInstruction* inst) {\n+  if (inst->original_value()) {\n+    if (!inst->original_value()->IsCompatibleWith(inst->shape())) {\n+      LOG(ERROR) << \"Instruction '\" << inst->name()\n+                 << \"' has original value incompatible with its \"\n+                    \"shape.\\nOriginal value: \"\n+                 << inst->original_value()->ToString()\n+                 << \"\\nShape: \" << inst->shape().ToString();\n+      // Return nullptr to bail out of original value tracking.\n+      return nullptr;\n+    }\n+    return inst->original_value();\n   }\n+  return std::make_shared<OriginalValue>(inst->shape());\n+}\n \n-  if (!remaining_ov) {\n-    remaining_ov = std::make_shared<OriginalValue>(remaining_shape);\n+// Sets the original value on the final (aka remaining) instruction after\n+// fusion. This function assumes the final instruction to have a fused\n+// shape. This fused shape should be a tuple containing elements from\n+// `first_fused_ov` and `second_fused_ov`.\n+void SetOriginalValueOnFusedInstruction(\n+    HloInstruction* final_instr, std::shared_ptr<OriginalValue> first_fused_ov,\n+    std::shared_ptr<OriginalValue> second_fused_ov) {\n+  if (!first_fused_ov || !second_fused_ov) {\n+    return;\n   }\n-  if (!fused_ov) {\n-    fused_ov = std::make_shared<OriginalValue>(fused_shape);\n+  if (first_fused_ov->is_synthetic_call() ||\n+      second_fused_ov->is_synthetic_call() ||\n+      (first_fused_ov->IsEmpty() && second_fused_ov->IsEmpty())) {\n+    // Synthetic calls are generated by optimization passes and usually they\n+    // should be inlined immediately. If somehow this multi output pass needs to\n+    // fuse synthetic calls, we just ignore the original value because it's not\n+    // clear how to fuse them.\n+    final_instr->set_original_value(nullptr);\n+    return;\n   }\n+\n   std::vector<std::optional<OriginalArray>> new_leaves;\n-  for (const auto& [index, value] : remaining_ov->original_arrays()) {\n+  for (const auto& [index, value] : first_fused_ov->original_arrays()) {\n     new_leaves.push_back(value);\n   }\n-  for (const auto& [index, value] : fused_ov->original_arrays()) {\n+  for (const auto& [index, value] : second_fused_ov->original_arrays()) {\n     new_leaves.push_back(value);\n   }\n \n-  auto new_ov = std::make_shared<OriginalValue>(remaining->shape());\n+  auto new_ov = std::make_shared<OriginalValue>(final_instr->shape());\n   int64_t leaf_index = 0;\n   for (auto& [index, value] : new_ov->mutable_original_arrays()) {\n+    CHECK_LT(leaf_index, new_leaves.size());\n     value = new_leaves[leaf_index++];\n   }\n-  remaining->set_original_value(new_ov);\n+  final_instr->set_original_value(new_ov);\n }\n }  // namespace\n \n HloInstruction* MultiOutputFusion::Fuse(HloInstruction* instr1,\n                                         HloInstruction* instr2) {\n   HloInstruction* remaining = instr1;\n   HloInstruction* fused = instr2;\n-  const Shape& remaining_shape = remaining->shape();\n-  const Shape& fused_shape = fused->shape();\n \n   // Make sure that if only one of the instructions is a fusion, or if only one\n   // of the instructions is a multi-output fusion, it's what will be fused into.\n   if (!remaining->IsMultiOutputFusion() && fused->IsMultiOutputFusion()) {\n     std::swap(remaining, fused);\n   }\n+\n+  std::shared_ptr<OriginalValue> remaining_ov;\n+  std::shared_ptr<OriginalValue> fused_ov;\n+  if (remaining->original_value() || fused->original_value()) {\n+    // Only set these for tracking original value if original value is at least\n+    // set for one of the instructions. Otherwise, just bail out of any original\n+    // value logic below.\n+    remaining_ov = GetOriginalValueOrPlaceholder(remaining);\n+    fused_ov = GetOriginalValueOrPlaceholder(fused);\n+  }\n+\n   if (remaining->opcode() != HloOpcode::kFusion) {\n     remaining = CreateFusion(remaining, fused);\n   }\n@@ -139,7 +178,7 @@ HloInstruction* MultiOutputFusion::Fuse(HloInstruction* instr1,\n     remaining->FuseInstructionIntoMultiOutput(fused);\n   }\n \n-  SetOriginalValue(remaining, fused, remaining_shape, fused_shape);\n+  SetOriginalValueOnFusedInstruction(remaining, remaining_ov, fused_ov);\n   return remaining;\n }\n \n@@ -148,6 +187,7 @@ HloInstruction* MultiOutputFusion::CreateFusion(HloInstruction* base,\n   HloInstruction* input_fusion =\n       computation()->AddInstruction(HloInstruction::CreateFusion(\n           base->shape(), HloInstruction::FusionKind::kLoop, base));\n+  input_fusion->set_original_value(base->original_value());\n \n   // Update candidate_ and all_fusion_candidates_.\n   int64_t index = candidates_.size();"
+        },
+        {
+            "sha": "dcdf8442e8bca437298e2e215d2fb420f4fb668b",
+            "filename": "third_party/xla/xla/tuple_tree.h",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 0,
+            "changes": 15,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f51e6bf91780f6f4335d0f71345b0797ff88594e/third_party%2Fxla%2Fxla%2Ftuple_tree.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f51e6bf91780f6f4335d0f71345b0797ff88594e/third_party%2Fxla%2Fxla%2Ftuple_tree.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Ftuple_tree.h?ref=f51e6bf91780f6f4335d0f71345b0797ff88594e",
+            "patch": "@@ -356,6 +356,21 @@ class TupleTree {\n     return entry_or.value()->children_start_id == -1;\n   }\n \n+  // Checks if the structure of this TupleTree is compatible with the given\n+  // shape.\n+  bool IsStructurallyCompatible(const Shape& shape) const {\n+    internal::IndexTable shape_table(shape);\n+    auto shape_root_or = shape_table.GetEntry({});\n+    auto tree_root_or = index_table_.GetEntry({});\n+    if (!shape_root_or.ok() || !tree_root_or.ok()) {\n+      return false;\n+    }\n+    return internal::IndexTable::IsSubtreeCompatible(\n+               shape_table, shape_root_or.value(), index_table_,\n+               tree_root_or.value())\n+        .ok();\n+  }\n+\n   absl::Status CopyCompatibleSubtreeFrom(const TupleTree<T>& other,\n                                          const ShapeIndex& src_index,\n                                          const ShapeIndex& dst_index) {"
+        }
+    ],
+    "stats": {
+        "total": 107,
+        "additions": 90,
+        "deletions": 17
+    }
+}

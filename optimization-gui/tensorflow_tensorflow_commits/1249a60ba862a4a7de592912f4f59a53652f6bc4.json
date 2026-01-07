@@ -1,0 +1,36 @@
+{
+    "author": "ezhulenev",
+    "message": "[xla:ifrt] Migrate from deprecated PjRtFuture::CreatePromise API\n\nPiperOrigin-RevId: 803288703",
+    "sha": "1249a60ba862a4a7de592912f4f59a53652f6bc4",
+    "files": [
+        {
+            "sha": "97443a1b0b99751fae33716a813633b25efb7c31",
+            "filename": "third_party/xla/xla/python/pjrt_ifrt/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/1249a60ba862a4a7de592912f4f59a53652f6bc4/third_party%2Fxla%2Fxla%2Fpython%2Fpjrt_ifrt%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/1249a60ba862a4a7de592912f4f59a53652f6bc4/third_party%2Fxla%2Fxla%2Fpython%2Fpjrt_ifrt%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpython%2Fpjrt_ifrt%2FBUILD?ref=1249a60ba862a4a7de592912f4f59a53652f6bc4",
+            "patch": "@@ -540,6 +540,7 @@ xla_cc_test(\n         \"@com_google_absl//absl/algorithm:container\",\n         \"@com_google_absl//absl/log\",\n         \"@com_google_absl//absl/status\",\n+        \"@com_google_absl//absl/status:status_matchers\",\n         \"@com_google_absl//absl/strings\",\n         \"@com_google_absl//absl/strings:cord\",\n         \"@com_google_absl//absl/strings:string_view\","
+        },
+        {
+            "sha": "7afc72615831c4846a0c708bfc9e98323b3e4dc9",
+            "filename": "third_party/xla/xla/python/pjrt_ifrt/basic_string_array_test.cc",
+            "status": "modified",
+            "additions": 23,
+            "deletions": 19,
+            "changes": 42,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/1249a60ba862a4a7de592912f4f59a53652f6bc4/third_party%2Fxla%2Fxla%2Fpython%2Fpjrt_ifrt%2Fbasic_string_array_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/1249a60ba862a4a7de592912f4f59a53652f6bc4/third_party%2Fxla%2Fxla%2Fpython%2Fpjrt_ifrt%2Fbasic_string_array_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpython%2Fpjrt_ifrt%2Fbasic_string_array_test.cc?ref=1249a60ba862a4a7de592912f4f59a53652f6bc4",
+            "patch": "@@ -29,6 +29,7 @@ limitations under the License.\n #include \"absl/algorithm/container.h\"\n #include \"absl/log/log.h\"\n #include \"absl/status/status.h\"\n+#include \"absl/status/status_matchers.h\"\n #include \"absl/strings/cord.h\"\n #include \"absl/strings/str_cat.h\"\n #include \"absl/strings/string_view.h\"\n@@ -58,7 +59,6 @@ namespace {\n using ::testing::ElementsAre;\n using ::testing::ElementsAreArray;\n using ::testing::HasSubstr;\n-using ::tsl::testing::StatusIs;\n \n // ////////////////////////////////////////////////////////////////////////////\n //\n@@ -109,8 +109,8 @@ absl::StatusOr<std::pair<tsl::RCReference<BasicStringArray>,\n CreateNonReadyTestArray(\n     Client* client, Device* const device,\n     BasicStringArray::OnDoneWithBuffer on_done_with_buffer) {\n-  auto buffers_promise = Future<BasicStringArray::Buffers>::CreatePromise();\n-  auto buffers_future = Future<BasicStringArray::Buffers>(buffers_promise);\n+  auto [buffers_promise, buffers_future] =\n+      Future<BasicStringArray::Buffers>::MakePromise();\n   Shape shape({1});\n   ShardingRef sharding = SingleDeviceSharding::Create(device, MemoryKind());\n \n@@ -158,19 +158,20 @@ TEST(BasicStringArrayTest, Destruction) {\n   BasicStringArray::OnDoneWithBuffer on_done_with_buffer =\n       [&on_done_with_buffer_called]() { on_done_with_buffer_called.Notify(); };\n \n-  auto array_creation_status_promise = PjRtFuture<>::CreatePromise();\n+  auto [array_creation_promise, array_creation_future] =\n+      PjRtFuture<>::MakePromise();\n \n-  tsl::Env::Default()->SchedClosure(([&]() {\n-    auto array = CreateTestArray(client.get(),\n-                                 Future<BasicStringArray::Buffers>(buffers),\n-                                 std::move(on_done_with_buffer));\n-\n-    array_creation_status_promise.Set(array.status());\n-    // `array` goes out of scope and gets destroyed.\n-  }));\n+  tsl::Env::Default()->SchedClosure(\n+      ([&, promise = std::move(array_creation_promise)]() mutable {\n+        auto array = CreateTestArray(client.get(),\n+                                     Future<BasicStringArray::Buffers>(buffers),\n+                                     std::move(on_done_with_buffer));\n+        promise.Set(array.status());\n+        // `array` goes out of scope and gets destroyed.\n+      }));\n \n   // Make sure that the array has been created successfully.\n-  TF_ASSERT_OK(Future<>(array_creation_status_promise).Await());\n+  TF_ASSERT_OK(array_creation_future.Await());\n \n   // Destruction must release the buffer. That is, the `on_done_with_buffer`\n   // callback must be called.\n@@ -237,8 +238,8 @@ TEST(BasicStringArrayTest, Delete) {\n TEST(GetReadyFutureTest, SuccessCase) {\n   TF_ASSERT_OK_AND_ASSIGN(auto client, test_util::GetClient());\n   // Make a BasicStringArray with a future that is not ready.\n-  auto promise = Future<BasicStringArray::Buffers>::CreatePromise();\n-  auto buffers_future = Future<BasicStringArray::Buffers>(promise);\n+  auto [promise, buffers_future] =\n+      Future<BasicStringArray::Buffers>::MakePromise();\n   TF_ASSERT_OK_AND_ASSIGN(auto array,\n                           CreateTestArray(client.get(), buffers_future,\n                                           /*on_done_with_buffer=*/nullptr));\n@@ -250,15 +251,16 @@ TEST(GetReadyFutureTest, SuccessCase) {\n   // Make the buffers future ready asynchronously.\n   BasicStringArray::Buffers buffers;\n   buffers.push_back({absl::Cord(\"abc\"), absl::Cord(\"def\")});\n-  tsl::Env::Default()->SchedClosure([&]() { promise.Set(buffers); });\n+  tsl::Env::Default()->SchedClosure(\n+      [&, promise = std::move(promise)]() mutable { promise.Set(buffers); });\n   TF_EXPECT_OK(ready_future.Await());\n }\n \n TEST(GetReadyFutureTest, FailureCases) {\n   TF_ASSERT_OK_AND_ASSIGN(auto client, test_util::GetClient());\n   // Make a BasicStringArray with a future that is not ready.\n-  auto promise = Future<BasicStringArray::Buffers>::CreatePromise();\n-  auto buffers_future = Future<BasicStringArray::Buffers>(promise);\n+  auto [promise, buffers_future] =\n+      Future<BasicStringArray::Buffers>::MakePromise();\n   TF_ASSERT_OK_AND_ASSIGN(auto array,\n                           CreateTestArray(client.get(), buffers_future,\n                                           /*on_done_with_buffer=*/nullptr));\n@@ -269,7 +271,9 @@ TEST(GetReadyFutureTest, FailureCases) {\n \n   // Make the buffers future ready with an error asynchronously\n   tsl::Env::Default()->SchedClosure(\n-      [&]() { promise.Set(absl::InternalError(\"injected error\")); });\n+      [&, promise = std::move(promise)]() mutable {\n+        promise.Set(absl::InternalError(\"injected error\"));\n+      });\n \n   EXPECT_THAT(ready_future.Await(),\n               absl_testing::StatusIs(absl::StatusCode::kInternal));"
+        }
+    ],
+    "stats": {
+        "total": 43,
+        "additions": 24,
+        "deletions": 19
+    }
+}

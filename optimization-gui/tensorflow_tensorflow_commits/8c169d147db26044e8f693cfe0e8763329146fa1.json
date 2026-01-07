@@ -1,0 +1,60 @@
+{
+    "author": "shawnwang18",
+    "message": "PR #32719: 【XLA:GPU] Command buffer DynamicSliceFusionCmd supports cuda graph loop unrolling\n\nImported from GitHub PR https://github.com/openxla/xla/pull/32719\n\n📝 Summary of Changes\nThis PR enables command buffer DynamicSliceFusion command to be recorded into an unrolled cuda-graph, when it is surrounded by WhileCmd\n\n🎯 Justification\nThis feature is required if we want to fully command buffer WhileCmd into an unrolled cuda-graph.\n\n🚀 Kind of Contribution\nPlease remove what does not apply:\n✨ New Feature\n\n🧪 Unit Tests:\nxla/backends/gpu/codegen/dynamic_slice_fusion_test.cc\nCopybara import of the project:\n\n--\ndaa975804cbffcc3a6bc5b37e3494b51a2dbe2ca by Shawn Wang <shawnw@nvidia.com>:\n\nDynamicSliceFsuionCmd supports unrolling\n\nMerging this change closes #32719\n\nPiperOrigin-RevId: 822071751",
+    "sha": "8c169d147db26044e8f693cfe0e8763329146fa1",
+    "files": [
+        {
+            "sha": "c9c1785b38a9efa7ee7cc342efdc18c457c6ad22",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/BUILD",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/8c169d147db26044e8f693cfe0e8763329146fa1/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/8c169d147db26044e8f693cfe0e8763329146fa1/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2FBUILD?ref=8c169d147db26044e8f693cfe0e8763329146fa1",
+            "patch": "@@ -218,7 +218,10 @@ xla_test(\n         \"//xla/service/gpu:ir_emission_utils\",\n         \"//xla/service/gpu/transforms:dynamic_slice_fusion_rewriter\",\n         \"//xla/stream_executor:device_memory\",\n+        \"//xla/stream_executor:platform_manager\",\n         \"//xla/stream_executor:stream\",\n+        \"//xla/stream_executor:stream_executor_h\",\n+        \"//xla/stream_executor/cuda:cuda_compute_capability\",\n         \"//xla/tests:hlo_test_base\",\n         \"//xla/tsl/platform:errors\",\n         \"//xla/tsl/platform:statusor\","
+        },
+        {
+            "sha": "2f81904a8e1ad8f0ed89c4ea21253a96f380e6fc",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/dynamic_slice_fusion_test.cc",
+            "status": "modified",
+            "additions": 58,
+            "deletions": 4,
+            "changes": 62,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/8c169d147db26044e8f693cfe0e8763329146fa1/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Fdynamic_slice_fusion_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/8c169d147db26044e8f693cfe0e8763329146fa1/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Fdynamic_slice_fusion_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Fdynamic_slice_fusion_test.cc?ref=8c169d147db26044e8f693cfe0e8763329146fa1",
+            "patch": "@@ -47,8 +47,11 @@ limitations under the License.\n #include \"xla/service/platform_util.h\"\n #include \"xla/shape.h\"\n #include \"xla/shape_util.h\"\n+#include \"xla/stream_executor/cuda/cuda_compute_capability.h\"\n #include \"xla/stream_executor/device_memory.h\"\n+#include \"xla/stream_executor/platform_manager.h\"\n #include \"xla/stream_executor/stream.h\"\n+#include \"xla/stream_executor/stream_executor.h\"\n #include \"xla/tests/hlo_test_base.h\"\n #include \"xla/tsl/platform/errors.h\"\n #include \"xla/tsl/platform/statusor.h\"\n@@ -73,6 +76,28 @@ MATCHER_P(ThunkKindIs, kind, \"\") {\n   return ExplainMatchResult(::testing::Eq(kind), arg->kind(), result_listener);\n }\n \n+se::StreamExecutor* GpuExecutor() {\n+  auto name =\n+      absl::AsciiStrToUpper(PlatformUtil::CanonicalPlatformName(\"gpu\").value());\n+  auto* platform = se::PlatformManager::PlatformWithName(name).value();\n+  return platform->ExecutorForDevice(0).value();\n+}\n+\n+bool IsAtLeastCuda12900(const se::StreamExecutor* stream_executor) {\n+  const auto& device_description = stream_executor->GetDeviceDescription();\n+  const auto* cuda_cc = std::get_if<se::CudaComputeCapability>(\n+      &device_description.gpu_compute_capability());\n+  if (cuda_cc != nullptr) {\n+    if (device_description.driver_version() >=\n+            stream_executor::SemanticVersion(12, 9, 0) &&\n+        device_description.runtime_version() >=\n+            stream_executor::SemanticVersion(12, 9, 0)) {\n+      return true;\n+    }\n+  }\n+  return false;\n+}\n+\n class DynamicSliceFusionTest : public HloTestBase {\n  public:\n   HloModuleConfig GetModuleConfigWithoutCommandBuffer() {\n@@ -105,6 +130,30 @@ class DynamicSliceFusionTest : public HloTestBase {\n     return config;\n   }\n \n+  HloModuleConfig GetModuleConfigWithCommandBufferUnrollLoops() {\n+    DebugOptions debug_options = GetDebugOptionsForTest();\n+    debug_options.set_xla_gpu_enable_cublaslt(false);\n+    debug_options.set_xla_gpu_gemm_rewrite_size_threshold(0);\n+    debug_options.set_xla_gpu_enable_dynamic_slice_fusion(true);\n+    debug_options.set_xla_gpu_triton_gemm_any(false);\n+    debug_options.set_xla_gpu_enable_cublaslt(false);\n+    debug_options.set_xla_gpu_cublas_fallback(true);\n+    debug_options.set_xla_gpu_graph_min_graph_size(1);\n+    debug_options.add_xla_gpu_enable_command_buffer(DebugOptions::FUSION);\n+    debug_options.add_xla_gpu_enable_command_buffer(DebugOptions::CUBLAS);\n+    debug_options.add_xla_gpu_enable_command_buffer(DebugOptions::CUBLASLT);\n+    debug_options.add_xla_gpu_enable_command_buffer(DebugOptions::CUSTOM_CALL);\n+    debug_options.add_xla_gpu_enable_command_buffer(DebugOptions::CUDNN);\n+    debug_options.add_xla_gpu_enable_command_buffer(DebugOptions::COLLECTIVES);\n+    debug_options.add_xla_gpu_enable_command_buffer(DebugOptions::WHILE);\n+    debug_options.add_xla_gpu_enable_command_buffer(\n+        DebugOptions::DYNAMIC_SLICE_FUSION);\n+    debug_options.set_xla_gpu_command_buffer_unroll_loops(true);\n+    HloModuleConfig config;\n+    config.set_debug_options(debug_options);\n+    return config;\n+  }\n+\n   HloModuleConfig GetModuleConfigWithDeterministicOps() {\n     DebugOptions debug_options = GetDebugOptionsForTest();\n     debug_options.set_xla_gpu_exclude_nondeterministic_ops(true);\n@@ -3454,10 +3503,6 @@ TEST_F(DynamicSliceFusionTest,\n     ROOT %while = while(%initial_tuple), condition=%Cond, body=%Body, backend_config={\"known_trip_count\":{\"n\":\"11\"}}\n   })\";\n \n-  // Run the same HLO with and without command buffer and compare results.\n-  HloModuleConfig with_cmd_buffer = GetModuleConfigWithCommandBuffer();\n-  HloModuleConfig without_cmd_buffer = GetModuleConfigWithoutCommandBuffer();\n-\n   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> cmd_buffer_module,\n                           ParseAndReturnVerifiedModule(hlo));\n \n@@ -3469,6 +3514,15 @@ TEST_F(DynamicSliceFusionTest,\n       RunAndCompareTwoModules(hlo, hlo, GetModuleConfigWithCommandBuffer(),\n                               GetModuleConfigWithoutCommandBuffer(), error_spec,\n                               /*run_hlo_passes=*/true));\n+\n+  se::StreamExecutor* stream_executor = GpuExecutor();\n+  if (!IsAtLeastCuda12900(stream_executor)) {\n+    GTEST_SKIP() << \"While loop unrolling is not supported for CUDA < 12.9\";\n+  }\n+  EXPECT_TRUE(RunAndCompareTwoModules(\n+      hlo, hlo, GetModuleConfigWithCommandBufferUnrollLoops(),\n+      GetModuleConfigWithoutCommandBuffer(), error_spec,\n+      /*run_hlo_passes=*/true));\n }\n \n TEST_F(DynamicSliceFusionTest, MultipleOffsetsAsFunctionOfInductionVariable) {"
+        },
+        {
+            "sha": "10e9584af0e67088bfc235c168192ff8cbdf27e9",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/command_buffer_cmd.cc",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 0,
+            "changes": 8,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/8c169d147db26044e8f693cfe0e8763329146fa1/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fcommand_buffer_cmd.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/8c169d147db26044e8f693cfe0e8763329146fa1/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fcommand_buffer_cmd.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fcommand_buffer_cmd.cc?ref=8c169d147db26044e8f693cfe0e8763329146fa1",
+            "patch": "@@ -1493,6 +1493,14 @@ absl::Status WhileCmd::Initialize(const Thunk::InitializeParams& params,\n   return absl::OkStatus();\n }\n \n+absl::Status WhileCmd::Prepare(\n+    const Thunk::PrepareParams& params,\n+    Thunk::ResourceRequestsInterface& resource_requests) {\n+  TF_RETURN_IF_ERROR(cond_commands_.Prepare(params, resource_requests));\n+  TF_RETURN_IF_ERROR(body_commands_.Prepare(params, resource_requests));\n+  return absl::OkStatus();\n+}\n+\n absl::StatusOr<const se::CommandBuffer::Command*> WhileCmd::Record(\n     const Thunk::ExecuteParams& execute_params,\n     const RecordParams& record_params, RecordAction record_action,"
+        },
+        {
+            "sha": "9938caded89277dda2695d88f65c67d1f443fc2c",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/command_buffer_cmd.h",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 1,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/8c169d147db26044e8f693cfe0e8763329146fa1/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fcommand_buffer_cmd.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/8c169d147db26044e8f693cfe0e8763329146fa1/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fcommand_buffer_cmd.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fcommand_buffer_cmd.h?ref=8c169d147db26044e8f693cfe0e8763329146fa1",
+            "patch": "@@ -869,6 +869,10 @@ class WhileCmd : public CommandBufferCmd {\n   absl::Status Initialize(const Thunk::InitializeParams& params,\n                           StateManager& state) override;\n \n+  absl::Status Prepare(\n+      const Thunk::PrepareParams& params,\n+      Thunk::ResourceRequestsInterface& resource_requests) override;\n+\n   absl::StatusOr<const se::CommandBuffer::Command*> Record(\n       const Thunk::ExecuteParams& execute_params,\n       const RecordParams& record_params, RecordAction record_action,\n@@ -1240,7 +1244,7 @@ class DynamicSliceFusionCmd : public CommandBufferCmd {\n \n   bool requires_initialization() override;\n \n-  bool support_loop_unroll() override { return false; }\n+  bool support_loop_unroll() override { return true; }\n \n   bool IsNestedCommandBuffer() const final { return true; }\n "
+        }
+    ],
+    "stats": {
+        "total": 79,
+        "additions": 74,
+        "deletions": 5
+    }
+}

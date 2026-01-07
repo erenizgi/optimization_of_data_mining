@@ -1,0 +1,36 @@
+{
+    "author": "hariprasadravi",
+    "message": "[mlir][tosa] Enhance TosaConvertTFLUInt8 pass to handle tosa.const with quant u8 values (#105178)\n\n* Enhance TosaConvertTFLUInt8 pass to handle tosa.const with quant u8 values\n\n* Fix test to use ui8 attribute values\n\n* Revert \"Fixes to convert tfl uint8\"\n\nThis reverts commit 583daed6aa73fa7b6f5b8e53cb825f4228defb72.\n\n* Revert \"Enhance TosaConvertTFLUInt8 pass to handle tosa.const with quant u8 values\"\n\nThis reverts commit 496b46ef927e427fc470c202ebc497638df9fcdd.\n\n* Error if tosa.const operations are observed when running tosa-convert-tfl-uint8\n\n* Update convert_tfl_uint8 pass to error if there tosa ops\n\n* Address feedback",
+    "sha": "4c6f6242d0901eb4e152efd76dde5dc2227612cc",
+    "files": [
+        {
+            "sha": "cd9a2dcdf746fdf48ffd3ad890be903651b3ab19",
+            "filename": "tensorflow/compiler/mlir/tosa/tests/convert-tfl-uint8.mlir",
+            "status": "modified",
+            "additions": 18,
+            "deletions": 1,
+            "changes": 19,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4c6f6242d0901eb4e152efd76dde5dc2227612cc/tensorflow%2Fcompiler%2Fmlir%2Ftosa%2Ftests%2Fconvert-tfl-uint8.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4c6f6242d0901eb4e152efd76dde5dc2227612cc/tensorflow%2Fcompiler%2Fmlir%2Ftosa%2Ftests%2Fconvert-tfl-uint8.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcompiler%2Fmlir%2Ftosa%2Ftests%2Fconvert-tfl-uint8.mlir?ref=4c6f6242d0901eb4e152efd76dde5dc2227612cc",
+            "patch": "@@ -1,4 +1,4 @@\n-// RUN: tf-tosa-opt --tosa-convert-tfl-uint8  --verify-each %s | FileCheck %s\n+// RUN: tf-tosa-opt --tosa-convert-tfl-uint8 --verify-diagnostics --verify-each %s | FileCheck %s\n \n \n // Operations for testing --tosa-convert-tfl-uint8\n@@ -28,3 +28,20 @@ func.func @test_cast_ui8(%arg0: tensor<1x256x256x3x!quant.uniform<u8:f32, 0.0156\n   %0 = \"tfl.cast\"(%arg0) : (tensor<1x256x256x3x!quant.uniform<u8:f32, 0.015603500418365002:128>>) -> tensor<1x256x256x3xf32>\n   func.return %0 : tensor<1x256x256x3xf32>\n }\n+\n+// ----\n+\n+// CHECK-LABEL: test_error_tosa_ops\n+func.func @test_error_tosa_ops(%arg0: tensor<5x10xi8>) -> (tensor<5x10xi8>, none) {\n+\n+  // Dummy use to TFL dialect to load TFL dialect in MLIR context\n+  %0 = \"tfl.no_value\"() <{value}> : () -> none\n+\n+  // expected-error @+1 {{tosa operations are not expected in this pass. Run tosa-convert-tfl-uint8 before tosa-legalize-tfl}}\n+  %cst1 = \"tosa.const\"() <{values = dense<1> : tensor<5x10xi8>}> : () -> tensor<5x10xi8>\n+  // expected-error @+1 {{tosa operations are not expected in this pass. Run tosa-convert-tfl-uint8 before tosa-legalize-tfl}}\n+  %1 = \"tosa.add\"(%arg0, %cst1) : (tensor<5x10xi8>, tensor<5x10xi8>) -> tensor<5x10xi8>\n+\n+\n+  func.return %1, %0 : tensor<5x10xi8>, none\n+}\n\\ No newline at end of file"
+        },
+        {
+            "sha": "6edfc57ad8a89a239705617733abf28d04234476",
+            "filename": "tensorflow/compiler/mlir/tosa/transforms/convert_tfl_uint8.cc",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 1,
+            "changes": 10,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4c6f6242d0901eb4e152efd76dde5dc2227612cc/tensorflow%2Fcompiler%2Fmlir%2Ftosa%2Ftransforms%2Fconvert_tfl_uint8.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4c6f6242d0901eb4e152efd76dde5dc2227612cc/tensorflow%2Fcompiler%2Fmlir%2Ftosa%2Ftransforms%2Fconvert_tfl_uint8.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcompiler%2Fmlir%2Ftosa%2Ftransforms%2Fconvert_tfl_uint8.cc?ref=4c6f6242d0901eb4e152efd76dde5dc2227612cc",
+            "patch": "@@ -264,7 +264,8 @@ LogicalResult convert_graph_uint8_tensor(mlir::MLIRContext &context,\n     // Convert intermediate tensor.\n     for (auto &op : bb) {\n       if (llvm::dyn_cast<tosa::ConstOp>(&op)) {\n-        continue;  // Skip if the operation is a tosa::ConstOp\n+        // Skip tosa const ops created during rescaling. \n+        continue;\n       }\n \n       for (Value output_val : op.getResults()) {\n@@ -355,6 +356,13 @@ void ConvertUint8ToInt8::runOnOperation() {\n   auto &ctx = getContext();\n   mlir::func::FuncOp func = getOperation();\n \n+  func.walk([&](Operation *op) {\n+    if (isa<TosaOp>(op)){\n+      // Run this before calling convert_graph_uint8_tensor as rescaling introduces tosa ops\n+      op->emitError(\"tosa operations are not expected in this pass. Run tosa-convert-tfl-uint8 before tosa-legalize-tfl\");\n+    }\n+  });\n+\n   // Convert uint8 const tensor. const needs to be handled specifically.\n   patterns.add<ConvertUint8QConstOp>(&ctx);\n   (void)applyPatternsGreedily(func, std::move(patterns));"
+        }
+    ],
+    "stats": {
+        "total": 29,
+        "additions": 27,
+        "deletions": 2
+    }
+}

@@ -1,0 +1,24 @@
+{
+    "author": "rao-ashish",
+    "message": "PR #35113: Enqueue cross-host send after send buffer definition events are recorded, not complete\n\nImported from GitHub PR https://github.com/openxla/xla/pull/35113\n\n📝 Summary of Changes\nThis PR modifies `StreamExecutorGpuClient::ScheduleSendsOnLocalDevice` to enqueue cross-host sends as soon as the definition event of the buffer that needs to be sent has been recorded, instead of waiting for it to complete.\n\n🎯 Justification\nThe original implementation blocks the execute thread until the send buffer is fully materialized before enqueuing the cross-host send. This prevents the execute thread from 'running ahead' and enqueuing multiple executables to launch on the device.\n\nWe can see this happening with [this toy program](https://gist.github.com/rao-ashish/0ecb3e3874328798e30412ab7e4870e3), which performs a matmul on devices 0-3 and transfers the result to devices 4-7. Without this fix, \\~19 ms are spent blocking the execute thread between the `ncclGroupStart` and `ncclGroupEnd` for one batch of transfers:\n\n<img width=\"2132\" height=\"450\" alt=\"cross_host_transfer_before_fix\" src=\"https://github.com/user-attachments/assets/fff3f5c1-026f-4ead-9b64-837fc0f71d74\" />\n\nWith this fix, this is reduced to \\~88 us:\n\n<img width=\"1195\" height=\"636\" alt=\"cross_host_transfer_after_fix\" src=\"https://github.com/user-attachments/assets/b338632a-6a07-43dc-96f5-2ef26b12ef07\" />\n\nOn this program, this ends up allowing us to launch matmul and data transfer kernels back-to-back, instead of incurring \\~300 us of idle time on the device.\n\nProfile screenshot before the fix, with the 300 us gap:\n<img width=\"1587\" height=\"76\" alt=\"cross_host_transfer_device_before_fix\" src=\"https://github.com/user-attachments/assets/3d4320cf-b922-463c-9b94-9e5462d9ed43\" />\n\nProfile screenshot after the fix, showing back-to-back launches:\n<img width=\"2004\" height=\"72\" alt=\"cross_host_transfer_device_after_fix\" src=\"https://github.com/user-attachments/assets/8a3d4463-afa7-449c-9f81-731f1b16993b\" />\n\n🚀 Kind of Contribution\n🐛 Bug Fix\n\n🧪 Unit Tests:\nThe previously added unit tests inside `se_gpu_pjrt_client_test.cc` continue to pass.\n\n🧪 Execution Tests:\nVerified that the implementation still works on these [four end-to-end tests](https://gist.github.com/rao-ashish/24ac0df0cb18243c649ac535964b31b8).\nCopybara import of the project:\n\n--\ne9c4e7418b4ee22b43d60945fea0f2754b62873f by Ashish Rao <asrao@nvidia.com>:\n\nEnqueue send after send buffer definition events are recorded, not when they are complete\n\nMerging this change closes #35113\n\nPiperOrigin-RevId: 845754674",
+    "sha": "9c9429b376626d7cfc83e65420de467ffee90a57",
+    "files": [
+        {
+            "sha": "172806fbcb2128a36e776459dcc88b768ddc3075",
+            "filename": "third_party/xla/xla/pjrt/gpu/se_gpu_pjrt_client.cc",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 1,
+            "changes": 7,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/9c9429b376626d7cfc83e65420de467ffee90a57/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Fse_gpu_pjrt_client.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/9c9429b376626d7cfc83e65420de467ffee90a57/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Fse_gpu_pjrt_client.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Fse_gpu_pjrt_client.cc?ref=9c9429b376626d7cfc83e65420de467ffee90a57",
+            "patch": "@@ -793,7 +793,12 @@ void StreamExecutorGpuClient::ScheduleSendsOnLocalDevice(\n     for (PreparedSend& prepared_send : prepared_sends) {\n       // Wait until the buffer we want to send is fully materialized.\n       for (const auto& event : prepared_send.definition_events_) {\n-        tsl::BlockUntilReady(event.get());\n+        if (event->IsType<BufferSequencingEvent>()) {\n+          tsl::AsyncValueRef<BufferSequencingEvent> event_ref(event);\n+          event_ref->WaitForEventOnStream(stream);\n+        } else {\n+          tsl::BlockUntilReady(event.get());\n+        }\n         if (auto* status = event->GetErrorIfPresent(); status != nullptr) {\n           return *status;\n         }"
+        }
+    ],
+    "stats": {
+        "total": 7,
+        "additions": 6,
+        "deletions": 1
+    }
+}

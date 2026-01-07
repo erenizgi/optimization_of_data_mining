@@ -1,0 +1,60 @@
+{
+    "author": "sohaibiftikhar",
+    "message": "[XLA:GPU]: Add utility function for wrapping HloInstruction in a Fusion\n\nTo create a temporary fusion without modifying the original module\nwe need to clone an instruction and its called computations into a new module.\n\nThis change adds a utility to do the same and adds tests for it.\n\nPiperOrigin-RevId: 827619728",
+    "sha": "99384379e5ba8790b3d11e336979a0e921408d59",
+    "files": [
+        {
+            "sha": "eebc45f707a8fe040bb33cbce2514eea609f0978",
+            "filename": "third_party/xla/xla/service/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/99384379e5ba8790b3d11e336979a0e921408d59/third_party%2Fxla%2Fxla%2Fservice%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/99384379e5ba8790b3d11e336979a0e921408d59/third_party%2Fxla%2Fxla%2Fservice%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2FBUILD?ref=99384379e5ba8790b3d11e336979a0e921408d59",
+            "patch": "@@ -2088,6 +2088,7 @@ xla_cc_test(\n         \"//xla/tests:xla_internal_test_main\",\n         \"//xla/tsl/platform:statusor\",\n         \"@com_google_absl//absl/log:check\",\n+        \"@com_google_absl//absl/strings:string_view\",\n         \"@com_google_absl//absl/types:span\",\n         \"@com_google_googletest//:gtest\",\n     ],"
+        },
+        {
+            "sha": "7fd80c89763a36a98bc9433c03105e45b9b77092",
+            "filename": "third_party/xla/xla/service/hlo_creation_utils.cc",
+            "status": "modified",
+            "additions": 57,
+            "deletions": 0,
+            "changes": 57,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/99384379e5ba8790b3d11e336979a0e921408d59/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_creation_utils.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/99384379e5ba8790b3d11e336979a0e921408d59/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_creation_utils.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_creation_utils.cc?ref=99384379e5ba8790b3d11e336979a0e921408d59",
+            "patch": "@@ -949,4 +949,61 @@ HloInstruction* MakeScalarLikeFromLiteral(HloInstruction* base,\n       ShapeUtil::MakeStaticShape(base->shape()), scalar, {}));\n }\n \n+std::unique_ptr<HloModule> NewModuleWithFusion(\n+    const HloInstruction* instruction, HloInstruction::FusionKind fusion_kind) {\n+  auto hlo_module = std::make_unique<HloModule>(\n+      absl::StrCat(\"wrapped_module_\", instruction->name()),\n+      instruction->GetModule()->config());\n+\n+  // New computation  with a single instruction as given by the instruction\n+  // parameter.\n+  HloComputation::Builder fusion_builder(\n+      absl::StrCat(\"wrapped_\", instruction->name()));\n+\n+  const auto build_parameter_instructions =\n+      [instruction](HloComputation::Builder& builder) {\n+        std::vector<HloInstruction*> parameters;\n+        parameters.reserve(instruction->operand_count());\n+        for (int i = 0; i < instruction->operand_count(); ++i) {\n+          const HloInstruction* operand = instruction->operand(i);\n+          parameters.push_back(\n+              builder.AddInstruction(HloInstruction::CreateParameter(\n+                  i, operand->shape(), absl::StrCat(\"param_\", i))));\n+        }\n+        return parameters;\n+      };\n+  std::vector<HloInstruction*> fusion_parameters =\n+      build_parameter_instructions(fusion_builder);\n+  HloInstruction* fused_root =\n+      fusion_builder.AddInstruction(instruction->CloneWithNewOperands(\n+          instruction->shape(), fusion_parameters));\n+\n+  // If the original instruction had any sub-computations (like to_apply), clone\n+  // them.\n+  if (!instruction->called_computations().empty()) {\n+    HloCloneContext context(hlo_module.get());\n+    fused_root->ReplaceCalledComputations([&](HloComputation* callee) {\n+      if (callee->parent() != hlo_module.get()) {\n+        return hlo_module->DeepCloneComputation(callee, &context);\n+      }\n+      return callee;\n+    });\n+  }\n+\n+  HloComputation* fused_computation =\n+      hlo_module->AddEmbeddedComputation(fusion_builder.Build(fused_root));\n+\n+  // Entry computation for the new module.\n+  HloComputation::Builder entry_builder(\"entry\");\n+  std::vector<HloInstruction*> entry_parameters =\n+      build_parameter_instructions(entry_builder);\n+  HloInstruction* fusion_instruction = entry_builder.AddInstruction(\n+      HloInstruction::CreateFusion(instruction->shape(), fusion_kind,\n+                                   entry_parameters, fused_computation));\n+\n+  hlo_module->AddEntryComputation(entry_builder.Build(fusion_instruction));\n+\n+  return hlo_module;\n+}\n+\n }  // namespace xla"
+        },
+        {
+            "sha": "c7258129cf1279c33d06d0ee3f2eb5907df0cd82",
+            "filename": "third_party/xla/xla/service/hlo_creation_utils.h",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/99384379e5ba8790b3d11e336979a0e921408d59/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_creation_utils.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/99384379e5ba8790b3d11e336979a0e921408d59/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_creation_utils.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_creation_utils.h?ref=99384379e5ba8790b3d11e336979a0e921408d59",
+            "patch": "@@ -442,6 +442,11 @@ absl::StatusOr<HloInstruction*> MakeWithinBounds(HloInstruction* inst,\n                                                  HloInstruction* lower_bound,\n                                                  HloInstruction* upper_bound);\n \n+// Creates a new module with a single computation that contains a fusion of the\n+// given instruction with the given fusion kind.\n+std::unique_ptr<HloModule> NewModuleWithFusion(\n+    const HloInstruction* instruction, HloInstruction::FusionKind fusion_kind);\n+\n }  // namespace xla\n \n #endif  // XLA_SERVICE_HLO_CREATION_UTILS_H_"
+        },
+        {
+            "sha": "058ced67fc519636f65364b0f2cd3e2bdb44fe0a",
+            "filename": "third_party/xla/xla/service/hlo_creation_utils_test.cc",
+            "status": "modified",
+            "additions": 44,
+            "deletions": 0,
+            "changes": 44,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/99384379e5ba8790b3d11e336979a0e921408d59/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_creation_utils_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/99384379e5ba8790b3d11e336979a0e921408d59/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_creation_utils_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_creation_utils_test.cc?ref=99384379e5ba8790b3d11e336979a0e921408d59",
+            "patch": "@@ -20,10 +20,13 @@ limitations under the License.\n \n #include <gtest/gtest.h>\n #include \"absl/log/check.h\"\n+#include \"absl/strings/string_view.h\"\n #include \"absl/types/span.h\"\n #include \"xla/array2d.h\"\n #include \"xla/hlo/evaluator/hlo_evaluator.h\"\n+#include \"xla/hlo/ir/hlo_casting_utils.h\"\n #include \"xla/hlo/ir/hlo_instruction.h\"\n+#include \"xla/hlo/ir/hlo_instructions.h\"\n #include \"xla/hlo/ir/hlo_module.h\"\n #include \"xla/hlo/ir/hlo_opcode.h\"\n #include \"xla/hlo/testlib/hlo_hardware_independent_test_base.h\"\n@@ -559,5 +562,46 @@ TEST_F(HloCreationUtilsTest, DynamicBroadcastShape) {\n   EXPECT_TRUE(one_constant->shape().is_static());\n }\n \n+TEST_F(HloCreationUtilsTest, NewModuleWithFusion) {\n+  static constexpr absl::string_view kModuleStr = R\"(\n+    HloModule test\n+    apply_op {\n+      x = f32[] parameter(0)\n+      y = f32[] parameter(1)\n+      ROOT apply_op = f32[] add(x, y)\n+    }\n+\n+    ENTRY test_computation {\n+      param_0 = f32[65536] parameter(0)\n+      all-reduce-start = f32[65536] all-reduce-start(param_0), to_apply=apply_op, replica_groups={{0,1}}\n+      ROOT all-reduce-done = f32[65536] all-reduce-done(all-reduce-start)\n+    }\n+  )\";\n+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,\n+                          ParseAndReturnVerifiedModule(kModuleStr));\n+  const HloInstruction* all_reduce_start =\n+      module->entry_computation()->GetInstructionWithName(\"all-reduce-start\");\n+  std::unique_ptr<HloModule> fusion_module =\n+      NewModuleWithFusion(all_reduce_start, HloInstruction::FusionKind::kLoop);\n+  EXPECT_EQ(fusion_module->entry_computation()->root_instruction()->opcode(),\n+            HloOpcode::kFusion);\n+  auto* fusion_instruction = Cast<HloFusionInstruction>(\n+      fusion_module->entry_computation()->root_instruction());\n+  EXPECT_EQ(fusion_instruction->fusion_kind(),\n+            HloInstruction::FusionKind::kLoop);\n+  EXPECT_EQ(fusion_instruction->fused_instructions_computation()\n+                ->root_instruction()\n+                ->opcode(),\n+            HloOpcode::kAllReduceStart);\n+  HloAllReduceInstruction* all_reduce = Cast<HloAllReduceInstruction>(\n+      fusion_instruction->fused_instructions_computation()->root_instruction());\n+  EXPECT_EQ(all_reduce->replica_groups().size(), 1);\n+  EXPECT_EQ(all_reduce->replica_groups()[0].replica_ids().size(), 2);\n+  // Check that all-reduce has the correct to_apply.\n+  HloComputation* to_apply = all_reduce->to_apply();\n+  EXPECT_EQ(to_apply->name(), \"apply_op\");\n+  EXPECT_EQ(to_apply->num_parameters(), 2);\n+  EXPECT_EQ(to_apply->root_instruction()->opcode(), HloOpcode::kAdd);\n+}\n }  // namespace\n }  // namespace xla"
+        }
+    ],
+    "stats": {
+        "total": 107,
+        "additions": 107,
+        "deletions": 0
+    }
+}

@@ -1,0 +1,108 @@
+{
+    "author": "shawnwang18",
+    "message": "PR #33533: [XLA:GPU] Unify the priority setting for cuda stream and cuda graph nodes\n\nImported from GitHub PR https://github.com/openxla/xla/pull/33533\n\n📝 Summary of Changes\nThis PR refactors the code to uses a common approach to fetch priority value for gpu device when setting the priority for cuda stream and cuda graph nodes.\n\n🎯 Justification\nCode refactoring for better code reuse, make stream_executor:GetGpuDeviceStreamPrirority call once.\n\n🚀 Kind of Contribution\nPlease remove what does not apply: ♻️ Cleanup\n\n📊 Benchmark (for Performance Improvements)\nNo new feature introduced.\n\nCopybara import of the project:\n\n--\n895c8580d012d17ece3a0ebac650b13836062c6d by Shawn Wang <shawnw@nvidia.com>:\n\nUnify the priority setting for cuda stream and cuda graph nodes.\n\nMerging this change closes #33533\n\nPiperOrigin-RevId: 829293287",
+    "sha": "a96d88aa603afced43305dd64ff752440580b7c2",
+    "files": [
+        {
+            "sha": "8dacdb6f642b70c8ae8adc10c08b332c085a5560",
+            "filename": "third_party/xla/xla/stream_executor/cuda/cuda_command_buffer.cc",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 15,
+            "changes": 18,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a96d88aa603afced43305dd64ff752440580b7c2/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_command_buffer.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a96d88aa603afced43305dd64ff752440580b7c2/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_command_buffer.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_command_buffer.cc?ref=a96d88aa603afced43305dd64ff752440580b7c2",
+            "patch": "@@ -79,19 +79,6 @@ CUgraphNode ToCudaGraphHandle(GraphNodeHandle handle) {\n   return absl::bit_cast<CUgraphNode>(handle);\n }\n \n-int ToCudaGraphKernelNodePriority(StreamPriority priority) {\n-  switch (priority) {\n-    case StreamPriority::Default:\n-      return 0;\n-    case StreamPriority::Lowest:\n-      return -1;\n-    case StreamPriority::Highest:\n-      return 1;\n-    default:\n-      return 0;\n-  }\n-}\n-\n // Converts a platform independent GraphConditionalHandle into a CUDA specific\n // CUgraphConditionalHandle.\n CUgraphConditionalHandle ToCudaGraphHandle(GraphConditionalHandle handle) {\n@@ -543,7 +530,7 @@ absl::StatusOr<GraphNodeHandle> CudaCommandBuffer::CreateKernelNode(\n \n   if (priority != StreamPriority::Default) {\n     CUlaunchAttributeValue value;\n-    value.priority = ToCudaGraphKernelNodePriority(priority);\n+    value.priority = stream_exec_->GetGpuStreamPriority(priority);\n     TF_RETURN_IF_ERROR(\n         cuda::ToStatus(cuGraphKernelNodeSetAttribute(\n                            node_handle, CU_LAUNCH_ATTRIBUTE_PRIORITY, &value),\n@@ -703,14 +690,15 @@ absl::Status CudaCommandBuffer::SetPriority(StreamPriority priority) {\n   TF_RETURN_IF_ERROR(\n       cuda::ToStatus(cuGraphGetNodes(graph_, nodes.data(), &num_nodes)));\n \n+  int priority_value = stream_exec_->GetGpuStreamPriority(priority);\n   for (size_t i = 0; i < num_nodes; i++) {\n     CUgraphNodeType type;\n     TF_RETURN_IF_ERROR(cuda::ToStatus(cuGraphNodeGetType(nodes[i], &type),\n                                       \"Failed to get kernel node type\"));\n \n     if (type == CU_GRAPH_NODE_TYPE_KERNEL) {\n       CUlaunchAttributeValue value;\n-      value.priority = ToCudaGraphKernelNodePriority(priority);\n+      value.priority = priority_value;\n       TF_RETURN_IF_ERROR(\n           cuda::ToStatus(cuGraphKernelNodeSetAttribute(\n                              nodes[i], CU_LAUNCH_ATTRIBUTE_PRIORITY, &value),"
+        },
+        {
+            "sha": "e18a5ec6d12a12213711a307e305a114e52bc65a",
+            "filename": "third_party/xla/xla/stream_executor/cuda/cuda_executor.cc",
+            "status": "modified",
+            "additions": 29,
+            "deletions": 0,
+            "changes": 29,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a96d88aa603afced43305dd64ff752440580b7c2/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_executor.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a96d88aa603afced43305dd64ff752440580b7c2/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_executor.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_executor.cc?ref=a96d88aa603afced43305dd64ff752440580b7c2",
+            "patch": "@@ -1769,6 +1769,35 @@ absl::StatusOr<MemoryType> CudaExecutor::GetPointerMemorySpace(\n   }\n }\n \n+int CudaExecutor::GetGpuStreamPriority(StreamPriority priority) {\n+  if (priority == StreamPriority::Default) {\n+    return 0;\n+  }\n+\n+  absl::call_once(stream_priority_once_, [this]() {\n+    std::unique_ptr<ActivateContext> activation = Activate();\n+    int lowest = 0;\n+    int highest = 0;\n+    absl::Status status =\n+        cuda::ToStatus(cuCtxGetStreamPriorityRange(&lowest, &highest));\n+    if (!status.ok()) {\n+      LOG(ERROR) << \"Could not query stream priority range. Returning default \"\n+                    \"priority.\";\n+      stream_priority_query_ok_ = false;\n+      return;\n+    }\n+    stream_priority_lowest_ = lowest;\n+    stream_priority_highest_ = highest;\n+    stream_priority_query_ok_ = true;\n+  });\n+\n+  if (!stream_priority_query_ok_) {\n+    return 0;\n+  }\n+  return priority == StreamPriority::Highest ? stream_priority_highest_\n+                                             : stream_priority_lowest_;\n+}\n+\n absl::StatusOr<const CudaKernel*> CudaExecutor::GetCudaKernel(\n     const Kernel* kernel) {\n   absl::MutexLock lock{in_memory_modules_mu_};"
+        },
+        {
+            "sha": "af5f77000cf2e76836e20399ca3dc96ab439811e",
+            "filename": "third_party/xla/xla/stream_executor/cuda/cuda_executor.h",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a96d88aa603afced43305dd64ff752440580b7c2/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_executor.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a96d88aa603afced43305dd64ff752440580b7c2/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_executor.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_executor.h?ref=a96d88aa603afced43305dd64ff752440580b7c2",
+            "patch": "@@ -143,6 +143,8 @@ class CudaExecutor : public GpuExecutor {\n   // object, the offset of the slices should be aligned with this granularity.\n   absl::StatusOr<size_t> GetVmmGranularity() const;\n \n+  int GetGpuStreamPriority(StreamPriority priority) override;\n+\n   // RAII wrapper for a VMM memory handle.\n   class VmmMemoryHandle {\n    public:\n@@ -280,6 +282,13 @@ class CudaExecutor : public GpuExecutor {\n \n   // CudaContext for this device.\n   CudaContext* cuda_context_;\n+\n+  // Cached CUDA stream priority range. Initialized once on first non-default\n+  // request and then reused for subsequent calls.\n+  absl::once_flag stream_priority_once_;\n+  int stream_priority_lowest_ = 0;\n+  int stream_priority_highest_ = 0;\n+  bool stream_priority_query_ok_ = false;\n };\n \n }  // namespace stream_executor::gpu"
+        },
+        {
+            "sha": "b23eaf4e13ca1fe8382d9161be916bcbfd066874",
+            "filename": "third_party/xla/xla/stream_executor/cuda/cuda_stream.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 16,
+            "changes": 17,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a96d88aa603afced43305dd64ff752440580b7c2/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_stream.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a96d88aa603afced43305dd64ff752440580b7c2/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_stream.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fstream_executor%2Fcuda%2Fcuda_stream.cc?ref=a96d88aa603afced43305dd64ff752440580b7c2",
+            "patch": "@@ -72,21 +72,6 @@ absl::Status RecordGpuEvent(StreamExecutor* executor, CUevent event,\n                         \"Error recording CUDA event\");\n }\n \n-int GetGpuStreamPriority(stream_executor::StreamPriority stream_priority) {\n-  if (stream_priority == stream_executor::StreamPriority::Default) {\n-    return 0;\n-  }\n-  int lowest, highest;\n-  auto status = cuda::ToStatus(cuCtxGetStreamPriorityRange(&lowest, &highest));\n-  if (!status.ok()) {\n-    LOG(ERROR)\n-        << \"Could not query stream priority range. Returning default priority.\";\n-    return 0;\n-  }\n-  return stream_priority == stream_executor::StreamPriority::Highest ? highest\n-                                                                     : lowest;\n-}\n-\n absl::StatusOr<CUstream> CreateStream(StreamExecutor* executor, int priority) {\n   std::unique_ptr<ActivateContext> activation = executor->Activate();\n   CUstream stream;\n@@ -191,7 +176,7 @@ absl::StatusOr<std::unique_ptr<CudaStream>> CudaStream::Create(\n       return std::get<int>(priority.value());\n     }\n     std::unique_ptr<ActivateContext> activation = executor->Activate();\n-    return GetGpuStreamPriority(\n+    return executor->GetGpuStreamPriority(\n         std::get<StreamPriority>(priority.value_or(StreamPriority::Default)));\n   }();\n   TF_ASSIGN_OR_RETURN(auto stream_handle,"
+        },
+        {
+            "sha": "2e1d3657de805b6e41b509bc277f47f22dbecacd",
+            "filename": "third_party/xla/xla/stream_executor/rocm/rocm_executor.cc",
+            "status": "modified",
+            "additions": 14,
+            "deletions": 0,
+            "changes": 14,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a96d88aa603afced43305dd64ff752440580b7c2/third_party%2Fxla%2Fxla%2Fstream_executor%2Frocm%2Frocm_executor.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a96d88aa603afced43305dd64ff752440580b7c2/third_party%2Fxla%2Fxla%2Fstream_executor%2Frocm%2Frocm_executor.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fstream_executor%2Frocm%2Frocm_executor.cc?ref=a96d88aa603afced43305dd64ff752440580b7c2",
+            "patch": "@@ -1076,6 +1076,20 @@ RocmExecutor::CreateCommandBuffer(CommandBuffer::Mode mode) {\n   return RocmCommandBuffer::Create(mode, this);\n }\n \n+int RocmExecutor::GetGpuStreamPriority(StreamPriority priority) {\n+  if (priority == StreamPriority::Default) {\n+    return 0;\n+  }\n+  std::unique_ptr<ActivateContext> activation = Activate();\n+  int lowest, highest;\n+  auto status = wrap::hipDeviceGetStreamPriorityRange(&lowest, &highest);\n+  if (status != hipSuccess) {\n+    LOG(ERROR) << \"Failed to get stream priority range: \" << ToString(status);\n+    return 0;\n+  }\n+  return priority == StreamPriority::Highest ? highest : lowest;\n+}\n+\n absl::StatusOr<std::unique_ptr<DeviceDescription>>\n RocmExecutor::CreateDeviceDescription(int device_ordinal) {\n   TF_ASSIGN_OR_RETURN(hipDevice_t device, GetDevice(device_ordinal));"
+        },
+        {
+            "sha": "eb02184e4cee4273f051584207205669455d532d",
+            "filename": "third_party/xla/xla/stream_executor/rocm/rocm_executor.h",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a96d88aa603afced43305dd64ff752440580b7c2/third_party%2Fxla%2Fxla%2Fstream_executor%2Frocm%2Frocm_executor.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a96d88aa603afced43305dd64ff752440580b7c2/third_party%2Fxla%2Fxla%2Fstream_executor%2Frocm%2Frocm_executor.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fstream_executor%2Frocm%2Frocm_executor.h?ref=a96d88aa603afced43305dd64ff752440580b7c2",
+            "patch": "@@ -133,6 +133,8 @@ class RocmExecutor : public GpuExecutor {\n   absl::StatusOr<std::unique_ptr<MemoryAllocator>> CreateMemoryAllocator(\n       MemoryType type) override;\n \n+  int GetGpuStreamPriority(StreamPriority priority) override;\n+\n  private:\n   // Initializes Blas interfaces\n   absl::Status InitBlas();"
+        },
+        {
+            "sha": "14447e393539484c21541b437ee36fefce410380",
+            "filename": "third_party/xla/xla/stream_executor/rocm/rocm_stream.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 18,
+            "changes": 19,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a96d88aa603afced43305dd64ff752440580b7c2/third_party%2Fxla%2Fxla%2Fstream_executor%2Frocm%2Frocm_stream.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a96d88aa603afced43305dd64ff752440580b7c2/third_party%2Fxla%2Fxla%2Fstream_executor%2Frocm%2Frocm_stream.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fstream_executor%2Frocm%2Frocm_stream.cc?ref=a96d88aa603afced43305dd64ff752440580b7c2",
+            "patch": "@@ -50,22 +50,6 @@ limitations under the License.\n \n namespace stream_executor::gpu {\n namespace {\n-int GetGpuStreamPriority(StreamExecutor* executor,\n-                         stream_executor::StreamPriority stream_priority) {\n-  std::unique_ptr<ActivateContext> activation = executor->Activate();\n-  if (stream_priority == stream_executor::StreamPriority::Default) {\n-    return 0;\n-  }\n-  int lowest, highest;\n-  hipError_t res = wrap::hipDeviceGetStreamPriorityRange(&lowest, &highest);\n-  if (res != hipSuccess) {\n-    LOG(ERROR)\n-        << \"Could not query stream priority range. Returning default priority.\";\n-    return 0;\n-  }\n-  return stream_priority == stream_executor::StreamPriority::Highest ? highest\n-                                                                     : lowest;\n-}\n \n absl::StatusOr<hipStream_t> CreateStream(StreamExecutor* executor,\n                                          int priority) {\n@@ -188,8 +172,7 @@ absl::StatusOr<std::unique_ptr<RocmStream>> RocmStream::Create(\n     if (priority.has_value() && std::holds_alternative<int>(priority.value())) {\n       return std::get<int>(priority.value());\n     }\n-    return GetGpuStreamPriority(\n-        executor,\n+    return executor->GetGpuStreamPriority(\n         std::get<StreamPriority>(priority.value_or(StreamPriority::Default)));\n   }();\n   TF_ASSIGN_OR_RETURN(auto stream_handle,"
+        },
+        {
+            "sha": "e8858ac82e9a754249819dd968bd37dc23a76d2e",
+            "filename": "third_party/xla/xla/stream_executor/stream_executor.h",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a96d88aa603afced43305dd64ff752440580b7c2/third_party%2Fxla%2Fxla%2Fstream_executor%2Fstream_executor.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a96d88aa603afced43305dd64ff752440580b7c2/third_party%2Fxla%2Fxla%2Fstream_executor%2Fstream_executor.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fstream_executor%2Fstream_executor.h?ref=a96d88aa603afced43305dd64ff752440580b7c2",
+            "patch": "@@ -257,6 +257,9 @@ class StreamExecutor {\n   virtual absl::StatusOr<std::unique_ptr<DeviceDescription>>\n   CreateDeviceDescription() const = 0;\n \n+  // Return the platform dependent stream priority value for the given priority.\n+  virtual int GetGpuStreamPriority(StreamPriority priority) { return 0; }\n+\n   // Gets-or-creates a BlasSupport datatype that can be used to execute BLAS\n   // routines on the current platform.\n   //"
+        }
+    ],
+    "stats": {
+        "total": 111,
+        "additions": 62,
+        "deletions": 49
+    }
+}

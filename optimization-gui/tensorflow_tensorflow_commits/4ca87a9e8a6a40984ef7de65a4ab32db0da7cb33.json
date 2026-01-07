@@ -1,0 +1,36 @@
+{
+    "author": "khasanovaa",
+    "message": "[XLA:GPU] Try to form command buffers from `kConditionalThunk` branches thunks even if the `kConditionalThunk` is not convertible itself\n\nPiperOrigin-RevId: 810793330",
+    "sha": "4ca87a9e8a6a40984ef7de65a4ab32db0da7cb33",
+    "files": [
+        {
+            "sha": "690e38b8f052ae014a5c7a02663f202e103c7a99",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/command_buffer_conversion_pass.cc",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 0,
+            "changes": 10,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4ca87a9e8a6a40984ef7de65a4ab32db0da7cb33/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fcommand_buffer_conversion_pass.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4ca87a9e8a6a40984ef7de65a4ab32db0da7cb33/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fcommand_buffer_conversion_pass.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fcommand_buffer_conversion_pass.cc?ref=4ca87a9e8a6a40984ef7de65a4ab32db0da7cb33",
+            "patch": "@@ -451,6 +451,16 @@ absl::StatusOr<bool> CommandBufferConversionPass::Run(\n           bool changed_in_body,\n           Run(while_thunk->body_thunk_sequence(), debug_options, device_info));\n       changed |= changed_in_body;\n+    } else if (thunk->kind() == Thunk::kConditional) {\n+      // If a `ConditionalThunk` itself is not eligible for conversion into a\n+      // command buffer, we attempt to convert thunks within its branches.\n+      auto conditional_thunk = static_cast<ConditionalThunk*>(thunk.get());\n+      for (auto& branch_thunk : conditional_thunk->branch_thunks()) {\n+        TF_ASSIGN_OR_RETURN(\n+            bool changed_in_branch,\n+            Run(branch_thunk.get(), debug_options, device_info));\n+        changed |= changed_in_branch;\n+      }\n     }\n \n     // If the current thunk is not convertible, flush collected eligible thunk"
+        },
+        {
+            "sha": "179aea4c74b2cb34068a929e807dd845a8808f00",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/command_buffer_conversion_pass_test.cc",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 3,
+            "changes": 19,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4ca87a9e8a6a40984ef7de65a4ab32db0da7cb33/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fcommand_buffer_conversion_pass_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4ca87a9e8a6a40984ef7de65a4ab32db0da7cb33/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fcommand_buffer_conversion_pass_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fcommand_buffer_conversion_pass_test.cc?ref=4ca87a9e8a6a40984ef7de65a4ab32db0da7cb33",
+            "patch": "@@ -648,6 +648,9 @@ TEST(CommandBufferConversionPassTest, ConvertWhileThunk) {\n \n TEST(CommandBufferConversionPassTest,\n      DontConvertConditionalThunkWithNonConvertibleBranch) {\n+  // Check that if a branch of a conditional thunk is not convertible, the\n+  // conditional thunk is not convertible either, but the branches are attempted\n+  // to be converted independently.\n   CommandBufferConversionPass pass;\n \n   std::vector<std::unique_ptr<Thunk>> thunks;\n@@ -660,7 +663,9 @@ TEST(CommandBufferConversionPassTest,\n   std::vector<std::unique_ptr<Thunk>> branch1_thunks;\n   BufferAllocation alloc1(1, 16 * 4, 0);\n   BufferAllocation alloc2(1, 16 * 4, 0);\n+  BufferAllocation alloc3(1, 16 * 4, 0);\n   branch1_thunks.push_back(CreateAllGatherStartThunk(alloc1, alloc2));\n+  branch1_thunks.push_back(CreateCopyThunk(alloc3));\n \n   // Create a conditional thunk\n   std::vector<std::vector<std::unique_ptr<Thunk>>> branch_thunks;\n@@ -680,11 +685,19 @@ TEST(CommandBufferConversionPassTest,\n   ASSERT_EQ(root_thunk->thunks().size(), 1);\n \n   ASSERT_THAT(pass.Run(root_thunk.get(), debug_options, device_info),\n-              IsOkAndHolds(false));\n+              IsOkAndHolds(true));\n \n-  // Expected no transformation, because one of the branches has an unclosed\n-  // async thunk => is not convertible.\n+  // Expected transformation is: kConditional({kCopy}, {kAllGatherStart, kCopy})\n+  // -> kConditional(kCommandBuffer(kCopy), {kAllGatherStart,\n+  // kCommandBuffer(kCopy)}).\n   EXPECT_THAT(root_thunk->thunks(), ThunkKindsAre(Thunk::kConditional));\n+  auto* conditional_thunk =\n+      dynamic_cast<const ConditionalThunk*>(root_thunk->thunks()[0].get());\n+  ASSERT_NE(conditional_thunk, nullptr);\n+  EXPECT_THAT(conditional_thunk->branch_thunks()[0]->thunks(),\n+              ThunkKindsAre(Thunk::kCommandBuffer));\n+  EXPECT_THAT(conditional_thunk->branch_thunks()[1]->thunks(),\n+              ThunkKindsAre(Thunk::kAllGatherStart, Thunk::kCommandBuffer));\n }\n \n TEST(CommandBufferConversionPassTest, ConvertWhileThunkWithAsyncPair) {"
+        }
+    ],
+    "stats": {
+        "total": 29,
+        "additions": 26,
+        "deletions": 3
+    }
+}

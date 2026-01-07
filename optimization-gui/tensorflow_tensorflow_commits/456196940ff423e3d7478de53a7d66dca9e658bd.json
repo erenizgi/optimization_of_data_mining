@@ -1,0 +1,96 @@
+{
+    "author": "WillFroom",
+    "message": "[XLA:CPU] Simplify loop unrolling flags pass and use it as part of fusion compiler.\n\nPiperOrigin-RevId: 800830559",
+    "sha": "456196940ff423e3d7478de53a7d66dca9e658bd",
+    "files": [
+        {
+            "sha": "7aaeb57cc5c9b4aede6cea8ccc0fea0a3f39b01f",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/emitters/transforms/add_loop_unroll_flags.cc",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 41,
+            "changes": 50,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/456196940ff423e3d7478de53a7d66dca9e658bd/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Femitters%2Ftransforms%2Fadd_loop_unroll_flags.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/456196940ff423e3d7478de53a7d66dca9e658bd/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Femitters%2Ftransforms%2Fadd_loop_unroll_flags.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Femitters%2Ftransforms%2Fadd_loop_unroll_flags.cc?ref=456196940ff423e3d7478de53a7d66dca9e658bd",
+            "patch": "@@ -55,9 +55,9 @@ class AddLoopUnrollFlagsPass\n     mlir::func::FuncOp func_op = getOperation();\n     mlir::MLIRContext* context = func_op.getContext();\n \n-    llvm::DenseMap<mlir::scf::ForOp, int64_t> nested_iteration_bits;\n+    llvm::DenseMap<mlir::scf::ForOp, int64_t> nested_iteration_map;\n     func_op->walk<mlir::WalkOrder::PreOrder>([&](mlir::scf::ForOp for_op) {\n-      RecursiveWalk(for_op, nested_iteration_bits);\n+      RecursiveWalk(for_op, nested_iteration_map);\n       return mlir::WalkResult::skip();\n     });\n \n@@ -80,48 +80,19 @@ class AddLoopUnrollFlagsPass\n         /*endLoc=*/nullptr,\n         /*parallelAccesses=*/{});\n \n-    for (auto& [for_op, bits] : nested_iteration_bits) {\n-      if (bits >= max_nested_bits_) {\n+    for (auto& [for_op, nested_iterations] : nested_iteration_map) {\n+      if (nested_iterations > max_nested_iterations_) {\n         for_op->setAttr(mlir::LLVM::LoopAnnotationAttr::getMnemonic(),\n                         loop_annotation);\n       }\n     }\n   }\n \n  private:\n-  // Get the minimum element size in bits of any tensor extract/insert that use\n-  // the loops induction variable.\n-  static int64_t MinElementBits(mlir::scf::ForOp& for_op) {\n-    mlir::DataLayout data_layout = mlir::DataLayout::closest(for_op);\n-    std::optional<int64_t> min_element_bits;\n-\n-    auto update_min_element_bits = [&](mlir::Type type) {\n-      llvm::TypeSize size = data_layout.getTypeSizeInBits(type);\n-      int64_t element_bits = size.getFixedValue();\n-      if (!min_element_bits.has_value()) {\n-        min_element_bits = element_bits;\n-      } else if (element_bits < min_element_bits.value()) {\n-        min_element_bits = element_bits;\n-      }\n-    };\n-\n-    for_op.walk([&](mlir::Operation* op) {\n-      if (auto extract_op = mlir::dyn_cast<mlir::tensor::ExtractOp>(op)) {\n-        update_min_element_bits(extract_op.getResult().getType());\n-      }\n-\n-      if (auto insert_op = mlir::dyn_cast<mlir::tensor::InsertOp>(op)) {\n-        update_min_element_bits(insert_op.getScalar().getType());\n-      }\n-    });\n-\n-    return min_element_bits ? *min_element_bits : 0;\n-  }\n-\n   // Recursively insert the number of nested accessed bits for each loop.\n   static int64_t RecursiveWalk(\n       mlir::scf::ForOp for_op,\n-      llvm::DenseMap<mlir::scf::ForOp, int64_t>& nested_iteration_bits) {\n+      llvm::DenseMap<mlir::scf::ForOp, int64_t>& nested_iteration_map) {\n     auto lb = for_op.getLowerBound();\n     auto ub = for_op.getUpperBound();\n     auto step = for_op.getStep();\n@@ -133,17 +104,14 @@ class AddLoopUnrollFlagsPass\n       return 0;\n     }\n \n-    int64_t min_element_bits = MinElementBits(for_op);\n-\n     int64_t nested_iterations = 0;\n     for_op.getBody()->walk<mlir::WalkOrder::PreOrder>(\n         [&](mlir::scf::ForOp for_op) {\n-          nested_iterations += RecursiveWalk(for_op, nested_iteration_bits);\n+          nested_iterations += RecursiveWalk(for_op, nested_iteration_map);\n           return mlir::WalkResult::skip();\n         });\n \n-    nested_iteration_bits.insert(\n-        {for_op, nested_iterations * min_element_bits});\n+    nested_iteration_map.insert({for_op, nested_iterations});\n \n     if (nested_iterations == 0) {\n       return *this_trip_count;\n@@ -156,9 +124,9 @@ class AddLoopUnrollFlagsPass\n }  // namespace\n \n std::unique_ptr<mlir::Pass> CreateAddLoopUnrollFlagsPass(\n-    int32_t max_nested_bits) {\n+    int32_t max_nested_iterations) {\n   AddLoopUnrollFlagsPassOptions options;\n-  options.max_nested_bits_ = max_nested_bits;\n+  options.max_nested_iterations_ = max_nested_iterations;\n   return std::make_unique<AddLoopUnrollFlagsPass>(options);\n }\n "
+        },
+        {
+            "sha": "e2cfc8188089cc6a10d6440b772e1f2b690e2771",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/emitters/transforms/lower_xla_shared.cc",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 23,
+            "changes": 23,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/456196940ff423e3d7478de53a7d66dca9e658bd/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Femitters%2Ftransforms%2Flower_xla_shared.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/456196940ff423e3d7478de53a7d66dca9e658bd/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Femitters%2Ftransforms%2Flower_xla_shared.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Femitters%2Ftransforms%2Flower_xla_shared.cc?ref=456196940ff423e3d7478de53a7d66dca9e658bd",
+            "patch": "@@ -117,29 +117,6 @@ struct LowerForall : mlir::OpRewritePattern<mlir::scf::ForallOp> {\n           return new_results;\n         });\n \n-    // Disable unrolling for all loops except the innermost.\n-    auto loop_unroll = rewriter.getAttr<mlir::LLVM::LoopUnrollAttr>(\n-        /*disable=*/rewriter.getBoolAttr(true), /*count=*/nullptr,\n-        /*runtimeDisable=*/nullptr,\n-        /*full=*/nullptr,\n-        /*followupUnrolled=*/nullptr, /*followupRemainder=*/nullptr,\n-        /*followupAll=*/nullptr);\n-    auto loop_annotation = rewriter.getAttr<mlir::LLVM::LoopAnnotationAttr>(\n-        /*disableNonforced=*/nullptr, /*vectorize=*/nullptr,\n-        /*interleave=*/nullptr, loop_unroll,\n-        /*unrollAndJam=*/nullptr, /*licm=*/nullptr, /*distribute=*/nullptr,\n-        /*pipeline=*/nullptr, /*peeled=*/nullptr, /*unswitch=*/nullptr,\n-        /*mustProgress=*/nullptr,\n-        /*isVectorized=*/nullptr,\n-        /*startLoc=*/nullptr,\n-        /*endLoc=*/nullptr,\n-        /*parallelAccesses=*/llvm::ArrayRef<mlir::LLVM::AccessGroupAttr>());\n-\n-    for (auto& for_op : absl::MakeSpan(loop_nest.loops).first(num_dims - 1)) {\n-      for_op->setAttr(mlir::LLVM::LoopAnnotationAttr::getMnemonic(),\n-                      loop_annotation);\n-    }\n-\n     rewriter.replaceOp(op, loop_nest.results);\n     return mlir::success();\n   }"
+        },
+        {
+            "sha": "da7ce28b20608feeb00c4f376acf2084881f60b5",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/emitters/transforms/passes.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/456196940ff423e3d7478de53a7d66dca9e658bd/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Femitters%2Ftransforms%2Fpasses.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/456196940ff423e3d7478de53a7d66dca9e658bd/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Femitters%2Ftransforms%2Fpasses.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Femitters%2Ftransforms%2Fpasses.h?ref=456196940ff423e3d7478de53a7d66dca9e658bd",
+            "patch": "@@ -31,7 +31,7 @@ std::unique_ptr<mlir::Pass> CreateLowerXlaSharedPass();\n std::unique_ptr<mlir::Pass> CreateExpandFloatOpsPass();\n std::unique_ptr<mlir::Pass> CreateAddReductionFastMathFlagsPass();\n std::unique_ptr<mlir::Pass> CreateAddLoopUnrollFlagsPass(\n-    int32_t max_nested_bits = 256);\n+    int32_t max_nested_iterations = 1);\n std::unique_ptr<mlir::Pass> CreatePeelWorkgroupLoopPass();\n \n #define GEN_PASS_REGISTRATION"
+        },
+        {
+            "sha": "15a01ec923b039c05c5dddcee77e375ac0e3e6e6",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/emitters/transforms/passes.td",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/456196940ff423e3d7478de53a7d66dca9e658bd/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Femitters%2Ftransforms%2Fpasses.td",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/456196940ff423e3d7478de53a7d66dca9e658bd/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Femitters%2Ftransforms%2Fpasses.td",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Femitters%2Ftransforms%2Fpasses.td?ref=456196940ff423e3d7478de53a7d66dca9e658bd",
+            "patch": "@@ -102,8 +102,8 @@ def AddLoopUnrollFlagsPass : Pass<\"xla-cpu-add-loop-unroll-flags\", \"mlir::func::\n   ];\n \n   let options = [\n-    Option<\"max_nested_bits_\", \"max_nested_bits\", \"int32_t\", \"256\",\n-           \"The maximum number of bits accessed in a nested loop before disabling unrolling\">,\n+    Option<\"max_nested_iterations_\", \"max_nested_iterations\", \"int32_t\", \"1\",\n+           \"The maximum number of iterations accessed in a nested loop before disabling unrolling\">,\n   ];\n \n   let constructor = \"CreateAddLoopUnrollFlagsPass()\";"
+        },
+        {
+            "sha": "d3367b86b33e89aa64abb76194267769490be3f3",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/emitters/transforms/tests/add_loop_unroll_flags.mlir",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 4,
+            "changes": 5,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/456196940ff423e3d7478de53a7d66dca9e658bd/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Femitters%2Ftransforms%2Ftests%2Fadd_loop_unroll_flags.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/456196940ff423e3d7478de53a7d66dca9e658bd/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Femitters%2Ftransforms%2Ftests%2Fadd_loop_unroll_flags.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Femitters%2Ftransforms%2Ftests%2Fadd_loop_unroll_flags.mlir?ref=456196940ff423e3d7478de53a7d66dca9e658bd",
+            "patch": "@@ -9,10 +9,7 @@ func.func @nested_for(%arg : tensor<16x16x8xf32>) -> () {\n   scf.for %iter0 = %c0 to %c16 step %c1 iter_args(%res0 = %arg) -> tensor<16x16x8xf32> {\n     scf.for %iter1 = %c0 to %c16 step %c1 iter_args(%res1 = %res0) -> tensor<16x16x8xf32> {\n       scf.for %iter2 = %c0 to %c8 step %c1 iter_args(%res2 = %res1) -> tensor<16x16x8xf32> {\n-        // Ensure this still works when IV is used indirectly.\n-        %c_0 = arith.constant 0 : index\n-        %iter1_plus_zero = arith.addi %iter1, %c_0 : index\n-        %extracted = tensor.extract %res2[%iter0, %iter1_plus_zero, %iter2] : tensor<16x16x8xf32>\n+        %extracted = tensor.extract %res2[%iter0, %iter1, %iter2] : tensor<16x16x8xf32>\n         scf.yield %res2 : tensor<16x16x8xf32>\n       }\n       scf.yield %res1 : tensor<16x16x8xf32>"
+        },
+        {
+            "sha": "6abdda5ad78ccfa4eea1710fa44408556ec421cd",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/emitters/transforms/tests/lower_xla_shared.mlir",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 4,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/456196940ff423e3d7478de53a7d66dca9e658bd/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Femitters%2Ftransforms%2Ftests%2Flower_xla_shared.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/456196940ff423e3d7478de53a7d66dca9e658bd/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Femitters%2Ftransforms%2Ftests%2Flower_xla_shared.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Femitters%2Ftransforms%2Ftests%2Flower_xla_shared.mlir?ref=456196940ff423e3d7478de53a7d66dca9e658bd",
+            "patch": "@@ -14,8 +14,6 @@ func.func @forall_op(%input: tensor<1024x32x2xf32>) -> (tensor<1024x32x2xf32>) {\n   }\n   func.return %double : tensor<1024x32x2xf32>\n }\n-// CHECK: #[[LOOP_UNROLL:.*]] = #llvm.loop_unroll<disable = true>\n-// CHECK: #[[LOOP_ANNOTATION:.*]] = #llvm.loop_annotation<unroll = #[[LOOP_UNROLL]]>\n // CHECK-DAG: [[CONST_0:%.*]] = arith.constant 0 : index\n // CHECK-DAG: [[CONST_1:%.*]] = arith.constant 1 : index\n // CHECK-DAG: [[CONST_2:%.*]] = arith.constant 2 : index\n@@ -29,7 +27,7 @@ func.func @forall_op(%input: tensor<1024x32x2xf32>) -> (tensor<1024x32x2xf32>) {\n // CHECK-NEXT: }\n // CHECK-NOT: loop_annotation\n // CHECK: scf.yield\n-// CHECK-NEXT: } {loop_annotation = #[[LOOP_ANNOTATION]]}\n+// CHECK-NEXT: }\n // CHECK: scf.yield\n-// CHECK-NEXT: } {loop_annotation = #[[LOOP_ANNOTATION]]}\n+// CHECK-NEXT: }\n "
+        },
+        {
+            "sha": "0bfe7a44b284b34a6d914a2765571ae8ea7746eb",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/fusion_compiler.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/456196940ff423e3d7478de53a7d66dca9e658bd/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ffusion_compiler.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/456196940ff423e3d7478de53a7d66dca9e658bd/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ffusion_compiler.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ffusion_compiler.cc?ref=456196940ff423e3d7478de53a7d66dca9e658bd",
+            "patch": "@@ -146,6 +146,7 @@ static void AddLoopTransformationPasses(mlir::OpPassManager& pm,\n   //     emitters::CreateVectorizeLoadsAndStoresPass(/*target_type=*/\"cpu\"));\n   pm.addPass(mlir::createCanonicalizerPass());\n   pm.addPass(mlir::createCSEPass());\n+  pm.addNestedPass<mlir::func::FuncOp>(CreateAddLoopUnrollFlagsPass());\n }\n \n static void AddLoweringPasses(mlir::OpPassManager& pm, int32_t vector_width,"
+        }
+    ],
+    "stats": {
+        "total": 91,
+        "additions": 16,
+        "deletions": 75
+    }
+}

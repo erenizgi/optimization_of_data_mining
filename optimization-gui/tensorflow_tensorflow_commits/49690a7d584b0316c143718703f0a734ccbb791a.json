@@ -1,0 +1,48 @@
+{
+    "author": "WillFroom",
+    "message": "[XTile] Add MaskOp.\n\nThis will be used to allow different backends specialize how they lower reduce from the tiled emitter, e.g. CPU has vector.create_mask / can fold it into reduction lowering.\n\nPiperOrigin-RevId: 832242696",
+    "sha": "49690a7d584b0316c143718703f0a734ccbb791a",
+    "files": [
+        {
+            "sha": "3edd30584d5f9c2385aab54a9bae857af27c6235",
+            "filename": "third_party/xla/xla/codegen/xtile/ir/tests/ops.mlir",
+            "status": "modified",
+            "additions": 25,
+            "deletions": 1,
+            "changes": 26,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/49690a7d584b0316c143718703f0a734ccbb791a/third_party%2Fxla%2Fxla%2Fcodegen%2Fxtile%2Fir%2Ftests%2Fops.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/49690a7d584b0316c143718703f0a734ccbb791a/third_party%2Fxla%2Fxla%2Fcodegen%2Fxtile%2Fir%2Ftests%2Fops.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fcodegen%2Fxtile%2Fir%2Ftests%2Fops.mlir?ref=49690a7d584b0316c143718703f0a734ccbb791a",
+            "patch": "@@ -117,11 +117,35 @@ func.func @type_mismatch_insert(%src: tensor<24xf64>, %dst: memref<1024xf32>) {\n   return\n }\n \n-\n // -----\n \n func.func @dot_scaled(%lhs: tensor<128x128xf32>, %lhs_scale: tensor<128x4xi8>, %rhs: tensor<128x256xf32>, %rhs_scale: tensor<256x4xi8>, %acc: tensor<128x256xf32>) -> tensor<128x256xf32> {\n   %0 = xtile.dot_scaled %lhs scale %lhs_scale, %rhs scale %rhs_scale {fastMath = true} : tensor<128x128xf32>, tensor<128x4xi8> * tensor<128x256xf32>, tensor<256x4xi8> -> tensor<128x256xf32>\n   return %0 : tensor<128x256xf32>\n }\n \n+\n+// -----\n+\n+func.func @legal_mask_op(%src: tensor<32xf64>, %mask: f64) -> tensor<32xf64> {\n+  %masked = xtile.mask %src bounds [10], %mask : tensor<32xf64>\n+  return %masked : tensor<32xf64>\n+}\n+\n+// -----\n+\n+func.func @illegal_mask_bound_rank_mismatch(\n+    %src: tensor<32xf64>, %mask: f64) -> tensor<32xf64> {\n+  // expected-error@+1 {{tensor rank: 1 does not match mask bounds rank: 2}}\n+  %masked = xtile.mask %src bounds [10, 1], %mask : tensor<32xf64>\n+  return %masked : tensor<32xf64>\n+}\n+\n+// -----\n+\n+func.func @illegal_mask_out_of_bounds(%src: tensor<32xf64>, %mask: f64) -> tensor<32xf64> {\n+  // expected-error@+1 {{mask bound not less than or equal to the tensor size}}\n+  %masked = xtile.mask %src bounds [33], %mask : tensor<32xf64>\n+  return %masked : tensor<32xf64>\n+}\n+"
+        },
+        {
+            "sha": "5bc7fc57fde2f1681c4c0f440a815ba0fcd1e30b",
+            "filename": "third_party/xla/xla/codegen/xtile/ir/xtile_ops.cc",
+            "status": "modified",
+            "additions": 44,
+            "deletions": 0,
+            "changes": 44,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/49690a7d584b0316c143718703f0a734ccbb791a/third_party%2Fxla%2Fxla%2Fcodegen%2Fxtile%2Fir%2Fxtile_ops.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/49690a7d584b0316c143718703f0a734ccbb791a/third_party%2Fxla%2Fxla%2Fcodegen%2Fxtile%2Fir%2Fxtile_ops.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fcodegen%2Fxtile%2Fir%2Fxtile_ops.cc?ref=49690a7d584b0316c143718703f0a734ccbb791a",
+            "patch": "@@ -198,4 +198,48 @@ mlir::TypedValue<mlir::RankedTensorType> InsertTileOp::getTile() {\n \n mlir::LogicalResult InsertTileOp::verify() { return VerifyBufferOp(*this); }\n \n+llvm::SmallVector<int64_t> MaskOp::getMaskedDimensions() {\n+  llvm::SmallVector<int64_t> masked_dimensions;\n+\n+  int64_t idx = 0;\n+  for (const auto [bound_size, tensor_size] :\n+       llvm::zip(getBounds(), getType().getShape())) {\n+    if (bound_size < tensor_size) {\n+      masked_dimensions.push_back(idx);\n+    }\n+    ++idx;\n+  }\n+\n+  return masked_dimensions;\n+}\n+\n+mlir::LogicalResult MaskOp::verify() {\n+  mlir::ArrayRef<int64_t> tensor_shape = getType().getShape();\n+  mlir::ArrayRef<int64_t> bounds = getBounds();\n+\n+  if (tensor_shape.size() != bounds.size()) {\n+    return emitOpError() << \"tensor rank: \" << tensor_shape.size()\n+                         << \" does not match mask bounds rank: \"\n+                         << bounds.size();\n+  }\n+\n+  for (const auto [bound_size, tensor_size] : llvm::zip(bounds, tensor_shape)) {\n+    if (bound_size > tensor_size) {\n+      return emitOpError()\n+             << \"mask bound not less than or equal to the tensor size\";\n+    }\n+  }\n+\n+  return mlir::success();\n+}\n+\n+mlir::OpFoldResult MaskOp::fold(FoldAdaptor) {\n+  if (getMaskedDimensions().empty()) {\n+    // If none of the dimensions are masked then the op is a nop.\n+    return getSource();\n+  }\n+\n+  return {};\n+}\n+\n }  // namespace xla::xtile"
+        },
+        {
+            "sha": "b6c5b6ac43d31f011c0fe8c88900fe873ac790c6",
+            "filename": "third_party/xla/xla/codegen/xtile/ir/xtile_ops.td",
+            "status": "modified",
+            "additions": 36,
+            "deletions": 0,
+            "changes": 36,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/49690a7d584b0316c143718703f0a734ccbb791a/third_party%2Fxla%2Fxla%2Fcodegen%2Fxtile%2Fir%2Fxtile_ops.td",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/49690a7d584b0316c143718703f0a734ccbb791a/third_party%2Fxla%2Fxla%2Fcodegen%2Fxtile%2Fir%2Fxtile_ops.td",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fcodegen%2Fxtile%2Fir%2Fxtile_ops.td?ref=49690a7d584b0316c143718703f0a734ccbb791a",
+            "patch": "@@ -212,6 +212,42 @@ def InsertTileOp : XTile_Op<\"insert\", [TiledBufferInterface]> {\n   let hasVerifier = 1;\n }\n \n+def MaskOp : XTile_Op<\"mask\",\n+                      [Pure,\n+                       AllTypesMatch<[\"source\", \"result\"]>,\n+                       TypesMatchWith<\"mask type matches result element type\",\n+                          \"result\", \"value\", ElementType<\"_self\">.result>\n+                      ]> {\n+  let summary = \"Mask the values of a tensor.\";\n+\n+  let description = [{\n+    Masks out the values of the input tensor that are outside the range of the\n+    given mask upper bound. Masked values are set to the provided value.\n+  }];\n+\n+\n+  let arguments = (ins\n+    AnyRankedTensor:$source,\n+    DenseI64ArrayAttr:$bounds,\n+    AnyType:$value\n+  );\n+\n+  let results = (outs AnyRankedTensor:$result);\n+\n+  let assemblyFormat = [{\n+    $source `bounds` $bounds `,` $value `:` type($result) attr-dict\n+  }];\n+\n+  let extraClassDeclaration = [{\n+    // Get the dimensions where the mask bound is smaller than the dimension\n+    // size. The returned array is sorted in increasing order.\n+    llvm::SmallVector<int64_t> getMaskedDimensions();\n+  }];\n+\n+  let hasVerifier = 1;\n+  let hasFolder = 1;\n+}\n+\n \n //\n // DotScaled Op"
+        }
+    ],
+    "stats": {
+        "total": 106,
+        "additions": 105,
+        "deletions": 1
+    }
+}

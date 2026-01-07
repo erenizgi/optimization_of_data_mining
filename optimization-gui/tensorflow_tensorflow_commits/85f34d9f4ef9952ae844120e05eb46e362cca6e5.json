@@ -1,0 +1,72 @@
+{
+    "author": "EusebioDM",
+    "message": "Add proto serialization for `OutfeedThunk`\n\nPiperOrigin-RevId: 815725149",
+    "sha": "85f34d9f4ef9952ae844120e05eb46e362cca6e5",
+    "files": [
+        {
+            "sha": "aed2870e777244bd79a9f2321e71aeea5257efa0",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/BUILD",
+            "status": "modified",
+            "additions": 21,
+            "deletions": 2,
+            "changes": 23,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/85f34d9f4ef9952ae844120e05eb46e362cca6e5/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/85f34d9f4ef9952ae844120e05eb46e362cca6e5/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2FBUILD?ref=85f34d9f4ef9952ae844120e05eb46e362cca6e5",
+            "patch": "@@ -1550,10 +1550,29 @@ cc_library(\n         \"//xla/service/gpu:gpu_transfer_manager\",\n         \"//xla/service/gpu:io_feed_manager\",\n         \"//xla/stream_executor:device_memory\",\n-        \"//xla/stream_executor:stream_executor_h\",\n+        \"//xla/stream_executor:stream\",\n+        \"//xla/tsl/platform:errors\",\n+        \"//xla/tsl/platform:statusor\",\n         \"@com_google_absl//absl/log\",\n         \"@com_google_absl//absl/status\",\n-        \"@local_tsl//tsl/platform:errors\",\n+        \"@com_google_absl//absl/status:statusor\",\n+        \"@com_google_absl//absl/types:span\",\n+    ],\n+)\n+\n+xla_cc_test(\n+    name = \"outfeed_thunk_test\",\n+    srcs = [\"outfeed_thunk_test.cc\"],\n+    deps = [\n+        \":outfeed_thunk\",\n+        \":thunk\",\n+        \":thunk_proto_cc\",\n+        \"//xla/service:buffer_assignment\",\n+        \"//xla/tsl/platform:statusor\",\n+        \"//xla/tsl/util/proto:parse_text_proto\",\n+        \"//xla/tsl/util/proto:proto_matchers\",\n+        \"@com_google_absl//absl/status:status_matchers\",\n+        \"@com_google_googletest//:gtest_main\",\n     ],\n )\n "
+        },
+        {
+            "sha": "a186723eeef8b0f3ff1795155acdb8e4e6f38fd9",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/outfeed_thunk.cc",
+            "status": "modified",
+            "additions": 34,
+            "deletions": 3,
+            "changes": 37,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/85f34d9f4ef9952ae844120e05eb46e362cca6e5/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Foutfeed_thunk.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/85f34d9f4ef9952ae844120e05eb46e362cca6e5/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Foutfeed_thunk.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Foutfeed_thunk.cc?ref=85f34d9f4ef9952ae844120e05eb46e362cca6e5",
+            "patch": "@@ -22,6 +22,7 @@ limitations under the License.\n \n #include \"absl/log/log.h\"\n #include \"absl/status/status.h\"\n+#include \"absl/types/span.h\"\n #include \"xla/backends/gpu/runtime/thunk.h\"\n #include \"xla/service/buffer_assignment.h\"\n #include \"xla/service/gpu/buffer_allocations.h\"\n@@ -32,9 +33,10 @@ limitations under the License.\n #include \"xla/shape_util.h\"\n #include \"xla/status_macros.h\"\n #include \"xla/stream_executor/device_memory.h\"\n-#include \"xla/stream_executor/stream_executor.h\"\n+#include \"xla/stream_executor/stream.h\"\n+#include \"xla/tsl/platform/errors.h\"\n+#include \"xla/tsl/platform/statusor.h\"\n #include \"xla/util.h\"\n-#include \"tsl/platform/errors.h\"\n \n namespace xla {\n namespace gpu {\n@@ -98,8 +100,9 @@ absl::Status OutfeedThunk::ExecuteOnStream(const ExecuteParams& params) {\n         << ShapeUtil::HumanStringWithLayout(source_slices_[index].shape);\n \n     BufferAllocation::Slice source_slice = source_slices_[index].slice;\n-    if (!source_slice.allocation())\n+    if (!source_slice.allocation()) {\n       return Internal(\"outfeed source missing buffer allocation\");\n+    }\n     se::DeviceMemoryBase data_address =\n         buffer_allocations.GetDeviceAddress(source_slice);\n \n@@ -120,5 +123,33 @@ absl::Status OutfeedThunk::ExecuteOnStream(const ExecuteParams& params) {\n   return absl::OkStatus();\n }\n \n+absl::StatusOr<std::unique_ptr<OutfeedThunk>> OutfeedThunk::FromProto(\n+    ThunkInfo thunk_info, const OutfeedThunkProto& proto,\n+    absl::Span<const BufferAllocation> source_allocations) {\n+  std::vector<ShapedSlice> source_slices;\n+  source_slices.reserve(proto.source_slices_size());\n+  for (const ShapedSliceProto& proto_source_slice : proto.source_slices()) {\n+    TF_ASSIGN_OR_RETURN(\n+        source_slices.emplace_back(),\n+        ShapedSlice::FromProto(proto_source_slice, source_allocations));\n+  }\n+\n+  return std::make_unique<OutfeedThunk>(std::move(thunk_info),\n+                                        std::move(source_slices));\n+}\n+\n+absl::StatusOr<ThunkProto> OutfeedThunk::ToProto() const {\n+  ThunkProto thunk_proto;\n+  *thunk_proto.mutable_thunk_info() = thunk_info().ToProto();\n+\n+  for (const ShapedSlice& shaped_slice : source_slices_) {\n+    TF_ASSIGN_OR_RETURN(\n+        *thunk_proto.mutable_outfeed_thunk()->add_source_slices(),\n+        shaped_slice.ToProto());\n+  }\n+\n+  return thunk_proto;\n+}\n+\n }  // namespace gpu\n }  // namespace xla"
+        },
+        {
+            "sha": "b07f90782b4907c305ce7a4a2dc5f3752d40045c",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/outfeed_thunk.h",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 3,
+            "changes": 19,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/85f34d9f4ef9952ae844120e05eb46e362cca6e5/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Foutfeed_thunk.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/85f34d9f4ef9952ae844120e05eb46e362cca6e5/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Foutfeed_thunk.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Foutfeed_thunk.h?ref=85f34d9f4ef9952ae844120e05eb46e362cca6e5",
+            "patch": "@@ -16,28 +16,41 @@ limitations under the License.\n #ifndef XLA_BACKENDS_GPU_RUNTIME_OUTFEED_THUNK_H_\n #define XLA_BACKENDS_GPU_RUNTIME_OUTFEED_THUNK_H_\n \n+#include <memory>\n #include <vector>\n \n #include \"absl/status/status.h\"\n+#include \"absl/status/statusor.h\"\n+#include \"absl/types/span.h\"\n #include \"xla/backends/gpu/runtime/thunk.h\"\n+#include \"xla/service/buffer_assignment.h\"\n \n namespace xla {\n namespace gpu {\n \n // A thunk that outfeeds data. Data must be already resident on the host. This\n-// thunk performs a device to host copy from the buffer allocated for the\n-// outfeed op to the host location.\n+// thunk performs a device to host copy, from the buffer allocated for the\n+// outfeed op, to the host location.\n class OutfeedThunk : public Thunk {\n  public:\n   // Constructs a OutfeedThunk that copies data to the host-side\n-  // outfeed queue from the buffers in the given shape tree.\n+  // outfeed queue, from the buffers in the given shape tree.\n   OutfeedThunk(ThunkInfo thunk_info, std::vector<ShapedSlice> source_slices);\n \n   OutfeedThunk(const OutfeedThunk&) = delete;\n   OutfeedThunk& operator=(const OutfeedThunk&) = delete;\n \n   absl::Status ExecuteOnStream(const ExecuteParams& params) override;\n \n+  // Deserializes an `OutfeedThunk` that will copy the data from the given\n+  // `source_allocations` to the host-side outfeed queue.\n+  // The `source_allocations` must outlive the returned `OutfeedThunk`.\n+  static absl::StatusOr<std::unique_ptr<OutfeedThunk>> FromProto(\n+      ThunkInfo thunk_info, const OutfeedThunkProto& proto,\n+      absl::Span<const BufferAllocation> source_allocations);\n+\n+  absl::StatusOr<ThunkProto> ToProto() const override;\n+\n  private:\n   const std::vector<ShapedSlice> source_slices_;\n };"
+        },
+        {
+            "sha": "de2ee75bb5d3f2f620a3a2667ab2c2e5cd39c073",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/outfeed_thunk_test.cc",
+            "status": "added",
+            "additions": 61,
+            "deletions": 0,
+            "changes": 61,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/85f34d9f4ef9952ae844120e05eb46e362cca6e5/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Foutfeed_thunk_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/85f34d9f4ef9952ae844120e05eb46e362cca6e5/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Foutfeed_thunk_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Foutfeed_thunk_test.cc?ref=85f34d9f4ef9952ae844120e05eb46e362cca6e5",
+            "patch": "@@ -0,0 +1,61 @@\n+/* Copyright 2025 The OpenXLA Authors.\n+\n+Licensed under the Apache License, Version 2.0 (the \"License\");\n+you may not use this file except in compliance with the License.\n+You may obtain a copy of the License at\n+\n+    http://www.apache.org/licenses/LICENSE-2.0\n+\n+Unless required by applicable law or agreed to in writing, software\n+distributed under the License is distributed on an \"AS IS\" BASIS,\n+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+See the License for the specific language governing permissions and\n+limitations under the License.\n+==============================================================================*/\n+\n+#include \"xla/backends/gpu/runtime/outfeed_thunk.h\"\n+\n+#include <memory>\n+#include <vector>\n+\n+#include <gmock/gmock.h>\n+#include <gtest/gtest.h>\n+#include \"absl/status/status_matchers.h\"\n+#include \"xla/backends/gpu/runtime/thunk.h\"\n+#include \"xla/backends/gpu/runtime/thunk.pb.h\"\n+#include \"xla/service/buffer_assignment.h\"\n+#include \"xla/tsl/platform/statusor.h\"\n+#include \"xla/tsl/util/proto/parse_text_proto.h\"\n+#include \"xla/tsl/util/proto/proto_matchers.h\"\n+\n+namespace xla::gpu {\n+namespace {\n+using ::absl_testing::IsOkAndHolds;\n+using ::tsl::proto_testing::EqualsProto;\n+using ::tsl::proto_testing::ParseTextProtoOrDie;\n+\n+TEST(OutfeedThunkTest, ProtoRoundTrip) {\n+  auto thunk_proto = ParseTextProtoOrDie<ThunkProto>(R\"pb(\n+    thunk_info { profile_annotation: \"outfeed\" execution_stream_id: 2 }\n+    outfeed_thunk {\n+      source_slices {\n+        slice { offset: 0 size: 4 buffer_allocation_index: 0 }\n+        shape { dimensions: 8 element_type: F32 is_dynamic_dimension: false }\n+      }\n+    }\n+  )pb\");\n+  TF_ASSERT_OK_AND_ASSIGN(\n+      Thunk::ThunkInfo thunk_info,\n+      Thunk::ThunkInfo::FromProto(thunk_proto.thunk_info()));\n+  std::vector<BufferAllocation> source_allocations = {\n+      BufferAllocation(/*index=*/0, /*size=*/4, /*color=*/0)};\n+  TF_ASSERT_OK_AND_ASSIGN(\n+      std::unique_ptr<OutfeedThunk> thunk,\n+      OutfeedThunk::FromProto(thunk_info, thunk_proto.outfeed_thunk(),\n+                              source_allocations));\n+\n+  EXPECT_THAT(thunk->ToProto(), IsOkAndHolds(EqualsProto(thunk_proto)));\n+}\n+\n+}  // namespace\n+}  // namespace xla::gpu"
+        },
+        {
+            "sha": "bd6413355f4395392443b7f8b1bf5adabef909ac",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/thunk.proto",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/85f34d9f4ef9952ae844120e05eb46e362cca6e5/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fthunk.proto",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/85f34d9f4ef9952ae844120e05eb46e362cca6e5/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fthunk.proto",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fthunk.proto?ref=85f34d9f4ef9952ae844120e05eb46e362cca6e5",
+            "patch": "@@ -143,6 +143,10 @@ message InfeedThunkProto {\n   repeated ShapedSliceProto dest_slices = 1;\n }\n \n+message OutfeedThunkProto {\n+  repeated ShapedSliceProto source_slices = 1;\n+}\n+\n message SelectKThunkProto {\n   // TODO(upwind): Add fields for SelectKThunkProto.\n }\n@@ -191,6 +195,7 @@ message ThunkProto {\n     SelectKThunkProto select_k_thunk = 20;\n     InfeedThunkProto infeed_thunk = 21;\n     CublasLtMatmulThunkProto cublas_lt_matmul_thunk = 22;\n+    OutfeedThunkProto outfeed_thunk = 23;\n   }\n }\n "
+        }
+    ],
+    "stats": {
+        "total": 145,
+        "additions": 137,
+        "deletions": 8
+    }
+}

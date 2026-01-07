@@ -1,0 +1,36 @@
+{
+    "author": "WillFroom",
+    "message": "[XLA:GPU][XTile] Handle scalar load/store in xtile lowering.\n\nPiperOrigin-RevId: 821617202",
+    "sha": "4d5ed207cd802444f386f686813c001724ca45d4",
+    "files": [
+        {
+            "sha": "44fc5a64ee38149bbaf4ed8348e401e71e63cf2c",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/transforms/tests/triton_xla_lower_xtile.mlir",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 0,
+            "changes": 15,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4d5ed207cd802444f386f686813c001724ca45d4/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftests%2Ftriton_xla_lower_xtile.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4d5ed207cd802444f386f686813c001724ca45d4/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftests%2Ftriton_xla_lower_xtile.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftests%2Ftriton_xla_lower_xtile.mlir?ref=4d5ed207cd802444f386f686813c001724ca45d4",
+            "patch": "@@ -37,3 +37,18 @@ xtile.entry_func @layout_preserved(%input: !arg_type,\n // CHECK-SAME: [1, 1, 1, 1] [1, 1, 1, 1] : tensor<1x1x1x1xbf16>\n // CHECK:   return\n // CHECK: }\n+\n+// -----\n+\n+!memref_type = memref<32xf64, #nvvm.memory_space<global>>\n+// CHECK:func.func @scalar_insert_extract(\n+// CHECK-SAME: %[[ARG0:.*]]: !tt.ptr<f64>, %[[ARG1:.*]]: !tt.ptr<f64>) {\n+xtile.entry_func @scalar_insert_extract(%input: !memref_type,\n+                                        %output: !memref_type,\n+                                        %tile_id: index) {\n+  // CHECK: %[[SCALAR_VALUE:.*]] = tt.load %[[ARG0]] : !tt.ptr<f64>\n+  %tile = xtile.extract %input[%tile_id][1][1] : !memref_type -> tensor<f64>\n+  // CHECK: tt.store %[[ARG1]], %[[SCALAR_VALUE]] : !tt.ptr<f64>\n+  xtile.insert %tile into %output[%tile_id][1][1] : tensor<f64> -> !memref_type\n+  xtile.return\n+}"
+        },
+        {
+            "sha": "fa3ad9871cd9149bc5c723ca3bcf1b656c9bca91",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/transforms/triton_xla_lower_xtile_pass.cc",
+            "status": "modified",
+            "additions": 20,
+            "deletions": 0,
+            "changes": 20,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4d5ed207cd802444f386f686813c001724ca45d4/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftriton_xla_lower_xtile_pass.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4d5ed207cd802444f386f686813c001724ca45d4/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftriton_xla_lower_xtile_pass.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftriton_xla_lower_xtile_pass.cc?ref=4d5ed207cd802444f386f686813c001724ca45d4",
+            "patch": "@@ -26,6 +26,7 @@ limitations under the License.\n #include \"mlir/Dialect/Arith/IR/Arith.h\"\n #include \"mlir/Dialect/Func/IR/FuncOps.h\"\n #include \"mlir/Dialect/MemRef/IR/MemRef.h\"\n+#include \"mlir/Dialect/Tensor/IR/Tensor.h\"\n #include \"mlir/IR/Builders.h\"\n #include \"mlir/IR/BuiltinAttributes.h\"\n #include \"mlir/IR/BuiltinOps.h\"\n@@ -211,6 +212,16 @@ class XTileExtractToTriton\n     mlir::Value memref_to_ptr =\n         CreateMemrefToPtr(rewriter, extract_op.getSource());\n \n+    if (extract_op.getType().getRank() == 0) {\n+      mlir::Value scalar_value = rewriter.create<ttir::LoadOp>(\n+          extract_op->getLoc(), memref_to_ptr, ttir::CacheModifier::NONE,\n+          ttir::EvictionPolicy::NORMAL, /*isVolatile=*/false);\n+\n+      rewriter.replaceOpWithNewOp<mlir::tensor::FromElementsOp>(\n+          extract_op, extract_op.getType(), scalar_value);\n+      return mlir::success();\n+    }\n+\n     absl::StatusOr<SmallVector<int64_t>> minor_to_major_or =\n         getPermutationMinorToMajor(source_type);\n     if (!minor_to_major_or.ok()) {\n@@ -243,6 +254,15 @@ class XTileInsertToTriton\n     mlir::Value memref_to_ptr =\n         CreateMemrefToPtr(rewriter, insert_op.getDestination());\n \n+    if (insert_op.getSource().getType().getRank() == 0) {\n+      mlir::Value scalar_value = rewriter.create<mlir::tensor::ExtractOp>(\n+          insert_op.getLoc(), insert_op.getSource());\n+\n+      rewriter.replaceOpWithNewOp<ttir::StoreOp>(\n+          insert_op, memref_to_ptr, scalar_value, /*mask=*/nullptr);\n+      return mlir::success();\n+    }\n+\n     absl::StatusOr<SmallVector<int64_t>> minor_to_major_or =\n         getPermutationMinorToMajor(destination_type);\n     if (!minor_to_major_or.ok()) {"
+        }
+    ],
+    "stats": {
+        "total": 35,
+        "additions": 35,
+        "deletions": 0
+    }
+}

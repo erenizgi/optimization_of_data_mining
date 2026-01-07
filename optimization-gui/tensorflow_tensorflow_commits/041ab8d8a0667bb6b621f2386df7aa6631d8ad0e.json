@@ -1,0 +1,36 @@
+{
+    "author": "unknown",
+    "message": "Handle edge case around float to int conversion when float type does not have a max value greater than the destination\n\nDue to the lovely design of C++, floating point to integer conversions are undefined when the float value can not exactly fit into the destination type (source attribution appears on line 1740 in literal.cc). Integer to floating point conversions are defined to be able to round however the implementation sees fit, and only values outside of the `float` (finite) representatble range are undefined behavior. To get around the undefined behavoire for float->int, we pre-map floating point values to integer values before doing the `static_cast`.\n\nThe previous logic would cast the largest S32 to F4E2M1FN and then check if the input was >= to that, but this ends up having the F4E2M1FN max of `6` mapped to S32::MAX. The logic now only saturates to destination max/lowest if the src is truly out-of-bound for the destination type as defined by C++'s float-to-int mapping.\n\nPiperOrigin-RevId: 845470175",
+    "sha": "041ab8d8a0667bb6b621f2386df7aa6631d8ad0e",
+    "files": [
+        {
+            "sha": "3e76da9f4608aae96795e3918c25b4cb0451b328",
+            "filename": "third_party/xla/xla/literal.cc",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 4,
+            "changes": 17,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/041ab8d8a0667bb6b621f2386df7aa6631d8ad0e/third_party%2Fxla%2Fxla%2Fliteral.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/041ab8d8a0667bb6b621f2386df7aa6631d8ad0e/third_party%2Fxla%2Fxla%2Fliteral.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fliteral.cc?ref=041ab8d8a0667bb6b621f2386df7aa6631d8ad0e",
+            "patch": "@@ -1747,18 +1747,27 @@ void ConvertBetweenNativeTypes(absl::Span<const NativeSrcT> src_data,\n     if constexpr (!std::is_same_v<NativeDestT, bool> &&\n                   !std::numeric_limits<NativeSrcT>::is_integer &&\n                   std::numeric_limits<NativeDestT>::is_integer) {\n+      // NaN check.\n       if (src != src) {\n         return NativeDestT{0};\n       }\n-      if (src >=\n-          static_cast<NativeSrcT>(std::numeric_limits<NativeDestT>::max())) {\n+\n+      // Clamp values that cannot fit in the destination type to avoid undefined\n+      // behavior.\n+      // An N-bit integer has a max of 2^N - 1 so max() + 1 is 2^N. Ensure\n+      // double can losslessly hold.\n+      static_assert((std::numeric_limits<double>::max_exponent - 1) >=\n+                    std::numeric_limits<NativeDestT>::digits);\n+      if (static_cast<double>(src) >=\n+          static_cast<double>(std::numeric_limits<NativeDestT>::max())) {\n         return std::numeric_limits<NativeDestT>::max();\n       }\n-      if (src <=\n-          static_cast<NativeSrcT>(std::numeric_limits<NativeDestT>::lowest())) {\n+      if (static_cast<double>(src) <=\n+          static_cast<double>(std::numeric_limits<NativeDestT>::lowest())) {\n         return std::numeric_limits<NativeDestT>::lowest();\n       }\n     }\n+\n     // TODO(b/370786669): Once ml_dtypes is updated to include\n     // https://github.com/jax-ml/ml_dtypes/pull/205, do not special-case e3m4 by\n     // casting to half first."
+        },
+        {
+            "sha": "fd86910256d471ac08500ecfa31c3766d99ac235",
+            "filename": "third_party/xla/xla/literal_test.cc",
+            "status": "modified",
+            "additions": 60,
+            "deletions": 0,
+            "changes": 60,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/041ab8d8a0667bb6b621f2386df7aa6631d8ad0e/third_party%2Fxla%2Fxla%2Fliteral_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/041ab8d8a0667bb6b621f2386df7aa6631d8ad0e/third_party%2Fxla%2Fxla%2Fliteral_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fliteral_test.cc?ref=041ab8d8a0667bb6b621f2386df7aa6631d8ad0e",
+            "patch": "@@ -1912,6 +1912,66 @@ TEST_F(LiteralUtilTest, ConvertIfTypesMatch) {\n   EXPECT_EQ(c128.Convert(S32).status().code(), tsl::error::UNIMPLEMENTED);\n }\n \n+TEST_F(LiteralUtilTest, ConvertFromF4E2M1FN) {\n+  // Raw F4 inputs.\n+  Literal f4 = LiteralUtil::CreateR1<tsl::float4_e2m1fn>({\n+      static_cast<tsl::float4_e2m1fn>(0.0f),\n+      static_cast<tsl::float4_e2m1fn>(0.5f),\n+      static_cast<tsl::float4_e2m1fn>(1.0f),\n+      static_cast<tsl::float4_e2m1fn>(1.5f),\n+      static_cast<tsl::float4_e2m1fn>(2.0f),\n+      static_cast<tsl::float4_e2m1fn>(3.0f),\n+      static_cast<tsl::float4_e2m1fn>(4.0f),\n+      static_cast<tsl::float4_e2m1fn>(6.0f),\n+      static_cast<tsl::float4_e2m1fn>(-0.0f),\n+      static_cast<tsl::float4_e2m1fn>(-0.5f),\n+      static_cast<tsl::float4_e2m1fn>(-1.0f),\n+      static_cast<tsl::float4_e2m1fn>(-1.5f),\n+      static_cast<tsl::float4_e2m1fn>(-2.0f),\n+      static_cast<tsl::float4_e2m1fn>(-3.0f),\n+      static_cast<tsl::float4_e2m1fn>(-4.0f),\n+      static_cast<tsl::float4_e2m1fn>(-6.0f),\n+  });\n+  // We assert these are our expectations.\n+  Literal f32 = LiteralUtil::CreateR1<float>({\n+      0.0f,\n+      0.5f,\n+      1.0f,\n+      1.5f,\n+      2.0f,\n+      3.0f,\n+      4.0f,\n+      6.0f,\n+      -0.0f,\n+      -0.5f,\n+      -1.0f,\n+      -1.5f,\n+      -2.0f,\n+      -3.0f,\n+      -4.0f,\n+      -6.0f,\n+  });\n+\n+  // From F4E2M1FN.\n+  EXPECT_EQ(f4.Convert(U2), f32.Convert(U2));\n+  EXPECT_EQ(f4.Convert(S2), f32.Convert(S2));\n+  EXPECT_EQ(f4.Convert(U4), f32.Convert(U4));\n+  EXPECT_EQ(f4.Convert(S4), f32.Convert(S4));\n+  EXPECT_EQ(f4.Convert(F4E2M1FN), f32.Convert(F4E2M1FN));\n+  EXPECT_EQ(f4.Convert(U8), f32.Convert(U8));\n+  EXPECT_EQ(f4.Convert(S8), f32.Convert(S8));\n+  EXPECT_EQ(f4.Convert(F8E4M3FN), f32.Convert(F8E4M3FN));\n+  EXPECT_EQ(f4.Convert(F8E4M3B11FNUZ), f32.Convert(F8E4M3B11FNUZ));\n+  EXPECT_EQ(f4.Convert(F8E5M2), f32.Convert(F8E5M2));\n+  EXPECT_EQ(f4.Convert(U16), f32.Convert(U16));\n+  EXPECT_EQ(f4.Convert(S16), f32.Convert(S16));\n+  EXPECT_EQ(f4.Convert(F16), f32.Convert(F16));\n+  EXPECT_EQ(f4.Convert(BF16), f32.Convert(BF16));\n+  EXPECT_EQ(f4.Convert(U32), f32.Convert(U32));\n+  EXPECT_EQ(f4.Convert(S32), f32.Convert(S32));\n+  EXPECT_EQ(f4.Convert(F32).value(), f32);\n+}\n+\n TYPED_TEST(LiteralUtilFloatTest, ConvertIfTypesMatchF8) {\n   constexpr auto ptype = primitive_util::NativeToPrimitiveType<TypeParam>();\n   if (!primitive_util::IsF8Type(ptype)) {"
+        }
+    ],
+    "stats": {
+        "total": 77,
+        "additions": 73,
+        "deletions": 4
+    }
+}

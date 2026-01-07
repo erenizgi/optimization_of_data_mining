@@ -1,0 +1,108 @@
+{
+    "author": "pschuh",
+    "message": "Add StatusOr to transfer server BulkTransportInterface on the bond id to\nforward errors from bond connection failures to the control plane connection.\n\nPiperOrigin-RevId: 820783819",
+    "sha": "b07145966f22148b10e2d499846f9ceecb8c5469",
+    "files": [
+        {
+            "sha": "38f6a41722a40363dfeaf6006bbc032351010430",
+            "filename": "third_party/xla/xla/python/transfer/socket-server.cc",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 2,
+            "changes": 8,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b07145966f22148b10e2d499846f9ceecb8c5469/third_party%2Fxla%2Fxla%2Fpython%2Ftransfer%2Fsocket-server.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b07145966f22148b10e2d499846f9ceecb8c5469/third_party%2Fxla%2Fxla%2Fpython%2Ftransfer%2Fsocket-server.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpython%2Ftransfer%2Fsocket-server.cc?ref=b07145966f22148b10e2d499846f9ceecb8c5469",
+            "patch": "@@ -299,10 +299,14 @@ class SocketServer::SocketNetworkState : public PollEventLoop::Handler {\n         msg.data = const_cast<void*>(data);\n         msg.size = size;\n         msg.on_send = [val = tsl::FormRef(this), offset, req_id, is_largest](\n-                          int bond_id, size_t size) {\n+                          absl::StatusOr<int> bond_id, size_t size) {\n+          if (!bond_id.ok()) {\n+            val->SendError(req_id, offset, size, is_largest, bond_id.status());\n+            return;\n+          }\n           SocketTransferRequest response;\n           auto* packet = response.mutable_packet();\n-          packet->set_bulk_transport_id(bond_id);\n+          packet->set_bulk_transport_id(*bond_id);\n           packet->set_offset(offset);\n           packet->set_size(size);\n           packet->set_req_id(req_id);"
+        },
+        {
+            "sha": "180b85d478dafb7e51938f06fa92105ff6cbae77",
+            "filename": "third_party/xla/xla/python/transfer/socket_bulk_transport.cc",
+            "status": "modified",
+            "additions": 21,
+            "deletions": 0,
+            "changes": 21,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b07145966f22148b10e2d499846f9ceecb8c5469/third_party%2Fxla%2Fxla%2Fpython%2Ftransfer%2Fsocket_bulk_transport.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b07145966f22148b10e2d499846f9ceecb8c5469/third_party%2Fxla%2Fxla%2Fpython%2Ftransfer%2Fsocket_bulk_transport.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpython%2Ftransfer%2Fsocket_bulk_transport.cc?ref=b07145966f22148b10e2d499846f9ceecb8c5469",
+            "patch": "@@ -180,6 +180,7 @@ class SendConnectionHandler : public PollEventLoop::Handler {\n         artificial_send_limit_(artificial_send_limit) {}\n \n   ~SendConnectionHandler() override {\n+    msg_queue_->Poison(absl::InternalError(\"A send connection has failed.\"));\n #ifdef MSG_ZEROCOPY\n     table_.ClearAll();\n #endif\n@@ -356,6 +357,19 @@ std::shared_ptr<SharedSendWorkQueue> SharedSendWorkQueue::Start() {\n   return result;\n }\n \n+void SharedSendMsgQueue::Poison(absl::Status s) {\n+  mu_.lock();\n+  poison_status_ = s;\n+  auto work_items = std::move(work_items_);\n+  mu_.unlock();\n+  while (!work_items.empty()) {\n+    auto work = std::move(work_items.front());\n+    work_items.pop_front();\n+    std::move(work.on_send)(s, work.size);\n+    std::move(work.on_done)();\n+  }\n+}\n+\n void SharedSendMsgQueue::ReportReadyToSend(SendConnectionHandler* handler) {\n   mu_.lock();\n   if (!work_items_.empty()) {\n@@ -375,6 +389,13 @@ void SharedSendMsgQueue::ReportReadyToSend(SendConnectionHandler* handler) {\n void SharedSendMsgQueue::ScheduleSendWork(\n     aux::BulkTransportInterface::SendMessage msg) {\n   mu_.lock();\n+  if (!poison_status_.ok()) {\n+    auto s = poison_status_;\n+    mu_.unlock();\n+    std::move(msg.on_send)(std::move(s), msg.size);\n+    std::move(msg.on_done)();\n+    return;\n+  }\n   DCHECK(!shutdown_);\n   if (work_items_.empty() && !handlers_.empty()) {\n     auto* handler = handlers_.front();"
+        },
+        {
+            "sha": "9c0fea0d4b96e4d11234e02f9da78384b5fa4cee",
+            "filename": "third_party/xla/xla/python/transfer/socket_bulk_transport.h",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b07145966f22148b10e2d499846f9ceecb8c5469/third_party%2Fxla%2Fxla%2Fpython%2Ftransfer%2Fsocket_bulk_transport.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b07145966f22148b10e2d499846f9ceecb8c5469/third_party%2Fxla%2Fxla%2Fpython%2Ftransfer%2Fsocket_bulk_transport.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpython%2Ftransfer%2Fsocket_bulk_transport.h?ref=b07145966f22148b10e2d499846f9ceecb8c5469",
+            "patch": "@@ -129,13 +129,16 @@ class SharedSendMsgQueue {\n       std::shared_ptr<SharedSendWorkQueue> work_queue,\n       size_t artificial_send_limiti = std::numeric_limits<size_t>::max());\n \n+  void Poison(absl::Status s);\n+\n  private:\n   friend class SendConnectionHandler;\n \n   void ReportReadyToSend(SendConnectionHandler* handler);\n \n   absl::Mutex mu_;\n   bool shutdown_ = false;\n+  absl::Status poison_status_;\n   std::deque<SendConnectionHandler*> handlers_;\n   std::deque<aux::BulkTransportInterface::SendMessage> work_items_;\n };"
+        },
+        {
+            "sha": "f042a4221193e3e73c3f3eead8230f842af92795",
+            "filename": "third_party/xla/xla/python/transfer/socket_bulk_transport_test.cc",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 4,
+            "changes": 8,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b07145966f22148b10e2d499846f9ceecb8c5469/third_party%2Fxla%2Fxla%2Fpython%2Ftransfer%2Fsocket_bulk_transport_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b07145966f22148b10e2d499846f9ceecb8c5469/third_party%2Fxla%2Fxla%2Fpython%2Ftransfer%2Fsocket_bulk_transport_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpython%2Ftransfer%2Fsocket_bulk_transport_test.cc?ref=b07145966f22148b10e2d499846f9ceecb8c5469",
+            "patch": "@@ -85,7 +85,7 @@ TEST(SendQueue, TestZeroCopyQueueCleanRemoteShutdown) {\n   BulkTransportInterface::SendMessage msg;\n   msg.data = txt_msg.data();\n   msg.size = txt_msg.size();\n-  msg.on_send = [](int id, size_t size) {};\n+  msg.on_send = [](absl::StatusOr<int> id, size_t size) {};\n   msg.on_done = [&notify]() { notify.Notify(); };\n   msg_queue->ScheduleSendWork(std::move(msg));\n   notify.WaitForNotification();\n@@ -124,7 +124,7 @@ TEST(SendQueue, SendAndRecvQueuesArtificialLimit) {\n     BulkTransportInterface::SendMessage msg;\n     msg.data = txt_msg.data();\n     msg.size = txt_msg.size();\n-    msg.on_send = [](int id, size_t size) {};\n+    msg.on_send = [](absl::StatusOr<int> id, size_t size) {};\n     msg.on_done = [&mu, &send_count]() {\n       absl::MutexLock l(mu);\n       --send_count;\n@@ -230,9 +230,9 @@ TEST(SocketBulkTransportFactoryTest, SendAndRecvWithFactory) {\n     BulkTransportInterface::SendMessage msg;\n     msg.data = txt_msgs[i].data();\n     msg.size = txt_msgs[i].size();\n-    msg.on_send = [&, i](int id, size_t size) {\n+    msg.on_send = [&, i](absl::StatusOr<int> id, size_t size) {\n       absl::MutexLock l(mu);\n-      send_queue.push_back({i, id});\n+      send_queue.push_back({i, id.value()});\n     };\n     msg.on_done = [&mu, &send_count]() {\n       absl::MutexLock l(mu);"
+        },
+        {
+            "sha": "ed8474a918ee06131230156c8885c6d9b784912e",
+            "filename": "third_party/xla/xla/python/transfer/streaming.cc",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 1,
+            "changes": 5,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b07145966f22148b10e2d499846f9ceecb8c5469/third_party%2Fxla%2Fxla%2Fpython%2Ftransfer%2Fstreaming.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b07145966f22148b10e2d499846f9ceecb8c5469/third_party%2Fxla%2Fxla%2Fpython%2Ftransfer%2Fstreaming.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpython%2Ftransfer%2Fstreaming.cc?ref=b07145966f22148b10e2d499846f9ceecb8c5469",
+            "patch": "@@ -151,7 +151,10 @@ BulkTransportInterface::SendMessage BulkTransportInterface::MakeMessage(\n   SendMessage result;\n   result.data = tmp->data();\n   result.size = tmp->size();\n-  result.on_send = std::move(on_send);\n+  result.on_send = [on_send = std::move(on_send)](absl::StatusOr<int> bond_id,\n+                                                  size_t size) mutable {\n+    std::move(on_send)(bond_id.value(), size);\n+  };\n   result.on_done = [tmp = std::move(tmp)]() {};\n   return result;\n }"
+        },
+        {
+            "sha": "91f7247b521234635bf7b538c87919765c837b03",
+            "filename": "third_party/xla/xla/python/transfer/streaming.h",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b07145966f22148b10e2d499846f9ceecb8c5469/third_party%2Fxla%2Fxla%2Fpython%2Ftransfer%2Fstreaming.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b07145966f22148b10e2d499846f9ceecb8c5469/third_party%2Fxla%2Fxla%2Fpython%2Ftransfer%2Fstreaming.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpython%2Ftransfer%2Fstreaming.h?ref=b07145966f22148b10e2d499846f9ceecb8c5469",
+            "patch": "@@ -107,7 +107,8 @@ class BulkTransportInterface {\n     // There may be some delay between Send() and when the message\n     // is actually sent. on_send gets called when the message actually\n     // gets sent.\n-    absl::AnyInvocable<void(int bond_id, size_t size) &&> on_send;\n+    absl::AnyInvocable<void(absl::StatusOr<int> bond_id, size_t size) &&>\n+        on_send;\n   };\n \n   // Schedules a send over a BulkTransportInterface connection."
+        },
+        {
+            "sha": "11cb746dca0480cb334c6677903520545c4aa93f",
+            "filename": "third_party/xla/xla/python/transfer/streaming_ifrt.cc",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 2,
+            "changes": 12,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b07145966f22148b10e2d499846f9ceecb8c5469/third_party%2Fxla%2Fxla%2Fpython%2Ftransfer%2Fstreaming_ifrt.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b07145966f22148b10e2d499846f9ceecb8c5469/third_party%2Fxla%2Fxla%2Fpython%2Ftransfer%2Fstreaming_ifrt.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpython%2Ftransfer%2Fstreaming_ifrt.cc?ref=b07145966f22148b10e2d499846f9ceecb8c5469",
+            "patch": "@@ -180,7 +180,9 @@ void PremappedCopierState::StartWorkUnlocked(const WorkList& work_list) {\n             --num_parallel_copies_;\n             work_item->is_ready = true;\n             work_item->result_status = s;\n-            FlushReadyWorkItemsInOrder();\n+            if (!currently_flushing_) {\n+              FlushReadyWorkItemsInOrder();\n+            }\n             work_list2 = FindWorkLocked();\n           }\n           StartWorkUnlocked(work_list2);\n@@ -194,14 +196,20 @@ void PremappedCopierState::FlushReadyWorkItemsInOrder() {\n     if (!work_item->is_ready) {\n       return;\n     }\n+    if (!work_item->result_status.ok()) {\n+      available_copy_offsets_.push_back(work_item->dest_buffer);\n+    }\n+    currently_flushing_ = true;\n+    mu_.unlock();\n     if (work_item->result_status.ok()) {\n       std::move(work_item->on_done)(this, work_item->dest_buffer,\n                                     work_item->work);\n     } else {\n       std::move(work_item->on_done)(this, work_item->result_status,\n                                     work_item->work);\n-      available_copy_offsets_.push_back(work_item->dest_buffer);\n     }\n+    mu_.lock();\n+    currently_flushing_ = false;\n     work_queue_.pop_front();\n     ++base_seq_id_;\n   }"
+        },
+        {
+            "sha": "aa835da2869e0ccf59a821cb57a350bdde1c370b",
+            "filename": "third_party/xla/xla/python/transfer/streaming_ifrt.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b07145966f22148b10e2d499846f9ceecb8c5469/third_party%2Fxla%2Fxla%2Fpython%2Ftransfer%2Fstreaming_ifrt.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b07145966f22148b10e2d499846f9ceecb8c5469/third_party%2Fxla%2Fxla%2Fpython%2Ftransfer%2Fstreaming_ifrt.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpython%2Ftransfer%2Fstreaming_ifrt.h?ref=b07145966f22148b10e2d499846f9ceecb8c5469",
+            "patch": "@@ -117,6 +117,7 @@ class PremappedCopierState\n   size_t num_parallel_copies_ = 0;\n   std::deque<WorkQueueItem> work_queue_ ABSL_GUARDED_BY(mu_);\n   std::shared_ptr<absl::Span<uint8_t>> scratch_;\n+  bool currently_flushing_ ABSL_GUARDED_BY(mu_) = false;\n   size_t max_num_parallel_copies_;\n   size_t xfer_size_;\n   size_t max_copies_;"
+        }
+    ],
+    "stats": {
+        "total": 61,
+        "additions": 51,
+        "deletions": 10
+    }
+}

@@ -1,0 +1,84 @@
+{
+    "author": "tf-marissaw",
+    "message": "Add peak private footprint memory measurement tracking\n\nPiperOrigin-RevId: 820398210",
+    "sha": "878a48559e9a12aa7d5136e0e55acbcd12814331",
+    "files": [
+        {
+            "sha": "0dacad0d5177c8eeb0d4f8c5665e3c7274355f33",
+            "filename": "tensorflow/lite/profiling/memory_info.cc",
+            "status": "modified",
+            "additions": 51,
+            "deletions": 3,
+            "changes": 54,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/878a48559e9a12aa7d5136e0e55acbcd12814331/tensorflow%2Flite%2Fprofiling%2Fmemory_info.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/878a48559e9a12aa7d5136e0e55acbcd12814331/tensorflow%2Flite%2Fprofiling%2Fmemory_info.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Flite%2Fprofiling%2Fmemory_info.cc?ref=878a48559e9a12aa7d5136e0e55acbcd12814331",
+            "patch": "@@ -16,7 +16,12 @@ limitations under the License.\n \n #include <stddef.h>\n \n+#include <cstdint>\n+#include <fstream>\n+#include <iostream>\n #include <ostream>\n+#include <sstream>\n+#include <string>\n \n #ifdef __linux__\n #include <malloc.h>\n@@ -37,6 +42,38 @@ namespace memory {\n \n const size_t MemoryUsage::kValueNotSet = 0;\n \n+namespace {\n+\n+#if defined(__linux__)\n+// Returns the current VM swap in kilobytes on Linux.\n+int64_t GetCurrentVmSwapKb() {\n+  std::ifstream status_file(\"/proc/self/status\");\n+  if (!status_file.is_open()) {\n+    return -1;\n+  }\n+  std::string line;\n+  while (std::getline(status_file, line)) {\n+    if (line.rfind(\"VmSwap:\", 0) == 0) {\n+      std::stringstream ss(line);\n+      std::string key;\n+      int64_t value_kb;\n+      // The line format is \"VmSwap:    1234 kB\"\n+      // We can extract the key (\"VmSwap:\") and the numeric value (\"1234\").\n+      ss >> key >> value_kb;\n+      if (!ss.fail()) {\n+        return value_kb;\n+      } else {\n+        return -1;  // Indicate parsing error\n+      }\n+    }\n+  }\n+  // If the VmSwap line is not found, it means 0 swap is being used.\n+  return 0;\n+}\n+#endif\n+\n+}  // namespace\n+\n bool MemoryUsage::IsSupported() {\n #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)\n   return true;\n@@ -50,6 +87,10 @@ MemoryUsage GetMemoryUsage() {\n   rusage res;\n   if (getrusage(RUSAGE_SELF, &res) == 0) {\n     result.mem_footprint_kb = res.ru_maxrss;\n+    int64_t vm_swap_kb = GetCurrentVmSwapKb();\n+    if (vm_swap_kb >= 0) {\n+      result.private_footprint_bytes = (vm_swap_kb + res.ru_maxrss) * 1024;\n+    }\n   }\n #if defined(__NO_MALLINFO__)\n   result.total_allocated_bytes = -1;\n@@ -71,19 +112,24 @@ MemoryUsage GetMemoryUsage() {\n   if (status == KERN_SUCCESS) {\n     result.mem_footprint_kb =\n         static_cast<int64_t>(vm_info.phys_footprint / 1024.0);\n+    // TODO: b/421171145 - Consider subtracting shared_resident_kb.\n+    result.private_footprint_bytes = vm_info.phys_footprint;\n   }\n   struct mstats stats = mstats();\n   result.total_allocated_bytes = stats.bytes_total;\n   result.in_use_allocated_bytes = stats.bytes_used;\n #elif defined(_WIN32)\n-  PROCESS_MEMORY_COUNTERS process_memory_counters;\n+  PROCESS_MEMORY_COUNTERS_EX process_memory_counters;\n   HANDLE process_handle = GetCurrentProcess();\n   if (process_handle != nullptr &&\n-      GetProcessMemoryInfo(process_handle, &process_memory_counters,\n+      GetProcessMemoryInfo(process_handle,\n+                           (PROCESS_MEMORY_COUNTERS*)&process_memory_counters,\n                            sizeof(process_memory_counters))) {\n     result.mem_footprint_kb = process_memory_counters.WorkingSetSize / 1024;\n+    result.private_footprint_bytes = process_memory_counters.PrivateUsage;\n   } else {\n     result.mem_footprint_kb = -1;\n+    result.private_footprint_bytes = -1;\n   }\n   CloseHandle(process_handle);\n   HANDLE process_heap = GetProcessHeap();\n@@ -108,7 +154,9 @@ void MemoryUsage::AllStatsToStream(std::ostream* stream) const {\n           << mem_footprint_kb / 1000.0 << \" MB, total non-mmapped heap size = \"\n           << total_allocated_bytes / 1000.0 / 1000.0\n           << \" MB, in-use heap size = \"\n-          << in_use_allocated_bytes / 1000.0 / 1000.0 << \" MB\";\n+          << in_use_allocated_bytes / 1000.0 / 1000.0\n+          << \" MB, private footprint = \"\n+          << private_footprint_bytes / 1000.0 / 1000.0 << \" MB\";\n }\n \n }  // namespace memory"
+        },
+        {
+            "sha": "75516f26f3fee958ac4ede480dec3cafb00dc339",
+            "filename": "tensorflow/lite/profiling/memory_info.h",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 1,
+            "changes": 14,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/878a48559e9a12aa7d5136e0e55acbcd12814331/tensorflow%2Flite%2Fprofiling%2Fmemory_info.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/878a48559e9a12aa7d5136e0e55acbcd12814331/tensorflow%2Flite%2Fprofiling%2Fmemory_info.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Flite%2Fprofiling%2Fmemory_info.h?ref=878a48559e9a12aa7d5136e0e55acbcd12814331",
+            "patch": "@@ -35,7 +35,8 @@ struct MemoryUsage {\n   MemoryUsage()\n       : mem_footprint_kb(kValueNotSet),\n         total_allocated_bytes(kValueNotSet),\n-        in_use_allocated_bytes(kValueNotSet) {}\n+        in_use_allocated_bytes(kValueNotSet),\n+        private_footprint_bytes(kValueNotSet) {}\n \n   // The memory footprint (in kilobytes).\n   //\n@@ -85,13 +86,22 @@ struct MemoryUsage {\n   // non-heap uses of memory such as thread stacks, globals, code, etc.\n   size_t in_use_allocated_bytes;\n \n+  // Private footprint (in kilobytes).\n+  //\n+  // For Linux this is the rusage::ru_maxrss + VmSwap.\n+  // For Mac this is the task_vm_info::phys_footprint.\n+  // For Windows this is the PrivateUsage.\n+  size_t private_footprint_bytes;\n+\n   MemoryUsage operator+(MemoryUsage const& obj) const {\n     MemoryUsage res;\n     res.mem_footprint_kb = mem_footprint_kb + obj.mem_footprint_kb;\n     res.total_allocated_bytes =\n         total_allocated_bytes + obj.total_allocated_bytes;\n     res.in_use_allocated_bytes =\n         in_use_allocated_bytes + obj.in_use_allocated_bytes;\n+    res.private_footprint_bytes =\n+        private_footprint_bytes + obj.private_footprint_bytes;\n     return res;\n   }\n \n@@ -102,6 +112,8 @@ struct MemoryUsage {\n         total_allocated_bytes - obj.total_allocated_bytes;\n     res.in_use_allocated_bytes =\n         in_use_allocated_bytes - obj.in_use_allocated_bytes;\n+    res.private_footprint_bytes =\n+        private_footprint_bytes - obj.private_footprint_bytes;\n     return res;\n   }\n "
+        },
+        {
+            "sha": "0e49ec868a2feb14907f2a949fae8652248d4f45",
+            "filename": "tensorflow/lite/profiling/memory_info_test.cc",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/878a48559e9a12aa7d5136e0e55acbcd12814331/tensorflow%2Flite%2Fprofiling%2Fmemory_info_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/878a48559e9a12aa7d5136e0e55acbcd12814331/tensorflow%2Flite%2Fprofiling%2Fmemory_info_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Flite%2Fprofiling%2Fmemory_info_test.cc?ref=878a48559e9a12aa7d5136e0e55acbcd12814331",
+            "patch": "@@ -30,27 +30,32 @@ TEST(MemoryUsage, AddAndSub) {\n   mem1.mem_footprint_kb = 5;\n   mem1.total_allocated_bytes = 7000;\n   mem1.in_use_allocated_bytes = 2000;\n+  mem1.private_footprint_bytes = 1000;\n \n   mem2.mem_footprint_kb = 3;\n   mem2.total_allocated_bytes = 7000;\n   mem2.in_use_allocated_bytes = 4000;\n+  mem2.private_footprint_bytes = 500;\n \n   const auto add_mem = mem1 + mem2;\n   EXPECT_EQ(8, add_mem.mem_footprint_kb);\n   EXPECT_EQ(14000, add_mem.total_allocated_bytes);\n   EXPECT_EQ(6000, add_mem.in_use_allocated_bytes);\n+  EXPECT_EQ(1500, add_mem.private_footprint_bytes);\n \n   const auto sub_mem = mem1 - mem2;\n   EXPECT_EQ(2, sub_mem.mem_footprint_kb);\n   EXPECT_EQ(0, sub_mem.total_allocated_bytes);\n   EXPECT_EQ(-2000, sub_mem.in_use_allocated_bytes);\n+  EXPECT_EQ(500, sub_mem.private_footprint_bytes);\n }\n \n TEST(MemoryUsage, GetMemoryUsage) {\n   MemoryUsage result;\n   EXPECT_EQ(MemoryUsage::kValueNotSet, result.mem_footprint_kb);\n   EXPECT_EQ(MemoryUsage::kValueNotSet, result.total_allocated_bytes);\n   EXPECT_EQ(MemoryUsage::kValueNotSet, result.in_use_allocated_bytes);\n+  EXPECT_EQ(MemoryUsage::kValueNotSet, result.private_footprint_bytes);\n \n #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)\n   // Just allocate some space in heap so that we have some meaningful\n@@ -72,6 +77,7 @@ TEST(MemoryUsage, GetMemoryUsage) {\n   EXPECT_GE(result.mem_footprint_kb, size / 1024);\n   EXPECT_GE(result.total_allocated_bytes, size);\n   EXPECT_GE(result.in_use_allocated_bytes, size);\n+  EXPECT_GE(result.private_footprint_bytes, size);\n #endif\n }\n "
+        },
+        {
+            "sha": "5cf102e92814b350c5c6a9626fe7e0bb9bb84c2c",
+            "filename": "tensorflow/lite/profiling/memory_latency_logger.cc",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 2,
+            "changes": 10,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/878a48559e9a12aa7d5136e0e55acbcd12814331/tensorflow%2Flite%2Fprofiling%2Fmemory_latency_logger.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/878a48559e9a12aa7d5136e0e55acbcd12814331/tensorflow%2Flite%2Fprofiling%2Fmemory_latency_logger.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Flite%2Fprofiling%2Fmemory_latency_logger.cc?ref=878a48559e9a12aa7d5136e0e55acbcd12814331",
+            "patch": "@@ -80,10 +80,16 @@ void MemoryLatencyLogger::Stop(absl::string_view log_message) {\n                    << \" MB,\";\n   }\n   if (mem_monitor_->GetCurrentInUseMemoryInMB() < 0) {\n-    message_stream << \" current in-use: unknown\";\n+    message_stream << \" current in-use: unknown,\";\n   } else {\n     message_stream << \" current in-use: \"\n-                   << mem_monitor_->GetCurrentInUseMemoryInMB() << \" MB\";\n+                   << mem_monitor_->GetCurrentInUseMemoryInMB() << \" MB,\";\n+  }\n+  if (mem_monitor_->GetPeakPrivateFootprintInMB() < 0) {\n+    message_stream << \" peak private: unknown\";\n+  } else {\n+    message_stream << \" peak private: \"\n+                   << mem_monitor_->GetPeakPrivateFootprintInMB() << \" MB\";\n   }\n   TFLITE_LOG(INFO) << message_stream.str();\n }"
+        },
+        {
+            "sha": "b6f852334ba04e645f28e1f4bbe41d63bb84d5f2",
+            "filename": "tensorflow/lite/profiling/memory_usage_monitor.cc",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/878a48559e9a12aa7d5136e0e55acbcd12814331/tensorflow%2Flite%2Fprofiling%2Fmemory_usage_monitor.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/878a48559e9a12aa7d5136e0e55acbcd12814331/tensorflow%2Flite%2Fprofiling%2Fmemory_usage_monitor.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Flite%2Fprofiling%2Fmemory_usage_monitor.cc?ref=878a48559e9a12aa7d5136e0e55acbcd12814331",
+            "patch": "@@ -62,6 +62,11 @@ void MemoryUsageMonitor::Start() {\n       if (current_in_use_bytes > peak_in_use_mem_bytes_) {\n         peak_in_use_mem_bytes_ = current_in_use_bytes;\n       }\n+      int64_t current_private_footprint_bytes =\n+          mem_info.private_footprint_bytes;\n+      if (current_private_footprint_bytes > peak_private_footprint_bytes_) {\n+        peak_private_footprint_bytes_ = current_private_footprint_bytes;\n+      }\n       if (stop_signal_->HasBeenNotified()) break;\n       sampler_->SleepFor(sampling_interval_);\n     }"
+        },
+        {
+            "sha": "c794aac2b86f4a08f0158391b6ca63782b9b4c86",
+            "filename": "tensorflow/lite/profiling/memory_usage_monitor.h",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 0,
+            "changes": 8,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/878a48559e9a12aa7d5136e0e55acbcd12814331/tensorflow%2Flite%2Fprofiling%2Fmemory_usage_monitor.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/878a48559e9a12aa7d5136e0e55acbcd12814331/tensorflow%2Flite%2Fprofiling%2Fmemory_usage_monitor.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Flite%2Fprofiling%2Fmemory_usage_monitor.h?ref=878a48559e9a12aa7d5136e0e55acbcd12814331",
+            "patch": "@@ -87,6 +87,13 @@ class MemoryUsageMonitor {\n     return BytesToMegabytes(peak_in_use_mem_bytes_);\n   }\n \n+  float GetPeakPrivateFootprintInMB() const {\n+    if (!is_supported_ || check_memory_thd_ != nullptr) {\n+      return kInvalidMemUsageMB;\n+    }\n+    return BytesToMegabytes(peak_private_footprint_bytes_);\n+  }\n+\n   MemoryUsageMonitor(MemoryUsageMonitor&) = delete;\n   MemoryUsageMonitor& operator=(const MemoryUsageMonitor&) = delete;\n   MemoryUsageMonitor(MemoryUsageMonitor&&) = delete;\n@@ -105,6 +112,7 @@ class MemoryUsageMonitor {\n   std::unique_ptr<std::thread> check_memory_thd_ = nullptr;\n   int64_t peak_mem_footprint_bytes_ = kInvalidMemUsageBytes;\n   int64_t peak_in_use_mem_bytes_ = kInvalidMemUsageBytes;\n+  int64_t peak_private_footprint_bytes_ = kInvalidMemUsageBytes;\n };\n \n }  // namespace memory"
+        }
+    ],
+    "stats": {
+        "total": 97,
+        "additions": 91,
+        "deletions": 6
+    }
+}

@@ -1,0 +1,36 @@
+{
+    "author": "olupton",
+    "message": "PR #30685: Dump HLO when deserializing CPU executables\n\nImported from GitHub PR https://github.com/openxla/xla/pull/30685\n\n📝 Summary of Changes\nThis enables dumping optimized HLO when deserializing CPU executables, respecting dump-related options (`--xla_dump_to` etc.) passed in when deserializing. The same change for GPU executables already landed via #28928, but the proposed JAX test jax-ml/jax#31328 currently fails on CPU due to missing plumbing in that backend.\n\n🎯 Justification\nThis is useful when working with the JAX persistent compilation cache.\n\n🚀 Kind of Contribution\n🐛 Bug Fix, 🧪 Tests\n\n🧪 Unit Tests:\n`PjRtCpuClientTest.DumpOnDeserialize`, similar to the existing GPU client test.\nCopybara import of the project:\n\n--\n3d6d51f9a8c077267c8dfe666cc7426175d17aac by Olli Lupton <olupton@nvidia.com>:\n\nDump HLO when deserializing CPU executables\n\nopenxla/xla#28928 added support for this in the GPU path. Needed to fix\nGPU-less execution of jax-ml/jax#31328.\n\nMerging this change closes #30685\n\nPiperOrigin-RevId: 800870426",
+    "sha": "d48815c0a03dff70e8806fa25c21fb5a0ccdb6b8",
+    "files": [
+        {
+            "sha": "9ef8a93c21fcb95a038d2fc4b74a768e6796a27d",
+            "filename": "third_party/xla/xla/pjrt/cpu/cpu_client.cc",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 0,
+            "changes": 12,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/d48815c0a03dff70e8806fa25c21fb5a0ccdb6b8/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fcpu_client.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/d48815c0a03dff70e8806fa25c21fb5a0ccdb6b8/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fcpu_client.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fcpu_client.cc?ref=d48815c0a03dff70e8806fa25c21fb5a0ccdb6b8",
+            "patch": "@@ -473,6 +473,18 @@ PjRtCpuClient::LoadSerializedExecutable(absl::string_view serialized,\n     }\n   }\n \n+  // Propagate env_option_overrides-> debug_options\n+  TF_RETURN_IF_ERROR(compile_options.ApplyAllOptionOverrides());\n+  // Override the debug_options() embedded in the module with those\n+  // explicitly passed in when deserializing. This allows options such as\n+  // --xla_dump_to to be changed.\n+  if (executable->has_module()) {\n+    DumpHloModuleIfEnabled(executable->module(), kAfterOptimizationsDumpName,\n+                           build_options.has_debug_options()\n+                               ? &build_options.debug_options()\n+                               : nullptr);\n+  }\n+\n   auto cpu_executable = std::make_unique<PjRtCpuExecutable>(\n       num_replicas, num_partitions, std::move(device_assignment),\n       compile_options.parameter_is_tupled_arguments, std::move(input_options),"
+        },
+        {
+            "sha": "7ffe028119bbc998dc643306a46dcb71f3b79bfb",
+            "filename": "third_party/xla/xla/pjrt/cpu/cpu_client_test.cc",
+            "status": "modified",
+            "additions": 63,
+            "deletions": 0,
+            "changes": 63,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/d48815c0a03dff70e8806fa25c21fb5a0ccdb6b8/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fcpu_client_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/d48815c0a03dff70e8806fa25c21fb5a0ccdb6b8/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fcpu_client_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fcpu_client_test.cc?ref=d48815c0a03dff70e8806fa25c21fb5a0ccdb6b8",
+            "patch": "@@ -356,6 +356,69 @@ TEST(PjRtCpuClientTest, UnoptimizedHloSnapshot) {\n       LiteralUtil::CreateR2<float>({{10.0, 20.0}, {30.0, 40.0}, {50.0, 60.0}}));\n }\n \n+TEST(PjRtCpuClientTest, DumpOnDeserialize) {\n+  static constexpr char kProgram[] = R\"(\n+    HloModule add\n+    ENTRY add {\n+      x = f32[3,2] parameter(0)\n+      y = f32[3,2] parameter(1)\n+      ROOT add = f32[3,2] add(x, y)\n+    })\";\n+  TF_ASSERT_OK_AND_ASSIGN(auto client, GetPjRtCpuClient(CpuClientOptions()));\n+  TF_ASSERT_OK_AND_ASSIGN(auto hlo_module,\n+                          ParseAndReturnUnverifiedModule(kProgram, {}));\n+  XlaComputation xla_computation(hlo_module->ToProto());\n+\n+  tsl::Env* env = tsl::Env::Default();\n+  EXPECT_TRUE(env);\n+  std::string compile_dump_dir;\n+  EXPECT_TRUE(env->LocalTempFilename(&compile_dump_dir));\n+  CompileOptions compile_options;\n+  compile_options.executable_build_options.mutable_debug_options()\n+      ->set_xla_dump_to(compile_dump_dir);\n+  TF_ASSERT_OK_AND_ASSIGN(\n+      auto executable,\n+      client->CompileAndLoad(xla_computation, compile_options));\n+  std::string compile_dump_name, compile_dump_contents;\n+  {\n+    std::vector<std::string> matches;\n+    TF_ASSERT_OK(env->GetMatchingPaths(\n+        tsl::io::JoinPath(compile_dump_dir, \"*after_optimizations.txt\"),\n+        &matches));\n+    EXPECT_THAT(matches, ::testing::SizeIs(1));\n+    compile_dump_name = std::move(matches.front());\n+    TF_ASSERT_OK(\n+        tsl::ReadFileToString(env, compile_dump_name, &compile_dump_contents));\n+  }\n+\n+  TF_ASSERT_OK_AND_ASSIGN(std::string serialized,\n+                          executable->SerializeExecutable());\n+\n+  std::string deserialize_dump_dir;\n+  EXPECT_TRUE(env->LocalTempFilename(&deserialize_dump_dir));\n+  EXPECT_NE(compile_dump_dir, deserialize_dump_dir);\n+  CompileOptions deserialize_options;\n+  deserialize_options.executable_build_options.mutable_debug_options()\n+      ->set_xla_dump_to(deserialize_dump_dir);\n+  LoadOptions load_options;\n+  TF_ASSERT_OK_AND_ASSIGN(\n+      std::unique_ptr<PjRtLoadedExecutable> reloaded_executable,\n+      client->LoadSerializedExecutable(serialized, deserialize_options,\n+                                       load_options));\n+  std::string deserialize_dump_name, deserialize_dump_contents;\n+  {\n+    std::vector<std::string> matches;\n+    TF_ASSERT_OK(env->GetMatchingPaths(\n+        tsl::io::JoinPath(deserialize_dump_dir, \"*after_optimizations.txt\"),\n+        &matches));\n+    EXPECT_THAT(matches, ::testing::SizeIs(1));\n+    deserialize_dump_name = std::move(matches.front());\n+    TF_ASSERT_OK(tsl::ReadFileToString(env, deserialize_dump_name,\n+                                       &deserialize_dump_contents));\n+  }\n+  EXPECT_EQ(compile_dump_contents, deserialize_dump_contents);\n+}\n+\n TEST(PjRtCpuClientTest, AsyncTransferRawData) {\n   TF_ASSERT_OK_AND_ASSIGN(auto client, GetPjRtCpuClient(CpuClientOptions()));\n   xla::Shape shape = ShapeUtil::MakeShape(U32, {3, 2});"
+        }
+    ],
+    "stats": {
+        "total": 75,
+        "additions": 75,
+        "deletions": 0
+    }
+}

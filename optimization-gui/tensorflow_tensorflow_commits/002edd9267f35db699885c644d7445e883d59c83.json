@@ -1,0 +1,48 @@
+{
+    "author": "qukhan",
+    "message": "Fix `IsCompatibleCacheFile()`\n\n- Change the overload signature to take a `FileDescriptorView` instead of a `FileDescriptor`.\n- Move to the beginning of the file before attempting to read it.\n\nPiperOrigin-RevId: 845393565",
+    "sha": "002edd9267f35db699885c644d7445e883d59c83",
+    "files": [
+        {
+            "sha": "d92060ad2357d24104014c73a2c25d1d742f7306",
+            "filename": "tensorflow/lite/delegates/xnnpack/weight_cache.cc",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 1,
+            "changes": 4,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/002edd9267f35db699885c644d7445e883d59c83/tensorflow%2Flite%2Fdelegates%2Fxnnpack%2Fweight_cache.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/002edd9267f35db699885c644d7445e883d59c83/tensorflow%2Flite%2Fdelegates%2Fxnnpack%2Fweight_cache.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Flite%2Fdelegates%2Fxnnpack%2Fweight_cache.cc?ref=002edd9267f35db699885c644d7445e883d59c83",
+            "patch": "@@ -672,12 +672,14 @@ bool IsCompatibleCacheFile(const char* path) {\n   return IsCompatibleCacheFile(std::move(fd));\n }\n \n-bool IsCompatibleCacheFile(const FileDescriptor& fd) {\n+bool IsCompatibleCacheFile(FileDescriptorView fd) {\n   XNNPACK_RETURN_CHECK(fd.IsValid(), \"Invalid file descriptor: %d.\",\n                        fd.Value());\n   const size_t current_pos = fd.GetPos();\n   ScopeGuard reset_pos_on_return(\n       [current_pos, &fd] { fd.SetPos(current_pos); });\n+  XNNPACK_RETURN_CHECK(fd.SetPos(0) != -1,\n+                       \"Couldn't move to the start of the file.\");\n \n   XNNPackCacheHeader header;\n   XNNPACK_RETURN_CHECK(fd.Read(&header, sizeof(header)),"
+        },
+        {
+            "sha": "a7c8654df4f7eca7943ef60b65aff0a5170ef34d",
+            "filename": "tensorflow/lite/delegates/xnnpack/weight_cache.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/002edd9267f35db699885c644d7445e883d59c83/tensorflow%2Flite%2Fdelegates%2Fxnnpack%2Fweight_cache.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/002edd9267f35db699885c644d7445e883d59c83/tensorflow%2Flite%2Fdelegates%2Fxnnpack%2Fweight_cache.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Flite%2Fdelegates%2Fxnnpack%2Fweight_cache.h?ref=002edd9267f35db699885c644d7445e883d59c83",
+            "patch": "@@ -74,7 +74,7 @@ bool IsCompatibleCacheFile(const char* path);\n // restored upon exiting.\n //\n // Note: the file descriptor must be open and valid.\n-bool IsCompatibleCacheFile(const FileDescriptor& fd);\n+bool IsCompatibleCacheFile(FileDescriptorView fd);\n \n struct PackIdentifier {\n   enum { kNoId = SIZE_MAX };"
+        },
+        {
+            "sha": "dd3093b27365172197a5cfa72653b1a3b67b1dfb",
+            "filename": "tensorflow/lite/delegates/xnnpack/weight_cache_test.cc",
+            "status": "modified",
+            "additions": 38,
+            "deletions": 7,
+            "changes": 45,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/002edd9267f35db699885c644d7445e883d59c83/tensorflow%2Flite%2Fdelegates%2Fxnnpack%2Fweight_cache_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/002edd9267f35db699885c644d7445e883d59c83/tensorflow%2Flite%2Fdelegates%2Fxnnpack%2Fweight_cache_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Flite%2Fdelegates%2Fxnnpack%2Fweight_cache_test.cc?ref=002edd9267f35db699885c644d7445e883d59c83",
+            "patch": "@@ -972,8 +972,13 @@ TEST_P(MMapWeightCacheProviderTest, XnnpackRebuildOnVersionMismatch) {\n   ASSERT_TRUE(cache_provider.StartBuildStep());\n }\n \n-class IsCompatibleCacheFileTest : public testing::Test {\n+enum class IsCompatibleCacheFileTestOverload { kPath, kDescriptor };\n+\n+class IsCompatibleCacheFileTest\n+    : public testing::TestWithParam<IsCompatibleCacheFileTestOverload> {\n  public:\n+  using Param = IsCompatibleCacheFileTestOverload;\n+\n   void SetUp() override {\n     header_.version = XNNPackCacheHeader::kVersion;\n     memcpy(header_.xnnpack_build_identifier,\n@@ -982,28 +987,54 @@ class IsCompatibleCacheFileTest : public testing::Test {\n   }\n \n   bool WriteHeaderAndReturnIsCompatibleCacheFile() {\n-    const bool res = fd_.Write(&header_, sizeof(header_));\n-    fd_.Close();\n-    return res && IsCompatibleCacheFile(fd_.GetCPath());\n+    if (!fd_.Write(&header_, sizeof(header_))) {\n+      return false;\n+    }\n+    if (GetParam() == Param::kPath) {\n+      fd_.Close();\n+      return IsCompatibleCacheFile(fd_.GetCPath());\n+    } else {\n+      const FileDescriptor::Offset pos = fd_.GetPos();\n+      EXPECT_NE(pos, 0);  // Ensure that we are testing with a non 0 position.\n+      const bool compatible = IsCompatibleCacheFile(fd_);\n+      EXPECT_EQ(pos, fd_.GetPos());\n+      return compatible;\n+    }\n   }\n \n   XNNPackCacheHeader header_{};\n   TempFileDesc fd_;\n };\n \n-TEST_F(IsCompatibleCacheFileTest, ReturnsTrueForACorrectHeader) {\n+std::string Name(\n+    const testing::TestParamInfo<IsCompatibleCacheFileTestOverload>& info) {\n+  switch (info.param) {\n+    case IsCompatibleCacheFileTestOverload::kPath:\n+      return \"WithPathOverload\";\n+    case IsCompatibleCacheFileTestOverload::kDescriptor:\n+      return \"WithFileDescriptorOverload\";\n+  }\n+}\n+\n+TEST_P(IsCompatibleCacheFileTest, ReturnsTrueForACorrectHeader) {\n   EXPECT_TRUE(WriteHeaderAndReturnIsCompatibleCacheFile());\n }\n \n-TEST_F(IsCompatibleCacheFileTest, ReturnsFalseForWrongHeaderVersion) {\n+TEST_P(IsCompatibleCacheFileTest, ReturnsFalseForWrongHeaderVersion) {\n   header_.version += 1;\n   EXPECT_FALSE(WriteHeaderAndReturnIsCompatibleCacheFile());\n }\n \n-TEST_F(IsCompatibleCacheFileTest, ReturnsFalseForWrongBuildIdentifier) {\n+TEST_P(IsCompatibleCacheFileTest, ReturnsFalseForWrongBuildIdentifier) {\n   header_.xnnpack_build_identifier[0] += 1;\n   EXPECT_FALSE(WriteHeaderAndReturnIsCompatibleCacheFile());\n }\n \n+INSTANTIATE_TEST_SUITE_P(\n+    Test, IsCompatibleCacheFileTest,\n+    testing::Values(IsCompatibleCacheFileTest::Param::kPath,\n+                    IsCompatibleCacheFileTest::Param::kDescriptor),\n+    Name);\n+\n }  // namespace\n }  // namespace tflite::xnnpack"
+        }
+    ],
+    "stats": {
+        "total": 51,
+        "additions": 42,
+        "deletions": 9
+    }
+}

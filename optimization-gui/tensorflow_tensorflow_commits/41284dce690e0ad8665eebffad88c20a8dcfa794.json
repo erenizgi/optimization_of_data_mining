@@ -1,0 +1,36 @@
+{
+    "author": "ezhulenev",
+    "message": "[xla:hlo] Allocate OpMetadata only if it's not empty\n\nPiperOrigin-RevId: 797397791",
+    "sha": "41284dce690e0ad8665eebffad88c20a8dcfa794",
+    "files": [
+        {
+            "sha": "75b8ca0019bbeccf3e61501822bb7177c7e055c3",
+            "filename": "third_party/xla/xla/hlo/ir/hlo_instruction.cc",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 4,
+            "changes": 12,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/41284dce690e0ad8665eebffad88c20a8dcfa794/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_instruction.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/41284dce690e0ad8665eebffad88c20a8dcfa794/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_instruction.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_instruction.cc?ref=41284dce690e0ad8665eebffad88c20a8dcfa794",
+            "patch": "@@ -95,9 +95,10 @@ using absl::StrAppend;\n using absl::StrCat;\n using absl::StrJoin;\n \n-// Empty static object\n+// Empty static objects\n const HloInstruction::Rare* const HloInstruction::kEmptyRare =\n     new HloInstruction::Rare;\n+const OpMetadata* const HloInstruction::kEmptyMetadata = new OpMetadata;\n \n HloInstruction::Users::~Users() = default;\n \n@@ -1356,7 +1357,10 @@ absl::StatusOr<std::unique_ptr<HloInstruction>> HloInstruction::CreateFromProto(\n \n   TF_RET_CHECK(!proto.name().empty());\n   instruction->SetAndSanitizeName(proto.name());\n-  *instruction->metadata_ = proto.metadata();\n+  if (!tsl::protobuf::util::MessageDifferencer::Equals(proto.metadata(),\n+                                                       *kEmptyMetadata)) {\n+    instruction->mutable_metadata() = proto.metadata();\n+  }\n   instruction->backend_config_ = BackendConfigWrapper(proto.backend_config());\n \n   TF_RET_CHECK(proto.id() >= 0)\n@@ -2371,7 +2375,7 @@ void HloInstruction::SetupDerivedInstruction(\n   } else if (!ShapeUtil::CompatibleKind(shape_, derived_instruction->shape())) {\n     derived_instruction->clear_sharding();\n   }\n-  derived_instruction->set_metadata(*metadata_);\n+  derived_instruction->set_metadata(metadata());\n   if (has_rare()) {\n     derived_instruction->set_result_accuracy(result_accuracy());\n     derived_instruction->set_frontend_attributes(frontend_attributes());\n@@ -4377,7 +4381,7 @@ HloInstructionProto HloInstruction::ToProto() const {\n     proto.add_control_predecessor_ids(control->unique_id_64_bits());\n   }\n \n-  *proto.mutable_metadata() = *metadata_;\n+  *proto.mutable_metadata() = metadata();\n   proto.set_backend_config(backend_config_.GetRawString());\n   if (opcode() != HloOpcode::kFusion) {\n     for (const HloComputation* computation : called_computations()) {"
+        },
+        {
+            "sha": "93321957e3d67f71e47aa540fa63b6516b2cde56",
+            "filename": "third_party/xla/xla/hlo/ir/hlo_instruction.h",
+            "status": "modified",
+            "additions": 27,
+            "deletions": 10,
+            "changes": 37,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/41284dce690e0ad8665eebffad88c20a8dcfa794/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_instruction.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/41284dce690e0ad8665eebffad88c20a8dcfa794/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_instruction.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_instruction.h?ref=41284dce690e0ad8665eebffad88c20a8dcfa794",
+            "patch": "@@ -2041,26 +2041,43 @@ class HloInstruction {\n \n   // Sets the debug metadata for this instruction, excluding creation_pass_id,\n   // which should never be copied anywhere.\n-  void set_metadata(const OpMetadata& metadata) { *metadata_ = metadata; }\n+  void set_metadata(const OpMetadata& metadata) {\n+    if (&metadata == kEmptyMetadata) {\n+      metadata_.reset();\n+    } else {\n+      mutable_metadata() = metadata;\n+    }\n+  }\n \n   void set_size_of_generated_code_in_bytes(int64_t code_size_in_bytes) {\n-    metadata_->set_size_of_generated_code_in_bytes(code_size_in_bytes);\n+    mutable_metadata().set_size_of_generated_code_in_bytes(code_size_in_bytes);\n   }\n   void set_size_of_memory_working_set_in_bytes(\n       int64_t working_set_size_in_bytes) {\n-    metadata_->set_size_of_memory_working_set_in_bytes(\n+    mutable_metadata().set_size_of_memory_working_set_in_bytes(\n         working_set_size_in_bytes);\n   }\n   void set_metadata_op_name(const std::string& name) {\n-    metadata_->set_op_name(name);\n+    mutable_metadata().set_op_name(name);\n   }\n   void set_metadata_deduplicated_name(std::string deduplicated_name) {\n-    metadata_->set_deduplicated_name(std::move(deduplicated_name));\n+    mutable_metadata().set_deduplicated_name(std::move(deduplicated_name));\n   }\n   void set_metadata_scheduling_name(absl::string_view name) {\n-    metadata_->set_scheduling_name(std::string(name));\n+    mutable_metadata().set_scheduling_name(name);\n+  }\n+\n+  const OpMetadata& metadata() const {\n+    OpMetadata* m = metadata_.get();\n+    return (m == nullptr) ? *kEmptyMetadata : *m;\n+  }\n+\n+  OpMetadata& mutable_metadata() {\n+    if (metadata_ == nullptr) {\n+      metadata_ = std::make_unique<OpMetadata>();\n+    }\n+    return *metadata_;\n   }\n-  const OpMetadata& metadata() const { return *metadata_; }\n \n   // Get the computation containing this instruction.\n   const HloComputation* parent() const { return parent_; }\n@@ -2553,8 +2570,6 @@ class HloInstruction {\n     ResultAccuracy result_accuracy;\n   };\n \n-  static const Rare* const kEmptyRare;\n-\n   bool has_rare() const { return rare_ != nullptr; }\n \n   // Return the allocated rare state, or the pointer to the static empty rare\n@@ -2638,6 +2653,7 @@ class HloInstruction {\n \n   // If needed, points off to allocated struct holding out-of-line info\n   // for things that are rarely filled\n+  static const Rare* const kEmptyRare;\n   std::unique_ptr<Rare> rare_;\n \n   // The users of this instruction. Users are HLOs where this instruction is an\n@@ -2669,7 +2685,8 @@ class HloInstruction {\n \n   // Metadata for debugging.  Allocate it on heap, so that it does not increase\n   // the memory footprint of HloInstruction.\n-  std::unique_ptr<OpMetadata> metadata_ = std::make_unique<OpMetadata>();\n+  static const OpMetadata* const kEmptyMetadata;\n+  std::unique_ptr<OpMetadata> metadata_;\n };\n \n // Explicit instantiations in hlo_instruction.cc."
+        }
+    ],
+    "stats": {
+        "total": 49,
+        "additions": 35,
+        "deletions": 14
+    }
+}

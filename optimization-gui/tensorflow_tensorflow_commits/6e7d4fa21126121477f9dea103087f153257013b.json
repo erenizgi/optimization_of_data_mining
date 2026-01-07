@@ -1,0 +1,72 @@
+{
+    "author": "WillFroom",
+    "message": "[XLA:CPU] Don't hoist small while loops containing an fft.\n\nFixes https://github.com/jax-ml/jax/issues/31374\n\nPiperOrigin-RevId: 803153482",
+    "sha": "6e7d4fa21126121477f9dea103087f153257013b",
+    "files": [
+        {
+            "sha": "34a365187a0096c811be79812bccaf64254ff0af",
+            "filename": "third_party/xla/xla/service/cpu/cpu_runtime.cc",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 5,
+            "changes": 5,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/6e7d4fa21126121477f9dea103087f153257013b/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fcpu_runtime.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/6e7d4fa21126121477f9dea103087f153257013b/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fcpu_runtime.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fcpu_runtime.cc?ref=6e7d4fa21126121477f9dea103087f153257013b",
+            "patch": "@@ -110,11 +110,6 @@ extern const char* const kEigenConv3DF16SymbolName =\n     \"__xla_cpu_runtime_EigenConv3DF16\";\n extern const char* const kEigenConv3DF32SymbolName =\n     \"__xla_cpu_runtime_EigenConv3DF32\";\n-extern const char* const kLegacyDuccFftSymbolName =\n-    \"__xla_cpu_runtime_LegacyDuccFft\";\n-extern const char* const kDuccFftSymbolName = \"__xla_cpu_runtime_DuccFft\";\n-extern const char* const kDuccSingleThreadedFftSymbolName =\n-    \"__xla_cpu_runtime_DuccSingleThreadedFft\";\n extern const char* const kEigenSingleThreadedMatMulF8E4M3FNSymbolName =\n     \"__xla_cpu_runtime_EigenSingleThreadedMatMulF8E4M3FN\";\n extern const char* const kEigenSingleThreadedMatMulF8E5M2SymbolName ="
+        },
+        {
+            "sha": "8b9f5f3de90deed7fbec7022a24fe96c957c349f",
+            "filename": "third_party/xla/xla/service/cpu/cpu_runtime.h",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 3,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/6e7d4fa21126121477f9dea103087f153257013b/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fcpu_runtime.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/6e7d4fa21126121477f9dea103087f153257013b/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fcpu_runtime.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fcpu_runtime.h?ref=6e7d4fa21126121477f9dea103087f153257013b",
+            "patch": "@@ -56,9 +56,6 @@ extern const char* const kEigenConv2DF16SymbolName;\n extern const char* const kEigenConv2DF32SymbolName;\n extern const char* const kEigenConv3DF16SymbolName;\n extern const char* const kEigenConv3DF32SymbolName;\n-extern const char* const kLegacyDuccFftSymbolName;\n-extern const char* const kDuccFftSymbolName;\n-extern const char* const kDuccSingleThreadedFftSymbolName;\n extern const char* const kEigenSingleThreadedMatMulF16SymbolName;\n extern const char* const kEigenSingleThreadedMatMulF32SymbolName;\n extern const char* const kEigenSingleThreadedMatMulF64SymbolName;"
+        },
+        {
+            "sha": "c3d0a307f119d6d83fa07fe4a9f47b1039d5441a",
+            "filename": "third_party/xla/xla/service/cpu/ir_emitter.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 49,
+            "changes": 50,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/6e7d4fa21126121477f9dea103087f153257013b/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fir_emitter.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/6e7d4fa21126121477f9dea103087f153257013b/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fir_emitter.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fir_emitter.cc?ref=6e7d4fa21126121477f9dea103087f153257013b",
+            "patch": "@@ -992,55 +992,7 @@ absl::Status IrEmitter::HandleConvolution(HloInstruction* convolution) {\n }\n \n absl::Status IrEmitter::HandleFft(HloInstruction* fft) {\n-  auto operand = fft->operand(0);\n-  TF_RETURN_IF_ERROR(ElementTypesSameAndSupported(\n-      /*instruction=*/*fft, /*operands=*/{operand},\n-      /*supported_types=*/{F32, F64, C64, C128}));\n-  TF_RET_CHECK(LayoutUtil::IsMonotonicWithDim0Major(operand->shape().layout()));\n-  TF_RET_CHECK(LayoutUtil::IsMonotonicWithDim0Major(fft->shape().layout()));\n-  VLOG(3) << \"operand=\" << ShapeUtil::HumanStringWithLayout(operand->shape());\n-  VLOG(3) << \"fft=\" << ShapeUtil::HumanStringWithLayout(fft->shape());\n-\n-  llvm::Value* operand_address = GetEmittedValueFor(operand);\n-  TF_RETURN_IF_ERROR(EmitTargetAddressForOp(fft));\n-\n-  const std::vector<int64_t>& fft_length = fft->fft_length();\n-  const int fft_rank = fft_length.size();\n-\n-  // Flatten operand batches.\n-  absl::InlinedVector<int64_t, 4> operand_shape_flat(fft_rank + 1);\n-  int64_t input_batch = 1;\n-  int64_t input_batch_length = fft->shape().dimensions().size() - fft_rank;\n-  for (int i = 0; i < input_batch_length; i++) {\n-    input_batch *= operand->shape().dimensions(i);\n-  }\n-  operand_shape_flat[0] = input_batch;\n-  for (int i = 0; i < fft_rank; ++i) {\n-    operand_shape_flat[i + 1] =\n-        operand->shape().dimensions(i + input_batch_length);\n-  }\n-\n-  // Args have been computed, make the call.\n-  bool multi_threaded_eigen =\n-      hlo_module_config_.debug_options().xla_cpu_multi_thread_eigen();\n-  const char* fn_name = multi_threaded_eigen\n-                            ? runtime::kLegacyDuccFftSymbolName\n-                            : runtime::kDuccSingleThreadedFftSymbolName;\n-  auto* fft_lengths =\n-      EmitGlobalForLiteral(LiteralUtil::CreateR1<int64_t>(fft_length));\n-  auto* input_shape =\n-      EmitGlobalForLiteral(LiteralUtil::CreateR1<int64_t>(operand_shape_flat));\n-  EmitCallToFunc(fn_name,\n-                 {GetExecutableRunOptionsArgument(), GetEmittedValueFor(fft),\n-                  operand_address, b()->getInt32(fft->fft_type()),\n-                  b()->getInt32(operand->shape().element_type() == F64 ||\n-                                operand->shape().element_type() == C128),\n-                  b()->getInt32(fft_rank), input_shape, fft_lengths},\n-                 b()->getVoidTy(), /*does_not_throw=*/true,\n-                 /*only_accesses_arg_memory=*/false,\n-                 /*only_accesses_inaccessible_mem_or_arg_mem=*/true);\n-\n-  return absl::OkStatus();\n+  return Unimplemented(\"Fft is not implemented in the legacy emitter\");\n }\n \n absl::Status IrEmitter::HandleAllReduceSingleReplica(HloInstruction* crs) {"
+        },
+        {
+            "sha": "d032db343c362c4b867580f407cd1ccf3e73be41",
+            "filename": "third_party/xla/xla/service/cpu/small_while_loop_hoisting_pass.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 3,
+            "changes": 4,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/6e7d4fa21126121477f9dea103087f153257013b/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fsmall_while_loop_hoisting_pass.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/6e7d4fa21126121477f9dea103087f153257013b/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fsmall_while_loop_hoisting_pass.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fsmall_while_loop_hoisting_pass.cc?ref=6e7d4fa21126121477f9dea103087f153257013b",
+            "patch": "@@ -42,14 +42,12 @@ static bool InstructionIsUnavailable(const HloInstruction* instr) {\n   // The following instructions are not currently supported by the call thunk\n   // emitter due to how the legacy & thunk emitters interact; specifically,\n   // how the run options are passed.\n-  // Convolution & Dot may or may not call into Eigen depending on the shape,\n-  // Eigen requires a thread pool to be passed so we conservatively exclude it.\n-  // (This could be relaxed with a little work to make it optional if required).\n   switch (instr->opcode()) {\n     case HloOpcode::kCustomCall:\n     case HloOpcode::kInfeed:\n     case HloOpcode::kOutfeed:\n     case HloOpcode::kScatter:\n+    case HloOpcode::kFft:\n       return true;\n     default:\n       return IsCollective(instr);"
+        },
+        {
+            "sha": "3df9b4031c8ca28a3a6d0acbeecac2a841b68ed1",
+            "filename": "third_party/xla/xla/service/cpu/small_while_loop_hoisting_pass_test.cc",
+            "status": "modified",
+            "additions": 37,
+            "deletions": 0,
+            "changes": 37,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/6e7d4fa21126121477f9dea103087f153257013b/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fsmall_while_loop_hoisting_pass_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/6e7d4fa21126121477f9dea103087f153257013b/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fsmall_while_loop_hoisting_pass_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fsmall_while_loop_hoisting_pass_test.cc?ref=6e7d4fa21126121477f9dea103087f153257013b",
+            "patch": "@@ -157,5 +157,42 @@ TEST_F(SmallWhileLoopHoistingPassTest, NoInOutFeedWhileLoopHoisting) {\n   EXPECT_FALSE(changed);\n }\n \n+TEST_F(SmallWhileLoopHoistingPassTest, NoFftWhileLoopHoisting) {\n+  constexpr absl::string_view hlo_string = R\"(\n+    HloModule fft_module\n+\n+    %body_comp (arg_tuple.3: (s32[], c64[30])) -> (s32[], c64[30]) {\n+      %arg_tuple.3 = (s32[], c64[30]{0}) parameter(0)\n+      %get-tuple-element.4 = s32[] get-tuple-element(%arg_tuple.3), index=0\n+      %constant.6 = s32[] constant(1)\n+      %add.14 = s32[] add(%get-tuple-element.4, %constant.6)\n+      %get-tuple-element.5 = c64[30]{0} get-tuple-element(%arg_tuple.3), index=1\n+      %fft.10 = c64[30]{0} fft(%get-tuple-element.5), fft_type=FFT, fft_length={30}\n+      ROOT %tuple.15 = (s32[], c64[30]{0}) tuple(%add.14, %get-tuple-element.5)\n+    }\n+\n+    %condition_comp (arg_tuple.17: (s32[], c64[30])) -> pred[] {\n+      %arg_tuple.17 = (s32[], c64[30]{0}) parameter(0)\n+      %get-tuple-element.18 = s32[] get-tuple-element(%arg_tuple.17), index=0\n+      %constant.20 = s32[] constant(10)\n+      ROOT %lt.21 = pred[] compare(%get-tuple-element.18, %constant.20), direction=LT\n+    }\n+\n+    ENTRY %main.27 (args_0_.1: c64[30]) -> c64[30] {\n+      %constant.2 = s32[] constant(0)\n+      %args_0_.1 = c64[30]{0} parameter(0)\n+      %while.23 = (s32[], c64[30]{0}) tuple(%constant.2, %args_0_.1)\n+      %while.24 = (s32[], c64[30]{0}) while(%while.23), condition=%condition_comp, body=%body_comp\n+      %while.25 = s32[] get-tuple-element(%while.24), index=0\n+      ROOT %while.26 = c64[30]{0} get-tuple-element(%while.24), index=1\n+    }\n+    )\";\n+\n+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> m,\n+                          ParseAndReturnVerifiedModule(hlo_string));\n+  TF_ASSERT_OK_AND_ASSIGN(bool changed, RunSmallWhileLoopHoistingPass(m.get()));\n+  EXPECT_FALSE(changed);\n+}\n+\n }  // namespace\n }  // namespace xla"
+        }
+    ],
+    "stats": {
+        "total": 99,
+        "additions": 39,
+        "deletions": 60
+    }
+}

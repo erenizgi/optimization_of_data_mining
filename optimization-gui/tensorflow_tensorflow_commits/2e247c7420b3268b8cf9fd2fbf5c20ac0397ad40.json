@@ -1,0 +1,36 @@
+{
+    "author": "deqiangc",
+    "message": "Enable mlrt pipeline to dump intermediate pass mlir\n\nPiperOrigin-RevId: 802879671",
+    "sha": "2e247c7420b3268b8cf9fd2fbf5c20ac0397ad40",
+    "files": [
+        {
+            "sha": "379a91c9080edd33098e6a72bd4ea6f4daac573c",
+            "filename": "tensorflow/compiler/mlir/tfrt/transforms/mlrt/BUILD",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/2e247c7420b3268b8cf9fd2fbf5c20ac0397ad40/tensorflow%2Fcompiler%2Fmlir%2Ftfrt%2Ftransforms%2Fmlrt%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/2e247c7420b3268b8cf9fd2fbf5c20ac0397ad40/tensorflow%2Fcompiler%2Fmlir%2Ftfrt%2Ftransforms%2Fmlrt%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcompiler%2Fmlir%2Ftfrt%2Ftransforms%2Fmlrt%2FBUILD?ref=2e247c7420b3268b8cf9fd2fbf5c20ac0397ad40",
+            "patch": "@@ -174,6 +174,7 @@ cc_library(\n         \":assign_op_key\",\n         \":passes\",\n         \":while_to_map_fn\",\n+        \"//tensorflow/compiler/mlir/tensorflow:bridge_logger\",\n         \"//tensorflow/compiler/mlir/tensorflow:dump_mlir_util\",\n         \"//tensorflow/compiler/mlir/tensorflow:error_util\",\n         \"//tensorflow/compiler/mlir/tf2xla/api/v2:tf_executor_to_graph\",\n@@ -183,6 +184,7 @@ cc_library(\n         \"//tensorflow/compiler/mlir/tfrt:tfrt_compile_options\",\n         \"//tensorflow/compiler/mlir/tfrt:tfrt_pipeline_options\",\n         \"//tensorflow/compiler/mlir/tfrt/translate/mlrt:mlir_to_bytecode\",\n+        \"//tensorflow/core:framework\",\n         \"//tensorflow/core:protos_all_cc\",\n         \"//tensorflow/core/platform:status\",\n         \"//tensorflow/core/platform:statusor\",\n@@ -194,6 +196,7 @@ cc_library(\n         \"@com_google_absl//absl/log\",\n         \"@com_google_absl//absl/status\",\n         \"@com_google_absl//absl/strings\",\n+        \"@llvm-project//llvm:Support\",\n         \"@llvm-project//mlir:FuncDialect\",\n         \"@llvm-project//mlir:IR\",\n         \"@llvm-project//mlir:Pass\","
+        },
+        {
+            "sha": "9af14817b4fd7857a62f5ad297075878e60a0d10",
+            "filename": "tensorflow/compiler/mlir/tfrt/transforms/mlrt/import_model.cc",
+            "status": "modified",
+            "additions": 30,
+            "deletions": 0,
+            "changes": 30,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/2e247c7420b3268b8cf9fd2fbf5c20ac0397ad40/tensorflow%2Fcompiler%2Fmlir%2Ftfrt%2Ftransforms%2Fmlrt%2Fimport_model.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/2e247c7420b3268b8cf9fd2fbf5c20ac0397ad40/tensorflow%2Fcompiler%2Fmlir%2Ftfrt%2Ftransforms%2Fmlrt%2Fimport_model.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcompiler%2Fmlir%2Ftfrt%2Ftransforms%2Fmlrt%2Fimport_model.cc?ref=2e247c7420b3268b8cf9fd2fbf5c20ac0397ad40",
+            "patch": "@@ -14,19 +14,22 @@ limitations under the License.\n ==============================================================================*/\n #include \"tensorflow/compiler/mlir/tfrt/transforms/mlrt/import_model.h\"\n \n+#include <memory>\n #include <string>\n #include <utility>\n #include <vector>\n \n #include \"absl/log/log.h\"\n #include \"absl/status/status.h\"\n #include \"absl/strings/str_cat.h\"\n+#include \"llvm/ADT/StringRef.h\"\n #include \"mlir/Dialect/Func/IR/FuncOps.h\"  // from @llvm-project\n #include \"mlir/IR/BuiltinOps.h\"  // from @llvm-project\n #include \"mlir/IR/OwningOpRef.h\"  // from @llvm-project\n #include \"mlir/Pass/PassManager.h\"  // from @llvm-project\n #include \"mlir/Support/LogicalResult.h\"  // from @llvm-project\n #include \"mlir/Transforms/Passes.h\"  // from @llvm-project\n+#include \"tensorflow/compiler/mlir/tensorflow/utils/data_dumper_logger_config.h\"\n #include \"tensorflow/compiler/mlir/tensorflow/utils/dump_mlir_util.h\"\n #include \"tensorflow/compiler/mlir/tensorflow/utils/error_util.h\"\n #include \"tensorflow/compiler/mlir/tfrt/transforms/mlrt/assign_op_key.h\"\n@@ -47,9 +50,30 @@ limitations under the License.\n #include \"tensorflow/core/tfrt/mlrt/attribute/attribute.h\"\n #include \"tensorflow/core/tfrt/mlrt/bytecode/bytecode.h\"\n #include \"tensorflow/core/tfrt/runtime/runtime.h\"\n+#include \"tensorflow/core/util/debug_data_dumper.h\"\n \n namespace tensorflow {\n namespace mlrt_compiler {\n+namespace {\n+// Setup the input pass manager to enable IR dumping after each pass.\n+// Note a side effect of this method is that multi threading will be disabled.\n+void EnablePassIRPrinting(mlir::PassManager& pm,\n+                          const std::string& dump_group_name,\n+                          llvm::StringRef module_name) {\n+  // Print the whole module after each pass, which requires disabling\n+  // multi-threading as well.\n+  pm.getContext()->disableMultithreading();\n+  pm.enableIRPrinting(std::make_unique<::tensorflow::DataDumperLoggerConfig>(\n+      [module_name, dump_group_name](const std::string& pass_tag_name,\n+                                     mlir::Operation* op) {\n+        return DEBUG_DATA_DUMPER()->GetDumpFilename(\n+            module_name.str(), dump_group_name, pass_tag_name);\n+      },\n+      /*pass_prefix=*/\"\",\n+      /*print_module_scope=*/true));\n+  pm.enableTiming();\n+}\n+}  // namespace\n \n absl::StatusOr<mlrt::bc::Buffer> ConvertTfMlirToBytecode(\n     const TfrtCompileOptions& options, tfrt_stub::FallbackState& fallback_state,\n@@ -106,7 +130,13 @@ absl::StatusOr<mlrt::bc::Buffer> ConvertTfMlirToBytecode(\n         // cause op_key discontinuity\n         pm.addNestedPass<mlir::func::FuncOp>(mlir::createCanonicalizerPass());\n         pm.addPass(mlrt_compiler::CreateAssignOpKeyPass());\n+\n         // Run passes until (including) AssignOpKeyPass.\n+        if (VLOG_IS_ON(4)) {\n+          EnablePassIRPrinting(pm, \"mlrt_runtime_lowering_tf\",\n+                               \"mlrt_runtime_lowering_tf\");\n+        }\n+\n         if (mlir::failed(pm.run(module))) {\n           return diag_handler.Combine(absl::InternalError(\n               \"failed to finish passes before (including) assign op keys.\"));"
+        }
+    ],
+    "stats": {
+        "total": 33,
+        "additions": 33,
+        "deletions": 0
+    }
+}

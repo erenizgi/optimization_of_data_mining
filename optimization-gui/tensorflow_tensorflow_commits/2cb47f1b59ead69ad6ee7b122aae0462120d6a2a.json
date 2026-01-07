@@ -1,0 +1,24 @@
+{
+    "author": "pschuh",
+    "message": "Remove usage of PjRtStreamExecutorBuffer from\nStreamExecutorGpuClient::MakeCrossHostReceiveBuffers.\n\nPiperOrigin-RevId: 822860960",
+    "sha": "2cb47f1b59ead69ad6ee7b122aae0462120d6a2a",
+    "files": [
+        {
+            "sha": "0ef42da9f3d0cedacf795905bcc9defe281ad733",
+            "filename": "third_party/xla/xla/pjrt/gpu/se_gpu_pjrt_client.cc",
+            "status": "modified",
+            "additions": 27,
+            "deletions": 16,
+            "changes": 43,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/2cb47f1b59ead69ad6ee7b122aae0462120d6a2a/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Fse_gpu_pjrt_client.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/2cb47f1b59ead69ad6ee7b122aae0462120d6a2a/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Fse_gpu_pjrt_client.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Fse_gpu_pjrt_client.cc?ref=2cb47f1b59ead69ad6ee7b122aae0462120d6a2a",
+            "patch": "@@ -492,6 +492,18 @@ StreamExecutorGpuClient::MakeCrossHostReceiveBuffers(\n     return absl::InternalError(\"Failed to get GPU collectives\");\n   }\n \n+  TF_ASSIGN_OR_RETURN(auto* memory_space, device->default_memory_space());\n+  TF_ASSIGN_OR_RETURN(\n+      Shape on_device_shape,\n+      MakeDefaultShapeForMemorySpace(\n+          memory_space, shape, shape.has_layout() ? &shape.layout() : nullptr));\n+  TF_ASSIGN_OR_RETURN(size_t on_device_bytes_count,\n+                      GetOnDeviceBytesCount(memory_space, on_device_shape));\n+  TF_ASSIGN_OR_RETURN(tsl::RCReference<CommonPjRtRawBuffer> raw_buffer,\n+                      AllocateRawBuffer(memory_space, on_device_bytes_count,\n+                                        /*retry_on_oom=*/true,\n+                                        /*allocate_after=*/{}));\n+\n   // Allocate an uninitialized buffer. The buffer will be populated with data\n   // received from the sending process.\n   TF_ASSIGN_OR_RETURN(LocalDeviceState * local_device,\n@@ -501,25 +513,24 @@ StreamExecutorGpuClient::MakeCrossHostReceiveBuffers(\n   BufferSequencingEventRef definition_event =\n       BufferSequencingEvent::Create(this->thread_pool());\n   TF_ASSIGN_OR_RETURN(\n-      std::unique_ptr<PjRtStreamExecutorBuffer> buffer,\n-      AllocateDestinationBuffer(shape, device, local_device,\n-                                /*copy_stream=*/stream,\n-                                /*is_uninitialized_create=*/true, this,\n-                                definition_event));\n-\n-  // Acquire a hold on the buffer to access the underlying memory.\n-  CommonPjRtBuffer::ScopedHold hold =\n-      buffer->GetBufferWithHold(CommonPjRtBuffer::ScopedHold::kUsage);\n-\n-  auto recv = [this, gpu_collectives, notifier, local_device, definition_event,\n-               stream,\n-               mem = tensorflow::down_cast<TrackedDeviceBuffer*>(hold.buffer())\n-                         ->device_memory(),\n-               shape = shapes[0], dtype = buffer->element_type()]() mutable {\n+      auto buffer,\n+      DefineBuffer(\n+          on_device_shape, raw_buffer,\n+          {tsl::MakeRef<PjRtStreamExecutorDeviceEvent>(definition_event)},\n+          /*raw_buffer_is_mutable=*/true));\n+\n+  auto recv = [this, gpu_collectives, notifier = std::move(notifier),\n+               local_device, definition_event, stream,\n+               raw_buffer = std::move(raw_buffer), shape = shapes[0],\n+               dtype = buffer->element_type()]() mutable {\n+    WaitForAllocation(stream, *raw_buffer);\n     auto f = [&]() -> absl::Status {\n       // Create a CliqueId.\n       TF_ASSIGN_OR_RETURN(CliqueId clique_id,\n                           gpu_collectives->CreateUniqueCliqueId());\n+      auto mem =\n+          tensorflow::down_cast<PjRtStreamExecutorRawBuffer*>(raw_buffer.get())\n+              ->device_buffer();\n \n       // Notify the caller with the CliqueId. They will send the id to the\n       // sender.\n@@ -562,7 +573,7 @@ StreamExecutorGpuClient::MakeCrossHostReceiveBuffers(\n       // Keep mem alive until the Recv has finished executing. Note that\n       // recv_event is fulfilled when the receive is enqueued, but not\n       // necessarily executed.\n-      TF_RETURN_IF_ERROR(local_device->ThenRelease(stream, mem));\n+      definition_event.AndThen([mem]() {});\n \n       // Set definition event.\n       TF_RETURN_IF_ERROR("
+        }
+    ],
+    "stats": {
+        "total": 43,
+        "additions": 27,
+        "deletions": 16
+    }
+}

@@ -1,0 +1,84 @@
+{
+    "author": "tensorflower-gardener",
+    "message": "Canonicalize convolutions with float inputs and non-float outputs by performing the convolution in F32 and casting the result back to the original output type.\n\nPiperOrigin-RevId: 845778539",
+    "sha": "b22ae073cde56e9043683784da17232238d1d8b2",
+    "files": [
+        {
+            "sha": "0e3524878643d06fec696275b8f23e3611917c5a",
+            "filename": "third_party/xla/xla/hlo/transforms/expanders/BUILD",
+            "status": "modified",
+            "additions": 26,
+            "deletions": 0,
+            "changes": 26,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b22ae073cde56e9043683784da17232238d1d8b2/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fexpanders%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b22ae073cde56e9043683784da17232238d1d8b2/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fexpanders%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fexpanders%2FBUILD?ref=b22ae073cde56e9043683784da17232238d1d8b2",
+            "patch": "@@ -638,6 +638,32 @@ cc_library(\n     ],\n )\n \n+cc_library(\n+    name = \"convolution_type_canonicalizer\",\n+    srcs = [\"convolution_type_canonicalizer.cc\"],\n+    hdrs = [\"convolution_type_canonicalizer.h\"],\n+    deps = [\n+        \":op_expander_pass\",\n+        \"//xla:shape_util\",\n+        \"//xla/hlo/ir:hlo\",\n+        \"@com_google_absl//absl/status:statusor\",\n+        \"@com_google_absl//absl/strings:string_view\",\n+    ],\n+)\n+\n+xla_cc_test(\n+    name = \"convolution_type_canonicalizer_test\",\n+    srcs = [\"convolution_type_canonicalizer_test.cc\"],\n+    deps = [\n+        \":convolution_type_canonicalizer\",\n+        \"//xla/hlo/ir:hlo\",\n+        \"//xla/hlo/testlib:hlo_hardware_independent_test_base\",\n+        \"//xla/hlo/utils:hlo_matchers\",\n+        \"@com_google_absl//absl/strings:string_view\",\n+        \"@com_google_googletest//:gtest_main\",\n+    ],\n+)\n+\n xla_cc_test(\n     name = \"stochastic_convert_decomposer_test\",\n     srcs = [\"stochastic_convert_decomposer_test.cc\"],"
+        },
+        {
+            "sha": "a2dd02ade08ed6869efcea425617641ace20bc00",
+            "filename": "third_party/xla/xla/hlo/transforms/expanders/convolution_type_canonicalizer.cc",
+            "status": "added",
+            "additions": 62,
+            "deletions": 0,
+            "changes": 62,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b22ae073cde56e9043683784da17232238d1d8b2/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fexpanders%2Fconvolution_type_canonicalizer.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b22ae073cde56e9043683784da17232238d1d8b2/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fexpanders%2Fconvolution_type_canonicalizer.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fexpanders%2Fconvolution_type_canonicalizer.cc?ref=b22ae073cde56e9043683784da17232238d1d8b2",
+            "patch": "@@ -0,0 +1,62 @@\n+// Copyright 2025 The TensorFlow Authors. All Rights Reserved.\n+//\n+// Licensed under the Apache License, Version 2.0 (the \"License\");\n+// you may not use this file except in compliance with the License.\n+// You may obtain a copy of the License at\n+//\n+//     http://www.apache.org/licenses/LICENSE-2.0\n+//\n+// Unless required by applicable law or agreed to in writing, software\n+// distributed under the License is distributed on an \"AS IS\" BASIS,\n+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+// See the License for the specific language governing permissions and\n+// limitations under the License.\n+// =============================================================================\n+\n+#include \"xla/hlo/transforms/expanders/convolution_type_canonicalizer.h\"\n+\n+#include \"absl/status/statusor.h\"\n+#include \"xla/hlo/ir/hlo_instruction.h\"\n+#include \"xla/hlo/ir/hlo_opcode.h\"\n+#include \"xla/primitive_util.h\"\n+#include \"xla/shape_util.h\"\n+\n+namespace xla {\n+\n+bool ConvolutionTypeCanonicalizer::InstructionMatchesPattern(\n+    HloInstruction* instruction) {\n+  return (instruction->opcode() == HloOpcode::kDot ||\n+          instruction->opcode() == HloOpcode::kConvolution) &&\n+         (primitive_util::IsFloatingPointType(\n+              instruction->operand(0)->shape().element_type()) &&\n+          primitive_util::IsFloatingPointType(\n+              instruction->operand(1)->shape().element_type())) &&\n+         primitive_util::IsIntegralType(instruction->shape().element_type());\n+}\n+\n+absl::StatusOr<HloInstruction*> ConvolutionTypeCanonicalizer::ExpandInstruction(\n+    HloInstruction* instruction) {\n+  auto original_shape = instruction->shape();\n+  auto new_shape = ShapeUtil::ChangeElementType(original_shape, F32);\n+  HloInstruction* replacement_instruction;\n+  if (instruction->opcode() == HloOpcode::kDot) {\n+    replacement_instruction = instruction->parent()->AddInstruction(\n+        HloInstruction::CreateDot(new_shape, instruction->mutable_operand(0),\n+                                  instruction->mutable_operand(1),\n+                                  instruction->dot_dimension_numbers(),\n+                                  instruction->precision_config()));\n+  } else {\n+    replacement_instruction =\n+        instruction->parent()->AddInstruction(HloInstruction::CreateConvolve(\n+            new_shape, instruction->mutable_operand(0),\n+            instruction->mutable_operand(1), instruction->feature_group_count(),\n+            instruction->batch_group_count(), instruction->window(),\n+            instruction->convolution_dimension_numbers(),\n+            instruction->precision_config()));\n+  }\n+  HloInstruction* output_cast = instruction->parent()->AddInstruction(\n+      HloInstruction::CreateConvert(original_shape, replacement_instruction));\n+  return output_cast;\n+}\n+\n+}  // namespace xla"
+        },
+        {
+            "sha": "6fea6e9b58a991a7147f0712426cc2f8524d922a",
+            "filename": "third_party/xla/xla/hlo/transforms/expanders/convolution_type_canonicalizer.h",
+            "status": "added",
+            "additions": 44,
+            "deletions": 0,
+            "changes": 44,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b22ae073cde56e9043683784da17232238d1d8b2/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fexpanders%2Fconvolution_type_canonicalizer.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b22ae073cde56e9043683784da17232238d1d8b2/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fexpanders%2Fconvolution_type_canonicalizer.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fexpanders%2Fconvolution_type_canonicalizer.h?ref=b22ae073cde56e9043683784da17232238d1d8b2",
+            "patch": "@@ -0,0 +1,44 @@\n+// Copyright 2025 The TensorFlow Authors. All Rights Reserved.\n+//\n+// Licensed under the Apache License, Version 2.0 (the \"License\");\n+// you may not use this file except in compliance with the License.\n+// You may obtain a copy of the License at\n+//\n+//     http://www.apache.org/licenses/LICENSE-2.0\n+//\n+// Unless required by applicable law or agreed to in writing, software\n+// distributed under the License is distributed on an \"AS IS\" BASIS,\n+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+// See the License for the specific language governing permissions and\n+// limitations under the License.\n+// =============================================================================\n+\n+#ifndef XLA_HLO_TRANSFORMS_EXPANDERS_CONVOLUTION_TYPE_CANONICALIZER_H_\n+#define XLA_HLO_TRANSFORMS_EXPANDERS_CONVOLUTION_TYPE_CANONICALIZER_H_\n+\n+#include \"absl/status/statusor.h\"\n+#include \"absl/strings/string_view.h\"\n+#include \"xla/hlo/ir/hlo_instruction.h\"\n+#include \"xla/hlo/transforms/expanders/op_expander_pass.h\"\n+\n+namespace xla {\n+\n+class ConvolutionTypeCanonicalizer : public OpExpanderPass {\n+ public:\n+  ConvolutionTypeCanonicalizer() = default;\n+  absl::string_view name() const override {\n+    return \"ConvolutionTypeCanonicalizer\";\n+  }\n+\n+ private:\n+  // Returns `true` if `instruction` should be expanded by this pass.\n+  bool InstructionMatchesPattern(HloInstruction* instruction) override;\n+  // Returns a replacement for `instruction`, or nullptr if no replacement is\n+  // needed (e.g. only the to_apply subcomputation of the instruction was\n+  // modified).\n+  absl::StatusOr<HloInstruction*> ExpandInstruction(\n+      HloInstruction* instruction) override;\n+};\n+\n+}  // namespace xla\n+#endif  // XLA_HLO_TRANSFORMS_EXPANDERS_CONVOLUTION_TYPE_CANONICALIZER_H_"
+        },
+        {
+            "sha": "74092479fd07b80cae71c0957e8c33081c7a3e85",
+            "filename": "third_party/xla/xla/hlo/transforms/expanders/convolution_type_canonicalizer_test.cc",
+            "status": "added",
+            "additions": 98,
+            "deletions": 0,
+            "changes": 98,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b22ae073cde56e9043683784da17232238d1d8b2/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fexpanders%2Fconvolution_type_canonicalizer_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b22ae073cde56e9043683784da17232238d1d8b2/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fexpanders%2Fconvolution_type_canonicalizer_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fexpanders%2Fconvolution_type_canonicalizer_test.cc?ref=b22ae073cde56e9043683784da17232238d1d8b2",
+            "patch": "@@ -0,0 +1,98 @@\n+// Copyright 2025 The TensorFlow Authors. All Rights Reserved.\n+//\n+// Licensed under the Apache License, Version 2.0 (the \"License\");\n+// you may not use this file except in compliance with the License.\n+// You may obtain a copy of the License at\n+//\n+//     http://www.apache.org/licenses/LICENSE-2.0\n+//\n+// Unless required by applicable law or agreed to in writing, software\n+// distributed under the License is distributed on an \"AS IS\" BASIS,\n+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+// See the License for the specific language governing permissions and\n+// limitations under the License.\n+// =============================================================================\n+\n+#include \"xla/hlo/transforms/expanders/convolution_type_canonicalizer.h\"\n+\n+#include <memory>\n+\n+#include <gmock/gmock.h>\n+#include <gtest/gtest.h>\n+#include \"absl/strings/string_view.h\"\n+#include \"xla/hlo/ir/hlo_computation.h\"\n+#include \"xla/hlo/ir/hlo_instruction.h\"\n+#include \"xla/hlo/ir/hlo_module.h\"\n+#include \"xla/hlo/testlib/hlo_hardware_independent_test_base.h\"\n+#include \"xla/hlo/utils/hlo_matchers.h\"\n+\n+namespace xla {\n+namespace {\n+\n+namespace op = xla::testing::opcode_matchers;\n+\n+class ConvolutionTypeCanonicalizerTest : public HloHardwareIndependentTestBase {\n+};\n+\n+TEST_F(ConvolutionTypeCanonicalizerTest, DotBf16ToS32) {\n+  absl::string_view hlo_string = R\"(\n+HloModule module\n+\n+ENTRY main {\n+  p0 = bf16[10,10]{1,0} parameter(0)\n+  p1 = bf16[10,10]{1,0} parameter(1)\n+  ROOT dot = s32[10,10]{1,0} dot(p0, p1), lhs_contracting_dims={1}, rhs_contracting_dims={0}\n+}\n+)\";\n+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,\n+                       ParseAndReturnVerifiedModule(hlo_string));\n+  ConvolutionTypeCanonicalizer pass;\n+  ASSERT_OK_AND_ASSIGN(bool changed, pass.Run(module.get()));\n+  EXPECT_TRUE(changed);\n+  EXPECT_THAT(module->entry_computation()->root_instruction(),\n+              op::Convert(op::Dot(op::Parameter(0), op::Parameter(1))));\n+  EXPECT_THAT(module->entry_computation()->root_instruction(),\n+              xla::testing::opcode_matchers::Shape(\"s32[10,10]{1,0}\"));\n+}\n+\n+TEST_F(ConvolutionTypeCanonicalizerTest, ConvolutionBf16ToS32) {\n+  absl::string_view hlo_string = R\"(\n+HloModule module\n+\n+ENTRY main {\n+  p0 = bf16[1,1024,1024,1]{3,2,1,0} parameter(0)\n+  p1 = bf16[1,1,1,1]{3,2,1,0} parameter(1)\n+  ROOT conv = s32[1,1024,1024,1]{3,2,1,0} convolution(p0, p1), window={size=1x1}, dim_labels=b01f_01io->b01f\n+}\n+)\";\n+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,\n+                       ParseAndReturnVerifiedModule(hlo_string));\n+  ConvolutionTypeCanonicalizer pass;\n+  ASSERT_OK_AND_ASSIGN(bool changed, pass.Run(module.get()));\n+  EXPECT_TRUE(changed);\n+  EXPECT_THAT(module->entry_computation()->root_instruction(),\n+              op::Convert(op::Convolution(op::Parameter(0), op::Parameter(1))));\n+  EXPECT_THAT(\n+      module->entry_computation()->root_instruction(),\n+      xla::testing::opcode_matchers::Shape(\"s32[1,1024,1024,1]{3,2,1,0}\"));\n+}\n+\n+TEST_F(ConvolutionTypeCanonicalizerTest, NoChangeNeeded) {\n+  absl::string_view hlo_string = R\"(\n+HloModule module\n+\n+ENTRY main {\n+  p0 = f32[10,10]{1,0} parameter(0)\n+  p1 = f32[10,10]{1,0} parameter(1)\n+  ROOT dot = f32[10,10]{1,0} dot(p0, p1), lhs_contracting_dims={1}, rhs_contracting_dims={0}\n+}\n+)\";\n+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,\n+                       ParseAndReturnVerifiedModule(hlo_string));\n+  ConvolutionTypeCanonicalizer pass;\n+  ASSERT_OK_AND_ASSIGN(bool changed, pass.Run(module.get()));\n+  EXPECT_FALSE(changed);\n+}\n+\n+}  // namespace\n+}  // namespace xla"
+        },
+        {
+            "sha": "2b8f71df9da43db0ccf828245f8b623f08ec0a87",
+            "filename": "third_party/xla/xla/pjrt/interpreter/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b22ae073cde56e9043683784da17232238d1d8b2/third_party%2Fxla%2Fxla%2Fpjrt%2Finterpreter%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b22ae073cde56e9043683784da17232238d1d8b2/third_party%2Fxla%2Fxla%2Fpjrt%2Finterpreter%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Finterpreter%2FBUILD?ref=b22ae073cde56e9043683784da17232238d1d8b2",
+            "patch": "@@ -28,6 +28,7 @@ cc_library(\n         \"//xla/hlo/ir:hlo\",\n         \"//xla/hlo/pass:hlo_pass_pipeline\",\n         \"//xla/hlo/transforms/expanders:cholesky_expander\",\n+        \"//xla/hlo/transforms/expanders:convolution_type_canonicalizer\",\n         \"//xla/hlo/transforms/expanders:dynamic_index_splitter\",\n         \"//xla/hlo/transforms/expanders:eigh_expander\",\n         \"//xla/hlo/transforms/expanders:qr_expander\","
+        },
+        {
+            "sha": "757850fd2aa392287e1457225ac7dc2b021f875e",
+            "filename": "third_party/xla/xla/pjrt/interpreter/interpreter_client.cc",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b22ae073cde56e9043683784da17232238d1d8b2/third_party%2Fxla%2Fxla%2Fpjrt%2Finterpreter%2Finterpreter_client.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b22ae073cde56e9043683784da17232238d1d8b2/third_party%2Fxla%2Fxla%2Fpjrt%2Finterpreter%2Finterpreter_client.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Finterpreter%2Finterpreter_client.cc?ref=b22ae073cde56e9043683784da17232238d1d8b2",
+            "patch": "@@ -38,6 +38,7 @@ limitations under the License.\n #include \"xla/hlo/ir/hlo_module.h\"\n #include \"xla/hlo/pass/hlo_pass_pipeline.h\"\n #include \"xla/hlo/transforms/expanders/cholesky_expander.h\"\n+#include \"xla/hlo/transforms/expanders/convolution_type_canonicalizer.h\"\n #include \"xla/hlo/transforms/expanders/dynamic_index_splitter.h\"\n #include \"xla/hlo/transforms/expanders/eigh_expander.h\"\n #include \"xla/hlo/transforms/expanders/qr_expander.h\"\n@@ -490,6 +491,7 @@ absl::StatusOr<std::unique_ptr<HloModule>> InterpreterClient::RunHloPasses(\n       /*rewrite_grad_op=*/true);\n   pipeline.AddPass<LayoutAssignment>(\n       hlo_module->mutable_entry_computation_layout());\n+  pipeline.AddPass<ConvolutionTypeCanonicalizer>();\n \n   TF_RETURN_IF_ERROR(pipeline.Run(hlo_module.get()).status());\n   return hlo_module;"
+        }
+    ],
+    "stats": {
+        "total": 233,
+        "additions": 233,
+        "deletions": 0
+    }
+}

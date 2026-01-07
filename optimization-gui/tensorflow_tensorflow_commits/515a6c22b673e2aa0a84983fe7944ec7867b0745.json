@@ -1,0 +1,60 @@
+{
+    "author": "tensorflower-gardener",
+    "message": "[Autotuner] Populate scratch space size in GPU profiler.\n\nPiperOrigin-RevId: 797269738",
+    "sha": "515a6c22b673e2aa0a84983fe7944ec7867b0745",
+    "files": [
+        {
+            "sha": "a2dd98f4209f2a3c2bc163d8ad61760f6937629d",
+            "filename": "third_party/xla/xla/backends/autotuner/profiler.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/515a6c22b673e2aa0a84983fe7944ec7867b0745/third_party%2Fxla%2Fxla%2Fbackends%2Fautotuner%2Fprofiler.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/515a6c22b673e2aa0a84983fe7944ec7867b0745/third_party%2Fxla%2Fxla%2Fbackends%2Fautotuner%2Fprofiler.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fautotuner%2Fprofiler.h?ref=515a6c22b673e2aa0a84983fe7944ec7867b0745",
+            "patch": "@@ -44,6 +44,7 @@ struct ProfileOptions {\n struct ProfileResult {\n   absl::Duration duration = absl::ZeroDuration();\n   std::optional<ScopedShapedBuffer> output_buffer = std::nullopt;\n+  int scratch_bytes = 0;\n };\n \n struct InputBuffers {"
+        },
+        {
+            "sha": "5432d9b16908b7f7d77e4edb2cfe45f8b18b3c33",
+            "filename": "third_party/xla/xla/backends/gpu/autotuner/BUILD",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/515a6c22b673e2aa0a84983fe7944ec7867b0745/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/515a6c22b673e2aa0a84983fe7944ec7867b0745/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2FBUILD?ref=515a6c22b673e2aa0a84983fe7944ec7867b0745",
+            "patch": "@@ -630,6 +630,7 @@ xla_test(\n     name = \"gpu_profiler_test\",\n     srcs = [\"gpu_profiler_test.cc\"],\n     backends = [\"gpu\"],\n+    tags = [\"cuda-only\"],\n     deps = [\n         \":gpu_profiler\",\n         \"//xla:executable_run_options\",\n@@ -643,6 +644,8 @@ xla_test(\n         \"//xla/service:platform_util\",\n         \"//xla/service:shaped_buffer\",\n         \"//xla/service:transfer_manager\",\n+        \"//xla/service/gpu:gpu_compiler\",\n+        \"//xla/service/gpu:nvptx_compiler_impl\",\n         \"//xla/stream_executor:device_memory_allocator\",\n         \"//xla/stream_executor:platform\",\n         \"//xla/stream_executor:stream_executor_h\","
+        },
+        {
+            "sha": "68c15b868a90c91b779be61dba43f3784028bc16",
+            "filename": "third_party/xla/xla/backends/gpu/autotuner/gpu_profiler.cc",
+            "status": "modified",
+            "additions": 24,
+            "deletions": 3,
+            "changes": 27,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/515a6c22b673e2aa0a84983fe7944ec7867b0745/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Fgpu_profiler.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/515a6c22b673e2aa0a84983fe7944ec7867b0745/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Fgpu_profiler.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Fgpu_profiler.cc?ref=515a6c22b673e2aa0a84983fe7944ec7867b0745",
+            "patch": "@@ -63,6 +63,25 @@ std::vector<ExecutionInput> CreateExecutionInputsFromBuffers(\n   return inputs;\n }\n \n+int GetScratchBytes(const Executable* executable) {\n+  int scratch_bytes = 0;\n+  for (const auto& allocation : executable->GetAllocations()) {\n+    if (allocation.IsPreallocatedTempBuffer()) {\n+      for (const auto& [buffer, offset] : allocation.assigned_buffers()) {\n+        // Scratch space is allocated as the second element in the output tuple\n+        // of the instruction.\n+        const auto& shape_index = buffer->positions().front().index;\n+        bool is_second_element_in_output_tuple =\n+            !shape_index.empty() && shape_index[0] == 1;\n+        if (is_second_element_in_output_tuple) {\n+          scratch_bytes += offset.size;\n+        }\n+      }\n+    }\n+  }\n+  return scratch_bytes;\n+}\n+\n }  // namespace\n \n std::unique_ptr<GpuProfiler> GpuProfiler::Create(\n@@ -106,6 +125,8 @@ absl::StatusOr<ProfileResult> GpuProfiler::Profile(\n   const GpuInputBuffers& gpu_buffers =\n       tsl::down_cast<const GpuInputBuffers&>(buffers);\n   const RedzoneBuffers& rz_buffers = gpu_buffers.redzone_buffers;\n+  ProfileResult result;\n+  result.scratch_bytes = GetScratchBytes(executable);\n   {\n     // Warm up run.\n     std::vector<ExecutionInput> execution_inputs =\n@@ -128,11 +149,11 @@ absl::StatusOr<ProfileResult> GpuProfiler::Profile(\n       ExecutionOutput execution_output,\n       Execute(executable, std::move(execution_inputs), &profile));\n \n+  result.duration = absl::Nanoseconds(profile.compute_time_ns());\n   if (options_.should_populate_output_buffer) {\n-    return ProfileResult{absl::Nanoseconds(profile.compute_time_ns()),\n-                         execution_output.Commit().ConsumeResult()};\n+    result.output_buffer = execution_output.Commit().ConsumeResult();\n   }\n-  return ProfileResult{absl::Nanoseconds(profile.compute_time_ns())};\n+  return result;\n }\n \n absl::StatusOr<ExecutionOutput> GpuProfiler::Execute("
+        },
+        {
+            "sha": "4fc72111894eedacbb324dc23a6f91daef2a872c",
+            "filename": "third_party/xla/xla/backends/gpu/autotuner/gpu_profiler_test.cc",
+            "status": "modified",
+            "additions": 35,
+            "deletions": 0,
+            "changes": 35,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/515a6c22b673e2aa0a84983fe7944ec7867b0745/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Fgpu_profiler_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/515a6c22b673e2aa0a84983fe7944ec7867b0745/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Fgpu_profiler_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Fgpu_profiler_test.cc?ref=515a6c22b673e2aa0a84983fe7944ec7867b0745",
+            "patch": "@@ -37,6 +37,8 @@ limitations under the License.\n #include \"xla/literal.h\"\n #include \"xla/literal_util.h\"\n #include \"xla/service/executable.h\"\n+#include \"xla/service/gpu/gpu_compiler.h\"\n+#include \"xla/service/gpu/nvptx_compiler.h\"\n #include \"xla/service/platform_util.h\"\n #include \"xla/service/service_executable_run_options.h\"\n #include \"xla/service/shaped_buffer.h\"\n@@ -277,6 +279,39 @@ TEST_F(GpuProfilerTest, CheckOutputBufferWhenBuffersAreDifferent) {\n               StatusIs(absl::StatusCode::kInternal));\n }\n \n+TEST_F(GpuProfilerTest, CheckScratchBytesArePopulatedUsingBufferAssignment) {\n+  constexpr absl::string_view kHloModule = R\"(\n+HloModule gemm_fusion_dot.1, is_scheduled=true, entry_computation_layout={(bf16[32,120,6,512]{3,2,1,0}, f32[3072,512]{1,0})->bf16[3840,512]{1,0}}, frontend_attributes={fingerprint_before_lhs=\"40f912baf5b53a4f75b1ba9b3442042f\"}\n+\n+%wrapped_convert_computation (param_0: f32[3072,512]) -> bf16[3072,512] {\n+  %param_0 = f32[3072,512]{1,0} parameter(0)\n+  ROOT %convert.1 = bf16[3072,512]{1,0} convert(%param_0)\n+}\n+\n+ENTRY %entry_computation (transpose.562: bf16[32,120,6,512], Arg_1.2: f32[3072,512]) -> bf16[3840,512] {\n+  %Arg_1.2 = f32[3072,512]{1,0} parameter(1)\n+  %transpose.562 = bf16[32,120,6,512]{3,2,1,0} parameter(0)\n+  %bitcast.0 = bf16[1,32,120,6,512]{4,3,2,1,0} bitcast(%transpose.562)\n+  %bitcast.1 = bf16[3840,3072]{1,0} bitcast(%bitcast.0)\n+  %wrapped_convert = bf16[3072,512]{1,0} fusion(%Arg_1.2), kind=kLoop, calls=%wrapped_convert_computation\n+  %custom-call.1 = (bf16[512,3840]{0,1}, s8[26738688]{0}) custom-call(%wrapped_convert, %bitcast.1), custom_call_target=\"__cublas$gemm\", backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"gemm_backend_config\":{\"alpha_real\":1,\"beta\":0,\"dot_dimension_numbers\":{\"lhs_contracting_dimensions\":[\"0\"],\"rhs_contracting_dimensions\":[\"1\"],\"lhs_batch_dimensions\":[],\"rhs_batch_dimensions\":[]},\"alpha_imag\":0,\"precision_config\":{\"operand_precision\":[\"DEFAULT\",\"DEFAULT\"],\"algorithm\":\"ALG_UNSET\"},\"epilogue\":\"DEFAULT\",\"lhs_stride\":\"1572864\",\"rhs_stride\":\"11796480\",\"grad_x\":false,\"grad_y\":false,\"damax_output\":false},\"force_earliest_schedule\":false,\"reification_cost\":[]}\n+  %get-tuple-element = bf16[512,3840]{0,1} get-tuple-element(%custom-call.1), index=0\n+  ROOT %bitcast.2 = bf16[3840,512]{1,0} bitcast(%get-tuple-element)\n+})\";\n+  NVPTXCompiler compiler;\n+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,\n+                          ParseAndReturnVerifiedModule(kHloModule));\n+  TF_ASSERT_OK_AND_ASSIGN(auto gpu_executable,\n+                          compiler.RunBackend(std::move(module), stream_exec_,\n+                                              GpuCompiler::CompileOptions()));\n+  auto profiler = GpuProfiler::Create(stream_exec_, ProfileOptions());\n+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<InputBuffers> buffers,\n+                          profiler->CreateInputBuffers(gpu_executable.get()));\n+  TF_ASSERT_OK_AND_ASSIGN(ProfileResult profile,\n+                          profiler->Profile(gpu_executable.get(), *buffers));\n+  EXPECT_EQ(profile.scratch_bytes, 26738688);\n+}\n+\n }  // namespace\n \n }  // namespace gpu"
+        }
+    ],
+    "stats": {
+        "total": 66,
+        "additions": 63,
+        "deletions": 3
+    }
+}

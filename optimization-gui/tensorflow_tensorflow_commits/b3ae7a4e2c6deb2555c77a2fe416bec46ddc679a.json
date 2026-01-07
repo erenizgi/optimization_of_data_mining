@@ -1,0 +1,36 @@
+{
+    "author": "ezhulenev",
+    "message": "[xla:gpu] Add command buffer + custom calls test\n\nPiperOrigin-RevId: 837608163",
+    "sha": "b3ae7a4e2c6deb2555c77a2fe416bec46ddc679a",
+    "files": [
+        {
+            "sha": "3915776e1bb8f9b9365be2ac8391cd2c21db5661",
+            "filename": "third_party/xla/xla/service/gpu/tests/BUILD",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 0,
+            "changes": 11,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b3ae7a4e2c6deb2555c77a2fe416bec46ddc679a/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftests%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b3ae7a4e2c6deb2555c77a2fe416bec46ddc679a/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftests%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftests%2FBUILD?ref=b3ae7a4e2c6deb2555c77a2fe416bec46ddc679a",
+            "patch": "@@ -157,12 +157,21 @@ xla_test(\n     env = {\"TSAN_OPTIONS\": \"ignore_noninstrumented_modules=1\"},\n     tags = [\"test_migrated_to_hlo_runner_pjrt\"],\n     deps = [\n+        \"//xla:error_spec\",\n         \"//xla:literal\",\n         \"//xla:literal_util\",\n         \"//xla:xla_proto_cc\",\n+        \"//xla/backends/gpu:ffi\",\n+        \"//xla/ffi\",\n+        \"//xla/ffi:ffi_api\",\n+        \"//xla/hlo/ir:hlo\",\n         \"//xla/service:hlo_module_config\",\n+        \"//xla/service:hlo_runner_interface\",\n         \"//xla/service:platform_util\",\n+        \"//xla/stream_executor:device_memory\",\n         \"//xla/stream_executor:platform_manager\",\n+        \"//xla/stream_executor:semantic_version\",\n+        \"//xla/stream_executor:stream\",\n         \"//xla/stream_executor:stream_executor_h\",\n         \"//xla/stream_executor/cuda:cuda_compute_capability\",\n         \"//xla/tests:hlo_pjrt_interpreter_reference_mixin\",\n@@ -171,6 +180,8 @@ xla_test(\n         \"//xla/tests:test_utils\",\n         \"//xla/tsl/platform:statusor\",\n         \"//xla/tsl/platform:test\",\n+        \"@com_google_absl//absl/log:check\",\n+        \"@com_google_absl//absl/status:statusor\",\n         \"@com_google_absl//absl/strings\",\n         \"@com_google_absl//absl/strings:string_view\",\n         \"@com_google_absl//absl/types:span\","
+        },
+        {
+            "sha": "b313237804d81ecde216d29df7fe2cd0661d821e",
+            "filename": "third_party/xla/xla/service/gpu/tests/command_buffer_test.cc",
+            "status": "modified",
+            "additions": 53,
+            "deletions": 2,
+            "changes": 55,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b3ae7a4e2c6deb2555c77a2fe416bec46ddc679a/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftests%2Fcommand_buffer_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b3ae7a4e2c6deb2555c77a2fe416bec46ddc679a/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftests%2Fcommand_buffer_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftests%2Fcommand_buffer_test.cc?ref=b3ae7a4e2c6deb2555c77a2fe416bec46ddc679a",
+            "patch": "@@ -17,19 +17,28 @@ limitations under the License.\n #include <memory>\n #include <optional>\n #include <utility>\n-#include <variant>\n #include <vector>\n \n #include <gtest/gtest.h>\n+#include \"absl/log/check.h\"\n+#include \"absl/status/statusor.h\"\n #include \"absl/strings/ascii.h\"\n #include \"absl/strings/string_view.h\"\n #include \"absl/types/span.h\"\n+#include \"xla/backends/gpu/ffi.h\"\n+#include \"xla/error_spec.h\"\n+#include \"xla/ffi/ffi.h\"\n+#include \"xla/ffi/ffi_api.h\"\n+#include \"xla/hlo/ir/hlo_module.h\"\n #include \"xla/literal.h\"\n #include \"xla/literal_util.h\"\n #include \"xla/service/hlo_module_config.h\"\n+#include \"xla/service/hlo_runner_interface.h\"\n #include \"xla/service/platform_util.h\"\n-#include \"xla/stream_executor/cuda/cuda_compute_capability.h\"\n+#include \"xla/stream_executor/device_memory.h\"\n #include \"xla/stream_executor/platform_manager.h\"\n+#include \"xla/stream_executor/semantic_version.h\"\n+#include \"xla/stream_executor/stream.h\"\n #include \"xla/stream_executor/stream_executor.h\"\n #include \"xla/tests/hlo_pjrt_interpreter_reference_mixin.h\"\n #include \"xla/tests/hlo_pjrt_test_base.h\"\n@@ -232,6 +241,48 @@ TEST_P(CommandBufferTest, Fusions) {\n                               /*run_hlo_passes=*/false);\n }\n \n+static absl::Status Memcpy(se::Stream* stream, ffi::AnyBuffer src,\n+                           ffi::Result<ffi::AnyBuffer> dst) {\n+  se::DeviceMemoryBase dst_mem = dst->device_memory();\n+  se::DeviceMemoryBase src_mem = src.device_memory();\n+  return stream->MemcpyD2D(&dst_mem, src_mem, src_mem.size());\n+}\n+\n+XLA_FFI_DEFINE_HANDLER(kMemcpy, Memcpy,\n+                       ffi::Ffi::Bind()\n+                           .Ctx<ffi::Stream>()\n+                           .Arg<ffi::AnyBuffer>()   // src\n+                           .Ret<ffi::AnyBuffer>(),  // dst\n+                       {ffi::Traits::kCmdBufferCompatible});\n+\n+XLA_FFI_REGISTER_HANDLER(ffi::GetXlaFfiApi(), \"__xla_test$$memcpy\", \"gpu\",\n+                         kMemcpy);\n+\n+TEST_P(CommandBufferTest, TracedCustomCalls) {\n+  constexpr absl::string_view hlo_text = R\"(\n+  HloModule m, is_scheduled=true\n+\n+  command_buffer {\n+    p0 = f32[2,2] parameter(0)\n+    ROOT f3 = f32[2,2] custom-call(p0),\n+      custom_call_target=\"__xla_test$$memcpy\",\n+      api_version=API_VERSION_TYPED_FFI\n+  }\n+\n+  ENTRY main {\n+    p0 = f32[2,2] parameter(0)\n+    ROOT call = f32[2,2] call(p0), to_apply=command_buffer\n+  })\";\n+\n+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(hlo_text));\n+\n+  Literal argument = LiteralUtil::CreateR2<float>({{1.0, 2.0}, {3.0, 4.0}});\n+  Literal expected = LiteralUtil::CreateR2<float>({{1.0, 2.0}, {3.0, 4.0}});\n+\n+  ExecuteThreePhasesAndExpect(std::move(module), {&argument}, expected,\n+                              /*run_hlo_passes=*/false);\n+}\n+\n TEST_P(CommandBufferTest, TrueFalseConditional) {\n   constexpr absl::string_view hlo_text = R\"(\n   HloModule m, is_scheduled=true"
+        }
+    ],
+    "stats": {
+        "total": 66,
+        "additions": 64,
+        "deletions": 2
+    }
+}

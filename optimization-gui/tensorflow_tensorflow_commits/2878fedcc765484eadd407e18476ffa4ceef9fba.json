@@ -1,0 +1,36 @@
+{
+    "author": "vksnk",
+    "message": "Support padding in convolution op with YNNPACK enabled.\n\nPiperOrigin-RevId: 843329663",
+    "sha": "2878fedcc765484eadd407e18476ffa4ceef9fba",
+    "files": [
+        {
+            "sha": "e70e775757700166afd7a97e610926f26365e782",
+            "filename": "third_party/xla/xla/backends/cpu/ynn_emitter.cc",
+            "status": "modified",
+            "additions": 48,
+            "deletions": 9,
+            "changes": 57,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/2878fedcc765484eadd407e18476ffa4ceef9fba/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fynn_emitter.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/2878fedcc765484eadd407e18476ffa4ceef9fba/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fynn_emitter.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fynn_emitter.cc?ref=2878fedcc765484eadd407e18476ffa4ceef9fba",
+            "patch": "@@ -370,20 +370,54 @@ static ynn_status DefineBatchMatrixMultiply(ynn_subgraph_t subgraph,\n }\n \n static ynn_status DefineConvolution(\n-    ynn_subgraph_t subgraph, uint32_t input1_id, uint32_t input2_id,\n-    uint32_t output_id, const std::vector<int32_t>& stencil_axes,\n+    ynn_subgraph_t subgraph, ynn_type input1_id_type, uint32_t input1_id,\n+    uint32_t input2_id, uint32_t output_id,\n+    const std::vector<int32_t>& stencil_axes,\n     const std::vector<int32_t> new_axes,\n     const std::vector<size_t>& stencil_dims,\n     const std::vector<size_t>& stencil_strides,\n-    const std::vector<size_t>& stencil_dilations) {\n-  uint32_t padding_id = YNN_INVALID_VALUE_ID;\n+    const std::vector<size_t>& stencil_dilations,\n+    const std::vector<int64_t>& padding_lows,\n+    const std::vector<int64_t>& padding_highs) {\n   uint32_t stencil_id = YNN_INVALID_VALUE_ID;\n \n+  ynn_status status;\n+\n+  // If any of paddings is not zero, define a padding value and pad the input.\n+  if (absl::c_any_of(padding_lows, [](int32_t i) { return i != 0; }) ||\n+      absl::c_any_of(padding_highs, [](int32_t i) { return i != 0; })) {\n+    uint32_t padding_id = YNN_INVALID_VALUE_ID;\n+\n+    // Define padding value.\n+    uint64_t padding_value = 0;\n+    status = ynn_define_tensor_value(subgraph, input1_id_type,\n+                                     /*rank=*/0, /*dims=*/nullptr,\n+                                     /*data=*/&padding_value,\n+                                     /*zero_point_id=*/YNN_INVALID_VALUE_ID,\n+                                     /*scale_id=*/YNN_INVALID_VALUE_ID,\n+                                     /*flags=*/YNN_VALUE_FLAG_COPY_DATA,\n+                                     &padding_id);\n+\n+    if (status != ynn_status_success) {\n+      return status;\n+    }\n+\n+    uint32_t padded_id = YNN_INVALID_VALUE_ID;\n+    status = ynn_define_static_pad(\n+        subgraph, stencil_axes.size(), stencil_axes.data(), padding_lows.data(),\n+        padding_highs.data(), input1_id, padding_id, &padded_id, /*flags=*/0);\n+    if (status != ynn_status_success) {\n+      return status;\n+    }\n+    input1_id = padded_id;\n+    padding_id = YNN_INVALID_VALUE_ID;\n+  }\n+\n   // Make a stenciled view of the input [n, h, w, ci] -> [n, h, w, kh, kw, ci].\n-  ynn_status status = ynn_define_stencil_copy(\n+  status = ynn_define_stencil_copy(\n       subgraph, /*num_stencils=*/stencil_dims.size(), stencil_axes.data(),\n       new_axes.data(), stencil_dims.data(), stencil_strides.data(),\n-      stencil_dilations.data(), input1_id, padding_id, &stencil_id,\n+      stencil_dilations.data(), input1_id, YNN_INVALID_VALUE_ID, &stencil_id,\n       /*flags=*/0);\n   if (status != ynn_status_success) {\n     return status;\n@@ -532,19 +566,24 @@ static absl::StatusOr<YnnSubgraph> EmitYnnConvolutionSubgraph(\n   std::vector<size_t> stencil_dims(conv_window_dims_size);\n   std::vector<size_t> stencil_strides(conv_window_dims_size);\n   std::vector<size_t> stencil_dilations(conv_window_dims_size);\n+  std::vector<int64_t> padding_lows(conv_window_dims_size);\n+  std::vector<int64_t> padding_highs(conv_window_dims_size);\n \n   for (size_t i = 0; i < conv_window.dimensions_size(); ++i) {\n     stencil_axes[i] = conv_dimensions.input_spatial_dimensions(i);\n     stencil_dims[i] = conv_window.dimensions(i).size();\n     stencil_strides[i] = conv_window.dimensions(i).stride();\n     stencil_dilations[i] = 1;\n+    padding_lows[i] = conv_window.dimensions(i).padding_low();\n+    padding_highs[i] = conv_window.dimensions(i).padding_high();\n   }\n \n   std::iota(new_axes.begin(), new_axes.end(), lhs_dims.size() - 1);\n \n-  YNN_RETURN_IF_ERROR(DefineConvolution(subgraph.get(), lhs_id, rhs_id, out_id,\n-                                        stencil_axes, new_axes, stencil_dims,\n-                                        stencil_strides, stencil_dilations));\n+  YNN_RETURN_IF_ERROR(\n+      DefineConvolution(subgraph.get(), ynn_lhs_type, lhs_id, rhs_id, out_id,\n+                        stencil_axes, new_axes, stencil_dims, stencil_strides,\n+                        stencil_dilations, padding_lows, padding_highs));\n \n   ynn_status status = ynn_optimize_subgraph(\n       subgraph.get(), /*threadpool=*/nullptr, /*flags=*/0);"
+        },
+        {
+            "sha": "b455c00c7734fa8a06f3f645a3f49ef50bdf82e4",
+            "filename": "third_party/xla/xla/backends/cpu/ynn_support.cc",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 8,
+            "changes": 8,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/2878fedcc765484eadd407e18476ffa4ceef9fba/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fynn_support.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/2878fedcc765484eadd407e18476ffa4ceef9fba/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fynn_support.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fynn_support.cc?ref=2878fedcc765484eadd407e18476ffa4ceef9fba",
+            "patch": "@@ -327,14 +327,6 @@ bool IsConvolutionOpSupportedByYnn(const HloInstruction* instr) {\n     return false;\n   }\n \n-  // Only VALID padding for now.\n-  if ((window.dimensions(0).padding_low() != 0) ||\n-      (window.dimensions(0).padding_high() != 0) ||\n-      (window.dimensions(1).padding_low() != 0) ||\n-      (window.dimensions(1).padding_high() != 0)) {\n-    return false;\n-  }\n-\n   // No dilation for now.\n   if ((window.dimensions(0).window_dilation() != 1) ||\n       (window.dimensions(1).window_dilation() != 1) ||"
+        }
+    ],
+    "stats": {
+        "total": 65,
+        "additions": 48,
+        "deletions": 17
+    }
+}

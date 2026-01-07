@@ -1,0 +1,48 @@
+{
+    "author": "junwhanahn",
+    "message": "Explicitly guard against misuse of promises\n\n* When a promise is fulfilled more than once, `tsl::Promise::Set()` now `CHECK`-fails.\n* When a promise is never fulfilled until its destruction, it now unblocks the waiters with an error to prefer graceful errors over hangs.\n\nPiperOrigin-RevId: 813654914",
+    "sha": "da1e6a48f7d4b83fb7033b696d2bea94119ce45c",
+    "files": [
+        {
+            "sha": "f84314598695397f1425bbefcb239c652f298f1d",
+            "filename": "third_party/xla/xla/tsl/concurrency/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/da1e6a48f7d4b83fb7033b696d2bea94119ce45c/third_party%2Fxla%2Fxla%2Ftsl%2Fconcurrency%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/da1e6a48f7d4b83fb7033b696d2bea94119ce45c/third_party%2Fxla%2Fxla%2Ftsl%2Fconcurrency%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Ftsl%2Fconcurrency%2FBUILD?ref=da1e6a48f7d4b83fb7033b696d2bea94119ce45c",
+            "patch": "@@ -156,6 +156,7 @@ tsl_cc_test(\n         \"//xla/tsl/platform:test_benchmark\",\n         \"//xla/tsl/platform:test_main\",\n         \"@com_google_absl//absl/status\",\n+        \"@com_google_absl//absl/status:status_matchers\",\n         \"@com_google_absl//absl/status:statusor\",\n     ],\n )"
+        },
+        {
+            "sha": "f813ed9adf93c5853accda7392c64e49bcab25ab",
+            "filename": "third_party/xla/xla/tsl/concurrency/future.h",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 1,
+            "changes": 14,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/da1e6a48f7d4b83fb7033b696d2bea94119ce45c/third_party%2Fxla%2Fxla%2Ftsl%2Fconcurrency%2Ffuture.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/da1e6a48f7d4b83fb7033b696d2bea94119ce45c/third_party%2Fxla%2Fxla%2Ftsl%2Fconcurrency%2Ffuture.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Ftsl%2Fconcurrency%2Ffuture.h?ref=da1e6a48f7d4b83fb7033b696d2bea94119ce45c",
+            "patch": "@@ -201,6 +201,15 @@ class FutureBase : public FutureMoveControl<is_move_only> {\n     Promise(Promise&& other) = default;\n     Promise& operator=(Promise&& other) = default;\n \n+    ~Promise() {\n+      if (promise_ && !IsUniqueReference() && promise_.IsUnavailable()) {\n+        // At this point, we know that the underlying AsyncValueRef will\n+        // otherwise not fulfilled ever because `Promise` is move-only.\n+        promise_.emplace(\n+            absl::InternalError(\"Promise destroyed without being set\"));\n+      }\n+    }\n+\n     explicit operator bool() const { return static_cast<bool>(promise_); }\n \n     // Returns if this promise is the unique reference to the underlying value.\n@@ -218,6 +227,7 @@ class FutureBase : public FutureMoveControl<is_move_only> {\n     // debugging easier. Also, be aware that the current promise may still be\n     // used to mint a future.\n     bool IsUniqueReference() const {\n+      CHECK(promise_) << \"Promise must wrap an async value\";\n       return promise_.IsUnique() && !promise_.HasWaiter();\n     }\n \n@@ -227,7 +237,9 @@ class FutureBase : public FutureMoveControl<is_move_only> {\n \n     template <typename... Args>\n     void emplace(Args&&... args) const {\n-      DCHECK(promise_) << \"Promise must wrap an async value\";\n+      CHECK(promise_) << \"Promise must wrap an async value\";\n+      CHECK(promise_.IsUnavailable())\n+          << \"Promise must not be fulfilled more than once\";\n       promise_.template emplace<Args...>(std::forward<Args>(args)...);\n     }\n "
+        },
+        {
+            "sha": "e71cf45c01e95205ffcee6249e43cec954a66a1b",
+            "filename": "third_party/xla/xla/tsl/concurrency/future_test.cc",
+            "status": "modified",
+            "additions": 21,
+            "deletions": 0,
+            "changes": 21,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/da1e6a48f7d4b83fb7033b696d2bea94119ce45c/third_party%2Fxla%2Fxla%2Ftsl%2Fconcurrency%2Ffuture_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/da1e6a48f7d4b83fb7033b696d2bea94119ce45c/third_party%2Fxla%2Fxla%2Ftsl%2Fconcurrency%2Ffuture_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Ftsl%2Fconcurrency%2Ffuture_test.cc?ref=da1e6a48f7d4b83fb7033b696d2bea94119ce45c",
+            "patch": "@@ -17,16 +17,21 @@ limitations under the License.\n \n #include <cstdint>\n #include <memory>\n+#include <tuple>\n #include <utility>\n #include <vector>\n \n #include \"absl/status/status.h\"\n+#include \"absl/status/status_matchers.h\"\n #include \"absl/status/statusor.h\"\n #include \"xla/tsl/platform/test.h\"\n #include \"xla/tsl/platform/test_benchmark.h\"\n \n namespace tsl {\n \n+using ::absl_testing::IsOk;\n+using ::testing::Not;\n+\n TEST(FutureTest, StatusConstructedFuture) {\n   Future<> future = Future<>(absl::OkStatus());\n   EXPECT_TRUE(future.IsReady());\n@@ -162,6 +167,22 @@ TEST(FutureTest, OnReadyMoveOnlyFuture) {\n   });\n }\n \n+TEST(FutureTest, PromiseNotSet) {\n+  Future<> future;\n+  {\n+    Promise<> promise;\n+    std::tie(promise, future) = Future<>::MakePromise();\n+  }\n+  ASSERT_TRUE(future.IsReady());\n+  EXPECT_THAT(future.Await(), Not(IsOk()));\n+}\n+\n+TEST(FutureTest, PromiseSetTwice) {\n+  auto [promise, future] = Future<>::MakePromise();\n+  promise.Set();\n+  EXPECT_DEATH(promise.Set(), \"Promise must not be fulfilled more than once\");\n+}\n+\n TEST(FutureTest, UnlinkedPromiseIsUnique) {\n   auto [promise, future] = Future<>::MakePromise();\n   EXPECT_FALSE(promise.IsUniqueReference());"
+        }
+    ],
+    "stats": {
+        "total": 36,
+        "additions": 35,
+        "deletions": 1
+    }
+}

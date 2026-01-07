@@ -1,0 +1,60 @@
+{
+    "author": "ezhulenev",
+    "message": "[xla:cpu] Use sort_lib in tfcompile AOT compilation\n\nIn preparation for removing legacy runtime migrate AOT users to new sort_lib\n\nPiperOrigin-RevId: 832462966",
+    "sha": "6a93fd3b078190c95a3ea023bc3fa14d779815a4",
+    "files": [
+        {
+            "sha": "bb948be1407c7d55581dcf75ba9148bf207c475f",
+            "filename": "tensorflow/compiler/aot/codegen.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/6a93fd3b078190c95a3ea023bc3fa14d779815a4/tensorflow%2Fcompiler%2Faot%2Fcodegen.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/6a93fd3b078190c95a3ea023bc3fa14d779815a4/tensorflow%2Fcompiler%2Faot%2Fcodegen.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcompiler%2Faot%2Fcodegen.cc?ref=6a93fd3b078190c95a3ea023bc3fa14d779815a4",
+            "patch": "@@ -702,7 +702,7 @@ absl::Status ExtendRewrites(\n   if (HasThunkKind(aot_thunks->proto().thunk_sequence(),\n                    xla::cpu::ThunkProto::kSortThunk)) {\n     runtime_specific_includes.push_back(\n-        R\"(#include \"xla/service/cpu/runtime_key_value_sort.h\")\");\n+        R\"(#include \"xla/backends/cpu/runtime/sort_lib.h\")\");\n   }\n \n   if (HasThunkKind(aot_thunks->proto().thunk_sequence(),"
+        },
+        {
+            "sha": "fb44357f7e72e13e2f638a8cf7cecf2ba90ae7c7",
+            "filename": "tensorflow/compiler/aot/tfcompile.bzl",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/6a93fd3b078190c95a3ea023bc3fa14d779815a4/tensorflow%2Fcompiler%2Faot%2Ftfcompile.bzl",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/6a93fd3b078190c95a3ea023bc3fa14d779815a4/tensorflow%2Fcompiler%2Faot%2Ftfcompile.bzl",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcompiler%2Faot%2Ftfcompile.bzl?ref=6a93fd3b078190c95a3ea023bc3fa14d779815a4",
+            "patch": "@@ -336,8 +336,8 @@ def _tf_library(\n         ] or []) + (include_standard_runtime_deps and [\n             # TODO(cwhipkey): only depend on kernel code that the model actually\n             # needed.\n+            \"@local_xla//xla/backends/cpu/runtime:sort_lib\",\n             \"@local_xla//xla/service/cpu:runtime_conv2d\",\n-            \"@local_xla//xla/service/cpu:runtime_key_value_sort\",\n             \"@local_xla//xla/service/cpu:runtime_matmul\",\n             \"@local_xla//xla/service/cpu:runtime_topk\",\n             \"@local_xla//xla/service/cpu:runtime_single_threaded_conv2d\","
+        },
+        {
+            "sha": "59c3275bd7b6ac98bb4e69a3503bc8fc96f1e1c4",
+            "filename": "tensorflow/compiler/aot/thunk_proto_execution_deserializer.cc",
+            "status": "modified",
+            "additions": 29,
+            "deletions": 18,
+            "changes": 47,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/6a93fd3b078190c95a3ea023bc3fa14d779815a4/tensorflow%2Fcompiler%2Faot%2Fthunk_proto_execution_deserializer.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/6a93fd3b078190c95a3ea023bc3fa14d779815a4/tensorflow%2Fcompiler%2Faot%2Fthunk_proto_execution_deserializer.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcompiler%2Faot%2Fthunk_proto_execution_deserializer.cc?ref=6a93fd3b078190c95a3ea023bc3fa14d779815a4",
+            "patch": "@@ -594,35 +594,46 @@ ThunkProtoExecutionDeserializer::GetSortThunkRunImpl(\n   std::vector<std::string> buffers_to_sort;\n   buffers_to_sort.reserve(sort_thunk.inputs_shapes_size());\n \n-  std::vector<int32_t> values_primitive_type_size_in_bytes;\n-  values_primitive_type_size_in_bytes.reserve(sort_thunk.inputs_shapes_size());\n+  std::vector<int32_t> primitive_sizes;\n+  primitive_sizes.reserve(sort_thunk.inputs_shapes_size());\n   for (const auto& buffer_proto : sort_thunk.inputs_shapes()) {\n     buffers_to_sort.push_back(\n-        absl::StrCat(\"reinterpret_cast<char*>(\",\n+        absl::StrCat(\"reinterpret_cast<std::byte*>(\",\n                      GetBufferAllocationString(buffer_proto.slice()), \")\"));\n-    values_primitive_type_size_in_bytes.push_back(\n-        xla::ShapeUtil::ByteSizeOfPrimitiveType(\n-            buffer_proto.shape().element_type()));\n+    primitive_sizes.push_back(xla::ShapeUtil::ByteSizeOfPrimitiveType(\n+        buffer_proto.shape().element_type()));\n   }\n   absl::string_view sort_thunk_invocation_format = R\"(\n      // Sort Thunk\n      {\n-       std::vector<char*> values = {\n+       std::vector<std::byte*> values = {\n          {{BUFFERS_TO_SORT}}\n        };\n-       std::vector<int32_t> values_primitive_type_size_in_bytes = {\n+       std::vector<size_t> primitive_sizes = {\n          {{VALUES_PRIMITIVE_TYPE_SIZE_IN_BYTES}}\n        };\n \n-       __xla_cpu_runtime_KeyValueSort(\n-         {{HIGHER_DIMENSIONS}}, {{SORT_DIMENSION_ELEMENTS}}, {{LOWER_DIMENSIONS}},\n-         values.data(),\n-         int32_t(values.size()),\n-         values_primitive_type_size_in_bytes.data(),\n-         /*is_stable=*/{{IS_STABLE}},\n-         reinterpret_cast<char*>(run_options),\n-         /*prof_counters=*/nullptr,\n-         reinterpret_cast<void(*)(char*, char*, char**, char**, int64_t*)>({{SORT_FUNCTION_NAME}}));\n+       // Type alias compatible with `FunctionLibrary::Comparator`.\n+       using Comparator = void(bool* result, const void* run_options,\n+                               const void** params, const void* buffer_table,\n+                               const void* status, const void* prof_counters);\n+       Comparator* comparator = reinterpret_cast<Comparator*>(\n+           {{SORT_FUNCTION_NAME}});\n+\n+       absl::AnyInvocable<bool(const void** data)> less_than =\n+           [comparator](const void** data) {\n+             bool result;\n+             (*comparator)(&result, nullptr, data, nullptr, nullptr, nullptr);\n+             return result;\n+           };\n+\n+       xla::cpu::internal::SortInplace(\n+         {\n+           {{HIGHER_DIMENSIONS}},\n+           {{SORT_DIMENSION_ELEMENTS}},\n+           {{LOWER_DIMENSIONS}}\n+         },\n+         values, primitive_sizes, {{IS_STABLE}}, &less_than);\n      })\";\n \n   TF_ASSIGN_OR_RETURN(\n@@ -660,7 +671,7 @@ ThunkProtoExecutionDeserializer::GetSortThunkRunImpl(\n           {\"{{SORT_FUNCTION_NAME}}\", sort_thunk.comparator_name()},\n           {\"{{BUFFERS_TO_SORT}}\", absl::StrJoin(buffers_to_sort, \", \")},\n           {\"{{VALUES_PRIMITIVE_TYPE_SIZE_IN_BYTES}}\",\n-           absl::StrJoin(values_primitive_type_size_in_bytes, \", \")},\n+           absl::StrJoin(primitive_sizes, \", \")},\n           {\"{{IS_STABLE}}\", sort_thunk.is_stable() ? \"true\" : \"false\"},\n       });\n }"
+        },
+        {
+            "sha": "977e53a8b5034bb403ee5b64c45d6ccce4e70ed5",
+            "filename": "third_party/xla/xla/backends/cpu/runtime/BUILD",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/6a93fd3b078190c95a3ea023bc3fa14d779815a4/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fruntime%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/6a93fd3b078190c95a3ea023bc3fa14d779815a4/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fruntime%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fruntime%2FBUILD?ref=6a93fd3b078190c95a3ea023bc3fa14d779815a4",
+            "patch": "@@ -25,6 +25,7 @@ filegroup(\n         \"convolution_thunk_f16.cc\",\n         \"convolution_thunk_f32.cc\",\n         \"rng_state_lib.cc\",\n+        \"sort_lib.cc\",\n     ],\n     visibility = internal_visibility([\":friends\"]),\n )\n@@ -35,6 +36,7 @@ filegroup(\n         \"convolution_thunk_internal.h\",\n         \"kernel_c_api.h\",\n         \"rng_state_lib.h\",\n+        \"sort_lib.h\",\n         \"work_queue.h\",\n     ],\n     visibility = internal_visibility([\":friends\"]),"
+        }
+    ],
+    "stats": {
+        "total": 53,
+        "additions": 33,
+        "deletions": 20
+    }
+}

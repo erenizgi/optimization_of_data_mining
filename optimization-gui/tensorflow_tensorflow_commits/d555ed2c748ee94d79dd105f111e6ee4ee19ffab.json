@@ -1,0 +1,84 @@
+{
+    "author": "EusebioDM",
+    "message": "Add (de)serialization for `FftThunk`\n\nThis one is a pretty direct mapping from the struct to the proto.\n\nPiperOrigin-RevId: 819214943",
+    "sha": "d555ed2c748ee94d79dd105f111e6ee4ee19ffab",
+    "files": [
+        {
+            "sha": "503c483ea1def1a3d401f4f077563714e192a513",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/BUILD",
+            "status": "modified",
+            "additions": 19,
+            "deletions": 0,
+            "changes": 19,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/d555ed2c748ee94d79dd105f111e6ee4ee19ffab/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/d555ed2c748ee94d79dd105f111e6ee4ee19ffab/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2FBUILD?ref=d555ed2c748ee94d79dd105f111e6ee4ee19ffab",
+            "patch": "@@ -744,12 +744,14 @@ cc_library(\n     hdrs = [\"fft_thunk.h\"],\n     deps = [\n         \":thunk\",\n+        \":thunk_proto_cc\",\n         \"//xla:shape_util\",\n         \"//xla:status_macros\",\n         \"//xla:types\",\n         \"//xla:util\",\n         \"//xla:xla_data_proto_cc\",\n         \"//xla/service:buffer_assignment\",\n+        \"//xla/service:buffer_assignment_proto_cc\",\n         \"//xla/stream_executor:blas\",\n         \"//xla/stream_executor:device_memory\",\n         \"//xla/stream_executor:device_memory_allocator\",\n@@ -768,6 +770,22 @@ cc_library(\n     ],\n )\n \n+xla_cc_test(\n+    name = \"fft_thunk_test\",\n+    srcs = [\"fft_thunk_test.cc\"],\n+    deps = [\n+        \":fft_thunk\",\n+        \":thunk\",\n+        \":thunk_proto_cc\",\n+        \"//xla/service:buffer_assignment\",\n+        \"//xla/tsl/platform:statusor\",\n+        \"//xla/tsl/util/proto:parse_text_proto\",\n+        \"//xla/tsl/util/proto:proto_matchers\",\n+        \"@com_google_absl//absl/types:span\",\n+        \"@com_google_googletest//:gtest_main\",\n+    ],\n+)\n+\n cc_library(\n     name = \"gemm_thunk\",\n     srcs = [\"gemm_thunk.cc\"],\n@@ -2397,6 +2415,7 @@ cc_library(\n         \":convolution_thunk\",\n         \":copy_thunk\",\n         \":cudnn_thunk\",\n+        \":fft_thunk\",\n         \":gemm_thunk\",\n         \":gpublas_lt_matmul_thunk\",\n         \":infeed_thunk\","
+        },
+        {
+            "sha": "d0883c0435fd065d996d06367aeb003a430a0735",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/fft_thunk.cc",
+            "status": "modified",
+            "additions": 64,
+            "deletions": 0,
+            "changes": 64,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/d555ed2c748ee94d79dd105f111e6ee4ee19ffab/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Ffft_thunk.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/d555ed2c748ee94d79dd105f111e6ee4ee19ffab/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Ffft_thunk.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Ffft_thunk.cc?ref=d555ed2c748ee94d79dd105f111e6ee4ee19ffab",
+            "patch": "@@ -18,6 +18,8 @@ limitations under the License.\n #include <cstdint>\n #include <memory>\n #include <string>\n+#include <utility>\n+#include <vector>\n \n #include \"absl/log/check.h\"\n #include \"absl/log/log.h\"\n@@ -27,6 +29,7 @@ limitations under the License.\n #include \"absl/types/span.h\"\n #include \"xla/backends/gpu/runtime/thunk.h\"\n #include \"xla/service/buffer_assignment.h\"\n+#include \"xla/service/buffer_assignment.pb.h\"\n #include \"xla/shape.h\"\n #include \"xla/shape_util.h\"\n #include \"xla/status_macros.h\"\n@@ -81,6 +84,25 @@ std::string FftTypeToString(se::fft::Type type) {\n   }\n }\n \n+absl::StatusOr<FftType> SeTypeToFftType(se::fft::Type type) {\n+  switch (type) {\n+    case se::fft::Type::kC2CForward:\n+    case se::fft::Type::kZ2ZForward:\n+      return FftType::FFT;\n+    case se::fft::Type::kC2CInverse:\n+    case se::fft::Type::kZ2ZInverse:\n+      return FftType::IFFT;\n+    case se::fft::Type::kC2R:\n+    case se::fft::Type::kZ2D:\n+      return FftType::IRFFT;\n+    case se::fft::Type::kR2C:\n+    case se::fft::Type::kD2Z:\n+      return FftType::RFFT;\n+    case se::fft::Type::kInvalid:\n+      return Internal(\"Invalid fft type\");\n+  }\n+}\n+\n absl::StatusOr<stream_executor::blas::BlasSupport*> GetBlas(\n     se::Stream* stream) {\n   auto blas = stream->parent()->AsBlas();\n@@ -268,5 +290,47 @@ absl::Status RunFft(se::DeviceMemoryBase input, const Shape& input_shape,\n                   FftTypeToString(fft_type));\n }\n \n+absl::StatusOr<std::unique_ptr<FftThunk>> FftThunk::FromProto(\n+    ThunkInfo thunk_info, const FftThunkProto& proto,\n+    absl::Span<const BufferAllocation> buffer_allocations) {\n+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice input_buffer,\n+                      BufferAllocation::Slice::FromProto(proto.input_buffer(),\n+                                                         buffer_allocations));\n+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice output_buffer,\n+                      BufferAllocation::Slice::FromProto(proto.output_buffer(),\n+                                                         buffer_allocations));\n+\n+  TF_ASSIGN_OR_RETURN(Shape input_shape, Shape::FromProto(proto.input_shape()));\n+  TF_ASSIGN_OR_RETURN(Shape output_shape,\n+                      Shape::FromProto(proto.output_shape()));\n+\n+  std::vector<int64_t> fft_length{proto.fft_length().begin(),\n+                                  proto.fft_length().end()};\n+\n+  return std::make_unique<FftThunk>(thunk_info, proto.fft_type(),\n+                                    std::move(fft_length), input_buffer,\n+                                    output_buffer, input_shape, output_shape);\n+}\n+\n+absl::StatusOr<ThunkProto> FftThunk::ToProto() const {\n+  ThunkProto thunk_proto;\n+  *thunk_proto.mutable_thunk_info() = thunk_info().ToProto();\n+\n+  FftThunkProto* proto = thunk_proto.mutable_fft_thunk();\n+  TF_ASSIGN_OR_RETURN(FftType fft_type, SeTypeToFftType(fft_type_));\n+  proto->set_fft_type(fft_type);\n+\n+  *proto->mutable_fft_length() = {fft_length_.begin(), fft_length_.end()};\n+\n+  TF_ASSIGN_OR_RETURN(*proto->mutable_input_buffer(), input_buffer_.ToProto());\n+  TF_ASSIGN_OR_RETURN(*proto->mutable_output_buffer(),\n+                      output_buffer_.ToProto());\n+\n+  *proto->mutable_input_shape() = input_shape_.ToProto();\n+  *proto->mutable_output_shape() = output_shape_.ToProto();\n+\n+  return thunk_proto;\n+}\n+\n }  // namespace gpu\n }  // namespace xla"
+        },
+        {
+            "sha": "92aab371cd2f2ce6197bc240e3f5d6c32de9a8ab",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/fft_thunk.h",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 0,
+            "changes": 8,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/d555ed2c748ee94d79dd105f111e6ee4ee19ffab/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Ffft_thunk.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/d555ed2c748ee94d79dd105f111e6ee4ee19ffab/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Ffft_thunk.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Ffft_thunk.h?ref=d555ed2c748ee94d79dd105f111e6ee4ee19ffab",
+            "patch": "@@ -23,9 +23,11 @@ limitations under the License.\n #include \"absl/base/thread_annotations.h\"\n #include \"absl/container/flat_hash_map.h\"\n #include \"absl/status/status.h\"\n+#include \"absl/status/statusor.h\"\n #include \"absl/synchronization/mutex.h\"\n #include \"absl/types/span.h\"\n #include \"xla/backends/gpu/runtime/thunk.h\"\n+#include \"xla/backends/gpu/runtime/thunk.pb.h\"\n #include \"xla/service/buffer_assignment.h\"\n #include \"xla/shape.h\"\n #include \"xla/stream_executor/device_memory.h\"\n@@ -82,6 +84,12 @@ class FftThunk : public Thunk {\n   // Does the FFT for the thunk on \"stream\".\n   absl::Status ExecuteOnStream(const ExecuteParams& params) override;\n \n+  static absl::StatusOr<std::unique_ptr<FftThunk>> FromProto(\n+      ThunkInfo thunk_info, const FftThunkProto& proto,\n+      absl::Span<const BufferAllocation> buffer_allocations);\n+\n+  absl::StatusOr<ThunkProto> ToProto() const override;\n+\n  private:\n   const se::fft::Type fft_type_;\n   const std::vector<int64_t> fft_length_;"
+        },
+        {
+            "sha": "a40c44c3a14e1c61fdf78f0416893efe3e77bb36",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/fft_thunk_test.cc",
+            "status": "added",
+            "additions": 84,
+            "deletions": 0,
+            "changes": 84,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/d555ed2c748ee94d79dd105f111e6ee4ee19ffab/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Ffft_thunk_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/d555ed2c748ee94d79dd105f111e6ee4ee19ffab/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Ffft_thunk_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Ffft_thunk_test.cc?ref=d555ed2c748ee94d79dd105f111e6ee4ee19ffab",
+            "patch": "@@ -0,0 +1,84 @@\n+/* Copyright 2025 The OpenXLA Authors.\n+\n+Licensed under the Apache License, Version 2.0 (the \"License\");\n+you may not use this file except in compliance with the License.\n+You may obtain a copy of the License at\n+\n+    http://www.apache.org/licenses/LICENSE-2.0\n+\n+Unless required by applicable law or agreed to in writing, software\n+distributed under the License is distributed on an \"AS IS\" BASIS,\n+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+See the License for the specific language governing permissions and\n+limitations under the License.\n+==============================================================================*/\n+\n+#include \"xla/backends/gpu/runtime/fft_thunk.h\"\n+\n+#include <memory>\n+#include <vector>\n+\n+#include <gmock/gmock.h>\n+#include <gtest/gtest.h>\n+#include \"absl/types/span.h\"\n+#include \"xla/backends/gpu/runtime/thunk.h\"\n+#include \"xla/backends/gpu/runtime/thunk.pb.h\"\n+#include \"xla/service/buffer_assignment.h\"\n+#include \"xla/tsl/platform/statusor.h\"\n+#include \"xla/tsl/util/proto/parse_text_proto.h\"\n+#include \"xla/tsl/util/proto/proto_matchers.h\"\n+\n+namespace xla {\n+namespace gpu {\n+namespace {\n+\n+using ::tsl::proto_testing::EqualsProto;\n+using ::tsl::proto_testing::ParseTextProtoOrDie;\n+\n+TEST(FftThunkTest, ProtoRoundTrip) {\n+  auto proto = ParseTextProtoOrDie<ThunkProto>(R\"pb(\n+    thunk_info { profile_annotation: \"test\" execution_stream_id: 0 }\n+    fft_thunk {\n+      fft_type: FFT\n+      fft_length: [ 64, 64 ]\n+      input_buffer { buffer_allocation_index: 0 offset: 0 size: 1024 }\n+      output_buffer { buffer_allocation_index: 1 offset: 0 size: 1024 }\n+      input_shape {\n+        element_type: C64\n+        dimensions: 1\n+        dimensions: [ 64, 64 ]\n+        layout {\n+          minor_to_major: [ 2, 1, 0 ]\n+          tail_padding_alignment_in_elements: 1\n+        }\n+        is_dynamic_dimension: [ false, false, false ]\n+      }\n+      output_shape {\n+        element_type: C64\n+        dimensions: 1\n+        dimensions: [ 64, 64 ]\n+        layout {\n+          minor_to_major: [ 2, 1, 0 ]\n+          tail_padding_alignment_in_elements: 1\n+        }\n+        is_dynamic_dimension: [ false, false, false ]\n+      }\n+    }\n+  )pb\");\n+\n+  std::vector<BufferAllocation> buffer_allocations;\n+  buffer_allocations.emplace_back(/*index=*/0, /*size=*/1024, /*color=*/0);\n+  buffer_allocations.emplace_back(/*index=*/1, /*size=*/1024, /*color=*/0);\n+\n+  TF_ASSERT_OK_AND_ASSIGN(Thunk::ThunkInfo thunk_info,\n+                          Thunk::ThunkInfo::FromProto(proto.thunk_info()));\n+  TF_ASSERT_OK_AND_ASSIGN(\n+      std::unique_ptr<FftThunk> thunk,\n+      FftThunk::FromProto(thunk_info, proto.fft_thunk(), buffer_allocations));\n+  TF_ASSERT_OK_AND_ASSIGN(ThunkProto round_trip_proto, thunk->ToProto());\n+  EXPECT_THAT(round_trip_proto, EqualsProto(proto));\n+}\n+\n+}  // namespace\n+}  // namespace gpu\n+}  // namespace xla"
+        },
+        {
+            "sha": "c50e86c7775cab3da9d97697ea36c9c254b8a0ef",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/thunk.proto",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 0,
+            "changes": 10,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/d555ed2c748ee94d79dd105f111e6ee4ee19ffab/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fthunk.proto",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/d555ed2c748ee94d79dd105f111e6ee4ee19ffab/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fthunk.proto",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fthunk.proto?ref=d555ed2c748ee94d79dd105f111e6ee4ee19ffab",
+            "patch": "@@ -213,6 +213,15 @@ message ConvolutionReorderThunkProto {\n   optional ConvolutionReorderBiasBuffers biases = 4;\n }\n \n+message FftThunkProto {\n+  FftType fft_type = 1;\n+  repeated int64 fft_length = 2;\n+  xla.buffer_assignment.BufferAllocationSliceProto input_buffer = 3;\n+  xla.buffer_assignment.BufferAllocationSliceProto output_buffer = 4;\n+  xla.ShapeProto input_shape = 5;\n+  xla.ShapeProto output_shape = 6;\n+}\n+\n message ThunkProto {\n   ThunkInfoProto thunk_info = 1;\n \n@@ -242,6 +251,7 @@ message ThunkProto {\n     NormThunkProto norm_thunk = 24;\n     ConvolutionThunkProto convolution_thunk = 25;\n     ConvolutionReorderThunkProto convolution_reorder_thunk = 26;\n+    FftThunkProto fft_thunk = 27;\n   }\n }\n "
+        },
+        {
+            "sha": "2a6802795d7760b085ed2b44197d3bb52648a6db",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/thunk_proto_deserialization.cc",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/d555ed2c748ee94d79dd105f111e6ee4ee19ffab/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fthunk_proto_deserialization.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/d555ed2c748ee94d79dd105f111e6ee4ee19ffab/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fthunk_proto_deserialization.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fthunk_proto_deserialization.cc?ref=d555ed2c748ee94d79dd105f111e6ee4ee19ffab",
+            "patch": "@@ -32,6 +32,7 @@ limitations under the License.\n #include \"xla/backends/gpu/runtime/convolution_thunk.h\"\n #include \"xla/backends/gpu/runtime/copy_thunk.h\"\n #include \"xla/backends/gpu/runtime/cudnn_thunk.h\"\n+#include \"xla/backends/gpu/runtime/fft_thunk.h\"\n #include \"xla/backends/gpu/runtime/gemm_thunk.h\"\n #include \"xla/backends/gpu/runtime/gpublas_lt_matmul_thunk.h\"\n #include \"xla/backends/gpu/runtime/infeed_thunk.h\"\n@@ -159,6 +160,9 @@ absl::StatusOr<std::unique_ptr<Thunk>> DeserializeThunkProto(\n           std::move(thunk_info), thunk_proto.convolution_reorder_thunk(),\n           buffer_allocations);\n     }\n+    case ThunkProto::kFftThunk:\n+      return FftThunk::FromProto(std::move(thunk_info), thunk_proto.fft_thunk(),\n+                                 buffer_allocations);\n     default:\n       std::optional<absl::string_view> unsupported_thunk_type =\n           GetStoredThunkTypeName(thunk_proto);"
+        }
+    ],
+    "stats": {
+        "total": 189,
+        "additions": 189,
+        "deletions": 0
+    }
+}

@@ -1,0 +1,60 @@
+{
+    "author": "KanishAnand",
+    "message": "(4/N) Add support for `NamedSharding` in existing `HloShardingUtil` methods. Remaining methods will be updated in follow up cl's.\n\nPiperOrigin-RevId: 846460947",
+    "sha": "e54cce9f2b1c52f1675d4743e487ece6bcc444f0",
+    "files": [
+        {
+            "sha": "3631512f6299ddd0e469e21966542c36f271cab2",
+            "filename": "third_party/xla/xla/hlo/ir/named_sharding.h",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e54cce9f2b1c52f1675d4743e487ece6bcc444f0/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fnamed_sharding.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e54cce9f2b1c52f1675d4743e487ece6bcc444f0/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fnamed_sharding.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fnamed_sharding.h?ref=e54cce9f2b1c52f1675d4743e487ece6bcc444f0",
+            "patch": "@@ -87,6 +87,9 @@ class NamedSharding {\n   absl::Span<const DimensionSharding> dim_shardings() const {\n     return dim_shardings_;\n   }\n+  const DimensionSharding& dim_sharding(int64_t dim) const {\n+    return dim_shardings_[dim];\n+  }\n   absl::Span<const AxisRef> replicated_axes() const { return replicated_axes_; }\n   absl::Span<const AxisRef> unreduced_axes() const { return unreduced_axes_; }\n   absl::Span<const OpMetadata> metadata() const { return metadata_; }"
+        },
+        {
+            "sha": "116e26a4377d28061302dc44ff89ed1b28b2d412",
+            "filename": "third_party/xla/xla/hlo/utils/hlo_sharding_util.cc",
+            "status": "modified",
+            "additions": 57,
+            "deletions": 4,
+            "changes": 61,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e54cce9f2b1c52f1675d4743e487ece6bcc444f0/third_party%2Fxla%2Fxla%2Fhlo%2Futils%2Fhlo_sharding_util.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e54cce9f2b1c52f1675d4743e487ece6bcc444f0/third_party%2Fxla%2Fxla%2Fhlo%2Futils%2Fhlo_sharding_util.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Futils%2Fhlo_sharding_util.cc?ref=e54cce9f2b1c52f1675d4743e487ece6bcc444f0",
+            "patch": "@@ -789,6 +789,28 @@ HloSharding TransposeSharding(const HloSharding& sharding,\n   if (sharding.IsTileMaximal() || sharding.IsManual()) {\n     return sharding;\n   }\n+\n+  if (sharding.UseNamedShardingLeaf()) {\n+    // For NamedSharding, subgroup dimensions (e.g., for replication) are\n+    // handled separately from data dimensions. The `dimensions` parameter here\n+    // only permutes data dimensions, so its size must match the tensor rank.\n+    // This differs from the tile-based HloSharding format, where subgroup\n+    // dimensions are part of the tile assignment.\n+    CHECK_EQ(sharding.num_dimensions(), dimensions.size());\n+\n+    std::vector<NamedSharding::DimensionSharding> transposed_dim_shardings(\n+        sharding.num_dimensions());\n+    for (int64_t i = 0; i < dimensions.size(); ++i) {\n+      transposed_dim_shardings[dimensions[i]] =\n+          sharding.named_sharding().dim_sharding(i);\n+    }\n+    return HloSharding(NamedSharding(\n+        sharding.named_sharding().mesh(), transposed_dim_shardings,\n+        sharding.named_sharding().replicated_axes(),\n+        sharding.named_sharding().unreduced_axes(),\n+        sharding.named_sharding().metadata()));\n+  }\n+\n   std::vector<int> perm_dimensions(dimensions.begin(), dimensions.end());\n   // Add subgroup dims if missing.\n   if (sharding.TiledDataRank() == dimensions.size()) {\n@@ -1621,10 +1643,11 @@ HloSharding RemoveShapeDimensions(const HloSharding& sharding,\n   }\n \n   if (sharding.UseNamedShardingLeaf()) {\n-    // Check to ensure subgroup dimensions are not passed in dims_to_remove as\n-    // named sharding doesn't handle them as part of dim_shardings but separate\n-    // replicated, unreduced axes as opposed to tile hlo sharding format which\n-    // uses tile dimensions to represent subgroup dimensions as well.\n+    // For NamedSharding, subgroup dimensions (e.g., for replication) are\n+    // handled separately from data dimensions. The `dimensions` parameter here\n+    // only permutes data dimensions, so its size must match the tensor rank.\n+    // This differs from the tile-based HloSharding format, where subgroup\n+    // dimensions are part of the tile assignment.\n     DCHECK(\n         std::all_of(dims_to_remove.begin(), dims_to_remove.end(),\n                     [&](int64_t i) { return i < sharding.num_dimensions(); }));\n@@ -1669,6 +1692,36 @@ std::optional<HloSharding> TransposeShardingWithCollapsedDims(\n   if (source.IsTileMaximal() || source.IsManual()) {\n     return source;\n   }\n+\n+  if (source.UseNamedShardingLeaf()) {\n+    // For NamedSharding, subgroup dimensions (e.g., for replication) are\n+    // handled separately from data dimensions. The `dimensions` parameter here\n+    // only permutes data dimensions, so its size must match the tensor rank.\n+    // This differs from the tile-based HloSharding format, where subgroup\n+    // dimensions are part of the tile assignment.\n+    CHECK_EQ(source.num_dimensions(), src_to_tgt.size());\n+\n+    for (int64_t i = 0; i < src_to_tgt.size(); ++i) {\n+      if (src_to_tgt[i] < 0 && source.dimension(i) > 1) {\n+        return std::nullopt;\n+      }\n+    }\n+\n+    std::vector<NamedSharding::DimensionSharding> new_dim_shardings(\n+        tgt_to_src.size());\n+    for (int64_t i = 0; i < tgt_to_src.size(); ++i) {\n+      if (tgt_to_src[i] >= 0) {\n+        new_dim_shardings[i] =\n+            source.named_sharding().dim_sharding(tgt_to_src[i]);\n+      }\n+    }\n+\n+    return HloSharding(NamedSharding(\n+        source.named_sharding().mesh(), new_dim_shardings,\n+        source.named_sharding().replicated_axes(),\n+        source.named_sharding().unreduced_axes(), source.metadata()));\n+  }\n+\n   if (src_to_tgt.size() < source.num_dimensions()) {\n     // Add missing subgroup dims.\n     DimensionVector new_src_to_tgt(src_to_tgt.begin(), src_to_tgt.end());"
+        },
+        {
+            "sha": "95fd3d307cd954a4c1cfce92b9f5de79e6cc0ce9",
+            "filename": "third_party/xla/xla/hlo/utils/hlo_sharding_util.h",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 3,
+            "changes": 5,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e54cce9f2b1c52f1675d4743e487ece6bcc444f0/third_party%2Fxla%2Fxla%2Fhlo%2Futils%2Fhlo_sharding_util.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e54cce9f2b1c52f1675d4743e487ece6bcc444f0/third_party%2Fxla%2Fxla%2Fhlo%2Futils%2Fhlo_sharding_util.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Futils%2Fhlo_sharding_util.h?ref=e54cce9f2b1c52f1675d4743e487ece6bcc444f0",
+            "patch": "@@ -126,9 +126,8 @@ HloSharding FindCommonSharding(\n HloSharding MoveAndMergeShardingTiles(const HloSharding& sharding,\n                                       int64_t source_dim, int64_t target_dim);\n \n-// Returns the HloSharding with the tile dimensions and tile assignment\n-// transposed based on the specified dimension numbers. In case of a tile\n-// maximal sharding returns the original sharding.\n+// Returns the HloSharding transposed based on the specified dimension numbers.\n+// In case of a tile maximal sharding returns the original sharding.\n HloSharding TransposeSharding(const HloSharding& sharding,\n                               absl::Span<const int64_t> dimensions);\n "
+        },
+        {
+            "sha": "27b6f4ee1f90767fac2442c0b50c5dc4065b3a53",
+            "filename": "third_party/xla/xla/hlo/utils/hlo_sharding_util_test.cc",
+            "status": "modified",
+            "additions": 26,
+            "deletions": 0,
+            "changes": 26,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e54cce9f2b1c52f1675d4743e487ece6bcc444f0/third_party%2Fxla%2Fxla%2Fhlo%2Futils%2Fhlo_sharding_util_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e54cce9f2b1c52f1675d4743e487ece6bcc444f0/third_party%2Fxla%2Fxla%2Fhlo%2Futils%2Fhlo_sharding_util_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Futils%2Fhlo_sharding_util_test.cc?ref=e54cce9f2b1c52f1675d4743e487ece6bcc444f0",
+            "patch": "@@ -145,12 +145,28 @@ TEST(HloShardingUtilTest, MoveAndMergeShardingTilesSubGroup) {\n TEST(HloShardingUtilTest, TransposeShardingReplicated) {\n   EXPECT_EQ(TransposeSharding(HloSharding::Replicate(), {0, 1, 2}),\n             HloSharding::Replicate());\n+\n+  EXPECT_EQ(\n+      TransposeSharding(HloSharding::Replicate({}, /*use_named_sharding=*/true),\n+                        {0, 1, 2}),\n+      HloSharding::Replicate({}, /*use_named_sharding=*/true));\n }\n \n TEST(HloShardingUtilTest, TransposeShardingTiled) {\n   HloSharding input = HloSharding::IotaTile({1, 2, 1, 2});\n   HloSharding output = HloSharding::IotaTile({2, 1, 2, 1}, {2, 2}, {1, 0});\n   EXPECT_EQ(TransposeSharding(input, {3, 0, 1, 2}), output);\n+\n+  {\n+    Mesh mesh({2, 2}, {\"a\", \"b\"});\n+    NamedSharding input =\n+        test_utils::FromAxisNames(mesh, {{}, {\"a\"}, {}, {\"b\"}});\n+    NamedSharding output =\n+        test_utils::FromAxisNames(mesh, {{\"b\"}, {}, {\"a\"}, {}});\n+    EXPECT_EQ(\n+        TransposeSharding(HloSharding(input), {3, 2, 1, 0}).named_sharding(),\n+        output);\n+  }\n }\n \n TEST(HloShardingUtilTest, TransposeShardingWithCollapsedDimsSubgroupManual) {\n@@ -160,6 +176,16 @@ TEST(HloShardingUtilTest, TransposeShardingWithCollapsedDimsSubgroupManual) {\n       HloSharding::Subgroup(TileAssignment({1, 1, 2, 4}), {OpSharding::MANUAL});\n   EXPECT_EQ(TransposeShardingWithCollapsedDims(input, {-1, 2}, {-1, -1, 1}),\n             output);\n+\n+  {\n+    Mesh mesh({1, 2, 4}, {\"a\", \"b\", \"c\"});\n+    NamedSharding input = test_utils::FromAxisNames(mesh, {{\"a\"}, {\"b\"}});\n+    NamedSharding output = test_utils::FromAxisNames(mesh, {{}, {}, {\"b\"}});\n+    EXPECT_EQ(TransposeShardingWithCollapsedDims(HloSharding(input), {-1, 2},\n+                                                 {-1, -1, 1})\n+                  ->named_sharding(),\n+              output);\n+  }\n }\n \n TEST(HloShardingUtilTest, ReshapeShardingDimensionSizeOnePartitioned1) {"
+        }
+    ],
+    "stats": {
+        "total": 95,
+        "additions": 88,
+        "deletions": 7
+    }
+}

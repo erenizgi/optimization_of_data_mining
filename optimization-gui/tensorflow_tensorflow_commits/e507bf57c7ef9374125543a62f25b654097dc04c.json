@@ -1,0 +1,60 @@
+{
+    "author": "arfaian",
+    "message": "Add FP32-->FP16 folding support to tfl.cast.\n\nPiperOrigin-RevId: 836848293",
+    "sha": "e507bf57c7ef9374125543a62f25b654097dc04c",
+    "files": [
+        {
+            "sha": "08c37384741ca4db27c1a2a5cc6218d7d5d51c01",
+            "filename": "tensorflow/compiler/mlir/lite/ir/tfl_ops.cc",
+            "status": "modified",
+            "additions": 31,
+            "deletions": 11,
+            "changes": 42,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e507bf57c7ef9374125543a62f25b654097dc04c/tensorflow%2Fcompiler%2Fmlir%2Flite%2Fir%2Ftfl_ops.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e507bf57c7ef9374125543a62f25b654097dc04c/tensorflow%2Fcompiler%2Fmlir%2Flite%2Fir%2Ftfl_ops.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcompiler%2Fmlir%2Flite%2Fir%2Ftfl_ops.cc?ref=e507bf57c7ef9374125543a62f25b654097dc04c",
+            "patch": "@@ -247,16 +247,26 @@ bool ShouldFoldOperation(Operation* inst) {\n     return size;\n   };\n \n-  int64_t results_size = get_size(inst->getResultTypes());\n-  int64_t operands_size = get_size(inst->getOperandTypes());\n+  int64_t inputs_size = get_size(inst->getOperandTypes());\n+  int64_t outputs_size = get_size(inst->getResultTypes());\n \n-  constexpr int kSizeFactor = 2;\n-  constexpr int64_t kResultsSizeThreshold = (1 << 19);                // 64 KiB\n-  constexpr int64_t kOperandsSizeThreshold = 200L * 1024 * 1024 * 8;  // 200 MiB\n+  constexpr int64_t kInputsSizeThreshold = 200L * 1024 * 1024 * 8;  // 200 MiB\n+  constexpr int64_t kOutputsSizeThreshold =\n+      2 * kInputsSizeThreshold;  // 400 MiB\n \n-  return (operands_size <= kOperandsSizeThreshold) &&\n-         ((results_size <= kResultsSizeThreshold) ||\n-          (results_size <= kSizeFactor * operands_size));\n+  auto output_size_is_smaller_than_inputs = outputs_size <= inputs_size;\n+\n+  auto inputs_and_outputs_smaller_than_arbitrary_thresholds =\n+      (inputs_size <= kInputsSizeThreshold) &&\n+      (outputs_size <= kOutputsSizeThreshold);\n+\n+  // Folding rules are:\n+  // 1. if the size of the resulting outputs are smaller than the inputs then\n+  // just do the fold. The model size will be smaller as a result.\n+  // 2. if the inputs and outputs sizes are smaller than certain thresholds, do\n+  // the fold regardless of their impact on model size.\n+  return output_size_is_smaller_than_inputs ||\n+         inputs_and_outputs_smaller_than_arbitrary_thresholds;\n }\n \n // Returns dimension index for the given axis that supports negative\n@@ -4374,10 +4384,23 @@ OpFoldResult CastFloatToFloat(DenseFPElementsAttr data, FloatType in_type,\n     return DenseFPElementsAttr::get(result_type,\n                                     MapStaticCast<double, float>(data));\n   }\n+\n+  if (in_type.isF32() && out_type.isF16()) {\n+    return data.mapValues(out_type, [&](const APFloat& old_value) {\n+      APFloat value(old_value);\n+      bool unused_loses_info;\n+      value.convert(out_type.getFloatSemantics(), APFloat::rmNearestTiesToEven,\n+                    &unused_loses_info);\n+      return value.bitcastToAPInt();\n+    });\n+  }\n   return {};\n }\n \n OpFoldResult CastOp::fold(FoldAdaptor adaptor) {\n+  auto in_type = getInput().getType().getElementType();\n+  auto out_type = getType().getElementType();\n+\n   if (!ShouldFoldOperation(this->getOperation())) return {};\n \n   auto operands = adaptor.getOperands();\n@@ -4390,9 +4413,6 @@ OpFoldResult CastOp::fold(FoldAdaptor adaptor) {\n \n   auto input = operands[0];\n \n-  auto in_type = getInput().getType().getElementType();\n-  auto out_type = getType().getElementType();\n-\n   if (auto int_in_type = llvm::dyn_cast_or_null<IntegerType>(in_type)) {\n     auto in_data = llvm::dyn_cast_or_null<DenseIntElementsAttr>(input);\n     if (!in_data) {"
+        },
+        {
+            "sha": "5bc6bef17fe360911ccb1ef8c51b9c9b59429afb",
+            "filename": "tensorflow/compiler/mlir/lite/tests/const-fold.mlir",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e507bf57c7ef9374125543a62f25b654097dc04c/tensorflow%2Fcompiler%2Fmlir%2Flite%2Ftests%2Fconst-fold.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e507bf57c7ef9374125543a62f25b654097dc04c/tensorflow%2Fcompiler%2Fmlir%2Flite%2Ftests%2Fconst-fold.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcompiler%2Fmlir%2Flite%2Ftests%2Fconst-fold.mlir?ref=e507bf57c7ef9374125543a62f25b654097dc04c",
+            "patch": "@@ -1129,6 +1129,15 @@ func.func @cast_f32_to_f64() -> tensor<4xf64> {\n \n // CHECK: %cst = arith.constant dense<[-1.000000e+00, 0.000000e+00, 1.500000e+00, 1.000000e+02]> : tensor<4xf64>\n \n+// CHECK-LABEL: @cast_f32_to_f16\n+func.func @cast_f32_to_f16() -> tensor<4xf16> {\n+  %cst = arith.constant dense<[-1.0, 0.0, 1.5, 100.0]> : tensor<4xf32>\n+  %0 = \"tfl.cast\"(%cst) : (tensor<4xf32>) -> tensor<4xf16>\n+  func.return %0 : tensor<4xf16>\n+}\n+\n+// CHECK: %cst = arith.constant dense<[-1.000000e+00, 0.000000e+00, 1.500000e+00, 1.000000e+02]> : tensor<4xf16>\n+\n // CHECK-LABEL: @ConstantFoldFullyConnectedSmall\n func.func @ConstantFoldFullyConnectedSmall() -> tensor<3xf32> {\n   %cst_input = arith.constant dense<[2.0, 3.0]> : tensor<2xf32>"
+        },
+        {
+            "sha": "063e25944da6feea717b8e725383cce395fbbb54",
+            "filename": "tensorflow/compiler/mlir/lite/tests/optimize.mlir",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 17,
+            "changes": 17,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e507bf57c7ef9374125543a62f25b654097dc04c/tensorflow%2Fcompiler%2Fmlir%2Flite%2Ftests%2Foptimize.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e507bf57c7ef9374125543a62f25b654097dc04c/tensorflow%2Fcompiler%2Fmlir%2Flite%2Ftests%2Foptimize.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcompiler%2Fmlir%2Flite%2Ftests%2Foptimize.mlir?ref=e507bf57c7ef9374125543a62f25b654097dc04c",
+            "patch": "@@ -4802,23 +4802,6 @@ func.func @RealDivWithConstDivisor(%arg0: tensor<2x3xf32>) -> tensor<2x3xf32> {\n   // CHECK: return %0 : tensor<2x3xf32>\n }\n \n-// When the const tensor cst is very large, `1 / cst` div introduced by\n-// div->mul conversion may not be folded and the `1 / cst` div may trigger\n-// the div->mul conversion again.\n-// This test checks the div->mul conversion will not be done infinitively.\n-//\n-// CHECK-LABEL: @RealDivWithLargeSizeConstDivisor\n-func.func @RealDivWithLargeSizeConstDivisor(%arg0: tensor<1x16x4096x4096xf32>) -> tensor<1x16x4096x4096xf32> {\n-  %cst = arith.constant dense<5.000000e+01> : tensor<1x16x4096x4096xf32>\n-  %1 = tfl.div %arg0, %cst {fused_activation_function = \"NONE\"} : tensor<1x16x4096x4096xf32>\n-  func.return %1 : tensor<1x16x4096x4096xf32>\n-  // CHECK-NEXT: %[[CST0:.*]] = arith.constant dense<1.000000e+00> : tensor<f32>\n-  // CHECK-NEXT: %[[CST1:.*]] = arith.constant dense<5.000000e+01> : tensor<1x16x4096x4096xf32>\n-  // CHECK-NEXT: %[[DIV:.*]] = tfl.div(%[[CST0]], %[[CST1]]) <{fused_activation_function = \"NONE\"}> : (tensor<f32>, tensor<1x16x4096x4096xf32>) -> tensor<1x16x4096x4096xf32>\n-  // CHECK-NEXT: %[[MUL:.*]] = tfl.mul %arg0, %[[DIV]] {fused_activation_function = \"NONE\"} : tensor<1x16x4096x4096xf32>\n-  // CHECK-NEXT: return %[[MUL]] : tensor<1x16x4096x4096xf32>\n-}\n-\n //CHECK-LABEL: @PushTransposeThroughSqueezeNoDims\n func.func @PushTransposeThroughSqueezeNoDims(%arg0: tensor<1x1x2x3xf32>) -> (tensor<3x2xf32>) {\n   %cst = arith.constant dense<[0, 3, 1, 2]> : tensor<4xi32>"
+        },
+        {
+            "sha": "c3d28495a31fdeda7f46f3bee4973c476affaaaa",
+            "filename": "tensorflow/compiler/mlir/lite/transforms/optimize_patterns.td",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 6,
+            "changes": 7,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/e507bf57c7ef9374125543a62f25b654097dc04c/tensorflow%2Fcompiler%2Fmlir%2Flite%2Ftransforms%2Foptimize_patterns.td",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/e507bf57c7ef9374125543a62f25b654097dc04c/tensorflow%2Fcompiler%2Fmlir%2Flite%2Ftransforms%2Foptimize_patterns.td",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcompiler%2Fmlir%2Flite%2Ftransforms%2Foptimize_patterns.td?ref=e507bf57c7ef9374125543a62f25b654097dc04c",
+            "patch": "@@ -2155,18 +2155,13 @@ def ReorderGatherAndCast : Pat<\n // Replace division by a constant with a multiplication by a reciprocal of that\n // constant. Floating point division can be ~10x more expensive than a\n // multiplication.\n-// Only do the replacement when arg0 is not a constant, otherwise the newly\n-// generated div will be converted to mul again if the const div is not\n-// folded (that could happen when const tensor is very large), and that will\n-// cause infinite recursion.\n def RealDivWithF32ConstDivisor : Pat<\n   (TFL_DivOp:$src $arg0, (Arith_ConstantOp FloatElementsAttr<32>:$value), $activation),\n   (TFL_MulOp:$dest1 $arg0,\n     (TFL_DivOp (Arith_ConstantOp\n       (GetScalarOfType<1> (Arith_ConstantOp $value))),\n       (Arith_ConstantOp $value),  TFL_AF_None),\n-    $activation),\n-  [(NotConstantLike $arg0)]>;\n+    $activation)>;\n \n // Replace casting a boolean tensor to a numeric type, followed by comparing\n // with zero. Note it doesn't matter what type we're casting to. HasSameType"
+        }
+    ],
+    "stats": {
+        "total": 75,
+        "additions": 41,
+        "deletions": 34
+    }
+}

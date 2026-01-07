@@ -1,0 +1,36 @@
+{
+    "author": "jcai19",
+    "message": "[XLA][Numerics][HLO Original Value] Support original values for more cases in while loop simplifier pass\n\nThis updates the original value of a while loop if its input was nested tuples and got flatten during the pass\n\nPiperOrigin-RevId: 826644894",
+    "sha": "9c620f90b8e567a680ef7c89ce12f15a31cf8f40",
+    "files": [
+        {
+            "sha": "9a11a3b2d430ca180384a990a8772251b65e0a40",
+            "filename": "third_party/xla/xla/service/while_loop_simplifier.cc",
+            "status": "modified",
+            "additions": 21,
+            "deletions": 3,
+            "changes": 24,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/9c620f90b8e567a680ef7c89ce12f15a31cf8f40/third_party%2Fxla%2Fxla%2Fservice%2Fwhile_loop_simplifier.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/9c620f90b8e567a680ef7c89ce12f15a31cf8f40/third_party%2Fxla%2Fxla%2Fservice%2Fwhile_loop_simplifier.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fwhile_loop_simplifier.cc?ref=9c620f90b8e567a680ef7c89ce12f15a31cf8f40",
+            "patch": "@@ -151,7 +151,7 @@ static absl::StatusOr<HloInstruction*> RemoveDeadTupleIndices(\n     HloInstruction* while_op, absl::flat_hash_set<int64_t>& used_tuple_indices,\n     std::optional<absl::flat_hash_map<int32_t, int32_t>>\n         dead_to_surviving_index = std::nullopt) {\n-  auto copy_original_value =\n+  auto copy_remaining_original_arrays =\n       [&](const HloInstruction* src_instruction,\n           HloInstruction* dest_instruction,\n           const absl::flat_hash_map<int64_t, int64_t>& old_to_new_tuple_idx) {\n@@ -305,8 +305,9 @@ static absl::StatusOr<HloInstruction*> RemoveDeadTupleIndices(\n   CopyFrontendAttributes(while_op, new_while_op);\n   CopyMetadata(while_op, new_while_op);\n \n-  copy_original_value(while_init, new_while_init, old_to_new_tuple_idx);\n-  copy_original_value(while_op, new_while_op, old_to_new_tuple_idx);\n+  copy_remaining_original_arrays(while_init, new_while_init,\n+                                 old_to_new_tuple_idx);\n+  copy_remaining_original_arrays(while_op, new_while_op, old_to_new_tuple_idx);\n \n   // Create a tuple op that recreates the output of the old while op.  That is,\n   // we transform to\n@@ -1193,6 +1194,20 @@ static std::vector<HloInstruction*> GetFlatTupleElems(\n }\n \n static absl::StatusOr<bool> TryFlattenNestedTuples(HloInstruction* while_op) {\n+  auto flatten_original_value = [&](HloInstruction* old_instr,\n+                                    HloInstruction* new_instr) {\n+    if (old_instr->original_value()) {\n+      auto new_original_value =\n+          std::make_shared<OriginalValue>(new_instr->shape());\n+      int64_t i = 0;\n+      for (auto& [shape_index, original_array] :\n+           old_instr->original_value()->tree().leaves()) {\n+        *new_original_value->mutable_tree()->mutable_element({i++}) =\n+            original_array;\n+      }\n+      new_instr->set_original_value(new_original_value);\n+    }\n+  };\n   HloModule* module = while_op->GetModule();\n   HloComputation* computation = while_op->parent();\n   auto* while_init = while_op->mutable_operand(0);\n@@ -1294,6 +1309,9 @@ static absl::StatusOr<bool> TryFlattenNestedTuples(HloInstruction* while_op) {\n   for (auto& instr : new_instrs) {\n     computation->AddInstruction(std::move(instr));\n   }\n+\n+  flatten_original_value(while_init, new_while_op->mutable_operand(0));\n+  flatten_original_value(while_op, new_while_op);\n   return true;\n }\n "
+        },
+        {
+            "sha": "5b1efe3d32b42d9f3c3e6897a7bc002d4d873c15",
+            "filename": "third_party/xla/xla/service/while_loop_simplifier_test.cc",
+            "status": "modified",
+            "additions": 46,
+            "deletions": 0,
+            "changes": 46,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/9c620f90b8e567a680ef7c89ce12f15a31cf8f40/third_party%2Fxla%2Fxla%2Fservice%2Fwhile_loop_simplifier_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/9c620f90b8e567a680ef7c89ce12f15a31cf8f40/third_party%2Fxla%2Fxla%2Fservice%2Fwhile_loop_simplifier_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fwhile_loop_simplifier_test.cc?ref=9c620f90b8e567a680ef7c89ce12f15a31cf8f40",
+            "patch": "@@ -1535,5 +1535,51 @@ ENTRY %main (arg.0: f32[3], arg.1: f32[2]) -> (f32[3], f32[2], f32[2], f32[3]) {\n             R\"(({\"arg.0\"}, {\"arg.1\"}, {\"constant.0\"}))\");\n }\n \n+TEST_F(WhileLoopSimplifierTest, FlattenNestedTupleWithOriginalValue) {\n+  const std::string hlo_string = R\"(\n+  HloModule Test\n+  Body {\n+    param = ((s32[1]), (s32[2], s32[3], (s32[4]))) parameter(0)\n+    ta = (s32[1]) get-tuple-element(param), index=0\n+    a = s32[1] get-tuple-element(ta), index=0\n+    a.1 = s32[1] add(a, a)\n+    tbcd = (s32[2], s32[3], (s32[4])) get-tuple-element(param), index=1\n+    ROOT tuple = ((s32[1]), (s32[2], s32[3], (s32[4]))) tuple(ta, tbcd)\n+  }\n+  Cond {\n+    param = ((s32[1]), (s32[2], s32[3], (s32[4]))) parameter(0)\n+    ROOT cond = pred[] constant(true)\n+  }\n+  ENTRY Loop {\n+    a = s32[1] constant({0})\n+    b = s32[2] constant({0,1})\n+    c = s32[3] constant({0,1,2})\n+    d = s32[4] constant({0,1,2,3})\n+    ta = (s32[1]) tuple(a)\n+    td = (s32[4]) tuple(d)\n+    tbcd = (s32[2], s32[3], (s32[4])) tuple(b, c, td)\n+    init = ((s32[1]), (s32[2], s32[3], (s32[4]))) tuple(ta, tbcd), origin={(({\"a\"}), (\n+      {\"b\"}, {\"c\"}, ({\"d\"})))}\n+    ROOT while = ((s32[1]), (s32[2], s32[3], (s32[4]))) while(init),\n+      condition=Cond, body=Body, origin={(({\"while.116\" {0}}), (\n+      {\"while.116\" {1}}, {\"while.116\" {2}}, ({\"while.116\" {3}})))}\n+  })\";\n+\n+  TF_ASSERT_OK_AND_ASSIGN(auto module,\n+                          ParseAndReturnVerifiedModule(hlo_string));\n+  TF_ASSERT_OK_AND_ASSIGN(bool changed,\n+                          WhileLoopSimplifier().Run(module.get()));\n+  EXPECT_TRUE(changed);\n+  HloInstruction* while_instr = FindFirstWhile(module.get());\n+  ASSERT_NE(while_instr->original_value(), nullptr);\n+  EXPECT_EQ(\n+      while_instr->original_value()->ToString(),\n+      R\"(({\"while.116\" {0}}, {\"while.116\" {1}}, {\"while.116\" {2}}, {\"while.116\" {3}}))\");\n+  HloInstruction* while_init = while_instr->while_init();\n+  ASSERT_NE(while_init->original_value(), nullptr);\n+  EXPECT_EQ(while_init->original_value()->ToString(),\n+            R\"(({\"a\"}, {\"b\"}, {\"c\"}, {\"d\"}))\");\n+}\n+\n }  // namespace\n }  // namespace xla"
+        }
+    ],
+    "stats": {
+        "total": 70,
+        "additions": 67,
+        "deletions": 3
+    }
+}

@@ -1,0 +1,48 @@
+{
+    "author": "chsigg",
+    "message": "Cleanup: Remove special handling for `kTritonGemmFusionKind`.\n\nThis code path is dead.\n\nPiperOrigin-RevId: 836614086",
+    "sha": "0159a0a3c825f4fcb910ce4d0f24f24dd69bd488",
+    "files": [
+        {
+            "sha": "4870cba46bac732d4845ec669c734cc3a9fcf93e",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/0159a0a3c825f4fcb910ce4d0f24f24dd69bd488/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/0159a0a3c825f4fcb910ce4d0f24f24dd69bd488/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2FBUILD?ref=0159a0a3c825f4fcb910ce4d0f24f24dd69bd488",
+            "patch": "@@ -44,7 +44,6 @@ cc_library(\n         \"//xla/backends/gpu/runtime:thunk\",\n         \"//xla/codegen/emitters:kernel_arguments\",\n         \"//xla/codegen/tiling:tiled_hlo_computation\",\n-        \"//xla/hlo/analysis:symbolic_expr\",\n         \"//xla/hlo/ir:hlo\",\n         \"//xla/hlo/utils:hlo_traversal\",\n         \"//xla/service/gpu:backend_configs_cc\",\n@@ -55,7 +54,6 @@ cc_library(\n         \"//xla/service/gpu:kernel_reuse_cache\",\n         \"//xla/service/gpu:launch_dimensions\",\n         \"//xla/service/gpu/model:block_level_parameters\",\n-        \"//xla/service/llvm_ir:llvm_util\",\n         \"//xla/stream_executor:device_description\",\n         \"//xla/stream_executor:launch_dim\",\n         \"//xla/tsl/platform:statusor\",\n@@ -69,6 +67,7 @@ cc_library(\n         \"@com_google_absl//absl/types:span\",\n         \"@llvm-project//llvm:Support\",\n         \"@llvm-project//llvm:ir_headers\",\n+        \"@llvm-project//mlir:IR\",\n         \"@llvm-project//mlir:Support\",\n     ],\n )"
+        },
+        {
+            "sha": "fdae72184a3e4bf73df7fada9be235fda4bbc64e",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/fusion.cc",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 43,
+            "changes": 53,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/0159a0a3c825f4fcb910ce4d0f24f24dd69bd488/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/0159a0a3c825f4fcb910ce4d0f24f24dd69bd488/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion.cc?ref=0159a0a3c825f4fcb910ce4d0f24f24dd69bd488",
+            "patch": "@@ -36,13 +36,13 @@ limitations under the License.\n #include \"llvm/IR/Metadata.h\"\n #include \"llvm/IR/Module.h\"\n #include \"llvm/Support/Casting.h\"\n+#include \"mlir/IR/MLIRContext.h\"\n #include \"mlir/Support/LLVM.h\"\n #include \"xla/backends/gpu/codegen/fusion_emitter.h\"\n #include \"xla/backends/gpu/codegen/triton/fusion_emitter.h\"\n #include \"xla/backends/gpu/runtime/kernel_thunk.h\"\n #include \"xla/backends/gpu/runtime/thunk.h\"\n #include \"xla/codegen/emitters/kernel_arguments.h\"\n-#include \"xla/hlo/analysis/symbolic_expr.h\"\n #include \"xla/hlo/ir/hlo_computation.h\"\n #include \"xla/hlo/ir/hlo_instruction.h\"\n #include \"xla/hlo/ir/hlo_instructions.h\"\n@@ -54,7 +54,6 @@ limitations under the License.\n #include \"xla/service/gpu/kernel_reuse_cache.h\"\n #include \"xla/service/gpu/launch_dimensions.h\"\n #include \"xla/service/gpu/model/block_level_parameters.h\"\n-#include \"xla/service/llvm_ir/llvm_util.h\"\n #include \"xla/shape.h\"\n #include \"xla/status_macros.h\"\n #include \"xla/stream_executor/device_description.h\"\n@@ -95,49 +94,17 @@ TritonFusion::GenerateTritonKernelAndWrapper(\n     const se::DeviceDescription& device_info, llvm::Module* llvm_module,\n     mlir::MLIRContext* mlir_context) const {\n   const se::GpuComputeCapability& cc = device_info.gpu_compute_capability();\n-  auto backend_config =\n-      fusion.backend_config<GpuBackendConfig>()->fusion_backend_config();\n-  absl::string_view fusion_kind = backend_config.kind();\n-  TritonWrapperResult triton_wrapper_result;\n-\n-  if (fusion_kind == kTritonFusionKind ||\n-      fusion_kind == kTritonNestedGemmFusionKind ||\n-      fusion_kind == kTritonCollectiveFusionKind) {\n-    if (!analysis_.fusion_backend_config().has_block_level_fusion_config()) {\n-      return absl::InvalidArgumentError(absl::StrCat(\n-          \"Block level fusion config is required for Triton fusions: \",\n-          fusion.ToString()));\n-    }\n-    TF_ASSIGN_OR_RETURN(\n-        triton_wrapper_result,\n-        TritonWrapper(\n-            impl_fn_name, &fusion, cc, device_info,\n-            BlockLevelParameters::FromBlockLevelFusionConfig(\n-                analysis_.fusion_backend_config().block_level_fusion_config()),\n-            llvm_module, *mlir_context));\n-  } else {  // Must be a MatMul\n-    CHECK_EQ(fusion_kind, kTritonGemmFusionKind);\n-    // TODO(bchetioui): port matmul emitter to fully use the new\n-    // infrastructure.\n-    BlockLevelParameters block_level_parameters;\n-    if (!backend_config.has_triton_gemm_config()) {\n-      block_level_parameters.num_ctas = 1;\n-      block_level_parameters.num_stages = 1;\n-      block_level_parameters.num_warps = 2;\n-    } else {\n-      const auto& triton_config = backend_config.triton_gemm_config();\n-      block_level_parameters.num_ctas = triton_config.num_ctas();\n-      block_level_parameters.num_stages = triton_config.num_stages();\n-      block_level_parameters.num_warps = triton_config.num_warps();\n-    }\n \n-    TF_ASSIGN_OR_RETURN(\n-        triton_wrapper_result,\n-        TritonWrapper(impl_fn_name, &fusion, cc, device_info,\n-                      block_level_parameters, llvm_module, *mlir_context));\n+  if (!analysis_.fusion_backend_config().has_block_level_fusion_config()) {\n+    return absl::InvalidArgumentError(absl::StrCat(\n+        \"Block level fusion config is required for Triton fusions: \",\n+        fusion.ToString()));\n   }\n-\n-  return triton_wrapper_result;\n+  return TritonWrapper(\n+      impl_fn_name, &fusion, cc, device_info,\n+      BlockLevelParameters::FromBlockLevelFusionConfig(\n+          analysis_.fusion_backend_config().block_level_fusion_config()),\n+      llvm_module, *mlir_context);\n };\n \n absl::StatusOr<FusionEmissionResult> TritonFusion::Emit("
+        },
+        {
+            "sha": "45246d12c983fee7d8a4fca1937b948ca65d687b",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/fusion_emitter.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 9,
+            "changes": 10,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/0159a0a3c825f4fcb910ce4d0f24f24dd69bd488/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/0159a0a3c825f4fcb910ce4d0f24f24dd69bd488/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter.cc?ref=0159a0a3c825f4fcb910ce4d0f24f24dd69bd488",
+            "patch": "@@ -2034,20 +2034,12 @@ absl::Status LowerXTileToTriton(mlir::ModuleOp xtile_dialect_module,\n                                 const HloFusionInstruction& fusion,\n                                 const se::DeviceDescription& device_info) {\n   {\n-    auto backend_config =\n-        fusion.backend_config<GpuBackendConfig>()->fusion_backend_config();\n-    absl::string_view fusion_kind = backend_config.kind();\n-\n     // Convert xTile ops to Triton ops.\n     mlir::PassManager pm(&mlir_context);\n     // Disable verifier because the Triton code may be invalid due to the\n     // unsupported types.\n     pm.enableVerifier(/*enabled=*/false);\n-    // The legacy emitter supports 0D tensors so we would get inconsistent\n-    // results if we try to rewrite them.\n-    if (fusion_kind != kTritonGemmFusionKind) {\n-      pm.addPass(xtile::createConvertElementwise0DTensorToScalarPass());\n-    }\n+    pm.addPass(xtile::createConvertElementwise0DTensorToScalarPass());\n     pm.addPass(mlir::triton::xla::CreateArithFP8ConversionToTritonPass());\n     pm.addPass(mlir::triton::xla::CreateTensorLowerToTritonPass());\n     pm.addPass(mlir::triton::xla::CreateStableHLOLowerToTritonPass());"
+        }
+    ],
+    "stats": {
+        "total": 66,
+        "additions": 12,
+        "deletions": 54
+    }
+}

@@ -1,0 +1,120 @@
+{
+    "author": "metaflow",
+    "message": "[XLA:GPU] respect only fail_ptx_compilation_on_register_spilling in ptx backend\n\nInstead of relying on is_autotuning_compilation boolean it's now up to\nbackend runner to properly set --fail_ptx_compilation_on_register_spilling based on --xla_gpu_filter_kernels_spilling_registers_on_autotuning.\n\nNote the change in AutotunerCompileUtil::Compile calls\nGpuCodegenBackend::AdjustDebugOptionsForAutotuning. That seems to also\nimprove compile time of benchmarks.\n\nDropped gemm fusion autotuner tests about spilling as they\nbasically tested if the backend respects debug option flags. With this\nchange they would become tautological at best and don't exercise any behavior of\ngemm_fusion_autotuner.\n\nPiperOrigin-RevId: 837403708",
+    "sha": "a3ce88c9316dbfe69d242de2e956d7a59fa013f6",
+    "files": [
+        {
+            "sha": "424850500ee5fa1f4278655bb5a8cdfafaa4b470",
+            "filename": "third_party/xla/xla/backends/gpu/autotuner/gpu_codegen_backend.h",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 6,
+            "changes": 15,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a3ce88c9316dbfe69d242de2e956d7a59fa013f6/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Fgpu_codegen_backend.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a3ce88c9316dbfe69d242de2e956d7a59fa013f6/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Fgpu_codegen_backend.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Fgpu_codegen_backend.h?ref=a3ce88c9316dbfe69d242de2e956d7a59fa013f6",
+            "patch": "@@ -86,11 +86,11 @@ class GpuCodegenBackend : public CodegenBackend {\n   }\n \n   bool CanProduceWrongResults() const override { return false; }\n+  // When called, the backend will not set\n+  // `xla_gpu_fail_ptx_compilation_on_register_spilling` flag during autotuning,\n+  // keeping the value already set in module config.\n   // TODO b/443207721 - Remove this once we have a better way to handle register\n   // spilling during autotuning.\n-  // Allows compilation to succeed even if kernels spill registers,\n-  // ignoring the `xla_gpu_filter_kernels_spilling_registers_on_autotuning`\n-  // flag. If not called, the flag's value is honored.\n   void AllowRegisterSpills() { allow_register_spills_ = true; }\n \n   static void AdjustDebugOptionsForAutotuning(\n@@ -107,9 +107,12 @@ class GpuCodegenBackend : public CodegenBackend {\n     debug_options.set_xla_embed_ir_in_executable(false);\n     debug_options.set_xla_gpu_kernel_cache_file(\"\");\n     debug_options.set_xla_enable_scoped_logging_timers(false);\n-    if (force_allow_register_spills) {\n-      debug_options.set_xla_gpu_filter_kernels_spilling_registers_on_autotuning(\n-          false);\n+    // Don't touch the \"fail on register spilling\" flag if it's already on.\n+    if (!debug_options.xla_gpu_fail_ptx_compilation_on_register_spilling()) {\n+      debug_options.set_xla_gpu_fail_ptx_compilation_on_register_spilling(\n+          debug_options\n+              .xla_gpu_filter_kernels_spilling_registers_on_autotuning() &&\n+          !force_allow_register_spills);\n     }\n   }\n "
+        },
+        {
+            "sha": "7b08c0f0637cbf79775e9bcef09c23c477fc4956",
+            "filename": "third_party/xla/xla/backends/gpu/autotuner/gpu_codegen_backend_test.cc",
+            "status": "modified",
+            "additions": 20,
+            "deletions": 4,
+            "changes": 24,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a3ce88c9316dbfe69d242de2e956d7a59fa013f6/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Fgpu_codegen_backend_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a3ce88c9316dbfe69d242de2e956d7a59fa013f6/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Fgpu_codegen_backend_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fautotuner%2Fgpu_codegen_backend_test.cc?ref=a3ce88c9316dbfe69d242de2e956d7a59fa013f6",
+            "patch": "@@ -34,6 +34,7 @@ TEST_F(GpuCodegenBackendTest, AdjustDebugOptionsForAutotuning) {\n   debug_options.set_xla_gpu_kernel_cache_file(\"foo.txt\");\n   debug_options.set_xla_gpu_filter_kernels_spilling_registers_on_autotuning(\n       true);\n+  debug_options.set_xla_gpu_fail_ptx_compilation_on_register_spilling(false);\n \n   GpuCodegenBackend::AdjustDebugOptionsForAutotuning(\n       debug_options, /*force_allow_register_spills=*/false);\n@@ -47,19 +48,34 @@ TEST_F(GpuCodegenBackendTest, AdjustDebugOptionsForAutotuning) {\n   EXPECT_FALSE(debug_options.xla_embed_ir_in_executable());\n   EXPECT_EQ(debug_options.xla_gpu_kernel_cache_file(), \"\");\n   EXPECT_TRUE(\n-      debug_options.xla_gpu_filter_kernels_spilling_registers_on_autotuning());\n+      debug_options.xla_gpu_fail_ptx_compilation_on_register_spilling());\n }\n \n TEST_F(GpuCodegenBackendTest, AdjustDebugOptionsForAutotuningAllowSpilling) {\n   DebugOptions debug_options;\n   debug_options.set_xla_gpu_filter_kernels_spilling_registers_on_autotuning(\n       true);\n-\n+  debug_options.set_xla_gpu_fail_ptx_compilation_on_register_spilling(false);\n   GpuCodegenBackend::AdjustDebugOptionsForAutotuning(\n       debug_options, /*force_allow_register_spills=*/true);\n-\n   EXPECT_FALSE(\n-      debug_options.xla_gpu_filter_kernels_spilling_registers_on_autotuning());\n+      debug_options.xla_gpu_fail_ptx_compilation_on_register_spilling());\n+}\n+\n+TEST_F(GpuCodegenBackendTest,\n+       AdjustDebugOptionsForAutotuningKeepsAlreadySetFailOnSpilling) {\n+  DebugOptions debug_options;\n+  debug_options.set_xla_gpu_filter_kernels_spilling_registers_on_autotuning(\n+      false);\n+  debug_options.set_xla_gpu_fail_ptx_compilation_on_register_spilling(true);\n+  GpuCodegenBackend::AdjustDebugOptionsForAutotuning(\n+      debug_options, /*force_allow_register_spills=*/false);\n+  EXPECT_TRUE(\n+      debug_options.xla_gpu_fail_ptx_compilation_on_register_spilling());\n+  GpuCodegenBackend::AdjustDebugOptionsForAutotuning(\n+      debug_options, /*force_allow_register_spills=*/true);\n+  EXPECT_TRUE(\n+      debug_options.xla_gpu_fail_ptx_compilation_on_register_spilling());\n }\n \n }  // namespace"
+        },
+        {
+            "sha": "d84ec762be90c97d4b0ed931e6dd2449d76a84e9",
+            "filename": "third_party/xla/xla/debug_options_flags.cc",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a3ce88c9316dbfe69d242de2e956d7a59fa013f6/third_party%2Fxla%2Fxla%2Fdebug_options_flags.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a3ce88c9316dbfe69d242de2e956d7a59fa013f6/third_party%2Fxla%2Fxla%2Fdebug_options_flags.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fdebug_options_flags.cc?ref=a3ce88c9316dbfe69d242de2e956d7a59fa013f6",
+            "patch": "@@ -2147,7 +2147,8 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,\n           &DebugOptions::\n               set_xla_gpu_filter_kernels_spilling_registers_on_autotuning),\n       debug_options->xla_gpu_filter_kernels_spilling_registers_on_autotuning(),\n-      \"Filter out kernels that spill registers during autotuning\"));\n+      \"Filter out kernels that spill registers during autotuning. Default is \"\n+      \"true.\"));\n   flag_list->push_back(tsl::Flag(\n       \"xla_gpu_fail_ptx_compilation_on_register_spilling\",\n       bool_setter_for("
+        },
+        {
+            "sha": "8d677c1e066a9d0b4ab1f1c1bd68ed94d1131c80",
+            "filename": "third_party/xla/xla/service/gpu/autotuning/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a3ce88c9316dbfe69d242de2e956d7a59fa013f6/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a3ce88c9316dbfe69d242de2e956d7a59fa013f6/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2FBUILD?ref=a3ce88c9316dbfe69d242de2e956d7a59fa013f6",
+            "patch": "@@ -482,6 +482,7 @@ cc_library(\n         \"//xla:util\",\n         \"//xla:xla_data_proto_cc\",\n         \"//xla:xla_proto_cc\",\n+        \"//xla/backends/gpu/autotuner:gpu_codegen_backend\",\n         \"//xla/hlo/ir:hlo\",\n         \"//xla/service:compiler\",\n         \"//xla/service:executable\","
+        },
+        {
+            "sha": "abcbbe6035e2425372d65b8252e260c26ce710b8",
+            "filename": "third_party/xla/xla/service/gpu/autotuning/autotuner_compile_util.cc",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 1,
+            "changes": 5,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a3ce88c9316dbfe69d242de2e956d7a59fa013f6/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fautotuner_compile_util.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a3ce88c9316dbfe69d242de2e956d7a59fa013f6/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fautotuner_compile_util.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fautotuner_compile_util.cc?ref=a3ce88c9316dbfe69d242de2e956d7a59fa013f6",
+            "patch": "@@ -25,6 +25,7 @@ limitations under the License.\n #include \"absl/strings/string_view.h\"\n #include \"absl/time/time.h\"\n #include \"absl/types/span.h\"\n+#include \"xla/backends/gpu/autotuner/gpu_codegen_backend.h\"\n #include \"xla/executable_run_options.h\"\n #include \"xla/hlo/ir/hlo_clone_context.h\"\n #include \"xla/hlo/ir/hlo_computation.h\"\n@@ -137,7 +138,9 @@ absl::StatusOr<std::unique_ptr<Executable>> AutotunerCompileUtil::Compile(\n   if (!new_hlo_module.status().ok()) {\n     return new_hlo_module.status();\n   }\n-\n+  GpuCodegenBackend::AdjustDebugOptionsForAutotuning(\n+      new_hlo_module->get()->mutable_config().mutable_debug_options(),\n+      /*force_allow_register_spills=*/false);\n   absl::StatusOr<std::unique_ptr<Executable>> out = compiler_->RunBackend(\n       std::move(*new_hlo_module), &stream_executor_,\n       Compiler::CompileOptions{&allocator_, /*thread_pool=*/nullptr,"
+        },
+        {
+            "sha": "165177e36946f926328b2dc34a613534433d8aa1",
+            "filename": "third_party/xla/xla/service/gpu/autotuning/gemm_fusion_autotuner.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a3ce88c9316dbfe69d242de2e956d7a59fa013f6/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fgemm_fusion_autotuner.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a3ce88c9316dbfe69d242de2e956d7a59fa013f6/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fgemm_fusion_autotuner.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fgemm_fusion_autotuner.cc?ref=a3ce88c9316dbfe69d242de2e956d7a59fa013f6",
+            "patch": "@@ -303,8 +303,7 @@ absl::StatusOr<std::unique_ptr<HloModule>> TritonGemmAutotuneExtractor(\n   std::unique_ptr<HloModule> new_module =\n       ExtractInstructionIntoNewModule(*fusion);\n   if (!allow_filtering_kernels_spilling_registers) {\n-    debug_opts.set_xla_gpu_filter_kernels_spilling_registers_on_autotuning(\n-        false);\n+    debug_opts.set_xla_gpu_fail_ptx_compilation_on_register_spilling(true);\n   }\n   new_module->mutable_config().set_debug_options(debug_opts);\n "
+        },
+        {
+            "sha": "561fb0202ff34c7c342cbaa72b720445ec117715",
+            "filename": "third_party/xla/xla/service/gpu/autotuning/gemm_fusion_autotuner_test.cc",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 114,
+            "changes": 114,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a3ce88c9316dbfe69d242de2e956d7a59fa013f6/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fgemm_fusion_autotuner_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a3ce88c9316dbfe69d242de2e956d7a59fa013f6/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fgemm_fusion_autotuner_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fgemm_fusion_autotuner_test.cc?ref=a3ce88c9316dbfe69d242de2e956d7a59fa013f6",
+            "patch": "@@ -624,120 +624,6 @@ ENTRY e {\n   EXPECT_TRUE(RunAndCompare(kHloText, ErrorSpec{/*aabs=*/1e-3, /*arel=*/1e-3}));\n }\n \n-// TODO(b/344770374): Make this test not fragile.\n-TEST_F(GemmFusionAutotunerTest, DoNotRunAutotuningKernelSpillingRegisters) {\n-  if (GpuComputeComp().IsRocm()) {\n-    GTEST_SKIP() << \"Not supported on ROCm.\";\n-  }\n-  const std::string kHloText = R\"(\n-HloModule m\n-\n-lhs_computation {\n-  %p0 = s8[12288,1536] parameter(0)\n-  ROOT %convert = f16[12288,1536] convert(%p0)\n-}\n-\n-rhs_computation {\n-  %p1 = s8[4,12288] parameter(0)\n-  ROOT %convert = f16[4,12288] convert(%p1)\n-}\n-\n-%triton_gemm_dot {\n-  %p0 = s8[12288,1536] parameter(0)\n-  %p1 = s8[4,12288] parameter(1)\n-  %lhs = f16[12288,1536] fusion(%p0), kind=kCustom, calls=lhs_computation,\n-    backend_config={\"fusion_backend_config\":{\"kind\":\"__triton_nested_gemm_fusion\", \"block_level_fusion_config\":{\"output_tiles\":[{\"sizes\":[\"256\",\"16\"]}]}}}\n-  %rhs = f16[4,12288] fusion(%p1), kind=kCustom, calls=rhs_computation,\n-    backend_config={\"fusion_backend_config\":{\"kind\":\"__triton_nested_gemm_fusion\", \"block_level_fusion_config\":{\"output_tiles\":[{\"sizes\":[\"16\",\"256\"]}]}}}\n-  %dot = f16[4,1536] dot(%rhs, %lhs), lhs_contracting_dims={1}, rhs_contracting_dims={0}\n-  ROOT %convert = s8[4,1536] convert(%dot)\n-}\n-\n-ENTRY %e {\n-  %p0 = s8[12288,1536] parameter(0)\n-  %convert = s8[4,12288] parameter(1)\n-  ROOT %triton = s8[4,1536] fusion(%p0, %convert), kind=kCustom, calls=%triton_gemm_dot,\n-    backend_config={\"fusion_backend_config\":{\"kind\":\"__triton_nested_gemm_fusion\",\"block_level_fusion_config\":{\"output_tiles\":[{\"sizes\":[\"256\",\"256\"]}],\"num_stages\":\"1\",\"num_warps\":\"16\",\"num_ctas\":\"1\"}}}\n-})\";\n-\n-  auto module = ParseAndReturnVerifiedModule(kHloText).value();\n-  EXPECT_THAT(backend().compiler()->RunBackend(\n-                  std::move(module), backend().default_stream_executor(),\n-                  {/*device_allocator=*/nullptr,\n-                   /*thread_pool=*/nullptr,\n-                   /*layout_canonicalization_callback=*/{},\n-                   /*is_autotuning_compilation=*/true}),\n-              ::testing::AnyOf(\n-                  absl_testing::StatusIs(\n-                      tsl::error::CANCELLED,\n-                      \"Compilation result discarded due to register spilling\"),\n-                  // Hopper can't spill registers since wgmma instructions are\n-                  // asynchronous, instead it just runs out of them.\n-                  absl_testing::StatusIs(\n-                      tsl::error::RESOURCE_EXHAUSTED,\n-                      ::testing::HasSubstr(\"Register allocation failed\")),\n-                  absl_testing::StatusIs(\n-                      tsl::error::RESOURCE_EXHAUSTED,\n-                      ::testing::HasSubstr(\"Insufficient registers\"))));\n-}\n-\n-// TODO(b/344770374): Make this test not fragile.\n-TEST_F(GemmFusionAutotunerTest,\n-       DoNotFilterOutAutotuningKernelSpillingRegisters) {\n-  if (GetCudaComputeCapability().IsAtLeastHopper()) {\n-    GTEST_SKIP() << \"Hopper and newer runs out of registers for such HLOs\";\n-  }\n-  const std::string kHloText = R\"(\n-HloModule m\n-\n-rhs_computation {\n-  %p0 = s8[12288,1536] parameter(0)\n-  ROOT %convert = f16[12288,1536] convert(%p0)\n-}\n-\n-lhs_computation {\n-  %p1 = s8[4,12288] parameter(0)\n-  ROOT %convert = f16[4,12288] convert(%p1)\n-}\n-\n-%triton_gemm_dot {\n-  %p0 = s8[12288,1536] parameter(0)\n-  %p1 = s8[4,12288] parameter(1)\n-  %rhs = f16[12288,1536] fusion(%p0), kind=kCustom, calls=rhs_computation,\n-    backend_config={\"fusion_backend_config\":{\"kind\":\"__triton_nested_gemm_fusion\", \"block_level_fusion_config\":{\"output_tiles\":[{\"sizes\":[\"256\",\"16\"]}]}}}\n-  %lhs = f16[4,12288] fusion(%p1), kind=kCustom, calls=lhs_computation,\n-    backend_config={\"fusion_backend_config\":{\"kind\":\"__triton_nested_gemm_fusion\", \"block_level_fusion_config\":{\"output_tiles\":[{\"sizes\":[\"16\",\"256\"]}]}}}\n-  %dot = f16[4,1536] dot(%lhs, %rhs), lhs_contracting_dims={1}, rhs_contracting_dims={0}\n-  ROOT %convert = s8[4,1536] convert(%dot)\n-}\n-\n-ENTRY %e {\n-  %p0 = s8[12288,1536] parameter(0)\n-  %p1 = s8[4,12288] parameter(1)\n-  ROOT %triton = s8[4,1536] fusion(%p0, %p1), kind=kCustom, calls=%triton_gemm_dot,\n-    backend_config={\"fusion_backend_config\":{\"kind\":\"__triton_nested_gemm_fusion\",\"block_level_fusion_config\":{\"output_tiles\":[{\"sizes\":[\"256\",\"256\"]}],\"num_stages\":\"1\",\"num_warps\":\"16\",\"num_ctas\":\"1\"}}}\n-})\";\n-\n-  auto module = ParseAndReturnVerifiedModule(kHloText).value();\n-  HloModuleConfig config = module->config();\n-  DebugOptions debug_options = config.debug_options();\n-  debug_options.set_xla_gpu_filter_kernels_spilling_registers_on_autotuning(\n-      false);\n-  config.set_debug_options(debug_options);\n-  module->set_config(config);\n-\n-  std::unique_ptr<Executable> executable =\n-      backend()\n-          .compiler()\n-          ->RunBackend(std::move(module), backend().default_stream_executor(),\n-                       {/*device_allocator=*/nullptr,\n-                        /*thread_pool=*/nullptr,\n-                        /*layout_canonicalization_callback=*/{},\n-                        /*is_autotuning_compilation=*/true})\n-          .value();\n-  EXPECT_NE(executable, nullptr);\n-}\n-\n TEST_F(GemmFusionAutotunerTest, RunAutotuningKernelNotSpillingRegisters) {\n   const std::string kHloText = R\"(\n HloModule m"
+        },
+        {
+            "sha": "20312990b748420eb97ad3f772702a7424327fef",
+            "filename": "third_party/xla/xla/service/gpu/ptx_compile_options_from_debug_options.cc",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 3,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a3ce88c9316dbfe69d242de2e956d7a59fa013f6/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fptx_compile_options_from_debug_options.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a3ce88c9316dbfe69d242de2e956d7a59fa013f6/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fptx_compile_options_from_debug_options.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fptx_compile_options_from_debug_options.cc?ref=a3ce88c9316dbfe69d242de2e956d7a59fa013f6",
+            "patch": "@@ -24,9 +24,6 @@ stream_executor::cuda::CompilationOptions PtxCompileOptionsFromDebugOptions(\n     const DebugOptions& debug_options, bool is_autotuning_compilation) {\n   stream_executor::cuda::CompilationOptions compilation_options;\n   compilation_options.cancel_if_reg_spill =\n-      (debug_options\n-           .xla_gpu_filter_kernels_spilling_registers_on_autotuning() &&\n-       is_autotuning_compilation) ||\n       debug_options.xla_gpu_fail_ptx_compilation_on_register_spilling();\n   compilation_options.disable_optimizations =\n       debug_options.xla_gpu_disable_gpuasm_optimizations();"
+        },
+        {
+            "sha": "4c9d6fb849fe723300487e81ba8ae1731a6c25cb",
+            "filename": "third_party/xla/xla/service/gpu/ptx_compile_options_from_debug_options_test.cc",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 15,
+            "changes": 15,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/a3ce88c9316dbfe69d242de2e956d7a59fa013f6/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fptx_compile_options_from_debug_options_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/a3ce88c9316dbfe69d242de2e956d7a59fa013f6/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fptx_compile_options_from_debug_options_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fptx_compile_options_from_debug_options_test.cc?ref=a3ce88c9316dbfe69d242de2e956d7a59fa013f6",
+            "patch": "@@ -76,21 +76,6 @@ TEST(PtxCompileOptionsFromDebugOptionsTest, DebugInfoCanBeEnabled) {\n       Field(&CompilationOptions::generate_debug_info, true));\n }\n \n-TEST(PtxCompileOptionsFromDebugOptionsTest,\n-     RegSpillAsErrorCanBeEnabledForAutotuning) {\n-  DebugOptions debug_options;\n-  debug_options.set_xla_gpu_filter_kernels_spilling_registers_on_autotuning(\n-      true);\n-  EXPECT_THAT(\n-      PtxCompileOptionsFromDebugOptions(debug_options,\n-                                        /*is_autotuning_compilation=*/false),\n-      Field(&CompilationOptions::cancel_if_reg_spill, false));\n-  EXPECT_THAT(\n-      PtxCompileOptionsFromDebugOptions(debug_options,\n-                                        /*is_autotuning_compilation=*/true),\n-      Field(&CompilationOptions::cancel_if_reg_spill, true));\n-}\n-\n TEST(PtxCompileOptionsFromDebugOptionsTest,\n      RegSpillAsErrorCanBeEnabledForAllKernels) {\n   DebugOptions debug_options;"
+        }
+    ],
+    "stats": {
+        "total": 183,
+        "additions": 37,
+        "deletions": 146
+    }
+}

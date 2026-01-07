@@ -1,0 +1,120 @@
+{
+    "author": "mwhittaker",
+    "message": "Pipe incarnations to `jax.live_devices`.\n\nPiperOrigin-RevId: 822250955",
+    "sha": "5776d2771c08c81be379d3d39eef6f5301ad416c",
+    "files": [
+        {
+            "sha": "dbc5a0715b5a4266eb8d9f525342627dfa899651",
+            "filename": "third_party/xla/xla/pjrt/distributed/BUILD",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/5776d2771c08c81be379d3d39eef6f5301ad416c/third_party%2Fxla%2Fxla%2Fpjrt%2Fdistributed%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/5776d2771c08c81be379d3d39eef6f5301ad416c/third_party%2Fxla%2Fxla%2Fpjrt%2Fdistributed%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fdistributed%2FBUILD?ref=5776d2771c08c81be379d3d39eef6f5301ad416c",
+            "patch": "@@ -71,13 +71,15 @@ cc_library(\n     deps = [\n         \":key_value_store_interface\",\n         \":util\",\n+        \"//xla/service:global_device_id\",\n         \"//xla/tsl/distributed_runtime/coordination:coordination_client\",\n         \"//xla/tsl/distributed_runtime/coordination:coordination_service_agent\",\n         \"//xla/tsl/distributed_runtime/rpc/coordination:grpc_coordination_client\",\n         \"//xla/tsl/platform:env\",\n         \"//xla/tsl/platform:statusor\",\n         \"//xla/tsl/protobuf:coordination_config_proto_cc\",\n         \"//xla/tsl/protobuf:coordination_service_proto_cc\",\n+        \"@com_google_absl//absl/container:flat_hash_map\",\n         \"@com_google_absl//absl/log\",\n         \"@com_google_absl//absl/status\",\n         \"@com_google_absl//absl/status:statusor\",\n@@ -147,10 +149,12 @@ xla_cc_test(\n         \":service\",\n         \":topology_util\",\n         \"//xla:status_macros\",\n+        \"//xla/service:global_device_id\",\n         \"//xla/tsl/distributed_runtime/coordination:coordination_service_agent\",\n         \"//xla/tsl/lib/core:status_test_util\",\n         \"//xla/tsl/platform:env\",\n         \"//xla/tsl/util/proto:proto_matchers\",\n+        \"@com_google_absl//absl/container:flat_hash_map\",\n         \"@com_google_absl//absl/log\",\n         \"@com_google_absl//absl/status\",\n         \"@com_google_absl//absl/strings\","
+        },
+        {
+            "sha": "a1ac70e568e9d7b0364e7de2780dc9add79f4b52",
+            "filename": "third_party/xla/xla/pjrt/distributed/client.cc",
+            "status": "modified",
+            "additions": 27,
+            "deletions": 7,
+            "changes": 34,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/5776d2771c08c81be379d3d39eef6f5301ad416c/third_party%2Fxla%2Fxla%2Fpjrt%2Fdistributed%2Fclient.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/5776d2771c08c81be379d3d39eef6f5301ad416c/third_party%2Fxla%2Fxla%2Fpjrt%2Fdistributed%2Fclient.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fdistributed%2Fclient.cc?ref=5776d2771c08c81be379d3d39eef6f5301ad416c",
+            "patch": "@@ -22,6 +22,7 @@ limitations under the License.\n #include <utility>\n #include <vector>\n \n+#include \"absl/container/flat_hash_map.h\"\n #include \"absl/log/log.h\"\n #include \"absl/status/status.h\"\n #include \"absl/status/statusor.h\"\n@@ -31,6 +32,7 @@ limitations under the License.\n #include \"absl/types/span.h\"\n #include \"grpcpp/channel.h\"\n #include \"xla/pjrt/distributed/key_value_store_interface.h\"\n+#include \"xla/service/global_device_id.h\"\n #include \"xla/tsl/distributed_runtime/coordination/coordination_client.h\"\n #include \"xla/tsl/distributed_runtime/coordination/coordination_service_agent.h\"\n #include \"xla/tsl/distributed_runtime/rpc/coordination/grpc_coordination_client.h\"\n@@ -67,6 +69,8 @@ class DistributedRuntimeCoordinationServiceClient\n   absl::Status WaitAtBarrier(\n       std::string barrier_id, absl::Duration timeout,\n       std::optional<absl::Span<const int32_t>> process_ids) override;\n+  absl::StatusOr<absl::flat_hash_map<int32_t, IncarnationId>>\n+  GetLiveNodesWithIncarnations(absl::Span<const int32_t> nodes) override;\n   absl::StatusOr<std::vector<int32_t>> GetLiveNodes(\n       absl::Span<const int32_t> nodes) override;\n   absl::StatusOr<tsl::CoordinationServiceAgent*> GetCoordinationServiceAgent()\n@@ -208,8 +212,8 @@ absl::Status DistributedRuntimeCoordinationServiceClient::WaitAtBarrier(\n   return coord_agent_->WaitAtBarrier(barrier_id, timeout, tasks);\n }\n \n-absl::StatusOr<std::vector<int32_t>>\n-DistributedRuntimeCoordinationServiceClient::GetLiveNodes(\n+absl::StatusOr<absl::flat_hash_map<int32_t, IncarnationId>>\n+DistributedRuntimeCoordinationServiceClient::GetLiveNodesWithIncarnations(\n     absl::Span<const int32_t> nodes) {\n   // Note that jax.distributed uses terms \"process\" and \"node\", and the\n   // coordination service uses the term \"task\". These all refer to the same\n@@ -227,13 +231,29 @@ DistributedRuntimeCoordinationServiceClient::GetLiveNodes(\n   }\n \n   // Get the set of live tasks.\n-  TF_ASSIGN_OR_RETURN(const std::vector<tensorflow::CoordinatedTask> live_tasks,\n-                      coord_agent_->GetAliveTasks(tasks));\n+  TF_ASSIGN_OR_RETURN(\n+      const std::vector<tsl::CoordinationServiceAgent::AliveTask> live_tasks,\n+      coord_agent_->GetAliveTasks(tasks));\n \n   // Extract the node ids from the live tasks.\n-  std::vector<int32_t> live_nodes(live_tasks.size());\n-  for (int i = 0; i < live_tasks.size(); ++i) {\n-    live_nodes[i] = live_tasks[i].task_id();\n+  absl::flat_hash_map<int32_t, IncarnationId> live_nodes;\n+  for (const tsl::CoordinationServiceAgent::AliveTask& task : live_tasks) {\n+    live_nodes[task.task_id] = task.incarnation_id;\n+  }\n+  return live_nodes;\n+}\n+\n+absl::StatusOr<std::vector<int32_t>>\n+DistributedRuntimeCoordinationServiceClient::GetLiveNodes(\n+    absl::Span<const int32_t> nodes) {\n+  absl::StatusOr<absl::flat_hash_map<int32_t, IncarnationId>>\n+      live_nodes_with_incarnations = GetLiveNodesWithIncarnations(nodes);\n+  if (!live_nodes_with_incarnations.ok()) {\n+    return live_nodes_with_incarnations.status();\n+  }\n+  std::vector<int32_t> live_nodes;\n+  for (const auto& [task_id, unused] : *live_nodes_with_incarnations) {\n+    live_nodes.push_back(task_id);\n   }\n   return live_nodes;\n }"
+        },
+        {
+            "sha": "f152ec59db94ef70032394bc7c22c2ecf05ace9b",
+            "filename": "third_party/xla/xla/pjrt/distributed/client.h",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/5776d2771c08c81be379d3d39eef6f5301ad416c/third_party%2Fxla%2Fxla%2Fpjrt%2Fdistributed%2Fclient.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/5776d2771c08c81be379d3d39eef6f5301ad416c/third_party%2Fxla%2Fxla%2Fpjrt%2Fdistributed%2Fclient.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fdistributed%2Fclient.h?ref=5776d2771c08c81be379d3d39eef6f5301ad416c",
+            "patch": "@@ -24,6 +24,7 @@ limitations under the License.\n #include <utility>\n #include <vector>\n \n+#include \"absl/container/flat_hash_map.h\"\n #include \"absl/log/log.h\"\n #include \"absl/status/status.h\"\n #include \"absl/status/statusor.h\"\n@@ -32,6 +33,7 @@ limitations under the License.\n #include \"absl/types/span.h\"\n #include \"grpcpp/channel.h\"\n #include \"xla/pjrt/distributed/key_value_store_interface.h\"\n+#include \"xla/service/global_device_id.h\"\n #include \"xla/tsl/platform/env.h\"\n \n namespace tsl {\n@@ -149,8 +151,15 @@ class DistributedRuntimeClient {\n       std::string barrier_id, absl::Duration timeout,\n       std::optional<absl::Span<const int32_t>> nodes) = 0;\n \n+  // Returns the subset of live nodes, along with their incarnations. See\n+  // CoordinationService.GetAliveTasks for detailed semantics.\n+  virtual absl::StatusOr<absl::flat_hash_map<int32_t, IncarnationId>>\n+  GetLiveNodesWithIncarnations(absl::Span<const int32_t> nodes) = 0;\n+\n   // Returns the subset of live nodes. See CoordinationService.GetAliveTasks for\n   // detailed semantics.\n+  //\n+  // TODO: mwhittaker - Remove this function.\n   virtual absl::StatusOr<std::vector<int32_t>> GetLiveNodes(\n       absl::Span<const int32_t> nodes) = 0;\n "
+        },
+        {
+            "sha": "dde16a914f68239fa2e93603cee9d091305b4616",
+            "filename": "third_party/xla/xla/pjrt/distributed/client_server_test.cc",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 4,
+            "changes": 11,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/5776d2771c08c81be379d3d39eef6f5301ad416c/third_party%2Fxla%2Fxla%2Fpjrt%2Fdistributed%2Fclient_server_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/5776d2771c08c81be379d3d39eef6f5301ad416c/third_party%2Fxla%2Fxla%2Fpjrt%2Fdistributed%2Fclient_server_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fdistributed%2Fclient_server_test.cc?ref=5776d2771c08c81be379d3d39eef6f5301ad416c",
+            "patch": "@@ -21,6 +21,7 @@ limitations under the License.\n #include <vector>\n \n #include <gmock/gmock.h>\n+#include \"absl/container/flat_hash_map.h\"\n #include \"absl/log/log.h\"\n #include \"absl/status/status.h\"\n #include \"absl/strings/str_cat.h\"\n@@ -42,6 +43,7 @@ limitations under the License.\n #include \"xla/pjrt/distributed/protocol.pb.h\"\n #include \"xla/pjrt/distributed/service.h\"\n #include \"xla/pjrt/distributed/topology_util.h\"\n+#include \"xla/service/global_device_id.h\"\n #include \"xla/status_macros.h\"\n #include \"xla/tsl/distributed_runtime/coordination/coordination_service_agent.h\"\n #include \"xla/tsl/lib/core/status_test_util.h\"\n@@ -57,6 +59,7 @@ namespace xla {\n namespace {\n \n using ::testing::IsEmpty;\n+using ::testing::Key;\n using ::testing::Matches;\n using ::testing::Pair;\n using ::testing::UnorderedElementsAre;\n@@ -1001,10 +1004,10 @@ TEST_F(ClientServerTest, GetLiveTasksSucceeds) {\n       TF_ASSERT_OK(client->Connect());\n \n       // Get the set of live nodes. All three nodes should be live.\n-      absl::StatusOr<std::vector<int32_t>> live_nodes =\n-          client->GetLiveNodes(std::vector<int>{0, 1, 2});\n+      absl::StatusOr<absl::flat_hash_map<int32_t, IncarnationId>> live_nodes =\n+          client->GetLiveNodesWithIncarnations(std::vector<int>{0, 1, 2});\n       TF_ASSERT_OK(live_nodes.status());\n-      EXPECT_THAT(*live_nodes, UnorderedElementsAre(0, 1, 2));\n+      EXPECT_THAT(*live_nodes, UnorderedElementsAre(Key(0), Key(1), Key(2)));\n     });\n   }\n }\n@@ -1023,7 +1026,7 @@ TEST_F(ClientServerTest, GetLiveTasksWithoutBeingAMember) {\n       // Get the set of live nodes but don't include ourselves.\n       std::vector<int> nodes{0, 1, 2};\n       nodes.erase(nodes.begin() + i);\n-      EXPECT_THAT(client->GetLiveNodes(nodes),\n+      EXPECT_THAT(client->GetLiveNodesWithIncarnations(nodes),\n                   absl_testing::StatusIs(absl::StatusCode::kInvalidArgument));\n     });\n   }"
+        },
+        {
+            "sha": "e069d99f296006469214a6969f56a92eae55be1b",
+            "filename": "third_party/xla/xla/tsl/distributed_runtime/coordination/client_server_test.cc",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/5776d2771c08c81be379d3d39eef6f5301ad416c/third_party%2Fxla%2Fxla%2Ftsl%2Fdistributed_runtime%2Fcoordination%2Fclient_server_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/5776d2771c08c81be379d3d39eef6f5301ad416c/third_party%2Fxla%2Fxla%2Ftsl%2Fdistributed_runtime%2Fcoordination%2Fclient_server_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Ftsl%2Fdistributed_runtime%2Fcoordination%2Fclient_server_test.cc?ref=5776d2771c08c81be379d3d39eef6f5301ad416c",
+            "patch": "@@ -1062,8 +1062,8 @@ TEST_F(ClientServerTest, GetAliveTasks_Succeed) {\n   auto thread_fn = [&](int node_id) -> absl::Status {\n     auto client = GetClient(node_id);\n     TF_RETURN_IF_ERROR(client->Connect());\n-    absl::StatusOr<std::vector<tensorflow::CoordinatedTask>> alive_tasks =\n-        client->GetAliveTasks({GetTask(0), GetTask(1)});\n+    absl::StatusOr<std::vector<CoordinationServiceAgent::AliveTask>>\n+        alive_tasks = client->GetAliveTasks({GetTask(0), GetTask(1)});\n     if (!alive_tasks.ok()) {\n       return alive_tasks.status();\n     }"
+        },
+        {
+            "sha": "4a970f83aa0f80e2be07d75c064209aa72524c03",
+            "filename": "third_party/xla/xla/tsl/distributed_runtime/coordination/coordination_service.cc",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 2,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/5776d2771c08c81be379d3d39eef6f5301ad416c/third_party%2Fxla%2Fxla%2Ftsl%2Fdistributed_runtime%2Fcoordination%2Fcoordination_service.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/5776d2771c08c81be379d3d39eef6f5301ad416c/third_party%2Fxla%2Fxla%2Ftsl%2Fdistributed_runtime%2Fcoordination%2Fcoordination_service.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Ftsl%2Fdistributed_runtime%2Fcoordination%2Fcoordination_service.cc?ref=5776d2771c08c81be379d3d39eef6f5301ad416c",
+            "patch": "@@ -1566,7 +1566,6 @@ void CoordinationService::RefreshAliveness() {\n       // the same set of alive tasks (alive_tasks) to every task in the barrier.\n       std::vector<CoordinatedTask> v{alive_tasks.begin(), alive_tasks.end()};\n       std::vector<IncarnationId> incarnation_ids = IncarnationIds(v);\n-      absl::c_sort(incarnation_ids);\n       for (const GetAliveTasksCallback& done : it->dones) {\n         done(absl::OkStatus(), v, incarnation_ids);\n       }\n@@ -1618,7 +1617,6 @@ void CoordinationService::GetAliveTasksAsync(\n   if (TaskSetSubset(alive_tasks, it->in_barrier)) {\n     std::vector<CoordinatedTask> v{alive_tasks.begin(), alive_tasks.end()};\n     std::vector<IncarnationId> incarnation_ids = IncarnationIds(v);\n-    absl::c_sort(incarnation_ids);\n     for (const GetAliveTasksCallback& done : it->dones) {\n       done(absl::OkStatus(), v, incarnation_ids);\n     }"
+        },
+        {
+            "sha": "e2738cb2304875671941eaefb765e4d7bd85966b",
+            "filename": "third_party/xla/xla/tsl/distributed_runtime/coordination/coordination_service_agent.cc",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 11,
+            "changes": 23,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/5776d2771c08c81be379d3d39eef6f5301ad416c/third_party%2Fxla%2Fxla%2Ftsl%2Fdistributed_runtime%2Fcoordination%2Fcoordination_service_agent.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/5776d2771c08c81be379d3d39eef6f5301ad416c/third_party%2Fxla%2Fxla%2Ftsl%2Fdistributed_runtime%2Fcoordination%2Fcoordination_service_agent.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Ftsl%2Fdistributed_runtime%2Fcoordination%2Fcoordination_service_agent.cc?ref=5776d2771c08c81be379d3d39eef6f5301ad416c",
+            "patch": "@@ -1012,7 +1012,7 @@ void CoordinationServiceAgent::CancelBarrierAsync(absl::string_view barrier_id,\n       });\n }\n \n-absl::StatusOr<std::vector<tensorflow::CoordinatedTask>>\n+absl::StatusOr<std::vector<CoordinationServiceAgent::AliveTask>>\n CoordinationServiceAgent::GetAliveTasks(\n     const std::vector<CoordinatedTask>& tasks) {\n   // Validate the agent.\n@@ -1036,20 +1036,21 @@ CoordinationServiceAgent::GetAliveTasks(\n   };\n   leader_client_->GetAliveTasksAsync(request.get(), response.get(), done);\n   n.WaitForNotification();\n-\n-  // Parse the response.\n   if (!status.ok()) {\n     return status;\n   }\n-  {\n-    absl::MutexLock lock(incarnations_mu_);\n-    for (int i = 0; i < response->alive_tasks_size(); ++i) {\n-      incarnations_[response->alive_tasks(i).task_id()] =\n-          response->incarnations(i);\n-    }\n+\n+  // Parse the response.\n+  absl::MutexLock lock(incarnations_mu_);\n+  std::vector<AliveTask> alive_tasks;\n+  for (int i = 0; i < response->alive_tasks_size(); ++i) {\n+    int task_id = response->alive_tasks(i).task_id();\n+    IncarnationId incarnation_id(response->incarnations(i));\n+\n+    alive_tasks.push_back(AliveTask{task_id, incarnation_id});\n+    incarnations_[task_id] = incarnation_id;\n   }\n-  return std::vector<tensorflow::CoordinatedTask>(\n-      response->alive_tasks().begin(), response->alive_tasks().end());\n+  return alive_tasks;\n }\n \n // Returns an error if agent is not running."
+        },
+        {
+            "sha": "2a0dba4c331b89502b65cc50a3aaf420a6528836",
+            "filename": "third_party/xla/xla/tsl/distributed_runtime/coordination/coordination_service_agent.h",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 1,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/5776d2771c08c81be379d3d39eef6f5301ad416c/third_party%2Fxla%2Fxla%2Ftsl%2Fdistributed_runtime%2Fcoordination%2Fcoordination_service_agent.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/5776d2771c08c81be379d3d39eef6f5301ad416c/third_party%2Fxla%2Fxla%2Ftsl%2Fdistributed_runtime%2Fcoordination%2Fcoordination_service_agent.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Ftsl%2Fdistributed_runtime%2Fcoordination%2Fcoordination_service_agent.h?ref=5776d2771c08c81be379d3d39eef6f5301ad416c",
+            "patch": "@@ -320,7 +320,11 @@ class CoordinationServiceAgent {\n   // has failed and that every task calls GetAliveTasks([A, B, C, D]). The\n   // invocation will return tasks [A, B, C]. The GetAliveTasks call acts as a\n   // barrier across tasks A, B, and C. Task D, which failed, is ignored.\n-  absl::StatusOr<std::vector<tensorflow::CoordinatedTask>> GetAliveTasks(\n+  struct AliveTask {\n+    int task_id;\n+    IncarnationId incarnation_id;\n+  };\n+  absl::StatusOr<std::vector<AliveTask>> GetAliveTasks(\n       const std::vector<tensorflow::CoordinatedTask>& tasks);\n \n   // Returns the latest known set of incarnation ids for every task. Incarnation"
+        },
+        {
+            "sha": "ac0889990f489218994a864e8af0f1c4f4ecdb8e",
+            "filename": "third_party/xla/xla/tsl/distributed_runtime/coordination/coordination_service_test.cc",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 11,
+            "changes": 22,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/5776d2771c08c81be379d3d39eef6f5301ad416c/third_party%2Fxla%2Fxla%2Ftsl%2Fdistributed_runtime%2Fcoordination%2Fcoordination_service_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/5776d2771c08c81be379d3d39eef6f5301ad416c/third_party%2Fxla%2Fxla%2Ftsl%2Fdistributed_runtime%2Fcoordination%2Fcoordination_service_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Ftsl%2Fdistributed_runtime%2Fcoordination%2Fcoordination_service_test.cc?ref=5776d2771c08c81be379d3d39eef6f5301ad416c",
+            "patch": "@@ -2562,9 +2562,9 @@ TEST_F(GetAliveTasksTest, SuccessfulGetAliveTasks) {\n                   const std::vector<IncarnationId>& incarnations) {\n     EXPECT_OK(status);\n     EXPECT_THAT(alive_tasks, UnorderedElementsAreArray(GetTaskMatchers()));\n-    EXPECT_EQ(incarnations,\n-              (std::vector<IncarnationId>{IncarnationId(0), IncarnationId(1),\n-                                          IncarnationId(2)}));\n+    EXPECT_THAT(incarnations,\n+                UnorderedElementsAre(IncarnationId(0), IncarnationId(1),\n+                                     IncarnationId(2)));\n     finished.DecrementCount();\n   };\n   GetCoordinationService()->GetAliveTasksAsync(GetTask(0), GetTasks(), done);\n@@ -2583,8 +2583,8 @@ TEST_F(GetAliveTasksTest, FailedTaskBeforeCallingGetAliveTasks) {\n     EXPECT_OK(status);\n     EXPECT_THAT(alive_tasks, UnorderedElementsAre(EqualsProto(GetTask(0)),\n                                                   EqualsProto(GetTask(1))));\n-    EXPECT_EQ(incarnations,\n-              (std::vector<IncarnationId>{IncarnationId(0), IncarnationId(1)}));\n+    EXPECT_THAT(incarnations,\n+                UnorderedElementsAre(IncarnationId(0), IncarnationId(1)));\n     finished.DecrementCount();\n   };\n   ASSERT_OK(GetCoordinationService()->ReportTaskError(\n@@ -2605,8 +2605,8 @@ TEST_F(GetAliveTasksTest, FailedTaskAfterCallingGetAliveTasks) {\n     EXPECT_OK(status);\n     EXPECT_THAT(alive_tasks, UnorderedElementsAre(EqualsProto(GetTask(0)),\n                                                   EqualsProto(GetTask(1))));\n-    EXPECT_EQ(incarnations,\n-              (std::vector<IncarnationId>{IncarnationId(0), IncarnationId(1)}));\n+    EXPECT_THAT(incarnations,\n+                UnorderedElementsAre(IncarnationId(0), IncarnationId(1)));\n     finished.DecrementCount();\n   };\n   GetCoordinationService()->GetAliveTasksAsync(GetTask(0), GetTasks(), done);\n@@ -2630,8 +2630,8 @@ TEST_F(GetAliveTasksTest, ConcurrentGetAliveTasks) {\n     EXPECT_OK(status);\n     EXPECT_THAT(alive_tasks, UnorderedElementsAre(EqualsProto(tasks_01[0]),\n                                                   EqualsProto(tasks_01[1])));\n-    EXPECT_EQ(incarnations,\n-              (std::vector<IncarnationId>{IncarnationId(0), IncarnationId(1)}));\n+    EXPECT_THAT(incarnations,\n+                UnorderedElementsAre(IncarnationId(0), IncarnationId(1)));\n     finished_01.DecrementCount();\n   };\n \n@@ -2644,8 +2644,8 @@ TEST_F(GetAliveTasksTest, ConcurrentGetAliveTasks) {\n     EXPECT_OK(status);\n     EXPECT_THAT(alive_tasks, UnorderedElementsAre(EqualsProto(tasks_12[0]),\n                                                   EqualsProto(tasks_12[1])));\n-    EXPECT_EQ(incarnations,\n-              (std::vector<IncarnationId>{IncarnationId(1), IncarnationId(2)}));\n+    EXPECT_THAT(incarnations,\n+                UnorderedElementsAre(IncarnationId(1), IncarnationId(2)));\n     finished_12.DecrementCount();\n   };\n "
+        }
+    ],
+    "stats": {
+        "total": 115,
+        "additions": 77,
+        "deletions": 38
+    }
+}

@@ -1,0 +1,96 @@
+{
+    "author": "mwhittaker",
+    "message": "Fix incarnation propagation bug.\n\nRecall that every time a multi-controller JAX process starts, it is assigned a\nrandomly generated incarnation id. When a set of processes runs a collective,\nthe processes first call `live_devices`, which returns the incarnation ids of\nall currently live devices. These incarnations are plumbed through to PjRt\nexectables so that all processes agree on which processes (and their\nincarnations) should be participating in a collective.\n\nPreviously, the code assumed that a process knew the latest incarnation id of\n*every* process. If a GPU client didn't know the incarnation id of a process,\nit provided an empty set of incarnations. However, if a process spawned while\nother processes were dead, the call to `live_devices` would not return the\nincarnation ids for the failed processes. This was buggy.\n\nThis change fixes the bug. Now, a process only provides the incarnations of the\nprocesses it knows.\n\nPiperOrigin-RevId: 834491926",
+    "sha": "4e5913d121d631c4af99d5ca1978ad28e7ada173",
+    "files": [
+        {
+            "sha": "fc42aeb72fe3a01b8dd23e42171c5ea35f5804a8",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/collective_thunk.cc",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 1,
+            "changes": 7,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4e5913d121d631c4af99d5ca1978ad28e7ada173/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fcollective_thunk.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4e5913d121d631c4af99d5ca1978ad28e7ada173/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fcollective_thunk.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fcollective_thunk.cc?ref=4e5913d121d631c4af99d5ca1978ad28e7ada173",
+            "patch": "@@ -296,7 +296,12 @@ absl::StatusOr<GpuCliqueKey> GetGpuCliqueKey(\n   absl::flat_hash_set<IncarnationId> unique_incarnations;\n   if (params.incarnations) {\n     for (GlobalDeviceId id : participants) {\n-      unique_incarnations.insert(params.incarnations->at(id));\n+      auto it = params.incarnations->find(id);\n+      if (it == params.incarnations->end()) {\n+        return FailedPrecondition(\"Incarnation for device %d not found\",\n+                                  id.value());\n+      }\n+      unique_incarnations.insert(it->second);\n     }\n   }\n   std::vector<IncarnationId> incarnations(unique_incarnations.begin(),"
+        },
+        {
+            "sha": "d8afbd9aaa72c1c392b45eb6b6dc8bc5766b79ec",
+            "filename": "third_party/xla/xla/pjrt/gpu/se_gpu_pjrt_client.cc",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 9,
+            "changes": 17,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4e5913d121d631c4af99d5ca1978ad28e7ada173/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Fse_gpu_pjrt_client.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4e5913d121d631c4af99d5ca1978ad28e7ada173/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Fse_gpu_pjrt_client.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Fse_gpu_pjrt_client.cc?ref=4e5913d121d631c4af99d5ca1978ad28e7ada173",
+            "patch": "@@ -297,7 +297,7 @@ StreamExecutorGpuClient::CreateBuffersForAsyncHostToDevice(\n       shape_specs, std::move(device_layouts), memory_space);\n }\n \n-absl::StatusOr<absl::flat_hash_map<GlobalDeviceId, IncarnationId>>\n+absl::flat_hash_map<GlobalDeviceId, IncarnationId>\n StreamExecutorGpuClient::GetLatestIncarnations(const ExecuteOptions& options) {\n   // Map every device to its incarnation.\n   absl::flat_hash_map<GlobalDeviceId, IncarnationId> device_incarnations;\n@@ -307,7 +307,9 @@ StreamExecutorGpuClient::GetLatestIncarnations(const ExecuteOptions& options) {\n \n     auto it = options.incarnations.find(task_id);\n     if (it == options.incarnations.end()) {\n-      return FailedPrecondition(\"Incarnation for task %d not found\", task_id);\n+      // The task might be dead.\n+      LOG(WARNING) << \"Incarnation for task \" << task_id << \" not found\";\n+      continue;\n     }\n     device_incarnations[device_id] = it->second;\n   }\n@@ -316,13 +318,10 @@ StreamExecutorGpuClient::GetLatestIncarnations(const ExecuteOptions& options) {\n \n gpu::GpuExecutableRunOptions* StreamExecutorGpuClient::gpu_run_options(\n     const ExecuteOptions& options) {\n-  absl::StatusOr<absl::flat_hash_map<GlobalDeviceId, IncarnationId>>\n-      incarnations = GetLatestIncarnations(options);\n-  if (!incarnations.ok()) {\n-    VLOG(1) << \"Unable to set incarnations in GpuExecutableRunOptions: \"\n-            << incarnations.status();\n-  } else {\n-    gpu_run_options_->set_incarnations(*std::move(incarnations));\n+  if (!options.incarnations.empty()) {\n+    absl::flat_hash_map<GlobalDeviceId, IncarnationId> incarnations =\n+        GetLatestIncarnations(options);\n+    gpu_run_options_->set_incarnations(std::move(incarnations));\n   }\n   return gpu_run_options_.get();\n }"
+        },
+        {
+            "sha": "207e2e318e216ce1ec45bc8ce9e1dca97642e3e8",
+            "filename": "third_party/xla/xla/pjrt/gpu/se_gpu_pjrt_client.h",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4e5913d121d631c4af99d5ca1978ad28e7ada173/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Fse_gpu_pjrt_client.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4e5913d121d631c4af99d5ca1978ad28e7ada173/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Fse_gpu_pjrt_client.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Fse_gpu_pjrt_client.h?ref=4e5913d121d631c4af99d5ca1978ad28e7ada173",
+            "patch": "@@ -195,8 +195,8 @@ class StreamExecutorGpuClient : public xla::PjRtStreamExecutorClient {\n       bool lookup_addressable_devices) override;\n \n  private:\n-  absl::StatusOr<absl::flat_hash_map<GlobalDeviceId, IncarnationId>>\n-  GetLatestIncarnations(const ExecuteOptions& options);\n+  absl::flat_hash_map<GlobalDeviceId, IncarnationId> GetLatestIncarnations(\n+      const ExecuteOptions& options);\n \n   std::optional<int> num_nodes_;\n   const bool abort_collectives_on_failure_ = false;"
+        },
+        {
+            "sha": "a7c3dea624405f6c994f417e983c80788c4301f4",
+            "filename": "third_party/xla/xla/pjrt/gpu/tfrt/tfrt_gpu_executable.cc",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 8,
+            "changes": 11,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4e5913d121d631c4af99d5ca1978ad28e7ada173/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Ftfrt%2Ftfrt_gpu_executable.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4e5913d121d631c4af99d5ca1978ad28e7ada173/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Ftfrt%2Ftfrt_gpu_executable.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Ftfrt%2Ftfrt_gpu_executable.cc?ref=4e5913d121d631c4af99d5ca1978ad28e7ada173",
+            "patch": "@@ -624,14 +624,9 @@ absl::StatusOr<PjRtLoadedExecutable::Result> TfrtGpuExecutable::ExecuteHelper(\n         // Set the incarnations in gpu_run_options.\n         gpu::GpuExecutableRunOptions* gpu_run_options =\n             CHECK_NOTNULL(client->gpu_run_options());\n-        absl::StatusOr<absl::flat_hash_map<GlobalDeviceId, IncarnationId>>\n-            device_incarnations =\n-                GetLatestIncarnations(client->devices(), task_incarnations);\n-        if (!device_incarnations.ok()) {\n-          VLOG(1) << \"Unable to set incarnations in GpuExecutableRunOptions: \"\n-                  << device_incarnations.status();\n-        } else {\n-          gpu_run_options->set_incarnations(*std::move(device_incarnations));\n+        if (!task_incarnations.empty()) {\n+          gpu_run_options->set_incarnations(\n+              GetLatestIncarnations(client->devices(), task_incarnations));\n         }\n \n         auto stream = device->stream();"
+        },
+        {
+            "sha": "a7e53709fe4a79c60a8c56985d9ab00a9f6b8cd8",
+            "filename": "third_party/xla/xla/pjrt/gpu/tfrt/utils.cc",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 3,
+            "changes": 7,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4e5913d121d631c4af99d5ca1978ad28e7ada173/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Ftfrt%2Futils.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4e5913d121d631c4af99d5ca1978ad28e7ada173/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Ftfrt%2Futils.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Ftfrt%2Futils.cc?ref=4e5913d121d631c4af99d5ca1978ad28e7ada173",
+            "patch": "@@ -938,8 +938,7 @@ void EnqueueWorkWhenReady(\n   });\n }\n \n-absl::StatusOr<absl::flat_hash_map<GlobalDeviceId, IncarnationId>>\n-GetLatestIncarnations(\n+absl::flat_hash_map<GlobalDeviceId, IncarnationId> GetLatestIncarnations(\n     absl::Span<PjRtDevice* const> devices,\n     const absl::flat_hash_map<int, IncarnationId>& incarnations) {\n   // Map every device to its incarnation.\n@@ -948,7 +947,9 @@ GetLatestIncarnations(\n     int task_id = device->process_index();\n     auto it = incarnations.find(task_id);\n     if (it == incarnations.end()) {\n-      return FailedPrecondition(\"Incarnation for task %d not found\", task_id);\n+      // The task might be dead.\n+      LOG(WARNING) << \"Incarnation for task \" << task_id << \" not found\";\n+      continue;\n     }\n     GlobalDeviceId device_id(device->global_device_id().value());\n     device_incarnations[device_id] = it->second;"
+        },
+        {
+            "sha": "9fdf52226cecbaba06a3b0845750e9188777a0d2",
+            "filename": "third_party/xla/xla/pjrt/gpu/tfrt/utils.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4e5913d121d631c4af99d5ca1978ad28e7ada173/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Ftfrt%2Futils.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4e5913d121d631c4af99d5ca1978ad28e7ada173/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Ftfrt%2Futils.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fgpu%2Ftfrt%2Futils.h?ref=4e5913d121d631c4af99d5ca1978ad28e7ada173",
+            "patch": "@@ -180,8 +180,7 @@ void EnqueueWorkWhenReady(\n     absl::Span<const tsl::RCReference<tsl::AsyncValue>> values,\n     absl::AnyInvocable<void()> callee);\n \n-absl::StatusOr<absl::flat_hash_map<GlobalDeviceId, IncarnationId>>\n-GetLatestIncarnations(\n+absl::flat_hash_map<GlobalDeviceId, IncarnationId> GetLatestIncarnations(\n     absl::Span<PjRtDevice* const> devices,\n     const absl::flat_hash_map<int, IncarnationId>& incarnations);\n "
+        },
+        {
+            "sha": "f44159c986a428b8dbf8e1ad759c86063a43a09f",
+            "filename": "third_party/xla/xla/tsl/distributed_runtime/coordination/coordination_service_agent.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4e5913d121d631c4af99d5ca1978ad28e7ada173/third_party%2Fxla%2Fxla%2Ftsl%2Fdistributed_runtime%2Fcoordination%2Fcoordination_service_agent.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4e5913d121d631c4af99d5ca1978ad28e7ada173/third_party%2Fxla%2Fxla%2Ftsl%2Fdistributed_runtime%2Fcoordination%2Fcoordination_service_agent.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Ftsl%2Fdistributed_runtime%2Fcoordination%2Fcoordination_service_agent.cc?ref=4e5913d121d631c4af99d5ca1978ad28e7ada173",
+            "patch": "@@ -1042,6 +1042,7 @@ CoordinationServiceAgent::GetAliveTasks(\n \n   // Parse the response.\n   absl::MutexLock lock(incarnations_mu_);\n+  incarnations_.clear();\n   std::vector<AliveTask> alive_tasks;\n   for (int i = 0; i < response->alive_tasks_size(); ++i) {\n     int task_id = response->alive_tasks(i).task_id();"
+        }
+    ],
+    "stats": {
+        "total": 50,
+        "additions": 25,
+        "deletions": 25
+    }
+}

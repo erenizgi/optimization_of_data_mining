@@ -1,0 +1,84 @@
+{
+    "author": "hyeontaek",
+    "message": "[PjRt-IFRT] Create `ifrt::PjRtExecutable` only from `ifrt::PjRtCompiler` and `CompileOnlyIfrtCompiler`\n\nThis change migrates direct calls to `ifrt::PjRtExecutable::Create()` outside to use a public IFRT API `ifrt::PjRtCompiler::Compile()` instead.\n\nThis change should be no-op in practice. For PjRt-IFRT, it now performs IFRT device ID -> PjRt device ID conversion in `xla::CompileOptions::executable_build_options` (which was missing before) and thus can handle a client using a different device ID mapping.\n\nPiperOrigin-RevId: 844980890",
+    "sha": "eb61483d764c3ce21cbeb67bfce012344337f921",
+    "files": [
+        {
+            "sha": "a9279abc8fb5e0df2cdb1197600f25c38cc4d03f",
+            "filename": "third_party/xla/xla/python/compile_only_ifrt/BUILD",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/eb61483d764c3ce21cbeb67bfce012344337f921/third_party%2Fxla%2Fxla%2Fpython%2Fcompile_only_ifrt%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/eb61483d764c3ce21cbeb67bfce012344337f921/third_party%2Fxla%2Fxla%2Fpython%2Fcompile_only_ifrt%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpython%2Fcompile_only_ifrt%2FBUILD?ref=eb61483d764c3ce21cbeb67bfce012344337f921",
+            "patch": "@@ -19,14 +19,17 @@ cc_library(\n         \"//xla:xla_data_proto_cc\",\n         \"//xla/pjrt:host_memory_spaces\",\n         \"//xla/pjrt:pjrt_device_description\",\n+        \"//xla/pjrt:pjrt_executable\",\n         \"//xla/pjrt:pjrt_layout\",\n         \"//xla/python/ifrt\",\n         \"//xla/python/ifrt:attribute_map\",\n         \"//xla/python/ifrt:basic_device_list\",\n         \"//xla/python/ifrt:user_context\",\n+        \"//xla/python/ifrt/hlo:hlo_program\",\n         \"//xla/python/pjrt_ifrt\",\n         \"//xla/python/pjrt_ifrt:pjrt_attribute_map_util\",\n         \"//xla/python/pjrt_ifrt:pjrt_dtype\",\n+        \"//xla/python/pjrt_ifrt:xla_ifrt\",\n         \"//xla/service:computation_placer_hdr\",\n         \"//xla/tsl/concurrency:future\",\n         \"//xla/tsl/concurrency:ref_count\","
+        },
+        {
+            "sha": "380dc756cbce2f3fcc86d2879583fbff9e99b98f",
+            "filename": "third_party/xla/xla/python/compile_only_ifrt/client.cc",
+            "status": "modified",
+            "additions": 39,
+            "deletions": 0,
+            "changes": 39,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/eb61483d764c3ce21cbeb67bfce012344337f921/third_party%2Fxla%2Fxla%2Fpython%2Fcompile_only_ifrt%2Fclient.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/eb61483d764c3ce21cbeb67bfce012344337f921/third_party%2Fxla%2Fxla%2Fpython%2Fcompile_only_ifrt%2Fclient.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpython%2Fcompile_only_ifrt%2Fclient.cc?ref=eb61483d764c3ce21cbeb67bfce012344337f921",
+            "patch": "@@ -15,11 +15,50 @@ limitations under the License.\n \n #include \"xla/python/compile_only_ifrt/client.h\"\n \n+#include <memory>\n+#include <utility>\n+\n+#include \"absl/status/status.h\"\n+#include \"absl/status/statusor.h\"\n+#include \"xla/pjrt/pjrt_executable.h\"\n+#include \"xla/python/ifrt/compiler.h\"\n+#include \"xla/python/ifrt/executable.h\"\n+#include \"xla/python/ifrt/hlo/hlo_program.h\"\n+#include \"xla/python/ifrt/program.h\"\n+#include \"xla/python/ifrt/topology.h\"\n+#include \"xla/python/pjrt_ifrt/pjrt_executable.h\"\n+#include \"xla/python/pjrt_ifrt/pjrt_topology.h\"\n+#include \"xla/python/pjrt_ifrt/xla_compiler.h\"\n+#include \"xla/tsl/platform/statusor.h\"\n+\n namespace xla {\n \n [[maybe_unused]] char CompileOnlyMemory::ID = 0;\n [[maybe_unused]] char CompileOnlyDevice::ID = 0;\n [[maybe_unused]] char CompileOnlyIfrtCompiler::ID = 0;\n [[maybe_unused]] char CompileOnlyIfRtClient::ID = 0;\n \n+absl::StatusOr<ifrt::ExecutableRef> CompileOnlyIfrtCompiler::Compile(\n+    std::unique_ptr<ifrt::Program> program, const ifrt::Topology& topology,\n+    std::unique_ptr<ifrt::CompileOptions> options) {\n+  const auto* xla_program = llvm::dyn_cast<ifrt::HloProgram>(program.get());\n+  if (xla_program == nullptr) {\n+    return absl::InvalidArgumentError(\n+        \"CompileOnlyIfrtCompiler requires an HloProgram\");\n+  }\n+  TF_ASSIGN_OR_RETURN(auto xla_compile_options,\n+                      ifrt::GetXlaCompileOptions(std::move(options)));\n+  // Unlike PjRt-IFRT, device ID translation is unnecessary because\n+  // `CompileOnlyIfrtClient` does not support device ID mapping.\n+  const auto* pjrt_topology = llvm::dyn_cast<ifrt::PjRtTopology>(&topology);\n+  if (pjrt_topology == nullptr) {\n+    return absl::InvalidArgumentError(\n+        \"CompileOnlyIfrtCompiler requires a PjRtTopology\");\n+  }\n+  return ifrt::PjRtExecutable::Create(\n+      xla_program->mlir_module(),\n+      std::move(xla_compile_options->compile_options),\n+      *pjrt_topology->description());\n+}\n+\n }  // namespace xla"
+        },
+        {
+            "sha": "ef30a57d8cdd8a7d0621ecdfc20395c6722a5a05",
+            "filename": "third_party/xla/xla/python/compile_only_ifrt/client.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 3,
+            "changes": 4,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/eb61483d764c3ce21cbeb67bfce012344337f921/third_party%2Fxla%2Fxla%2Fpython%2Fcompile_only_ifrt%2Fclient.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/eb61483d764c3ce21cbeb67bfce012344337f921/third_party%2Fxla%2Fxla%2Fpython%2Fcompile_only_ifrt%2Fclient.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpython%2Fcompile_only_ifrt%2Fclient.h?ref=eb61483d764c3ce21cbeb67bfce012344337f921",
+            "patch": "@@ -167,9 +167,7 @@ class CompileOnlyIfrtCompiler final\n \n   absl::StatusOr<ifrt::ExecutableRef> Compile(\n       std::unique_ptr<ifrt::Program> program, const ifrt::Topology& topology,\n-      std::unique_ptr<ifrt::CompileOptions> options) override {\n-    return Unimplemented(\"Compile not implemented.\");\n-  }\n+      std::unique_ptr<ifrt::CompileOptions> options) override;\n \n   absl::Status IsExecutableVersionCompatible(\n       const xla::ifrt::ExecutableVersion& executable_version,"
+        },
+        {
+            "sha": "d668d190ba5ce692451c7e6b66c533e852539c51",
+            "filename": "third_party/xla/xla/python/pjrt_ifrt/pjrt_executable.cc",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 5,
+            "changes": 5,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/eb61483d764c3ce21cbeb67bfce012344337f921/third_party%2Fxla%2Fxla%2Fpython%2Fpjrt_ifrt%2Fpjrt_executable.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/eb61483d764c3ce21cbeb67bfce012344337f921/third_party%2Fxla%2Fxla%2Fpython%2Fpjrt_ifrt%2Fpjrt_executable.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpython%2Fpjrt_ifrt%2Fpjrt_executable.cc?ref=eb61483d764c3ce21cbeb67bfce012344337f921",
+            "patch": "@@ -418,11 +418,6 @@ char PjRtCompatibleLoadedExecutable::ID = 0;\n char PjRtExecutable::ID = 0;\n char PjRtLoadedExecutable::ID = 0;\n \n-absl::StatusOr<ExecutableRef> PjRtExecutable::Create(\n-    std::shared_ptr<xla::PjRtExecutable> pjrt_executable) {\n-  return ExecutableRef(new PjRtExecutable(std::move(pjrt_executable)));\n-}\n-\n absl::StatusOr<ExecutableRef> PjRtExecutable::Create(\n     mlir::ModuleOp module, xla::CompileOptions compile_options,\n     const xla::PjRtTopologyDescription& topology) {"
+        },
+        {
+            "sha": "71a3fb944ca0be1ce3cf157abd9b375de6903553",
+            "filename": "third_party/xla/xla/python/pjrt_ifrt/pjrt_executable.h",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 7,
+            "changes": 7,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/eb61483d764c3ce21cbeb67bfce012344337f921/third_party%2Fxla%2Fxla%2Fpython%2Fpjrt_ifrt%2Fpjrt_executable.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/eb61483d764c3ce21cbeb67bfce012344337f921/third_party%2Fxla%2Fxla%2Fpython%2Fpjrt_ifrt%2Fpjrt_executable.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpython%2Fpjrt_ifrt%2Fpjrt_executable.h?ref=eb61483d764c3ce21cbeb67bfce012344337f921",
+            "patch": "@@ -90,13 +90,6 @@ class PjRtCompatibleLoadedExecutable\n class PjRtExecutable final\n     : public llvm::RTTIExtends<PjRtExecutable, PjRtCompatibleExecutable> {\n  public:\n-  // Creates PjRtExecutable from xla::PjRtExecutable.\n-  ABSL_DEPRECATED(\n-      \"Use the `Create()` that takes an MLIR module and compiles it \"\n-      \"internally.\")\n-  static absl::StatusOr<ExecutableRef> Create(\n-      std::shared_ptr<xla::PjRtExecutable> pjrt_executable);\n-\n   // Creates PjRtExecutable from an MLIR module. Internally, it compiles the\n   // provided MLIR module into an `xla::PjRtExecutable`.\n   static absl::StatusOr<ExecutableRef> Create("
+        },
+        {
+            "sha": "8c3c21a0f9f178519c28641fb3083a887bb7f905",
+            "filename": "third_party/xla/xla/python/version.h",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/eb61483d764c3ce21cbeb67bfce012344337f921/third_party%2Fxla%2Fxla%2Fpython%2Fversion.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/eb61483d764c3ce21cbeb67bfce012344337f921/third_party%2Fxla%2Fxla%2Fpython%2Fversion.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpython%2Fversion.h?ref=eb61483d764c3ce21cbeb67bfce012344337f921",
+            "patch": "@@ -18,6 +18,7 @@ limitations under the License.\n \n // An increasing version number to protect jax code against breaking changes.\n // In JAX, reference this via jax._src.lib.ifrt_version.\n-#define JAX_IFRT_VERSION_NUMBER 41  // Python getter for advanced_configuration\n+#define JAX_IFRT_VERSION_NUMBER \\\n+  42  // PjRtExecutable is created using IFRT Compiler::Compile() API.\n \n #endif  // XLA_PYTHON_VERSION_H_"
+        }
+    ],
+    "stats": {
+        "total": 61,
+        "additions": 45,
+        "deletions": 16
+    }
+}

@@ -1,0 +1,60 @@
+{
+    "author": "ezhulenev",
+    "message": "[xla] Add ShapePool to keep canonical shapes within the process\n\n-------------------------------------------------------------------------------\nBenchmark                     Time             CPU   Iterations UserCounters...\n-------------------------------------------------------------------------------\nBM_GetCanonicalShape       57.8 ns         57.8 ns     11409570\n\nPiperOrigin-RevId: 800669179",
+    "sha": "b6a28148e97e11515ceda03dae9f6cb3db776435",
+    "files": [
+        {
+            "sha": "7fbe4f1edbb266de0e2c7ac0b1f8299a65bc3804",
+            "filename": "third_party/xla/xla/BUILD",
+            "status": "modified",
+            "additions": 29,
+            "deletions": 0,
+            "changes": 29,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b6a28148e97e11515ceda03dae9f6cb3db776435/third_party%2Fxla%2Fxla%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b6a28148e97e11515ceda03dae9f6cb3db776435/third_party%2Fxla%2Fxla%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2FBUILD?ref=b6a28148e97e11515ceda03dae9f6cb3db776435",
+            "patch": "@@ -476,6 +476,35 @@ cc_library(\n     ],\n )\n \n+cc_library(\n+    name = \"shape_pool\",\n+    srcs = [\"shape_pool.cc\"],\n+    hdrs = [\"shape_pool.h\"],\n+    visibility = [\"//visibility:public\"],\n+    deps = [\n+        \":shape_util\",\n+        \"@com_google_absl//absl/base:core_headers\",\n+        \"@com_google_absl//absl/base:no_destructor\",\n+        \"@com_google_absl//absl/container:flat_hash_map\",\n+        \"@com_google_absl//absl/log\",\n+        \"@com_google_absl//absl/synchronization\",\n+    ],\n+)\n+\n+xla_cc_test(\n+    name = \"shape_pool_test\",\n+    srcs = [\"shape_pool_test.cc\"],\n+    deps = [\n+        \":literal_util\",\n+        \":shape_pool\",\n+        \"//xla:shape_util\",\n+        \"//xla/tsl/platform:test\",\n+        \"//xla/tsl/platform:test_benchmark\",\n+        \"//xla/tsl/platform:test_main\",\n+        \"@com_google_googletest//:gtest\",\n+    ],\n+)\n+\n tf_proto_library(\n     name = \"shape_util_proto\",\n     srcs = [\"shape_util.proto\"],"
+        },
+        {
+            "sha": "9ca4feb3c09d958781ab697c56b6b67d0be67516",
+            "filename": "third_party/xla/xla/shape_pool.cc",
+            "status": "added",
+            "additions": 73,
+            "deletions": 0,
+            "changes": 73,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b6a28148e97e11515ceda03dae9f6cb3db776435/third_party%2Fxla%2Fxla%2Fshape_pool.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b6a28148e97e11515ceda03dae9f6cb3db776435/third_party%2Fxla%2Fxla%2Fshape_pool.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fshape_pool.cc?ref=b6a28148e97e11515ceda03dae9f6cb3db776435",
+            "patch": "@@ -0,0 +1,73 @@\n+/* Copyright 2025 The OpenXLA Authors.\n+\n+Licensed under the Apache License, Version 2.0 (the \"License\");\n+you may not use this file except in compliance with the License.\n+You may obtain a copy of the License at\n+\n+    http://www.apache.org/licenses/LICENSE-2.0\n+\n+Unless required by applicable law or agreed to in writing, software\n+distributed under the License is distributed on an \"AS IS\" BASIS,\n+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+See the License for the specific language governing permissions and\n+limitations under the License.\n+==============================================================================*/\n+\n+#include \"xla/shape_pool.h\"\n+\n+#include <cstddef>\n+#include <memory>\n+\n+#include \"absl/base/no_destructor.h\"\n+#include \"absl/base/optimization.h\"\n+#include \"absl/container/flat_hash_map.h\"\n+#include \"absl/log/log.h\"\n+#include \"absl/synchronization/mutex.h\"\n+#include \"xla/shape.h\"\n+\n+namespace xla {\n+\n+ShapePool* ShapePool::Default() {\n+  absl::NoDestructor<ShapePool> pool;\n+  return &*pool;\n+}\n+\n+size_t ShapePool::GarbageCollect() {\n+  absl::MutexLock lock(&mu_);\n+  size_t num_erased = absl::erase_if(\n+      canonical_shapes_, [](auto& entry) { return entry.second.expired(); });\n+  VLOG(3) << \"Garbage collected \" << num_erased << \" shapes\";\n+  return num_erased;\n+}\n+\n+std::shared_ptr<Shape> ShapePool::GetCanonicalShape(const Shape& shape) {\n+  absl::MutexLock lock(&mu_);\n+\n+  auto [it, _] = canonical_shapes_.try_emplace(shape, std::weak_ptr<Shape>());\n+\n+  std::shared_ptr<Shape> ptr = it->second.lock();\n+  if (ABSL_PREDICT_TRUE(ptr != nullptr)) {\n+    return ptr;\n+  }\n+\n+  std::shared_ptr<Shape> canonical_shape = std::make_shared<Shape>(shape);\n+  it->second = canonical_shape;\n+  return canonical_shape;\n+}\n+\n+std::shared_ptr<Shape> ShapePool::GetCanonicalShape(\n+    std::shared_ptr<Shape> shape) {\n+  absl::MutexLock lock(&mu_);\n+\n+  auto [it, _] = canonical_shapes_.try_emplace(*shape, std::weak_ptr<Shape>());\n+\n+  std::shared_ptr<Shape> ptr = it->second.lock();\n+  if (ABSL_PREDICT_TRUE(ptr != nullptr)) {\n+    return ptr;\n+  }\n+\n+  it->second = shape;\n+  return shape;\n+}\n+\n+}  // namespace xla"
+        },
+        {
+            "sha": "09926d37d0c0f7fbe9c65e5598414114adbb98d0",
+            "filename": "third_party/xla/xla/shape_pool.h",
+            "status": "added",
+            "additions": 60,
+            "deletions": 0,
+            "changes": 60,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b6a28148e97e11515ceda03dae9f6cb3db776435/third_party%2Fxla%2Fxla%2Fshape_pool.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b6a28148e97e11515ceda03dae9f6cb3db776435/third_party%2Fxla%2Fxla%2Fshape_pool.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fshape_pool.h?ref=b6a28148e97e11515ceda03dae9f6cb3db776435",
+            "patch": "@@ -0,0 +1,60 @@\n+/* Copyright 2025 The OpenXLA Authors.\n+\n+Licensed under the Apache License, Version 2.0 (the \"License\");\n+you may not use this file except in compliance with the License.\n+You may obtain a copy of the License at\n+\n+    http://www.apache.org/licenses/LICENSE-2.0\n+\n+Unless required by applicable law or agreed to in writing, software\n+distributed under the License is distributed on an \"AS IS\" BASIS,\n+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+See the License for the specific language governing permissions and\n+limitations under the License.\n+==============================================================================*/\n+\n+#ifndef XLA_SHAPE_POOL_H_\n+#define XLA_SHAPE_POOL_H_\n+\n+#include <cstddef>\n+#include <memory>\n+\n+#include \"absl/base/thread_annotations.h\"\n+#include \"absl/container/flat_hash_map.h\"\n+#include \"absl/synchronization/mutex.h\"\n+#include \"xla/shape.h\"\n+\n+namespace xla {\n+\n+// Shape pool provides a mechanism to deduplicate identical shapes and\n+// share them across multiple HLO instructions (and HLO modules).\n+class ShapePool {\n+ public:\n+  // Returns a default shape pool that can be used across multiple HLO modules\n+  // in a process.\n+  static ShapePool* Default();\n+\n+  // Returns a canonical shape from the pool. If the shape is not in the\n+  // pool, it is added to the pool and returned back.\n+  std::shared_ptr<Shape> GetCanonicalShape(const Shape& shape);\n+\n+  // Returns a canonical shape from the pool. If the shape is not in the\n+  // pool, it is added to the pool and returned back.\n+  std::shared_ptr<Shape> GetCanonicalShape(std::shared_ptr<Shape> shape);\n+\n+  // Runs garbage collection on all shapes in the pool. Returns the number\n+  // of shapes that were garbage collected.\n+  size_t GarbageCollect();\n+\n+ private:\n+  // We keep weak pointers to the shapes in the pool to allow for garbage\n+  // collection when owning HLO instructions are destroyed. We run periodic\n+  // garbage collection to clean up the shapes that are no longer referenced.\n+  absl::Mutex mu_;\n+  absl::flat_hash_map<Shape, std::weak_ptr<Shape>> canonical_shapes_\n+      ABSL_GUARDED_BY(mu_);\n+};\n+\n+}  // namespace xla\n+\n+#endif  // XLA_SHAPE_POOL_H_"
+        },
+        {
+            "sha": "7279c790d975338c389fdd7c5a5bc82bd8fe01b7",
+            "filename": "third_party/xla/xla/shape_pool_test.cc",
+            "status": "added",
+            "additions": 88,
+            "deletions": 0,
+            "changes": 88,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b6a28148e97e11515ceda03dae9f6cb3db776435/third_party%2Fxla%2Fxla%2Fshape_pool_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b6a28148e97e11515ceda03dae9f6cb3db776435/third_party%2Fxla%2Fxla%2Fshape_pool_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fshape_pool_test.cc?ref=b6a28148e97e11515ceda03dae9f6cb3db776435",
+            "patch": "@@ -0,0 +1,88 @@\n+/* Copyright 2025 The OpenXLA Authors.\n+\n+Licensed under the Apache License, Version 2.0 (the \"License\");\n+you may not use this file except in compliance with the License.\n+You may obtain a copy of the License at\n+\n+    http://www.apache.org/licenses/LICENSE-2.0\n+\n+Unless required by applicable law or agreed to in writing, software\n+distributed under the License is distributed on an \"AS IS\" BASIS,\n+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+See the License for the specific language governing permissions and\n+limitations under the License.\n+==============================================================================*/\n+\n+#include \"xla/shape_pool.h\"\n+\n+#include <memory>\n+\n+#include \"xla/shape.h\"\n+#include \"xla/shape_util.h\"\n+#include \"xla/tsl/platform/test.h\"\n+#include \"xla/tsl/platform/test_benchmark.h\"\n+\n+namespace xla {\n+namespace {\n+\n+TEST(ShapePoolTest, GetCanonicalShape) {\n+  ShapePool pool;\n+\n+  {  // Use nested scope to allow garbage collection below.\n+    Shape s0 = ShapeUtil::MakeShape(F32, {1, 2});\n+    Shape s1 = ShapeUtil::MakeShape(F32, {2, 1});\n+\n+    auto cs0_0 = pool.GetCanonicalShape(s0);\n+    auto cs0_1 = pool.GetCanonicalShape(s0);\n+    ASSERT_EQ(cs0_0, cs0_1);\n+\n+    auto cs1_0 = pool.GetCanonicalShape(s1);\n+    auto cs1_1 = pool.GetCanonicalShape(s1);\n+    ASSERT_NE(cs0_0, cs1_0);\n+    ASSERT_EQ(cs1_0, cs1_1);\n+  }\n+\n+  ASSERT_EQ(pool.GarbageCollect(), 2);\n+}\n+\n+TEST(ShapePoolTest, GetCanonicalShapeFromSharedPtr) {\n+  ShapePool pool;\n+\n+  {  // Use nested scope to allow garbage collection below.\n+    auto s0 = std::make_shared<Shape>(ShapeUtil::MakeShape(F32, {1, 2}));\n+    auto s1 = std::make_shared<Shape>(ShapeUtil::MakeShape(F32, {2, 1}));\n+\n+    auto cs0_0 = pool.GetCanonicalShape(s0);\n+    auto cs0_1 = pool.GetCanonicalShape(s0);\n+    ASSERT_EQ(cs0_0, cs0_1);\n+\n+    auto cs1_0 = pool.GetCanonicalShape(s1);\n+    auto cs1_1 = pool.GetCanonicalShape(s1);\n+    ASSERT_NE(cs0_0, cs1_0);\n+    ASSERT_EQ(cs1_0, cs1_1);\n+  }\n+\n+  ASSERT_EQ(pool.GarbageCollect(), 2);\n+}\n+\n+//===----------------------------------------------------------------------===//\n+// Performance benchmarks below.\n+//===----------------------------------------------------------------------===//\n+\n+static void BM_GetCanonicalShape(benchmark::State& state) {\n+  ShapePool pool;\n+\n+  auto s = std::make_shared<Shape>(ShapeUtil::MakeShape(F32, {1, 2}));\n+\n+  for (auto _ : state) {\n+    auto cs = pool.GetCanonicalShape(s);\n+    benchmark::DoNotOptimize(cs);\n+  }\n+\n+  state.SetItemsProcessed(state.iterations());\n+}\n+\n+BENCHMARK(BM_GetCanonicalShape);\n+\n+}  // namespace\n+}  // namespace xla"
+        }
+    ],
+    "stats": {
+        "total": 250,
+        "additions": 250,
+        "deletions": 0
+    }
+}

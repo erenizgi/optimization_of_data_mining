@@ -1,0 +1,36 @@
+{
+    "author": "tensorflower-gardener",
+    "message": "[SymbolicExpr] Implement Min/Max canonicalization rules\n\nPiperOrigin-RevId: 797345998",
+    "sha": "96d8c6c238c7d7e798282f7deb7c0bba750578e9",
+    "files": [
+        {
+            "sha": "c792871f3e71e0b69136336df45c54692fae26fd",
+            "filename": "third_party/xla/xla/service/gpu/model/experimental/symbolic_expr.cc",
+            "status": "modified",
+            "additions": 40,
+            "deletions": 0,
+            "changes": 40,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/96d8c6c238c7d7e798282f7deb7c0bba750578e9/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fmodel%2Fexperimental%2Fsymbolic_expr.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/96d8c6c238c7d7e798282f7deb7c0bba750578e9/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fmodel%2Fexperimental%2Fsymbolic_expr.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fmodel%2Fexperimental%2Fsymbolic_expr.cc?ref=96d8c6c238c7d7e798282f7deb7c0bba750578e9",
+            "patch": "@@ -21,6 +21,7 @@ limitations under the License.\n #include <cmath>\n #include <cstddef>\n #include <cstdint>\n+#include <optional>\n #include <string>\n #include <tuple>\n #include <utility>\n@@ -328,6 +329,39 @@ SymbolicExpr CanonicalizeMul(SymbolicExpr lhs, SymbolicExpr rhs) {\n   return ctx->CreateBinaryOp(SymbolicExprType::kMul, res_lhs, res_rhs);\n }\n \n+std::optional<int64_t> SubtractAndGetConstDiff(SymbolicExpr lhs,\n+                                               SymbolicExpr rhs) {\n+  SymbolicExpr diff = (lhs - rhs).Canonicalize();\n+  if (diff.GetType() == SymbolicExprType::kConstant) {\n+    return diff.GetValue();\n+  }\n+  return std::nullopt;\n+}\n+\n+SymbolicExpr CanonicalizeMin(SymbolicExpr lhs, SymbolicExpr rhs) {\n+  SymbolicExprContext* ctx = lhs.GetContext();\n+  if (auto diff = SubtractAndGetConstDiff(lhs, rhs)) {  // min(X, X + k) = X\n+    return (diff.value() <= 0) ? lhs : rhs;\n+  }\n+\n+  if (rhs < lhs) {\n+    std::swap(lhs, rhs);\n+  }\n+  return ctx->CreateBinaryOp(SymbolicExprType::kMin, lhs, rhs);\n+}\n+\n+SymbolicExpr CanonicalizeMax(SymbolicExpr lhs, SymbolicExpr rhs) {\n+  SymbolicExprContext* ctx = lhs.GetContext();\n+  if (auto diff = SubtractAndGetConstDiff(lhs, rhs)) {  // max(X, X + k) = X + k\n+    return (diff.value() >= 0) ? lhs : rhs;\n+  }\n+\n+  if (rhs < lhs) {\n+    std::swap(lhs, rhs);\n+  }\n+  return ctx->CreateBinaryOp(SymbolicExprType::kMax, lhs, rhs);\n+}\n+\n }  // namespace\n \n class SymbolicExprStorage : public mlir::StorageUniquer::BaseStorage {\n@@ -528,6 +562,12 @@ SymbolicExpr SymbolicExpr::Canonicalize() const {\n     case SymbolicExprType::kMul:\n       return CanonicalizeMul(this->GetLHS().Canonicalize(),\n                              this->GetRHS().Canonicalize());\n+    case SymbolicExprType::kMin:\n+      return CanonicalizeMin(this->GetLHS().Canonicalize(),\n+                             this->GetRHS().Canonicalize());\n+    case SymbolicExprType::kMax:\n+      return CanonicalizeMax(this->GetLHS().Canonicalize(),\n+                             this->GetRHS().Canonicalize());\n     default:\n       // TODO(b/433693793): Implement canonicalization for other types.\n       return *this;"
+        },
+        {
+            "sha": "0f2c349001c3e37c2e47a4bcf0c69acbbd32d8be",
+            "filename": "third_party/xla/xla/service/gpu/model/experimental/symbolic_expr_test.cc",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 6,
+            "changes": 13,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/96d8c6c238c7d7e798282f7deb7c0bba750578e9/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fmodel%2Fexperimental%2Fsymbolic_expr_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/96d8c6c238c7d7e798282f7deb7c0bba750578e9/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fmodel%2Fexperimental%2Fsymbolic_expr_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fmodel%2Fexperimental%2Fsymbolic_expr_test.cc?ref=96d8c6c238c7d7e798282f7deb7c0bba750578e9",
+            "patch": "@@ -124,7 +124,7 @@ TEST_F(SymbolicExprTest, UniquingWorks) {\n   EXPECT_NE(add1, add3);\n }\n \n-TEST_F(SymbolicExprTest, Canonicalization) {\n+TEST_F(SymbolicExprTest, Canonicalization_Basic) {\n   SymbolicExpr constants = (c2 * 3) + 5;\n   EXPECT_EQ(constants.Canonicalize().ToString(), \"11\");\n \n@@ -171,17 +171,18 @@ TEST_F(SymbolicExprTest, Canonicalization) {\n   EXPECT_EQ(nested_dist.Canonicalize().ToString(), \"((v0 * 8) + 20)\");\n }\n \n-TEST_F(SymbolicExprTest, DISABLED_Canonicalization_MinMaxDiv) {\n+TEST_F(SymbolicExprTest, Canonicalization_MinMax) {\n   // Min - Max\n   EXPECT_EQ((c2.min(5) + c2.max(7)).Canonicalize().ToString(), \"9\");\n   EXPECT_EQ((v0.max(v0)).Canonicalize().ToString(), \"v0\");\n   EXPECT_EQ((v0.min(v0)).Canonicalize().ToString(), \"v0\");\n   EXPECT_EQ((v0.max(v0 + 1)).Canonicalize().ToString(), \"(v0 + 1)\");\n-  EXPECT_EQ((v0.min(v0 - 1)).Canonicalize().ToString(), \"(v0 - 1)\");\n-\n-  SymbolicExpr non_affine_terms = (v0.min(v1) + v0.min(v1));\n-  EXPECT_EQ(non_affine_terms.Canonicalize().ToString(), \"(min(v0, v1) * 2)\");\n+  EXPECT_EQ((v0.min(v0 - 1)).Canonicalize().ToString(), \"(v0 + -1)\");\n+  EXPECT_EQ((v0.min(v1) + v0.min(v1)).Canonicalize().ToString(),\n+            \"(min(v0, v1) * 2)\");\n+}\n \n+TEST_F(SymbolicExprTest, DISABLED_Canonicalization_DivMod) {\n   // FloorDiv, CeilDiv, and Mod simplifications.\n   EXPECT_EQ((v0.floorDiv(1)).Canonicalize().ToString(), \"v0\");\n   EXPECT_EQ((v0.ceilDiv(1)).Canonicalize().ToString(), \"v0\");"
+        }
+    ],
+    "stats": {
+        "total": 53,
+        "additions": 47,
+        "deletions": 6
+    }
+}

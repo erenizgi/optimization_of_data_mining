@@ -1,0 +1,96 @@
+{
+    "author": "nputikhin",
+    "message": "[XLA:GPU] Enable dots with block_n=8 in triton and autotuner\n\nThis change utilizes recently added Triton support for smaller block sizes.\n\nSkipping occupancy optimization for some configs is essentially a workaround for incompatible split_k values. The impact of these configs is limited however because they are only present in non-exhaustive mode, so they mostly get filtered out anyway.\n\nPiperOrigin-RevId: 820617352",
+    "sha": "cc58fb18fdeb64b244971b2284b521fe376e1059",
+    "files": [
+        {
+            "sha": "ad09fffdd9308b4fcc8f2b523a6e835491634ac6",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/fusion_emitter_device_legacy_test.cc",
+            "status": "modified",
+            "additions": 33,
+            "deletions": 0,
+            "changes": 33,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/cc58fb18fdeb64b244971b2284b521fe376e1059/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter_device_legacy_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/cc58fb18fdeb64b244971b2284b521fe376e1059/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter_device_legacy_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter_device_legacy_test.cc?ref=cc58fb18fdeb64b244971b2284b521fe376e1059",
+            "patch": "@@ -1889,6 +1889,39 @@ ENTRY e  {\n                    .status());\n }\n \n+class RhsLayoutParameterizedTritonGemmTest\n+    : public TritonGemmTest,\n+      public ::testing::WithParamInterface<absl::string_view> {};\n+\n+TEST_P(RhsLayoutParameterizedTritonGemmTest,\n+       BF16WithSmallRHSOuterDimDoesNotCrash) {\n+  std::string hlo_text = absl::Substitute(R\"(\n+  triton_dot {\n+    p0 = bf16[64,32] parameter(0)\n+    p1 = bf16[32,8]$0 parameter(1)\n+    ROOT dot = f32[64,8] dot(p0, p1),\n+      lhs_contracting_dims={1},\n+      rhs_contracting_dims={0}\n+  }\n+\n+  ENTRY e {\n+    p0 = bf16[64,32] parameter(0)\n+    p1 = bf16[32,8]$0 parameter(1)\n+    ROOT _ = f32[64,8] fusion(p0, p1), kind=kCustom, calls=triton_dot,\n+      backend_config={\"fusion_backend_config\": {kind: \"__triton_gemm\", triton_gemm_config:\n+        {\"block_m\":64,\"block_n\":8,\"block_k\":32,\n+        \"split_k\":1,\"num_stages\":1,\"num_warps\":4,\n+        \"num_ctas\":1}}}\n+  })\",\n+                                          GetParam());\n+\n+  EXPECT_TRUE(RunAndCompare(hlo_text, ErrorSpec{/*aabs=*/1e-1, /*arel=*/1e-2}));\n+}\n+\n+INSTANTIATE_TEST_SUITE_P(RhsLayoutParameterizedTritonGemmTestSuite,\n+                         RhsLayoutParameterizedTritonGemmTest,\n+                         ::testing::Values(\"\", \"{0, 1}\", \"{1, 0}\"));\n+\n TEST_F(TritonGemmTest, BinaryOperationWithSmallInputsIsFused) {\n   constexpr absl::string_view kHloText = R\"(\n HloModule m"
+        },
+        {
+            "sha": "ac91d214798eb0734327464f79ecfa33d605ed02",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/fusion_emitter_device_test.cc",
+            "status": "modified",
+            "additions": 49,
+            "deletions": 0,
+            "changes": 49,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/cc58fb18fdeb64b244971b2284b521fe376e1059/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter_device_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/cc58fb18fdeb64b244971b2284b521fe376e1059/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter_device_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter_device_test.cc?ref=cc58fb18fdeb64b244971b2284b521fe376e1059",
+            "patch": "@@ -4148,6 +4148,55 @@ ENTRY entry {\n       kHloText, ErrorSpec{/*aabs=*/1e-4, /*arel=*/1e-6}));\n }\n \n+TEST_F(TritonEmitterTest, BF16WithSmallRHSOuterDimDoesNotCrash) {\n+  const std::string kHloText = R\"(\n+flhs {\n+  ROOT flhs.p0 = bf16[64,32] parameter(0)\n+}\n+\n+frhs {\n+  ROOT frhs.p0 = bf16[32,8] parameter(0)\n+}\n+\n+fdot {\n+  fdot.p0 = bf16[64,32] parameter(0)\n+  fdot.p1 = bf16[32,8] parameter(1)\n+  fdot.lhs = bf16[64,32] fusion(fdot.p0), kind=kCustom, calls=flhs, backend_config={\n+    \"fusion_backend_config\":{\n+      \"kind\":\"__triton_nested_gemm_fusion\", \"block_level_fusion_config\":{\n+        \"output_tiles\":[{\"sizes\":[\"64\", \"32\"]}]\n+      }\n+    }\n+  }\n+  fdot.rhs = bf16[32,8]{1,0} fusion(fdot.p1), kind=kCustom, calls=frhs, backend_config={\n+    \"fusion_backend_config\":{\n+      \"kind\":\"__triton_nested_gemm_fusion\", \"block_level_fusion_config\":{\n+        \"output_tiles\":[{\"sizes\":[\"32\", \"8\"]}]\n+      }\n+    }\n+  }\n+  ROOT fdot.root = bf16[64,8]{1,0} dot(fdot.lhs, fdot.rhs),\n+    lhs_contracting_dims={1}, rhs_contracting_dims={0}\n+}\n+\n+ENTRY entry {\n+  entry.p0 = bf16[64,32] parameter(0)\n+  entry.p1 = bf16[32,8] parameter(1)\n+  ROOT fusion = bf16[64,8] fusion(entry.p0, entry.p1),\n+    kind=kCustom, calls=fdot, backend_config={\n+      \"fusion_backend_config\":{\n+        \"kind\":\"__triton_nested_gemm_fusion\",\n+        \"block_level_fusion_config\":{\n+          \"output_tiles\":[{\"sizes\":[\"64\",\"8\"]}],\n+          \"num_warps\":\"4\",\n+          \"num_ctas\":\"1\",\n+          \"num_stages\":\"1\"}}}\n+})\";\n+\n+  EXPECT_TRUE(RunAndCompareNoHloPasses(\n+      kHloText, ErrorSpec{/*aabs=*/1e-1, /*arel=*/1e-2}));\n+}\n+\n struct ScaleDotTestParams {\n   std::string lhs_type;\n   std::string rhs_type;"
+        },
+        {
+            "sha": "1b17b71e5f22826d4805e750c9191ab24862186e",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/fusion_emitter_legacy_matmul.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/cc58fb18fdeb64b244971b2284b521fe376e1059/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter_legacy_matmul.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/cc58fb18fdeb64b244971b2284b521fe376e1059/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter_legacy_matmul.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter_legacy_matmul.cc?ref=cc58fb18fdeb64b244971b2284b521fe376e1059",
+            "patch": "@@ -812,7 +812,7 @@ absl::Status ValidateMatMulConfig(const TritonGemmConfig& config,\n   TF_RET_CHECK(config.split_k >= 1);\n   TF_RET_CHECK(config.block_m >= 16);\n   TF_RET_CHECK(config.block_k >= 16);\n-  TF_RET_CHECK(config.block_n >= 16);\n+  TF_RET_CHECK(config.block_n >= 8);\n \n   const auto& dims = dot.dot_dimension_numbers();\n   int num_batch_dims ="
+        },
+        {
+            "sha": "020e2db95e284190985b3a59e168dcb513897f68",
+            "filename": "third_party/xla/xla/service/gpu/autotuning/dot_search_space.cc",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 6,
+            "changes": 19,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/cc58fb18fdeb64b244971b2284b521fe376e1059/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fdot_search_space.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/cc58fb18fdeb64b244971b2284b521fe376e1059/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fdot_search_space.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fdot_search_space.cc?ref=cc58fb18fdeb64b244971b2284b521fe376e1059",
+            "patch": "@@ -329,12 +329,11 @@ bool TritonDotFusionSearchSpace::ShouldOptimizeForOccupancy() const {\n \n TritonDotFusionSearchSpace::OutputTile\n TritonDotFusionSearchSpace::GetMinOutputTile() const {\n-  // Triton currently doesn't support tiles smaller than 16x16.\n-  // TODO: b/395572776 - Lift this restriction, and calculate a smaller tile\n-  // based on the requested algorithm (e.g., if we want to use wgmma vs mma\n-  // vs fma, the minimal reasonable tile size is different).\n-  constexpr OutputTile kMinSupportedTile = {16, 16};\n-  constexpr OutputTile kMinWgmmaTile = {64, 16};\n+  // TODO: b/395572776 - Calculate tile sizes based on the requested algorithm\n+  // (e.g., if we want to use wgmma vs mma vs fma, the minimal reasonable tile\n+  // size is different).\n+  constexpr OutputTile kMinSupportedTile = {16, 8};\n+  constexpr OutputTile kMinWgmmaTile = {64, 8};\n   if (device_description_.cuda_compute_capability().IsAtLeastHopper() &&\n       !should_optimize_for_occupancy_) {\n     VLOG(5) << \"Computing output_tile: Want to use wgmma, so output_tile >= \"\n@@ -656,6 +655,14 @@ void TritonDotFusionSearchSpace::EliminateLowOccupancyConfigs(\n \n   ConfigWithNotes last_config = configs.back();  // Largest split.\n   auto has_too_few_tiles = [](const ConfigWithNotes& config) {\n+    // Small dots frequently lead to large split_k values that are not\n+    // compatible with codegen. We skip occupancy optimization for them to be\n+    // able to consider smaller splits in non-exhaustive mode.\n+    // The value of 4 was found by running exhaustive autotuning and noting that\n+    // the majority of optimal configs with block_n == 8 had split_k <= 4.\n+    if (config.config.block_n == 8 && config.config.split_k <= 4) {\n+      return false;\n+    }\n     if (config.not_enough_tiles) {\n       VLOG(10) << \"Skipping due to fewer tiles than cores, config = \"\n                << config.ToString();"
+        },
+        {
+            "sha": "6987c85b8badf95dc5e85bc6b93dc32a6b58b715",
+            "filename": "third_party/xla/xla/service/gpu/autotuning/dot_search_space_test.cc",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 7,
+            "changes": 14,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/cc58fb18fdeb64b244971b2284b521fe376e1059/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fdot_search_space_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/cc58fb18fdeb64b244971b2284b521fe376e1059/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fdot_search_space_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fdot_search_space_test.cc?ref=cc58fb18fdeb64b244971b2284b521fe376e1059",
+            "patch": "@@ -45,6 +45,7 @@ void PrintTo(const TritonGemmConfig& config, std::ostream* os) {\n namespace {\n \n using ::testing::AllOf;\n+using ::testing::Contains;\n using ::testing::ElementsAre;\n using ::testing::ElementsAreArray;\n using ::testing::Eq;\n@@ -195,7 +196,7 @@ TEST_F(DotSearchSpaceTest, SerializesSearchSpace) {\n \n   EXPECT_EQ(search_space.ToString(),\n             \"problem_size_BxMxNxKxE: 1x1024x1024x1024x(16->16) \"\n-            \"tile_range_SxMxNxK: [1-64]x[16-256]x[16-512]x[16-?] \"\n+            \"tile_range_SxMxNxK: [1-64]x[16-256]x[8-512]x[16-?] \"\n             \"desired_total_warps: 2640 occupancy_optimization: 1 \"\n             \"warps_per_cta: [2-?]\");\n }\n@@ -306,16 +307,15 @@ TEST_F(DotSearchSpaceTest, FindsGoodDataReuseTilesForLowOccupancyProblem) {\n               Contains(AllOf(BlockMIs(Ge(32)), SplitKIs(Ge(2)))));\n }\n \n-TEST_F(DotSearchSpaceTest,\n-       FindsUniqueOccupancyMaximizingTilingForSmallProblem) {\n+TEST_F(DotSearchSpaceTest, FindsOccupancyMaximizingTilingForSmallProblem) {\n   TF_ASSERT_OK_AND_ASSIGN(\n       std::unique_ptr<VerifiedHloModule> module,\n       GetDefaultDotModule(/*lhs_parallel_dim=*/64, /*rhs_parallel_dim=*/64,\n                           /*contracting_dim=*/64));\n   TritonDotFusionSearchSpace search_space = MakeSearchSpace(module.get());\n-  EXPECT_THAT(search_space.GenerateConfigs(),\n-              AllOf(SizeIs(1), Each(AllOf(BlockMIs(Eq(16)), BlockNIs(Eq(16)),\n-                                          SplitKIs(Eq(4))))));\n+  EXPECT_THAT(\n+      search_space.GenerateConfigs(),\n+      Contains(AllOf(BlockMIs(Eq(16)), BlockNIs(Eq(8)), SplitKIs(Eq(4)))));\n }\n \n TEST_F(DotSearchSpaceTest, FindsGoodDataReuseTilesForForcedHugeSplit) {\n@@ -348,7 +348,7 @@ TEST_F(DotSearchSpaceTest, HonorsMinimumOutputTileSizeForTinyProblem) {\n \n   EXPECT_THAT(\n       search_space.GenerateConfigs(),\n-      AllOf(Not(IsEmpty()), Each(BlockMIs(Ge(16))), Each(BlockNIs(Ge(16)))));\n+      AllOf(Not(IsEmpty()), Each(BlockMIs(Ge(16))), Each(BlockNIs(Ge(8)))));\n }\n \n TEST_F(DotSearchSpaceTest, AssignsEnoughWarpsPerScheduler) {"
+        },
+        {
+            "sha": "ffc57dd776230c59d727e1cc42c2319fdc1e7a3d",
+            "filename": "third_party/xla/xla/service/gpu/autotuning/gemm_fusion_autotuner_test.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/cc58fb18fdeb64b244971b2284b521fe376e1059/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fgemm_fusion_autotuner_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/cc58fb18fdeb64b244971b2284b521fe376e1059/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fgemm_fusion_autotuner_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Fgemm_fusion_autotuner_test.cc?ref=cc58fb18fdeb64b244971b2284b521fe376e1059",
+            "patch": "@@ -582,7 +582,7 @@ ENTRY e {\n   MatchOptimizedHlo(kHloText, R\"(\n ; CHECK: reduce\n ; CHECK: ENTRY\n-; CHECK: f32[16,7,18]{2,1,0} fusion({{.*}})\n+; CHECK: f32[{{.*}},7,18]{2,1,0} fusion({{.*}})\n ; CHECK: ROOT {{.*}} f16[7,18]{1,0} fusion({{.*}})\n )\");\n "
+        },
+        {
+            "sha": "7cb0896477b4194c0a27b2772bed3a1ba38c59d2",
+            "filename": "third_party/xla/xla/service/gpu/autotuning/triton_configs.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/cc58fb18fdeb64b244971b2284b521fe376e1059/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Ftriton_configs.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/cc58fb18fdeb64b244971b2284b521fe376e1059/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Ftriton_configs.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fautotuning%2Ftriton_configs.h?ref=cc58fb18fdeb64b244971b2284b521fe376e1059",
+            "patch": "@@ -65,7 +65,7 @@ static const std::vector<TritonGemmConfig>* const kHopperAmpereConfigs =\n          Config(128, 16, 32, 8, 4, 2),   Config(128, 16, 64, 16, 3, 2),\n          Config(128, 16, 64, 16, 1, 4),  Config(128, 32, 32, 8, 4, 2),\n          Config(128, 128, 32, 8, 4, 8),  Config(128, 256, 32, 1, 4, 8),\n-         Config(128, 256, 64, 1, 4, 8)});\n+         Config(128, 256, 64, 1, 4, 8),  Config(64, 8, 128, 2, 3, 4, 1)});\n \n static const std::vector<TritonGemmConfig>* const kDefaultCudaConfigs =\n     new std::vector<TritonGemmConfig>("
+        }
+    ],
+    "stats": {
+        "total": 121,
+        "additions": 105,
+        "deletions": 16
+    }
+}

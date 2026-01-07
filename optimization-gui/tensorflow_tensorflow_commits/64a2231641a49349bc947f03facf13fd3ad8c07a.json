@@ -1,0 +1,60 @@
+{
+    "author": "sergey-kozub",
+    "message": "PR #30749: Add lhs/rhs scale scopes to triton fusion analysis (support scaled dot)\n\nImported from GitHub PR https://github.com/openxla/xla/pull/30749\n\n📝 Summary of Changes\nAdd `LHS_SCALE` and `RHS_SCALE` scopes to `TritonFusionAnalysis`.\nThis allows passing a scaled-dot fusion to the fusion analysis, which is needed for the fusion emitters (upcoming).\n\n🚀 Kind of Contribution\n✨ New Feature (part of block scaled dot fusion support)\n\nCopybara import of the project:\n\n--\ncea94363d2c6944b20877ebbf530db20f56d3ff2 by Sergey Kozub <skozub@nvidia.com>:\n\nAdd lhs/rhs scale scopes to triton fusion analysis (support scaled dot)\n\nMerging this change closes #30749\n\nPiperOrigin-RevId: 802040521",
+    "sha": "64a2231641a49349bc947f03facf13fd3ad8c07a",
+    "files": [
+        {
+            "sha": "d3287bb27e4f8f707b5a5428f42992465971c649",
+            "filename": "third_party/xla/xla/service/gpu/transforms/cudnn_fusion_compiler.cc",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/64a2231641a49349bc947f03facf13fd3ad8c07a/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fcudnn_fusion_compiler.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/64a2231641a49349bc947f03facf13fd3ad8c07a/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fcudnn_fusion_compiler.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftransforms%2Fcudnn_fusion_compiler.cc?ref=64a2231641a49349bc947f03facf13fd3ad8c07a",
+            "patch": "@@ -248,6 +248,9 @@ class GemmDimensionAdapter {\n                        lhs_noncontracting_index,\n                        dot_.shape().dimensions_size() - 1};\n         break;\n+      case TritonFusionAnalysis::Scope::LHS_SCALE:\n+      case TritonFusionAnalysis::Scope::RHS_SCALE:\n+        LOG(FATAL) << \"Unsupported scope.\";\n     }\n \n     Result result;"
+        },
+        {
+            "sha": "674c917d19437e05984e26c142d65506a39f29d1",
+            "filename": "third_party/xla/xla/service/gpu/triton_fusion_analysis.cc",
+            "status": "modified",
+            "additions": 25,
+            "deletions": 5,
+            "changes": 30,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/64a2231641a49349bc947f03facf13fd3ad8c07a/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftriton_fusion_analysis.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/64a2231641a49349bc947f03facf13fd3ad8c07a/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftriton_fusion_analysis.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftriton_fusion_analysis.cc?ref=64a2231641a49349bc947f03facf13fd3ad8c07a",
+            "patch": "@@ -194,13 +194,17 @@ absl::StatusOr<TritonFusionAnalysis> TritonFusionAnalysis::Execute(\n   TritonFusionAnalysis analysis;\n   const HloInstruction* dot =\n       hlo_query::GetFirstInstructionWithOpcode(computation, HloOpcode::kDot);\n+  if (dot == nullptr) {\n+    dot = hlo_query::GetFirstInstructionWithOpcode(computation,\n+                                                   HloOpcode::kScaledDot);\n+  }\n   TF_RET_CHECK(dot != nullptr);\n   TF_RETURN_IF_ERROR(analysis.ExecuteForDotFusion(*dot, split_k));\n   return analysis;\n }\n \n absl::StatusOr<TritonFusionAnalysis> TritonFusionAnalysis::Execute(\n-    const HloDotInstruction& dot, int split_k) {\n+    const HloInstruction& dot, int split_k) {\n   TritonFusionAnalysis analysis;\n   TF_RETURN_IF_ERROR(analysis.ExecuteForDotFusion(dot, split_k));\n   return analysis;\n@@ -233,9 +237,19 @@ bool TritonFusionAnalysis::IsBatchDimMinorForInt4Parameter(\n \n absl::Status TritonFusionAnalysis::ExecuteForDotFusion(\n     const HloInstruction& dot, const int split_k) {\n+  is_scaled_dot_ = dot.opcode() == HloOpcode::kScaledDot;\n+\n   DotRequirements lhs_requirements(kNoSplitRequirement);\n-  for (const Scope scope : {Scope::LHS, Scope::RHS}) {\n-    const int operand_number = static_cast<int>(scope);\n+  for (const Scope scope :\n+       {Scope::LHS, Scope::RHS, Scope::LHS_SCALE, Scope::RHS_SCALE}) {\n+    int operand_number = static_cast<int>(scope);\n+    if (operand_number >= dot.operand_count()) {\n+      continue;  // Scale operands are optional.\n+    }\n+    if (is_scaled_dot_ && (operand_number == 1 || operand_number == 2)) {\n+      // Operands for scaled dot: (lhs, lhs_scale, rhs, rhs_scale)\n+      operand_number = 3 - operand_number;\n+    }\n     TF_ASSIGN_OR_RETURN(auto context, FusionContext::FromDotOperand(\n                                           dot, operand_number, split_k));\n     TF_RETURN_IF_ERROR(context.PropagateDimensionOrdersToParameters(\n@@ -297,8 +311,10 @@ absl::Status TritonFusionAnalysis::ExecuteForDotFusion(\n \n std::optional<TritonFusionAnalysis::Scope>\n TritonFusionAnalysis::QueryInstructionScope(const HloInstruction& hlo) const {\n-  for (const Scope& scope : {Scope::LHS, Scope::RHS, Scope::OUTPUT}) {\n-    if (iter_specs_.at(scope).count(&hlo) > 0) {\n+  for (const Scope& scope : {Scope::LHS, Scope::RHS, Scope::OUTPUT,\n+                             Scope::LHS_SCALE, Scope::RHS_SCALE}) {\n+    auto it = iter_specs_.find(scope);\n+    if (it != iter_specs_.end() && it->second.count(&hlo) > 0) {\n       return scope;\n     }\n   }\n@@ -336,6 +352,10 @@ std::string ScopeToString(TritonFusionAnalysis::Scope s) {\n       return \"LHS\";\n     case TritonFusionAnalysis::Scope::RHS:\n       return \"RHS\";\n+    case TritonFusionAnalysis::Scope::LHS_SCALE:\n+      return \"LHS_SCALE\";\n+    case TritonFusionAnalysis::Scope::RHS_SCALE:\n+      return \"RHS_SCALE\";\n     case TritonFusionAnalysis::Scope::OUTPUT:\n       return \"OUTPUT\";\n   }"
+        },
+        {
+            "sha": "5ec02dbd325a1e3666a762a54563237384bc32fe",
+            "filename": "third_party/xla/xla/service/gpu/triton_fusion_analysis.h",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 4,
+            "changes": 19,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/64a2231641a49349bc947f03facf13fd3ad8c07a/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftriton_fusion_analysis.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/64a2231641a49349bc947f03facf13fd3ad8c07a/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftriton_fusion_analysis.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftriton_fusion_analysis.h?ref=64a2231641a49349bc947f03facf13fd3ad8c07a",
+            "patch": "@@ -46,13 +46,20 @@ class TritonFusionAnalysis {\n \n   // Execute the analysis of a dot instruction until it reaches the computation\n   // boundaries.\n-  static absl::StatusOr<TritonFusionAnalysis> Execute(\n-      const HloDotInstruction& dot, int split_k = 1);\n+  static absl::StatusOr<TritonFusionAnalysis> Execute(const HloInstruction& dot,\n+                                                      int split_k = 1);\n \n   // A scope is an HLO graph that can be tiled efficiently using same or\n   // compatible tile shapes on all operations. GEMM dot fusion has 3 scopes\n-  // defined by left operand, right operand and output.\n-  enum class Scope { LHS = 0, RHS = 1, OUTPUT = 2 };\n+  // defined by left operand, right operand and output. GEMM scaled dot fusion\n+  // has 5 scopes (also includes scale operands).\n+  enum class Scope {\n+    LHS = 0,\n+    RHS = 1,\n+    LHS_SCALE = 2,\n+    RHS_SCALE = 3,\n+    OUTPUT = 4,\n+  };\n \n   using IterationSpecByInstructionMap =\n       ConstHloInstructionMap<TensorIterationSpec>;\n@@ -90,10 +97,14 @@ class TritonFusionAnalysis {\n   bool IsBatchDimMinorForInt4Parameter(const HloInstruction& dot,\n                                        Scope scope) const;\n \n+  bool is_scaled_dot() const { return is_scaled_dot_; }\n+\n  private:\n   IterationSpecByInstructionByScopeMap iter_specs_;\n   // HLO computation parameters per scope.\n   std::map<Scope, ConstHloInstructionSet> parameters_;\n+  // Scaled dot has additional scale scopes.\n+  bool is_scaled_dot_ = false;\n };\n \n // The details of the Triton fusion / tiling propagation are in a separate"
+        },
+        {
+            "sha": "403bbcd36eb6e439e141af2f30e33ecd2987b192",
+            "filename": "third_party/xla/xla/service/gpu/triton_fusion_analysis_test.cc",
+            "status": "modified",
+            "additions": 32,
+            "deletions": 0,
+            "changes": 32,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/64a2231641a49349bc947f03facf13fd3ad8c07a/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftriton_fusion_analysis_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/64a2231641a49349bc947f03facf13fd3ad8c07a/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftriton_fusion_analysis_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Ftriton_fusion_analysis_test.cc?ref=64a2231641a49349bc947f03facf13fd3ad8c07a",
+            "patch": "@@ -919,6 +919,38 @@ triton_gemm_dot {\n                             /*broadcast_multiplier=*/1)));\n }\n \n+TEST_F(TritonDotAnalysisTest, ScaledDotIsSupported) {\n+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,\n+                          ParseAndReturnVerifiedModule(R\"(\n+HloModule test\n+\n+scaled_dot {\n+  %lhs = f32[4,128,1024] parameter(0)\n+  %lhs_scale = f32[4,128,32] parameter(1)\n+  %rhs = f32[4,1024,256] parameter(2)\n+  %rhs_scale = f32[4,32,256] parameter(3)\n+  ROOT %dot = f32[4,128,256] scaled-dot(%lhs, %lhs_scale, %rhs, %rhs_scale),\n+      lhs_batch_dims={0}, lhs_contracting_dims={2},\n+      rhs_batch_dims={0}, rhs_contracting_dims={1}\n+})\"));\n+  const HloComputation* dot_computation = *module->computations().begin();\n+  TF_ASSERT_OK_AND_ASSIGN(const auto analysis,\n+                          TritonFusionAnalysis::Execute(*dot_computation));\n+  const HloInstruction* lhs = dot_computation->parameter_instruction(0);\n+  const HloInstruction* lhs_scale = dot_computation->parameter_instruction(1);\n+  const HloInstruction* rhs = dot_computation->parameter_instruction(2);\n+  const HloInstruction* rhs_scale = dot_computation->parameter_instruction(3);\n+\n+  using Scope = TritonFusionAnalysis::Scope;\n+  EXPECT_EQ(*analysis.ScopeParameters(Scope::LHS).begin(), lhs);\n+  EXPECT_EQ(*analysis.ScopeParameters(Scope::LHS_SCALE).begin(), lhs_scale);\n+  EXPECT_EQ(*analysis.ScopeParameters(Scope::RHS).begin(), rhs);\n+  EXPECT_EQ(*analysis.ScopeParameters(Scope::RHS_SCALE).begin(), rhs_scale);\n+  for (const auto& hlo : dot_computation->instructions()) {\n+    EXPECT_TRUE(analysis.QueryInstructionScope(*hlo).has_value());\n+  }\n+}\n+\n }  // namespace\n }  // namespace gpu\n }  // namespace xla"
+        }
+    ],
+    "stats": {
+        "total": 84,
+        "additions": 75,
+        "deletions": 9
+    }
+}

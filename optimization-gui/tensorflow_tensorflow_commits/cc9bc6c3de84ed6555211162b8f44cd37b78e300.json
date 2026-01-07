@@ -1,0 +1,60 @@
+{
+    "author": "ezhulenev",
+    "message": "[xla:cpu] Migrate tfcompile to convolution_lib\n\nPiperOrigin-RevId: 833576176",
+    "sha": "cc9bc6c3de84ed6555211162b8f44cd37b78e300",
+    "files": [
+        {
+            "sha": "79c0e8e35b164835e0aae9c60983967fa1131358",
+            "filename": "tensorflow/compiler/aot/codegen.cc",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 6,
+            "changes": 9,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/cc9bc6c3de84ed6555211162b8f44cd37b78e300/tensorflow%2Fcompiler%2Faot%2Fcodegen.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/cc9bc6c3de84ed6555211162b8f44cd37b78e300/tensorflow%2Fcompiler%2Faot%2Fcodegen.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcompiler%2Faot%2Fcodegen.cc?ref=cc9bc6c3de84ed6555211162b8f44cd37b78e300",
+            "patch": "@@ -690,13 +690,10 @@ absl::Status ExtendRewrites(\n \n   if (HasThunkKind(aot_thunks->proto().thunk_sequence(),\n                    xla::cpu::ThunkProto::kConvolutionThunk)) {\n-    if (xla_cpu_multi_thread_eigen) {\n-      runtime_specific_includes.push_back(\n-          R\"(#include \"xla/service/cpu/runtime_conv2d.h\")\");\n-    }\n-\n     runtime_specific_includes.push_back(\n-        R\"(#include \"xla/service/cpu/runtime_single_threaded_conv2d.h\")\");\n+        R\"(#include \"absl/synchronization/notification.h\")\");\n+    runtime_specific_includes.push_back(\n+        R\"(#include \"xla/backends/cpu/runtime/convolution_lib.h\")\");\n   }\n \n   if (HasThunkKind(aot_thunks->proto().thunk_sequence(),"
+        },
+        {
+            "sha": "39e019d400584742a7507defc1d28ab877dcd246",
+            "filename": "tensorflow/compiler/aot/tfcompile.bzl",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/cc9bc6c3de84ed6555211162b8f44cd37b78e300/tensorflow%2Fcompiler%2Faot%2Ftfcompile.bzl",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/cc9bc6c3de84ed6555211162b8f44cd37b78e300/tensorflow%2Fcompiler%2Faot%2Ftfcompile.bzl",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcompiler%2Faot%2Ftfcompile.bzl?ref=cc9bc6c3de84ed6555211162b8f44cd37b78e300",
+            "patch": "@@ -322,6 +322,7 @@ def _tf_library(\n             # include_standard_runtime_deps is False.  Without them, the\n             # generated code will fail to compile.\n             \"//third_party/absl/log:check\",\n+            \"//third_party/absl/synchronization\",\n             \"//tensorflow/compiler/tf2xla:xla_compiled_cpu_function\",\n             \"@local_xla//xla:types\",\n             \"@local_xla//xla/backends/cpu/runtime:kernel_c_api\",\n@@ -338,6 +339,7 @@ def _tf_library(\n             # needed.\n             \"@local_xla//xla/backends/cpu/runtime:sort_lib\",\n             \"@local_xla//xla/backends/cpu/runtime:topk_lib\",\n+            \"@local_xla//xla/backends/cpu/runtime:convolution_lib\",\n             \"@local_xla//xla/service/cpu:runtime_conv2d\",\n             \"@local_xla//xla/service/cpu:runtime_matmul\",\n             \"@local_xla//xla/service/cpu:runtime_single_threaded_conv2d\","
+        },
+        {
+            "sha": "ec65dccc84c10c0c4b253a5f78ff7cde93e0cf0f",
+            "filename": "tensorflow/compiler/aot/thunk_proto_execution_deserializer.cc",
+            "status": "modified",
+            "additions": 20,
+            "deletions": 63,
+            "changes": 83,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/cc9bc6c3de84ed6555211162b8f44cd37b78e300/tensorflow%2Fcompiler%2Faot%2Fthunk_proto_execution_deserializer.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/cc9bc6c3de84ed6555211162b8f44cd37b78e300/tensorflow%2Fcompiler%2Faot%2Fthunk_proto_execution_deserializer.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcompiler%2Faot%2Fthunk_proto_execution_deserializer.cc?ref=cc9bc6c3de84ed6555211162b8f44cd37b78e300",
+            "patch": "@@ -303,16 +303,12 @@ absl::StatusOr<std::string> ThunkProtoExecutionDeserializer::GetDotThunkRunImpl(\n \n absl::StatusOr<std::string>\n ThunkProtoExecutionDeserializer::GetConvolutionFunction(\n-    xla::PrimitiveType xla_type, bool is_single_threaded) {\n+    xla::PrimitiveType xla_type) {\n   switch (xla_type) {\n     case xla::F16:\n-      return is_single_threaded\n-                 ? \"__xla_cpu_runtime_EigenSingleThreadedConv2DF16\"\n-                 : \"__xla_cpu_runtime_EigenConv2DF16\";\n+      return \"xla::cpu::internal::EigenConv2D<Eigen::half>\";\n     case xla::F32:\n-      return is_single_threaded\n-                 ? \"__xla_cpu_runtime_EigenSingleThreadedConv2DF32\"\n-                 : \"__xla_cpu_runtime_EigenConv2DF32\";\n+      return \"xla::cpu::internal::EigenConv2D<float>\";\n     default:\n       return xla::Internal(\"Unsupported xla type: %d\", xla_type);\n   }\n@@ -345,63 +341,28 @@ ThunkProtoExecutionDeserializer::GetConvolution2DRunImpl(\n   TF_ASSIGN_OR_RETURN(\n       std::string convolution_function,\n       GetConvolutionFunction(\n-          convolution_thunk.input_buffer_shape().shape().element_type(),\n-          /*is_single_threaded=*/false));\n-\n-  TF_ASSIGN_OR_RETURN(\n-      std::string single_threaded_convolution_function,\n-      GetConvolutionFunction(\n-          convolution_thunk.input_buffer_shape().shape().element_type(),\n-          /*is_single_threaded=*/true));\n+          convolution_thunk.input_buffer_shape().shape().element_type()));\n \n-  absl::string_view convolution_thunk_invocation_format =\n-      xla_cpu_multi_thread_eigen_ ? R\"(\n+  absl::string_view convolution_thunk_invocation_format = R\"(\n      // Convolution Thunk\n      {\n-         if (run_options->intra_op_thread_pool() != nullptr) {\n-           {{CONVOLUTION_FUNCTION}}(\n-             run_options,\n-             {{OUTPUT_PTR}}, {{LHS_PTR}}, {{RHS_PTR}}, {{INPUT_BATCH}},\n-             {{INPUT_ROWS}}, {{INPUT_COLS}}, {{INPUT_CHANNELS}}, {{KERNEL_ROWS}},\n-             {{KERNEL_COLS}}, {{KERNEL_CHANNELS}}, {{KERNEL_FILTERS}},\n-             {{OUTPUT_ROWS}}, {{OUTPUT_COLS}}, {{ROW_STRIDE}}, {{COL_STRIDE}},\n-             {{PADDING_TOP}}, {{PADDING_BOTTOM}}, {{PADDING_LEFT}},\n-             {{PADDING_RIGHT}}, {{LHS_ROW_DILATION}}, {{LHS_COL_DILATION}},\n-             {{RHS_ROW_DILATION}}, {{RHS_COL_DILATION}}, {{FEATURE_GROUP_COUNT}}\n-           );\n-         } else {\n-           {{SINGLE_THREADED_CONVOLUTION_FUNCTION}}(\n-             nullptr,\n-             {{OUTPUT_PTR}}, {{LHS_PTR}}, {{RHS_PTR}}, {{INPUT_BATCH}},\n-             {{INPUT_ROWS}}, {{INPUT_COLS}}, {{INPUT_CHANNELS}}, {{KERNEL_ROWS}},\n-             {{KERNEL_COLS}}, {{KERNEL_CHANNELS}}, {{KERNEL_FILTERS}},\n-             {{OUTPUT_ROWS}}, {{OUTPUT_COLS}}, {{ROW_STRIDE}}, {{COL_STRIDE}},\n-             {{PADDING_TOP}}, {{PADDING_BOTTOM}}, {{PADDING_LEFT}},\n-             {{PADDING_RIGHT}}, {{LHS_ROW_DILATION}}, {{LHS_COL_DILATION}},\n-             {{RHS_ROW_DILATION}}, {{RHS_COL_DILATION}}, {{FEATURE_GROUP_COUNT}}\n-           );\n-         }\n-     })\"\n-                                  :\n-                                  R\"(\n-      // Convolution Thunk\n-      {\n-        {{SINGLE_THREADED_CONVOLUTION_FUNCTION}}(\n-              nullptr,\n-              {{OUTPUT_PTR}}, {{LHS_PTR}}, {{RHS_PTR}}, {{INPUT_BATCH}},\n-              {{INPUT_ROWS}}, {{INPUT_COLS}}, {{INPUT_CHANNELS}}, {{KERNEL_ROWS}},\n-              {{KERNEL_COLS}}, {{KERNEL_CHANNELS}}, {{KERNEL_FILTERS}},\n-              {{OUTPUT_ROWS}}, {{OUTPUT_COLS}}, {{ROW_STRIDE}}, {{COL_STRIDE}},\n-              {{PADDING_TOP}}, {{PADDING_BOTTOM}}, {{PADDING_LEFT}},\n-              {{PADDING_RIGHT}}, {{LHS_ROW_DILATION}}, {{LHS_COL_DILATION}},\n-              {{RHS_ROW_DILATION}}, {{RHS_COL_DILATION}}, {{FEATURE_GROUP_COUNT}}\n-            );\n-      }\n-      )\";\n+        absl::Notification done;\n+        {{CONVOLUTION_FUNCTION}}(\n+          run_options->intra_op_thread_pool(),\n+          {{OUTPUT_PTR}}, {{LHS_PTR}}, {{RHS_PTR}}, {{INPUT_BATCH}},\n+          {{INPUT_ROWS}}, {{INPUT_COLS}}, {{INPUT_CHANNELS}}, {{KERNEL_ROWS}},\n+          {{KERNEL_COLS}}, {{KERNEL_CHANNELS}}, {{KERNEL_FILTERS}},\n+          {{OUTPUT_ROWS}}, {{OUTPUT_COLS}}, {{ROW_STRIDE}}, {{COL_STRIDE}},\n+          {{PADDING_TOP}}, {{PADDING_BOTTOM}}, {{PADDING_LEFT}},\n+          {{PADDING_RIGHT}}, {{LHS_ROW_DILATION}}, {{LHS_COL_DILATION}},\n+          {{RHS_ROW_DILATION}}, {{RHS_COL_DILATION}}, {{FEATURE_GROUP_COUNT}},\n+          [&done] { done.Notify(); }\n+        );\n+        done.WaitForNotification();\n+     })\";\n \n   std::vector<std::pair<std::string, std::string>> rewrites = {\n-      {\"{{SINGLE_THREADED_CONVOLUTION_FUNCTION}}\",\n-       single_threaded_convolution_function},\n+      {\"{{CONVOLUTION_FUNCTION}}\", convolution_function},\n       {\"{{OUTPUT_PTR}}\", output_ptr},\n       {\"{{LHS_PTR}}\", lhs_ptr},\n       {\"{{RHS_PTR}}\", rhs_ptr},\n@@ -428,10 +389,6 @@ ThunkProtoExecutionDeserializer::GetConvolution2DRunImpl(\n       {\"{{FEATURE_GROUP_COUNT}}\",\n        absl::StrCat(canonical_dims.feature_group_count)}};\n \n-  if (xla_cpu_multi_thread_eigen_) {\n-    rewrites.push_back({\"{{CONVOLUTION_FUNCTION}}\", convolution_function});\n-  }\n-\n   return absl::StrReplaceAll(convolution_thunk_invocation_format, rewrites);\n }\n "
+        },
+        {
+            "sha": "2300aa3260d04e8dedee9fc9818768a400467d14",
+            "filename": "tensorflow/compiler/aot/thunk_proto_execution_deserializer.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/cc9bc6c3de84ed6555211162b8f44cd37b78e300/tensorflow%2Fcompiler%2Faot%2Fthunk_proto_execution_deserializer.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/cc9bc6c3de84ed6555211162b8f44cd37b78e300/tensorflow%2Fcompiler%2Faot%2Fthunk_proto_execution_deserializer.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcompiler%2Faot%2Fthunk_proto_execution_deserializer.h?ref=cc9bc6c3de84ed6555211162b8f44cd37b78e300",
+            "patch": "@@ -51,7 +51,7 @@ class ThunkProtoExecutionDeserializer {\n       const xla::cpu::ThunkProto& thunk);\n \n   absl::StatusOr<std::string> GetConvolutionFunction(\n-      xla::PrimitiveType xla_type, bool is_single_threaded);\n+      xla::PrimitiveType xla_type);\n \n   absl::StatusOr<std::string> GetConvolution2DRunImpl(\n       const xla::cpu::ConvolutionThunkProto& convolution_thunk,"
+        }
+    ],
+    "stats": {
+        "total": 96,
+        "additions": 26,
+        "deletions": 70
+    }
+}

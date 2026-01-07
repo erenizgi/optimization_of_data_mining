@@ -1,0 +1,132 @@
+{
+    "author": "pschuh",
+    "message": "Implement PjRtStreamExecutorClient::CreateRawBufferChannel and add common\ntesting for CreateRawBufferChannel.\n\nPiperOrigin-RevId: 827593557",
+    "sha": "af43ba815e6f6e7913037c1bb192d7d791a78e90",
+    "files": [
+        {
+            "sha": "49aa7a09e7eb6b45135fa464bb282ae375ec1a36",
+            "filename": "third_party/xla/xla/pjrt/BUILD",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/af43ba815e6f6e7913037c1bb192d7d791a78e90/third_party%2Fxla%2Fxla%2Fpjrt%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/af43ba815e6f6e7913037c1bb192d7d791a78e90/third_party%2Fxla%2Fxla%2Fpjrt%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2FBUILD?ref=af43ba815e6f6e7913037c1bb192d7d791a78e90",
+            "patch": "@@ -350,6 +350,7 @@ cc_library(\n     deps = [\n         \":pjrt_client\",\n         \":pjrt_compiler\",\n+        \"//xla:literal\",\n         \"//xla:shape_util\",\n         \"//xla:xla_data_proto_cc\",\n         \"//xla/backends/cpu:alignment\",\n@@ -358,6 +359,7 @@ cc_library(\n         \"//xla/hlo/parser:hlo_parser\",\n         \"//xla/hlo/testlib:test\",\n         \"//xla/tests:literal_test_util\",\n+        \"//xla/tsl/lib/core:status_test_util\",\n         \"@com_google_absl//absl/status:statusor\",\n         \"@com_google_absl//absl/synchronization\",\n         \"@com_google_absl//absl/types:span\","
+        },
+        {
+            "sha": "836be459549935be77fab0ba89b9d6f16127144c",
+            "filename": "third_party/xla/xla/pjrt/common_pjrt_client.cc",
+            "status": "modified",
+            "additions": 60,
+            "deletions": 4,
+            "changes": 64,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/af43ba815e6f6e7913037c1bb192d7d791a78e90/third_party%2Fxla%2Fxla%2Fpjrt%2Fcommon_pjrt_client.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/af43ba815e6f6e7913037c1bb192d7d791a78e90/third_party%2Fxla%2Fxla%2Fpjrt%2Fcommon_pjrt_client.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fcommon_pjrt_client.cc?ref=af43ba815e6f6e7913037c1bb192d7d791a78e90",
+            "patch": "@@ -198,11 +198,67 @@ absl::StatusOr<\n CommonPjRtClient::CreateAliasBuffer(const Shape& shape,\n                                     PjRtMemorySpace* memory_space) {\n   tsl::RCReference<CommonPjRtRawBuffer> raw_buffer;\n-  tsl::RCReference<PjRtDeviceEvent> definition_event;\n-  PjRtFulfillAliasBufferCallback fulfill_cb;\n+  PjRtFulfillAliasRawBufferCallback buffer_promise;\n+\n+  TF_ASSIGN_OR_RETURN(std::tie(raw_buffer, buffer_promise),\n+                      CreateRawBufferChannel(memory_space));\n+\n+  tsl::RCReference<xla::PjRtDeviceEventPromise> definition_event_promise;\n+  tsl::RCReference<xla::PjRtDeviceEvent> definition_event;\n+  TF_ASSIGN_OR_RETURN(\n+      std::tie(definition_event_promise, definition_event),\n+      CreateLinkedEventPromise(memory_space, \"CreateRawBufferChannel\"));\n+\n+  PjRtFulfillAliasBufferCallback fulfill_cb =\n+      [buffer_promise = std::move(buffer_promise),\n+       definition_event_promise = std::move(definition_event_promise),\n+       memory_space,\n+       shape](absl::StatusOr<xla::PjRtBuffer*> buffer_or) mutable {\n+        if (!buffer_or.ok()) {\n+          definition_event_promise->SetError(buffer_or.status());\n+          std::move(buffer_promise)(buffer_or.status()).IgnoreError();\n+          return buffer_or.status();\n+        }\n+        xla::PjRtBuffer* buffer = buffer_or.value();\n+        if (buffer->on_device_shape() != shape) {\n+          auto status = absl::InvalidArgumentError(absl::StrFormat(\n+              \"Shape mismatch in CreateRawBufferChannel fulfill: expected %s, \"\n+              \"got %s\",\n+              shape.ToString(), buffer->on_device_shape().ToString()));\n+          definition_event_promise->SetError(status);\n+          std::move(buffer_promise)(status).IgnoreError();\n+          return status;\n+        }\n+        xla::CommonPjRtBuffer* common_buffer =\n+            dynamic_cast<xla::CommonPjRtBuffer*>(buffer);\n+        if (common_buffer == nullptr) {\n+          auto status =\n+              absl::InternalError(\"Failed to cast to CommonPjRtBuffer\");\n+          definition_event_promise->SetError(status);\n+          std::move(buffer_promise)(status).IgnoreError();\n+          return status;\n+        }\n+        xla::CommonPjRtBuffer::ScopedHold hold =\n+            common_buffer->GetBufferWithHold(\n+                xla::CommonPjRtBuffer::ScopedHold::kDonation);\n+        auto device_event_or = hold.buffer()->GetDefinitionEvent(memory_space);\n+        if (!device_event_or.ok()) {\n+          auto status = device_event_or.status();\n+          definition_event_promise->SetError(status);\n+          std::move(buffer_promise)(status).IgnoreError();\n+          return status;\n+        }\n+        auto status = std::move(buffer_promise)(\n+            hold.buffer()->GetRawBuffer(memory_space));\n+        if (!status.ok()) {\n+          definition_event_promise->SetError(status);\n+          return status;\n+        }\n \n-  TF_ASSIGN_OR_RETURN(std::tie(raw_buffer, definition_event, fulfill_cb),\n-                      CreateRawBufferChannel(shape, memory_space));\n+        definition_event_promise->Set(std::move(*device_event_or));\n+        hold.ConfirmDonation();\n+        return absl::OkStatus();\n+      };\n \n   TF_ASSIGN_OR_RETURN(\n       auto result_buffer,"
+        },
+        {
+            "sha": "610679e0176a1ac9210f1e14b2a37255930343f4",
+            "filename": "third_party/xla/xla/pjrt/common_pjrt_client.h",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 9,
+            "changes": 15,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/af43ba815e6f6e7913037c1bb192d7d791a78e90/third_party%2Fxla%2Fxla%2Fpjrt%2Fcommon_pjrt_client.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/af43ba815e6f6e7913037c1bb192d7d791a78e90/third_party%2Fxla%2Fxla%2Fpjrt%2Fcommon_pjrt_client.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fcommon_pjrt_client.h?ref=af43ba815e6f6e7913037c1bb192d7d791a78e90",
+            "patch": "@@ -186,15 +186,12 @@ class CommonPjRtClient : public PjRtClient {\n   // Creates a raw buffer channel. Returns a tuple containing:\n   // 1.  A tsl::RCReference<CommonPjRtRawBuffer> which is an alias for a future\n   //     raw buffer.\n-  // 2.  A tsl::RCReference<PjRtDeviceEvent> which is the definition event\n-  //     for the alias raw buffer.\n-  // 3.  A PjRtFulfillAliasBufferCallback to fulfill the alias.\n-  // TODO(b/447164755 jparkerh): Rework this API to share a bit more code\n-  // between children of this class.\n-  virtual absl::StatusOr<std::tuple<tsl::RCReference<CommonPjRtRawBuffer>,\n-                                    tsl::RCReference<PjRtDeviceEvent>,\n-                                    PjRtFulfillAliasBufferCallback>>\n-  CreateRawBufferChannel(const Shape& shape, PjRtMemorySpace* memory_space) {\n+  // 3.  A PjRtFulfillAliasRawBufferCallback to fulfill the alias.\n+  using PjRtFulfillAliasRawBufferCallback = absl::AnyInvocable<absl::Status(\n+      absl::StatusOr<tsl::RCReference<CommonPjRtRawBuffer>>) &&>;\n+  virtual absl::StatusOr<std::pair<tsl::RCReference<CommonPjRtRawBuffer>,\n+                                   PjRtFulfillAliasRawBufferCallback>>\n+  CreateRawBufferChannel(PjRtMemorySpace* memory_space) {\n     return absl::UnimplementedError(\"CreateRawBufferChannel is not supported\");\n   }\n "
+        },
+        {
+            "sha": "38eadd91bf2d8a919ea646d1978e644f7009d6f0",
+            "filename": "third_party/xla/xla/pjrt/cpu/cpu_client.cc",
+            "status": "modified",
+            "additions": 26,
+            "deletions": 60,
+            "changes": 86,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/af43ba815e6f6e7913037c1bb192d7d791a78e90/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fcpu_client.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/af43ba815e6f6e7913037c1bb192d7d791a78e90/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fcpu_client.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fcpu_client.cc?ref=af43ba815e6f6e7913037c1bb192d7d791a78e90",
+            "patch": "@@ -1012,71 +1012,37 @@ PjRtCpuClient::AllocateRawBuffer(PjRtMemorySpace* memory_space,\n                                      *allocator_);\n }\n \n-absl::StatusOr<std::tuple<tsl::RCReference<CommonPjRtRawBuffer>,\n-                          tsl::RCReference<PjRtDeviceEvent>,\n-                          PjRtFulfillAliasBufferCallback>>\n-PjRtCpuClient::CreateRawBufferChannel(const Shape& shape,\n-                                      PjRtMemorySpace* memory_space) {\n+absl::StatusOr<std::pair<tsl::RCReference<CommonPjRtRawBuffer>,\n+                         CommonPjRtClient::PjRtFulfillAliasRawBufferCallback>>\n+PjRtCpuClient::CreateRawBufferChannel(PjRtMemorySpace* memory_space) {\n   auto buffer_promise = tsl::MakeIndirectAsyncValue();\n   auto raw_buffer = tsl::MakeRef<CpuRawBuffer>(\n       memory_space, tsl::AsyncValueRef<CpuDeviceMemory>(buffer_promise));\n \n-  tsl::RCReference<xla::PjRtDeviceEventPromise> definition_event_promise;\n-  tsl::RCReference<xla::PjRtDeviceEvent> definition_event;\n-  TF_ASSIGN_OR_RETURN(\n-      std::tie(definition_event_promise, definition_event),\n-      CreateLinkedEventPromise(memory_space, \"CreateRawBufferChannel\"));\n-\n-  PjRtFulfillAliasBufferCallback fulfill_alias_buffer_cb =\n-      [buffer_promise = std::move(buffer_promise),\n-       definition_event_promise = std::move(definition_event_promise),\n-       memory_space,\n-       shape](absl::StatusOr<xla::PjRtBuffer*> buffer_or) mutable {\n-        tsl::RCReference<xla::PjRtDeviceEvent> device_event;\n-        if (!buffer_or.ok()) {\n-          definition_event_promise->SetError(buffer_or.status());\n-          buffer_promise->SetError(buffer_or.status());\n-          return buffer_or.status();\n-        }\n-        xla::PjRtBuffer* buffer = buffer_or.value();\n-        if (buffer->on_device_shape() != shape) {\n-          auto status = absl::InvalidArgumentError(absl::StrFormat(\n-              \"Shape mismatch in CreateRawBufferChannel fulfill: expected %s, \"\n-              \"got \"\n-              \"%s\",\n-              shape.ToString(), buffer->on_device_shape().ToString()));\n-          definition_event_promise->SetError(status);\n-          buffer_promise->SetError(status);\n-          return status;\n-        }\n-        xla::CommonPjRtBuffer* common_buffer =\n-            dynamic_cast<xla::CommonPjRtBuffer*>(buffer);\n-        if (common_buffer == nullptr) {\n-          auto status =\n-              absl::InternalError(\"Failed to cast to CommonPjRtBuffer\");\n-          definition_event_promise->SetError(status);\n-          buffer_promise->SetError(status);\n-          return status;\n-        }\n-        xla::CommonPjRtBuffer::ScopedHold hold =\n-            common_buffer->GetBufferWithHold(\n-                xla::CommonPjRtBuffer::ScopedHold::kDonation);\n-        TF_ASSIGN_OR_RETURN(device_event,\n-                            hold.buffer()->GetDefinitionEvent(memory_space));\n-\n-        auto* tracked_cpu_buffer =\n-            tensorflow::down_cast<TrackedCpuDeviceBuffer*>(hold.buffer());\n-        tsl::AsyncValueRef<CpuDeviceMemory> real_cpu_buffer =\n-            tracked_cpu_buffer->buffer();\n-\n-        buffer_promise->ForwardTo(real_cpu_buffer.CopyRCRef());\n-        definition_event_promise->Set(device_event);\n-        hold.ConfirmDonation();\n-        return absl::OkStatus();\n-      };\n+  auto buffer_promise_cb =\n+      [buffer_promise = std::move(buffer_promise), memory_space](\n+          absl::StatusOr<tsl::RCReference<CommonPjRtRawBuffer>> raw_buffer)\n+      -> absl::Status {\n+    if (!raw_buffer.ok()) {\n+      buffer_promise->SetError(raw_buffer.status());\n+      return raw_buffer.status();\n+    }\n+    if (memory_space != (*raw_buffer)->memory_space()) {\n+      auto status = absl::InvalidArgumentError(absl::StrFormat(\n+          \"Memory space mismatch when forarding raw buffers: %s vs %s\",\n+          memory_space->DebugString(),\n+          (*raw_buffer)->memory_space()->DebugString()));\n+      buffer_promise->SetError(status);\n+      return status;\n+    }\n+    buffer_promise->ForwardTo(\n+        tensorflow::down_cast<xla::CpuRawBuffer*>(raw_buffer->get())\n+            ->buffer()\n+            .CopyRCRef());\n+    return absl::OkStatus();\n+  };\n \n-  return std::make_tuple(std::move(raw_buffer), std::move(definition_event),\n-                         std::move(fulfill_alias_buffer_cb));\n+  return std::make_pair(std::move(raw_buffer), std::move(buffer_promise_cb));\n }\n \n absl::StatusOr<int64_t> PjRtCpuClient::GetOnDeviceBytesCount("
+        },
+        {
+            "sha": "cfa22b6bc48681da79aa8da08ce93d567a10b586",
+            "filename": "third_party/xla/xla/pjrt/cpu/cpu_client.h",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 5,
+            "changes": 8,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/af43ba815e6f6e7913037c1bb192d7d791a78e90/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fcpu_client.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/af43ba815e6f6e7913037c1bb192d7d791a78e90/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fcpu_client.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fcpu%2Fcpu_client.h?ref=af43ba815e6f6e7913037c1bb192d7d791a78e90",
+            "patch": "@@ -200,11 +200,9 @@ class PjRtCpuClient final : public CommonPjRtClient {\n     return &topology_;\n   }\n \n-  absl::StatusOr<std::tuple<tsl::RCReference<CommonPjRtRawBuffer>,\n-                            tsl::RCReference<PjRtDeviceEvent>,\n-                            PjRtFulfillAliasBufferCallback>>\n-  CreateRawBufferChannel(const Shape& shape,\n-                         PjRtMemorySpace* memory_space) override;\n+  absl::StatusOr<std::pair<tsl::RCReference<CommonPjRtRawBuffer>,\n+                           PjRtFulfillAliasRawBufferCallback>>\n+  CreateRawBufferChannel(PjRtMemorySpace* memory_space) override;\n \n   absl::StatusOr<tsl::RCReference<CommonPjRtRawBuffer>> AllocateRawBuffer(\n       PjRtMemorySpace* memory_space, size_t on_device_bytes_count,"
+        },
+        {
+            "sha": "31129aecddcc6c2e3cffdcac2d4edfbce0940f26",
+            "filename": "third_party/xla/xla/pjrt/pjrt_client_test.cc",
+            "status": "modified",
+            "additions": 35,
+            "deletions": 0,
+            "changes": 35,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/af43ba815e6f6e7913037c1bb192d7d791a78e90/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_client_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/af43ba815e6f6e7913037c1bb192d7d791a78e90/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_client_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_client_test.cc?ref=af43ba815e6f6e7913037c1bb192d7d791a78e90",
+            "patch": "@@ -31,11 +31,13 @@ limitations under the License.\n #include \"xla/hlo/builder/xla_computation.h\"\n #include \"xla/hlo/parser/hlo_parser.h\"\n #include \"xla/hlo/testlib/test.h\"\n+#include \"xla/literal.h\"\n #include \"xla/pjrt/pjrt_client.h\"\n #include \"xla/pjrt/pjrt_compiler.h\"\n #include \"xla/shape.h\"\n #include \"xla/shape_util.h\"\n #include \"xla/tests/literal_test_util.h\"\n+#include \"xla/tsl/lib/core/status_test_util.h\"\n #include \"xla/xla_data.pb.h\"\n #include \"tsl/platform/statusor.h\"\n \n@@ -531,6 +533,39 @@ TEST(PjRtClientTest, CreateViewOfUnalignedBufferReturnsErrorCpuOnly) {\n               ::testing::HasSubstr(\"unaligned data\"));\n }\n \n+TEST(PjRtClientTest, FulfillAliasBuffer) {\n+  TF_ASSERT_OK_AND_ASSIGN(auto client, GetClient());\n+\n+  std::vector<int32_t> data{1, 2, 3, 4, 5, 6};\n+  Shape shape = ShapeUtil::MakeShape(S32, {2, 3});\n+  TF_ASSERT_OK_AND_ASSIGN(\n+      *shape.mutable_layout(),\n+      client->GetDefaultLayout(shape.element_type(), shape.dimensions()));\n+  TF_ASSERT_OK_AND_ASSIGN(\n+      auto alias_buffer,\n+      client->CreateAliasBuffer(shape, client->memory_spaces()[0]));\n+\n+  TF_ASSERT_OK_AND_ASSIGN(Shape host_shape, alias_buffer.first->HostShape());\n+  TF_ASSERT_OK_AND_ASSIGN(auto literal, Literal::Make(host_shape));\n+  auto shared_literal = std::make_shared<Literal>(std::move(literal));\n+  auto future = alias_buffer.first->ToLiteral(shared_literal.get());\n+\n+  TF_ASSERT_OK_AND_ASSIGN(\n+      auto param,\n+      client->BufferFromHostBuffer(\n+          data.data(), shape.element_type(), shape.dimensions(),\n+          /*byte_strides=*/std::nullopt,\n+          PjRtClient::HostBufferSemantics::kImmutableOnlyDuringCall, nullptr,\n+          client->memory_spaces()[0], /*device_layout=*/nullptr));\n+\n+  ASSERT_NE(alias_buffer.second, nullptr);\n+  TF_ASSERT_OK(std::move(alias_buffer.second)(param.get()));\n+  TF_ASSERT_OK(future.Await());\n+\n+  std::vector<int32_t> expected = {1, 2, 3, 4, 5, 6};\n+  EXPECT_EQ(shared_literal->data<int32_t>(), expected);\n+}\n+\n absl::StatusOr<std::unique_ptr<PjRtBuffer>> MakeFloatBuffer(\n     PjRtClient* client, const std::vector<float>& data,\n     absl::Span<const int64_t> dimensions) {"
+        },
+        {
+            "sha": "f5cdfc3ef74d633476ff4da797ec327d37090db1",
+            "filename": "third_party/xla/xla/pjrt/pjrt_stream_executor_client.cc",
+            "status": "modified",
+            "additions": 41,
+            "deletions": 0,
+            "changes": 41,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/af43ba815e6f6e7913037c1bb192d7d791a78e90/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_stream_executor_client.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/af43ba815e6f6e7913037c1bb192d7d791a78e90/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_stream_executor_client.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_stream_executor_client.cc?ref=af43ba815e6f6e7913037c1bb192d7d791a78e90",
+            "patch": "@@ -150,6 +150,7 @@ limitations under the License.\n #include \"xla/stream_executor/device_memory.h\"\n #include \"xla/stream_executor/device_memory_allocator.h\"\n #include \"xla/stream_executor/stream.h\"\n+#include \"xla/tsl/concurrency/async_value_ref.h\"\n #include \"xla/tsl/concurrency/ref_count.h\"\n #include \"xla/tsl/framework/allocator.h\"\n #include \"xla/tsl/platform/env.h\"\n@@ -534,6 +535,46 @@ PjRtStreamExecutorClient::DefineBuffer(\n   return py_buffer;\n }\n \n+absl::StatusOr<std::pair<tsl::RCReference<CommonPjRtRawBuffer>,\n+                         CommonPjRtClient::PjRtFulfillAliasRawBufferCallback>>\n+PjRtStreamExecutorClient::CreateRawBufferChannel(\n+    PjRtMemorySpace* memory_space) {\n+  auto buffer_promise = tsl::MakeIndirectAsyncValue();\n+  auto* device = tensorflow::down_cast<PjRtStreamExecutorDevice*>(\n+      memory_space->devices()[0]);\n+  TF_ASSIGN_OR_RETURN(LocalDeviceState * local_device,\n+                      device->GetLocalDeviceState());\n+  auto raw_buffer = tsl::MakeRef<PjRtStreamExecutorRawBuffer>(\n+      this, memory_space, local_device,\n+      tsl::AsyncValueRef<RawSEDeviceMemory>(buffer_promise));\n+\n+  auto buffer_promise_cb =\n+      [buffer_promise = std::move(buffer_promise), memory_space](\n+          absl::StatusOr<tsl::RCReference<CommonPjRtRawBuffer>> raw_buffer)\n+      -> absl::Status {\n+    if (!raw_buffer.ok()) {\n+      buffer_promise->SetError(raw_buffer.status());\n+      return raw_buffer.status();\n+    }\n+    if (memory_space != (*raw_buffer)->memory_space()) {\n+      auto status = absl::InvalidArgumentError(absl::StrFormat(\n+          \"Memory space mismatch when forarding raw buffers: %s vs %s\",\n+          memory_space->DebugString(),\n+          (*raw_buffer)->memory_space()->DebugString()));\n+      buffer_promise->SetError(status);\n+      return status;\n+    }\n+    buffer_promise->ForwardTo(\n+        tensorflow::down_cast<xla::PjRtStreamExecutorRawBuffer*>(\n+            raw_buffer->get())\n+            ->device_buffer()\n+            .CopyRCRef());\n+    return absl::OkStatus();\n+  };\n+\n+  return std::make_pair(std::move(raw_buffer), std::move(buffer_promise_cb));\n+}\n+\n void PjRtStreamExecutorClient::WaitForAllocation(\n     se::Stream* stream, const CommonPjRtRawBuffer& raw_buffer) {\n   auto event ="
+        },
+        {
+            "sha": "8a74eadf9bf343e2191f85845868dc9ad9f295ee",
+            "filename": "third_party/xla/xla/pjrt/pjrt_stream_executor_client.h",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/af43ba815e6f6e7913037c1bb192d7d791a78e90/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_stream_executor_client.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/af43ba815e6f6e7913037c1bb192d7d791a78e90/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_stream_executor_client.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_stream_executor_client.h?ref=af43ba815e6f6e7913037c1bb192d7d791a78e90",
+            "patch": "@@ -398,6 +398,10 @@ class PjRtStreamExecutorClient : public CommonPjRtClient {\n           definition_device_events,\n       bool raw_buffer_is_mutable) override;\n \n+  absl::StatusOr<std::pair<tsl::RCReference<CommonPjRtRawBuffer>,\n+                           PjRtFulfillAliasRawBufferCallback>>\n+  CreateRawBufferChannel(PjRtMemorySpace* memory_space) override;\n+\n   absl::StatusOr<tsl::RCReference<PjRtDeviceEvent>> LinearizeInto(\n       const LiteralSlice& literal, const xla::Shape& device_shape,\n       HostBufferSemantics host_buffer_semantics,"
+        },
+        {
+            "sha": "87c4c0e678f301c5262c143b2d9a9911e3839258",
+            "filename": "third_party/xla/xla/pjrt/tracked_device_buffer.cc",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 0,
+            "changes": 10,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/af43ba815e6f6e7913037c1bb192d7d791a78e90/third_party%2Fxla%2Fxla%2Fpjrt%2Ftracked_device_buffer.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/af43ba815e6f6e7913037c1bb192d7d791a78e90/third_party%2Fxla%2Fxla%2Fpjrt%2Ftracked_device_buffer.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Ftracked_device_buffer.cc?ref=af43ba815e6f6e7913037c1bb192d7d791a78e90",
+            "patch": "@@ -318,6 +318,16 @@ tsl::RCReference<CommonPjRtRawBuffer> TrackedDeviceBuffer::GetRawBuffer(\n       device_memory_);\n }\n \n+absl::StatusOr<tsl::RCReference<PjRtDeviceEvent>>\n+TrackedDeviceBuffer::GetDefinitionEvent(PjRtMemorySpace* memory_space) {\n+  if (definition_events_.size() != 1) {\n+    return absl::InternalError(\n+        \"GetMergedDefinitionEvent only supported on TPU for buffers with \"\n+        \"exactly 1 definition event.\");\n+  }\n+  return tsl::MakeRef<PjRtStreamExecutorDeviceEvent>(definition_events_[0]);\n+}\n+\n void TrackedDeviceBuffer::AddUsageEvent(\n     tsl::RCReference<PjRtDeviceEvent> event) {\n   if (event) {"
+        },
+        {
+            "sha": "efd239350c5b8aeab630bb1ab946515b327bc767",
+            "filename": "third_party/xla/xla/pjrt/tracked_device_buffer.h",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/af43ba815e6f6e7913037c1bb192d7d791a78e90/third_party%2Fxla%2Fxla%2Fpjrt%2Ftracked_device_buffer.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/af43ba815e6f6e7913037c1bb192d7d791a78e90/third_party%2Fxla%2Fxla%2Fpjrt%2Ftracked_device_buffer.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Ftracked_device_buffer.h?ref=af43ba815e6f6e7913037c1bb192d7d791a78e90",
+            "patch": "@@ -194,6 +194,9 @@ class TrackedDeviceBuffer : public AbstractTrackedDeviceBuffer {\n \n   Future<> GetReadyFuture(PjRtMemorySpace* memory_space) override;\n \n+  absl::StatusOr<tsl::RCReference<PjRtDeviceEvent>> GetDefinitionEvent(\n+      PjRtMemorySpace* memory_space) override;\n+\n  private:\n   PjRtDevice* device_;\n "
+        }
+    ],
+    "stats": {
+        "total": 268,
+        "additions": 190,
+        "deletions": 78
+    }
+}

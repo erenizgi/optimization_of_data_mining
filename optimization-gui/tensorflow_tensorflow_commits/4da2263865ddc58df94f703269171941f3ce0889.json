@@ -1,0 +1,72 @@
+{
+    "author": "pifon2a",
+    "message": "[XLA:GPU] Add GpuTargetConfig to GpuTopology.\n\nAlso add a method to retrieve the topology for the specified platform.\n\nPiperOrigin-RevId: 849704771",
+    "sha": "4da2263865ddc58df94f703269171941f3ce0889",
+    "files": [
+        {
+            "sha": "2370e259a0dd77ebbeee47ac53a0db6a617a37bc",
+            "filename": "third_party/xla/xla/service/BUILD",
+            "status": "modified",
+            "additions": 19,
+            "deletions": 0,
+            "changes": 19,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4da2263865ddc58df94f703269171941f3ce0889/third_party%2Fxla%2Fxla%2Fservice%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4da2263865ddc58df94f703269171941f3ce0889/third_party%2Fxla%2Fxla%2Fservice%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2FBUILD?ref=4da2263865ddc58df94f703269171941f3ce0889",
+            "patch": "@@ -6259,6 +6259,7 @@ tf_proto_library(\n     name = \"gpu_topology_proto\",\n     srcs = [\"gpu_topology.proto\"],\n     visibility = [\"//visibility:public\"],\n+    deps = [\"//xla/stream_executor:device_description_proto\"],\n )\n \n cc_library(\n@@ -6276,10 +6277,28 @@ cc_library(\n     ]),\n     deps = [\n         \":gpu_topology_proto_cc\",\n+        \"//xla/backends/gpu/target_config\",\n+        \"//xla/tsl/platform:status_macros\",\n+        \"@com_google_absl//absl/log:check\",\n+        \"@com_google_absl//absl/status\",\n+        \"@com_google_absl//absl/status:statusor\",\n+        \"@com_google_absl//absl/strings\",\n         \"@com_google_absl//absl/strings:string_view\",\n     ],\n )\n \n+xla_cc_test(\n+    name = \"gpu_topology_test\",\n+    srcs = [\"gpu_topology_test.cc\"],\n+    deps = [\n+        \":gpu_topology\",\n+        \"//xla/backends/gpu/target_config\",\n+        \"@com_google_absl//absl/status\",\n+        \"@com_google_absl//absl/status:status_matchers\",\n+        \"@com_google_googletest//:gtest_main\",\n+    ],\n+)\n+\n cc_library(\n     name = \"matmul_indexing_utils\",\n     srcs = [\"matmul_indexing_utils.cc\"],"
+        },
+        {
+            "sha": "08ef78d42de6030cb4daa3252a6417868c062b92",
+            "filename": "third_party/xla/xla/service/gpu_topology.cc",
+            "status": "modified",
+            "additions": 50,
+            "deletions": 1,
+            "changes": 51,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4da2263865ddc58df94f703269171941f3ce0889/third_party%2Fxla%2Fxla%2Fservice%2Fgpu_topology.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4da2263865ddc58df94f703269171941f3ce0889/third_party%2Fxla%2Fxla%2Fservice%2Fgpu_topology.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu_topology.cc?ref=4da2263865ddc58df94f703269171941f3ce0889",
+            "patch": "@@ -15,19 +15,52 @@ limitations under the License.\n \n #include \"xla/service/gpu_topology.h\"\n \n+#include <cstdint>\n #include <memory>\n+#include <optional>\n+#include <utility>\n \n+#include \"absl/log/check.h\"\n+#include \"absl/status/status.h\"\n+#include \"absl/strings/str_cat.h\"\n+#include \"absl/strings/string_view.h\"\n+#include \"xla/backends/gpu/target_config/target_config.h\"\n #include \"xla/service/gpu_topology.pb.h\"\n+#include \"xla/tsl/platform/status_macros.h\"\n \n namespace xla {\n+namespace {\n+\n+absl::StatusOr<gpu::GpuModel> GetGpuModel(absl::string_view platform_type) {\n+  if (platform_type == \"tesla_a100\") {\n+    return gpu::GpuModel::A100_SXM_40;\n+  }\n+  if (platform_type == \"nvidia_h100\") {\n+    return gpu::GpuModel::H100_SXM;\n+  }\n+  if (platform_type == \"umbriel_b200\") {\n+    return gpu::GpuModel::B200;\n+  }\n+  return absl::InvalidArgumentError(\n+      absl::StrCat(\"Unsupported GPU platform type: \", platform_type));\n+}\n+\n+}  // namespace\n \n std::unique_ptr<const GpuTopology> GpuTopology::FromProto(\n     const GpuTopologyProto& gpu_topology_proto) {\n+  std::optional<gpu::GpuTargetConfig> gpu_target_config = std::nullopt;\n+  if (gpu_topology_proto.has_gpu_target_config()) {\n+    auto gpu_target_config_or =\n+        gpu::GpuTargetConfig::FromProto(gpu_topology_proto.gpu_target_config());\n+    CHECK_OK(gpu_target_config_or);\n+    gpu_target_config = *std::move(gpu_target_config_or);\n+  }\n   return std::make_unique<GpuTopology>(\n       gpu_topology_proto.platform_version(),\n       gpu_topology_proto.num_partitions(),\n       gpu_topology_proto.num_hosts_per_partition(),\n-      gpu_topology_proto.num_devices_per_host());\n+      gpu_topology_proto.num_devices_per_host(), std::move(gpu_target_config));\n }\n \n GpuTopologyProto GpuTopology::ToProto() const {\n@@ -36,7 +69,23 @@ GpuTopologyProto GpuTopology::ToProto() const {\n   proto.set_num_partitions(num_partitions());\n   proto.set_num_hosts_per_partition(num_hosts_per_partition());\n   proto.set_num_devices_per_host(num_devices_per_host());\n+  if (gpu_target_config_.has_value()) {\n+    *proto.mutable_gpu_target_config() = gpu_target_config().ToProto();\n+  }\n   return proto;\n }\n \n+absl::StatusOr<GpuTopology> GetGpuTopologyForPlatform(\n+    absl::string_view platform_version, int32_t num_partitions,\n+    int32_t num_hosts_per_partition, int32_t num_devices_per_host) {\n+  // TODO(b/470487616): Don't use string matching to get the GpuTargetConfig.\n+  ASSIGN_OR_RETURN(auto spec_name, GetGpuModel(platform_version));\n+  ASSIGN_OR_RETURN(auto gpu_target_config_proto,\n+                   gpu::GetGpuTargetConfig(spec_name));\n+  ASSIGN_OR_RETURN(auto gpu_target_config,\n+                   gpu::GpuTargetConfig::FromProto(gpu_target_config_proto));\n+  return GpuTopology(platform_version, num_partitions, num_hosts_per_partition,\n+                     num_devices_per_host, std::move(gpu_target_config));\n+}\n+\n }  // namespace xla"
+        },
+        {
+            "sha": "0be662df014392406b64b50a904e09de379dbeb4",
+            "filename": "third_party/xla/xla/service/gpu_topology.h",
+            "status": "modified",
+            "additions": 20,
+            "deletions": 4,
+            "changes": 24,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4da2263865ddc58df94f703269171941f3ce0889/third_party%2Fxla%2Fxla%2Fservice%2Fgpu_topology.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4da2263865ddc58df94f703269171941f3ce0889/third_party%2Fxla%2Fxla%2Fservice%2Fgpu_topology.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu_topology.h?ref=4da2263865ddc58df94f703269171941f3ce0889",
+            "patch": "@@ -18,22 +18,28 @@ limitations under the License.\n \n #include <cstdint>\n #include <memory>\n+#include <optional>\n #include <string>\n+#include <utility>\n \n+#include \"absl/status/statusor.h\"\n #include \"absl/strings/string_view.h\"\n+#include \"xla/backends/gpu/target_config/target_config.h\"\n #include \"xla/service/gpu_topology.pb.h\"\n \n namespace xla {\n \n class GpuTopology {\n  public:\n-  explicit GpuTopology(absl::string_view platform_version,\n-                       int32_t num_partitions, int32_t num_hosts_per_partition,\n-                       int32_t num_devices_per_host)\n+  explicit GpuTopology(\n+      absl::string_view platform_version, int32_t num_partitions,\n+      int32_t num_hosts_per_partition, int32_t num_devices_per_host,\n+      std::optional<gpu::GpuTargetConfig> gpu_target_config = std::nullopt)\n       : platform_version_(platform_version),\n         num_partitions_(num_partitions),\n         num_hosts_per_partition_(num_hosts_per_partition),\n-        num_devices_per_host_(num_devices_per_host) {}\n+        num_devices_per_host_(num_devices_per_host),\n+        gpu_target_config_(std::move(gpu_target_config)) {}\n \n   bool operator==(const GpuTopology& other) const {\n     return platform_version_ == other.platform_version_ &&\n@@ -64,18 +70,28 @@ class GpuTopology {\n     return num_hosts_per_partition() * num_devices_per_host();\n   }\n \n+  bool has_gpu_target_config() const { return gpu_target_config_.has_value(); }\n+  const gpu::GpuTargetConfig& gpu_target_config() const {\n+    return *gpu_target_config_;\n+  }\n+\n  private:\n   const std::string platform_version_;\n   const int32_t num_partitions_;\n   const int32_t num_hosts_per_partition_;\n   const int32_t num_devices_per_host_;\n+  const std::optional<gpu::GpuTargetConfig> gpu_target_config_;\n \n   bool is_topology_symmetric() const {\n     return num_partitions_ != -1 && num_hosts_per_partition_ != -1 &&\n            num_devices_per_host_ != -1;\n   }\n };\n \n+absl::StatusOr<GpuTopology> GetGpuTopologyForPlatform(\n+    absl::string_view platform_version, int32_t num_partitions,\n+    int32_t num_hosts_per_partition, int32_t num_devices_per_host);\n+\n }  // namespace xla\n \n #endif  // XLA_SERVICE_GPU_TOPOLOGY_H_"
+        },
+        {
+            "sha": "6cccaeeb2afc7a042a5a148341af37c0f7b47952",
+            "filename": "third_party/xla/xla/service/gpu_topology.proto",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4da2263865ddc58df94f703269171941f3ce0889/third_party%2Fxla%2Fxla%2Fservice%2Fgpu_topology.proto",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4da2263865ddc58df94f703269171941f3ce0889/third_party%2Fxla%2Fxla%2Fservice%2Fgpu_topology.proto",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu_topology.proto?ref=4da2263865ddc58df94f703269171941f3ce0889",
+            "patch": "@@ -2,6 +2,8 @@ syntax = \"proto3\";\n \n package xla;\n \n+import \"xla/stream_executor/device_description.proto\";\n+\n option java_multiple_files = true;\n option java_outer_classname = \"GpuTopologyProto\";\n \n@@ -25,5 +27,8 @@ message GpuTopologyProto {\n   // The number of devices for each host.\n   int32 num_devices_per_host = 6;\n \n+  // The GPU target config.\n+  stream_executor.GpuTargetConfigProto gpu_target_config = 8;\n+\n   reserved 7;  // Was: core_count_per_chip\n }"
+        },
+        {
+            "sha": "88a8a170e5db332fd5e63a76031e60ffb47d3cc9",
+            "filename": "third_party/xla/xla/service/gpu_topology_test.cc",
+            "status": "added",
+            "additions": 67,
+            "deletions": 0,
+            "changes": 67,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4da2263865ddc58df94f703269171941f3ce0889/third_party%2Fxla%2Fxla%2Fservice%2Fgpu_topology_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4da2263865ddc58df94f703269171941f3ce0889/third_party%2Fxla%2Fxla%2Fservice%2Fgpu_topology_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu_topology_test.cc?ref=4da2263865ddc58df94f703269171941f3ce0889",
+            "patch": "@@ -0,0 +1,67 @@\n+/* Copyright 2025 The OpenXLA Authors.\n+\n+Licensed under the Apache License, Version 2.0 (the \"License\");\n+you may not use this file except in compliance with the License.\n+You may obtain a copy of the License at\n+\n+    http://www.apache.org/licenses/LICENSE-2.0\n+\n+Unless required by applicable law or agreed to in writing, software\n+distributed under the License is distributed on an \"AS IS\" BASIS,\n+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n+See the License for the specific language governing permissions and\n+limitations under the License.\n+==============================================================================*/\n+\n+#include \"xla/service/gpu_topology.h\"\n+\n+#include <gmock/gmock.h>\n+#include <gtest/gtest.h>\n+#include \"absl/status/status.h\"\n+#include \"absl/status/status_matchers.h\"\n+\n+namespace xla {\n+namespace {\n+\n+using ::absl_testing::StatusIs;\n+\n+TEST(GpuTopologyTest, GetGpuTopologyForPlatformTeslaA100) {\n+  auto topology_or = GetGpuTopologyForPlatform(\"tesla_a100\", 1, 1, 1);\n+  ASSERT_OK(topology_or);\n+  const auto& topology = *topology_or;\n+  EXPECT_EQ(topology.platform_version(), \"tesla_a100\");\n+  EXPECT_EQ(topology.num_partitions(), 1);\n+  EXPECT_EQ(topology.num_hosts_per_partition(), 1);\n+  EXPECT_EQ(topology.num_devices_per_host(), 1);\n+  EXPECT_TRUE(topology.has_gpu_target_config());\n+}\n+\n+TEST(GpuTopologyTest, GetGpuTopologyForPlatformNvidiaH100) {\n+  auto topology_or = GetGpuTopologyForPlatform(\"nvidia_h100\", 2, 1, 4);\n+  ASSERT_OK(topology_or);\n+  const auto& topology = *topology_or;\n+  EXPECT_EQ(topology.platform_version(), \"nvidia_h100\");\n+  EXPECT_EQ(topology.num_partitions(), 2);\n+  EXPECT_EQ(topology.num_hosts_per_partition(), 1);\n+  EXPECT_EQ(topology.num_devices_per_host(), 4);\n+  EXPECT_TRUE(topology.has_gpu_target_config());\n+}\n+\n+TEST(GpuTopologyTest, GetGpuTopologyForPlatformUmbrielB200) {\n+  auto topology_or = GetGpuTopologyForPlatform(\"umbriel_b200\", 1, 2, 8);\n+  ASSERT_OK(topology_or);\n+  const auto& topology = *topology_or;\n+  EXPECT_EQ(topology.platform_version(), \"umbriel_b200\");\n+  EXPECT_EQ(topology.num_partitions(), 1);\n+  EXPECT_EQ(topology.num_hosts_per_partition(), 2);\n+  EXPECT_EQ(topology.num_devices_per_host(), 8);\n+  EXPECT_TRUE(topology.has_gpu_target_config());\n+}\n+\n+TEST(GpuTopologyTest, GetGpuTopologyForPlatformInvalid) {\n+  EXPECT_THAT(GetGpuTopologyForPlatform(\"invalid_gpu\", 1, 1, 1),\n+              StatusIs(absl::StatusCode::kInvalidArgument));\n+}\n+\n+}  // namespace\n+}  // namespace xla"
+        }
+    ],
+    "stats": {
+        "total": 166,
+        "additions": 161,
+        "deletions": 5
+    }
+}

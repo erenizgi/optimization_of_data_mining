@@ -1,0 +1,48 @@
+{
+    "author": "Varcho",
+    "message": "[ReplicaGroupV3][Refactor][2/n] Store `CollectiveDeviceListBase` in HLOCollectiveInstruction proto. Add fields for different versions of collective device lists and assert a oneof constraint that only one field can be set.\n\nPiperOrigin-RevId: 845502926",
+    "sha": "dc6314fc0eee658b39f74e85418c3a8dc762315a",
+    "files": [
+        {
+            "sha": "c8a09b07ce03c15c3b16f8ebbd067cc9159d58fb",
+            "filename": "third_party/xla/xla/hlo/ir/hlo_instructions.cc",
+            "status": "modified",
+            "additions": 20,
+            "deletions": 4,
+            "changes": 24,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/dc6314fc0eee658b39f74e85418c3a8dc762315a/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_instructions.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/dc6314fc0eee658b39f74e85418c3a8dc762315a/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_instructions.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_instructions.cc?ref=dc6314fc0eee658b39f74e85418c3a8dc762315a",
+            "patch": "@@ -921,7 +921,7 @@ HloCollectiveInstruction::HloCollectiveInstruction(\n     const CollectiveDeviceList& device_list, bool constrain_layout,\n     const std::optional<int64_t>& channel_id)\n     : HloChannelInstruction(opcode, shape, channel_id),\n-      device_list_(device_list),\n+      device_list_(std::make_shared<CollectiveDeviceList>(device_list)),\n       constrain_layout_(constrain_layout) {\n   for (auto operand : operands) {\n     AppendOperand(operand);\n@@ -930,7 +930,23 @@ HloCollectiveInstruction::HloCollectiveInstruction(\n \n HloInstructionProto HloCollectiveInstruction::ToProto() const {\n   HloInstructionProto proto = HloChannelInstruction::ToProto();\n-  *proto.mutable_collective_device_list() = device_list_.ToProto();\n+\n+  if (const CollectiveDeviceList* device_list_v1 =\n+          dynamic_cast<const CollectiveDeviceList*>(device_list_.get())) {\n+    *proto.mutable_collective_device_list() = device_list_v1->ToProto();\n+  } else if (const IotaReplicaGroupList* device_list_v2 =\n+                 dynamic_cast<const IotaReplicaGroupList*>(\n+                     device_list_.get())) {\n+    *proto.mutable_iota_collective_device_list() = device_list_v2->ToProto();\n+  } else if (const MeshAxesReplicaGroupList* device_list_v3 =\n+                 dynamic_cast<const MeshAxesReplicaGroupList*>(\n+                     device_list_.get())) {\n+    *proto.mutable_mesh_axes_replica_group_list() = device_list_v3->ToProto();\n+  } else {\n+    LOG(FATAL) << \"Unknown or missing CollectiveDeviceList type in \"\n+                  \"HloCollectiveInstruction\";\n+  }\n+\n   proto.set_constrain_layout(constrain_layout_);\n   return proto;\n }\n@@ -940,10 +956,10 @@ void HloCollectiveInstruction::PrintExtraAttributesImpl(\n   HloChannelInstruction::PrintExtraAttributesImpl(printer, options);\n   printer.Next([this, &options](Printer* printer) {\n     VLOG(4) << name() << \" replica_groups=\"\n-            << device_list_.ToString(options.print_full_replica_group_list());\n+            << device_list_->ToString(options.print_full_replica_group_list());\n \n     printer->Append(\"replica_groups=\");\n-    device_list_.Print(printer, options.print_full_replica_group_list());\n+    device_list_->Print(printer, options.print_full_replica_group_list());\n   });\n   if (constrain_layout_) {\n     printer.Next("
+        },
+        {
+            "sha": "5b87d2636778beea94ef15639139f62603de9c56",
+            "filename": "third_party/xla/xla/hlo/ir/hlo_instructions.h",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 3,
+            "changes": 15,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/dc6314fc0eee658b39f74e85418c3a8dc762315a/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_instructions.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/dc6314fc0eee658b39f74e85418c3a8dc762315a/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_instructions.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_instructions.h?ref=dc6314fc0eee658b39f74e85418c3a8dc762315a",
+            "patch": "@@ -648,10 +648,19 @@ class HloRecvDoneInstruction : public HloSendRecvInstruction {\n class HloCollectiveInstruction : public HloChannelInstruction {\n  public:\n   const std::vector<ReplicaGroup>& replica_groups() const {\n-    return device_list_.replica_groups();\n+    return device_list_->replica_groups();\n   }\n \n-  const CollectiveDeviceList& device_list() const { return device_list_; }\n+  const CollectiveDeviceList& device_list() const {\n+    const CollectiveDeviceList* device_list_v1 =\n+        dynamic_cast<const CollectiveDeviceList*>(device_list_.get());\n+    // TODO(b/468442352): After XLA codebase is genericized to utilize\n+    // CollectiveDeviceListBase instead of CollectiveDeviceList remove this\n+    // check and return CollectiveDeviceListBase instead.\n+    CHECK(device_list_v1 != nullptr)\n+        << \"Failed to cast device_list_ to CollectiveDeviceList\";\n+    return *device_list_v1;\n+  }\n \n   // Returns true if the layout of the AllReduce is enforced by XLA client (as\n   // the layout set in the shape). The only reason for the client to set the\n@@ -686,7 +695,7 @@ class HloCollectiveInstruction : public HloChannelInstruction {\n       absl::FunctionRef<bool(const HloComputation*, const HloComputation*)>\n           eq_computations) const override;\n \n-  CollectiveDeviceList device_list_;\n+  std::shared_ptr<CollectiveDeviceListBase> device_list_;\n   bool constrain_layout_;\n };\n "
+        },
+        {
+            "sha": "01610575d714cfda64f925a0e419c7e990ba3416",
+            "filename": "third_party/xla/xla/service/hlo.proto",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 2,
+            "changes": 8,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/dc6314fc0eee658b39f74e85418c3a8dc762315a/third_party%2Fxla%2Fxla%2Fservice%2Fhlo.proto",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/dc6314fc0eee658b39f74e85418c3a8dc762315a/third_party%2Fxla%2Fxla%2Fservice%2Fhlo.proto",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fhlo.proto?ref=dc6314fc0eee658b39f74e85418c3a8dc762315a",
+            "patch": "@@ -113,7 +113,7 @@ enum CustomCallApiVersion {\n }\n \n // Serialization of HloInstruction.\n-// Next ID: 92\n+// Next ID: 94\n message HloInstructionProto {\n   reserved 10;\n   reserved \"parameter_name\";\n@@ -385,7 +385,11 @@ message HloInstructionProto {\n   reserved 86;\n \n   // Represents the list of devices that participate in a collective operation.\n-  xla.CollectiveDeviceListProto collective_device_list = 87;\n+  oneof replica_group_list {\n+    xla.CollectiveDeviceListProto collective_device_list = 87;\n+    xla.IotaReplicaGroupListProto iota_collective_device_list = 92;\n+    xla.MeshAxesReplicaGroupListProto mesh_axes_replica_group_list = 93;\n+  }\n \n   // For HLO value tracking.\n   xla.OriginalValueProto original_value = 88;"
+        }
+    ],
+    "stats": {
+        "total": 47,
+        "additions": 38,
+        "deletions": 9
+    }
+}

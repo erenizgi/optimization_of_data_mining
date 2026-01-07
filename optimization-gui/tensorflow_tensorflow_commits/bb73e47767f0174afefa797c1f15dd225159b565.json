@@ -1,0 +1,48 @@
+{
+    "author": "olegshyshkov",
+    "message": "[XLA:GPU] Remove the memcpy-based implementation of RaggedAllToAll.\n\nMemcpy-based implementation didn't show any benefits over other implementations. One-shot kernel + multi-host decomposer should be used in most of the production setups that have NVLink. NCCL can be used as slow, but the most generic implementation, even for multi-host. Memcpy-based returned out to be the slowest out of all and it only works on single host.\n\nPiperOrigin-RevId: 837508581",
+    "sha": "bb73e47767f0174afefa797c1f15dd225159b565",
+    "files": [
+        {
+            "sha": "e74493da3ffabc760442609ee79ceb1ca3997bd5",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/ragged_all_to_all_thunk.cc",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 62,
+            "changes": 62,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/bb73e47767f0174afefa797c1f15dd225159b565/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fragged_all_to_all_thunk.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/bb73e47767f0174afefa797c1f15dd225159b565/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fragged_all_to_all_thunk.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fragged_all_to_all_thunk.cc?ref=bb73e47767f0174afefa797c1f15dd225159b565",
+            "patch": "@@ -308,60 +308,6 @@ absl::Status RendezvousAfterKernelFinish(\n \n }  // namespace\n \n-absl::Status RaggedAllToAllStartThunk::RunMemCpyRaggedAllToAll(\n-    const GpuCliqueKey& clique_key, se::Stream& stream,\n-    const StreamState& state, absl::Span<DeviceBufferPair const> buffers,\n-    absl::Span<int64_t* const> ragged_metadata_allocs) {\n-  int device_ordinal = stream.parent()->device_ordinal();\n-  const RankId& rank = state.rank;\n-  const int64_t num_ranks = clique_key.num_local_participants();\n-\n-  VLOG(3) << \"[\" << device_ordinal << \"] Performing mem-copy-ragged-all-to-all\";\n-\n-  PrimitiveType element_type = buffers[0].element_type;\n-\n-  se::DeviceMemoryBase input_buffer = buffers[0].source_buffer;\n-  se::DeviceMemoryBase output_buffer = buffers[1].destination_buffer;\n-\n-  TF_RETURN_IF_ERROR(\n-      LoadRaggedTensorMetadata(stream, buffers, ragged_metadata_allocs));\n-\n-  const int64_t num_updates_per_replica = config_.num_total_updates / num_ranks;\n-\n-  const int64_t* input_offsets = ragged_metadata_allocs[0];\n-  const int64_t* send_sizes = ragged_metadata_allocs[1];\n-  const int64_t* output_offsets = ragged_metadata_allocs[2];\n-\n-  TF_ASSIGN_OR_RETURN(\n-      std::shared_ptr<std::vector<RendezvousValue>> rendezvous_values,\n-      RendezvousBeforeKernelStart(\n-          /*name=*/\"memcpy\", clique_key, rank, num_ranks, output_buffer, stream,\n-          state.start_event.get(), state.end_event.get()));\n-\n-  // Transfer a slice of data to each peer's output buffer.\n-  for (int64_t i = 0; i < num_updates_per_replica; ++i) {\n-    for (int peer = 0; peer < num_ranks; ++peer) {\n-      int64_t idx = peer * num_updates_per_replica + i;\n-      se::DeviceMemoryBase send_slice =\n-          GpuCollectives::Slice(input_buffer, element_type,\n-                                input_offsets[idx] * config_.num_row_elements,\n-                                send_sizes[idx] * config_.num_row_elements);\n-      se::DeviceMemoryBase dst_slice = GpuCollectives::Slice(\n-          (*rendezvous_values)[peer].output_buffer, element_type,\n-          output_offsets[idx] * config_.num_row_elements,\n-          send_sizes[idx] * config_.num_row_elements);\n-      TF_RETURN_IF_ERROR(\n-          stream.MemcpyD2D(&dst_slice, send_slice, send_slice.size()));\n-    }\n-  }\n-\n-  TF_RETURN_IF_ERROR(RendezvousAfterKernelFinish(\n-      /*name=*/\"memcpy\", clique_key, rank, num_ranks, stream,\n-      state.end_event.get(), rendezvous_values));\n-\n-  return absl::OkStatus();\n-}\n-\n absl::Status RaggedAllToAllStartThunk::RunOneShotRaggedAllToAll(\n     const GpuCliqueKey& clique_key, se::Stream& stream,\n     const StreamState& state, absl::Span<DeviceBufferPair const> buffers) {\n@@ -410,7 +356,6 @@ RaggedAllToAllStartThunk::RaggedAllToAllStartThunk(\n                       AsyncStreamKind::ASYNC_STREAM_KIND_COLLECTIVE),\n       config_(GetRaggedAllToAllConfig(instr)),\n       buffers_(std::move(buffers)),\n-      p2p_memcpy_enabled_(p2p_memcpy_enabled),\n       one_shot_kernel_enabled_(\n           instr->GetModule()\n               ->config()\n@@ -562,13 +507,6 @@ absl::StatusOr<bool> RaggedAllToAllStartThunk::RunCollective(\n         reinterpret_cast<int64_t*>(state->host_buffer_allocs[i]->opaque()));\n   }\n \n-  if (should_use_memcpy()) {\n-    TF_RETURN_IF_ERROR(RunMemCpyRaggedAllToAll(comm_handle.clique_key, stream,\n-                                               *state, device_buffers,\n-                                               ragged_metadata_allocs));\n-    return false;\n-  }\n-\n   TF_RETURN_IF_ERROR(RunRaggedAllToAll(\n       config_.num_row_elements, config_.num_total_updates, device_buffers,\n       stream, comm_handle.comm, ragged_metadata_allocs,"
+        },
+        {
+            "sha": "cdff47947f859daf7ea4c51899263358ccc027a8",
+            "filename": "third_party/xla/xla/backends/gpu/runtime/ragged_all_to_all_thunk.h",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 7,
+            "changes": 7,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/bb73e47767f0174afefa797c1f15dd225159b565/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fragged_all_to_all_thunk.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/bb73e47767f0174afefa797c1f15dd225159b565/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fragged_all_to_all_thunk.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fruntime%2Fragged_all_to_all_thunk.h?ref=bb73e47767f0174afefa797c1f15dd225159b565",
+            "patch": "@@ -101,22 +101,15 @@ class RaggedAllToAllStartThunk : public CollectiveThunk {\n         : device_ordinal(device_ordinal), rank(rank) {}\n   };\n \n-  absl::Status RunMemCpyRaggedAllToAll(\n-      const GpuCliqueKey& clique_key, se::Stream& stream,\n-      const StreamState& state, absl::Span<DeviceBufferPair const> buffers,\n-      absl::Span<int64_t* const> ragged_metadata_allocs);\n-\n   absl::Status RunOneShotRaggedAllToAll(\n       const GpuCliqueKey& clique_key, se::Stream& stream,\n       const StreamState& state, absl::Span<DeviceBufferPair const> buffers);\n \n   bool is_local() const;\n-  bool should_use_memcpy() const { return p2p_memcpy_enabled_ && is_local(); }\n \n   const RaggedAllToAllConfig config_;\n   const std::vector<Buffer> buffers_;\n   int64_t device_count_ = -1;\n-  const bool p2p_memcpy_enabled_;\n   const bool one_shot_kernel_enabled_;\n \n   absl::Mutex mutex_;"
+        },
+        {
+            "sha": "9f49f749368e6ae03736d785458754a2e23e567d",
+            "filename": "third_party/xla/xla/tests/ragged_all_to_all_e2e_test.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 6,
+            "changes": 7,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/bb73e47767f0174afefa797c1f15dd225159b565/third_party%2Fxla%2Fxla%2Ftests%2Fragged_all_to_all_e2e_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/bb73e47767f0174afefa797c1f15dd225159b565/third_party%2Fxla%2Fxla%2Ftests%2Fragged_all_to_all_e2e_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Ftests%2Fragged_all_to_all_e2e_test.cc?ref=bb73e47767f0174afefa797c1f15dd225159b565",
+            "patch": "@@ -54,16 +54,14 @@ using ::testing::NotNull;\n \n enum class RaggedAllToAllImplType {\n   kNccl,\n-  kMemcpy,\n   kDecomposer,\n   kOneShot,\n };\n \n class RaggedAllToAllTestBase : public CollectiveOpsWithFlagsBase {\n  public:\n   RaggedAllToAllTestBase(bool enable_async, RaggedAllToAllImplType impl_type)\n-      : CollectiveOpsWithFlagsBase(\n-            enable_async, impl_type == RaggedAllToAllImplType::kMemcpy),\n+      : CollectiveOpsWithFlagsBase(enable_async, /*enable_p2p_memcpy=*/false),\n         impl_type_(impl_type) {}\n \n   // Creates random test data for a ragged-all-to-all.\n@@ -824,8 +822,6 @@ std::string RaggedAllToAllImplTypeName(\n   switch (ragged_all_to_all_impl_type) {\n     case RaggedAllToAllImplType::kNccl:\n       return \"nccl\";\n-    case RaggedAllToAllImplType::kMemcpy:\n-      return \"memcpy\";\n     case RaggedAllToAllImplType::kDecomposer:\n       return \"decomposer\";\n     case RaggedAllToAllImplType::kOneShot:\n@@ -839,7 +835,6 @@ INSTANTIATE_TEST_SUITE_P(\n     RaggedAllToAllTest, RaggedAllToAllTest,\n     ::testing::Combine(::testing::Bool(),\n                        ::testing::Values(RaggedAllToAllImplType::kNccl,\n-                                         RaggedAllToAllImplType::kMemcpy,\n                                          RaggedAllToAllImplType::kDecomposer,\n                                          RaggedAllToAllImplType::kOneShot)),\n     [](const ::testing::TestParamInfo<std::tuple<bool, RaggedAllToAllImplType>>&"
+        }
+    ],
+    "stats": {
+        "total": 76,
+        "additions": 1,
+        "deletions": 75
+    }
+}

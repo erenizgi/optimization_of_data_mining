@@ -1,0 +1,48 @@
+{
+    "author": "ishark",
+    "message": "Fix the call to with GetTaskName(task) which leads to tsan failure.\nThe log was added when initialize barrier failed and task may be in the process of getting deleted when initialize barrier call fails.\n\nPiperOrigin-RevId: 800196366",
+    "sha": "02261c362db8b97c76dfd12c9b38dacab8a629ae",
+    "files": [
+        {
+            "sha": "f9d185a9f838cf3c98030e9799f99c428acea321",
+            "filename": "third_party/xla/xla/tsl/distributed_runtime/coordination/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/02261c362db8b97c76dfd12c9b38dacab8a629ae/third_party%2Fxla%2Fxla%2Ftsl%2Fdistributed_runtime%2Fcoordination%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/02261c362db8b97c76dfd12c9b38dacab8a629ae/third_party%2Fxla%2Fxla%2Ftsl%2Fdistributed_runtime%2Fcoordination%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Ftsl%2Fdistributed_runtime%2Fcoordination%2FBUILD?ref=02261c362db8b97c76dfd12c9b38dacab8a629ae",
+            "patch": "@@ -60,6 +60,7 @@ cc_library(\n         \"//xla/tsl/distributed_runtime:call_options\",\n         \"//xla/tsl/lib/gtl:int_type\",\n         \"//xla/tsl/platform:env\",\n+        \"//xla/tsl/platform:errors\",\n         \"//xla/tsl/platform:status\",\n         \"//xla/tsl/protobuf:coordination_config_proto_cc\",\n         \"//xla/tsl/protobuf:coordination_service_proto_cc\","
+        },
+        {
+            "sha": "cc489fd98fb7c3579b9591dc367bb9ebf3e19b7b",
+            "filename": "third_party/xla/xla/tsl/distributed_runtime/coordination/coordination_service.cc",
+            "status": "modified",
+            "additions": 20,
+            "deletions": 23,
+            "changes": 43,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/02261c362db8b97c76dfd12c9b38dacab8a629ae/third_party%2Fxla%2Fxla%2Ftsl%2Fdistributed_runtime%2Fcoordination%2Fcoordination_service.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/02261c362db8b97c76dfd12c9b38dacab8a629ae/third_party%2Fxla%2Fxla%2Ftsl%2Fdistributed_runtime%2Fcoordination%2Fcoordination_service.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Ftsl%2Fdistributed_runtime%2Fcoordination%2Fcoordination_service.cc?ref=02261c362db8b97c76dfd12c9b38dacab8a629ae",
+            "patch": "@@ -47,6 +47,7 @@ limitations under the License.\n #include \"xla/tsl/distributed_runtime/coordination/coordination_client.h\"\n #include \"xla/tsl/distributed_runtime/coordination/coordination_service_error_util.h\"\n #include \"xla/tsl/platform/env.h\"\n+#include \"xla/tsl/platform/errors.h\"\n #include \"xla/tsl/platform/status.h\"\n #include \"xla/tsl/protobuf/coordination_config.pb.h\"\n #include \"xla/tsl/protobuf/coordination_service.pb.h\"\n@@ -1161,21 +1162,18 @@ void CoordinationService::PollForErrorAsync(const CoordinatedTask& task,\n \n // Initializes a new barrier. Returns false if the barrier should fail\n // immediately.\n-bool CoordinationService::InitializeBarrier(\n+absl::Status CoordinationService::InitializeBarrier(\n     BarrierState* barrier, absl::string_view barrier_id, int64_t counter,\n     absl::Duration timeout, const CoordinatedTask& task,\n-    const std::vector<CoordinatedTask>& participating_tasks,\n-    BarrierCallback done) {\n+    const std::vector<CoordinatedTask>& participating_tasks) {\n   // Initialize barrier state.\n   barrier->id = barrier_id;\n   barrier->counter = counter;\n   barrier->passed = false;\n   barrier->result = absl::UnknownError(\"Invalid barrier result.\");\n   barrier->initiating_task = task;\n   barrier->done_callbacks.clear();\n-  if (!InitializeTasksAtBarrier(barrier, participating_tasks, done)) {\n-    return false;\n-  }\n+  TF_RETURN_IF_ERROR(InitializeTasksAtBarrier(barrier, participating_tasks));\n \n   barrier->num_pending_tasks = barrier->tasks_at_barrier.size();\n \n@@ -1196,8 +1194,7 @@ bool CoordinationService::InitializeBarrier(\n               \" Task error: \", task_cluster_state->GetStatus().ToString())),\n           barrier->id, barrier->counter);\n       PassBarrier(barrier, error);\n-      done(error, counter);\n-      return false;\n+      return error;\n     }\n   }\n   barrier->deadline_in_micros =\n@@ -1215,28 +1212,27 @@ bool CoordinationService::InitializeBarrier(\n     const CoordinatedTask& task = pending_task.first;\n     cluster_state_[GetTaskName(task)]->JoinBarrier(barrier_id);\n   }\n-  return true;\n+  return absl::OkStatus();\n }\n \n-bool CoordinationService::InitializeTasksAtBarrier(\n+absl::Status CoordinationService::InitializeTasksAtBarrier(\n     BarrierState* barrier,\n-    const std::vector<CoordinatedTask>& participating_tasks,\n-    BarrierCallback done) {\n+    const std::vector<CoordinatedTask>& participating_tasks) {\n   // Tasks were already specified for a previous barrier counter. Reset state\n   // and return early.\n   if (!barrier->tasks_at_barrier.empty()) {\n     for (auto& it : barrier->tasks_at_barrier) {\n       it.second = false;\n     }\n-    return true;\n+    return absl::OkStatus();\n   }\n   if (participating_tasks.empty()) {\n     // Assume barrier is for entire cluster if no tasks are specified.\n     for (const auto& task_state : cluster_state_) {\n       absl::string_view task_name = task_state.first;\n       barrier->tasks_at_barrier[GetTaskFromName(task_name)] = false;\n     }\n-    return true;\n+    return absl::OkStatus();\n   }\n   // Rely on the caller-specified task args.\n   for (const auto& task : participating_tasks) {\n@@ -1251,13 +1247,12 @@ bool CoordinationService::InitializeTasksAtBarrier(\n                            \"Barrier Id: \",\n                            BarrierName(*barrier))),\n           barrier->id, barrier->counter);\n-      AddBarrierCallback(barrier, task, std::move(done));\n       PassBarrier(barrier, error);\n-      return false;\n+      return error;\n     }\n     barrier->tasks_at_barrier[task] = false;\n   }\n-  return true;\n+  return absl::OkStatus();\n }\n \n void CoordinationService::AddBarrierCallback(BarrierState* barrier,\n@@ -1336,12 +1331,14 @@ void CoordinationService::BarrierAsyncLocked(\n \n   if (should_initialize_new_instance) {\n     // Initialize new barrier instance state.\n-    if (!InitializeBarrier(barrier, barrier_id, counter, timeout, task,\n-                           participating_tasks, done)) {\n-      LOG(WARNING) << \"Barrier init failed for barrier: \"\n-                   << BarrierName(barrier_id, counter)\n-                   << \" task: \" << GetTaskName(task);\n-      return;  // Exit early if barrier init failed.\n+    absl::Status status = InitializeBarrier(barrier, barrier_id, counter,\n+                                            timeout, task, participating_tasks);\n+    if (!status.ok()) {\n+      LOG(ERROR) << \"Barrier (\" << BarrierName(barrier_id, counter) << \") \"\n+                 << \"failed to initialize with status: \" << status\n+                 << \" for task: \" << GetTaskName(task);\n+      done(status, counter);\n+      return;\n     }\n   }\n "
+        },
+        {
+            "sha": "1c004ad220f2749904ba8e350bb0a1f33aa18e01",
+            "filename": "third_party/xla/xla/tsl/distributed_runtime/coordination/coordination_service.h",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 6,
+            "changes": 12,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/02261c362db8b97c76dfd12c9b38dacab8a629ae/third_party%2Fxla%2Fxla%2Ftsl%2Fdistributed_runtime%2Fcoordination%2Fcoordination_service.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/02261c362db8b97c76dfd12c9b38dacab8a629ae/third_party%2Fxla%2Fxla%2Ftsl%2Fdistributed_runtime%2Fcoordination%2Fcoordination_service.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Ftsl%2Fdistributed_runtime%2Fcoordination%2Fcoordination_service.h?ref=02261c362db8b97c76dfd12c9b38dacab8a629ae",
+            "patch": "@@ -392,16 +392,16 @@ class CoordinationService {\n   }\n   // Initializes a new barrier. Returns false if the barrier should fail\n   // immediately.\n-  bool InitializeBarrier(\n+  absl::Status InitializeBarrier(\n       BarrierState* barrier, absl::string_view barrier_id, int64_t counter,\n       absl::Duration timeout, const tensorflow::CoordinatedTask& task,\n-      const std::vector<tensorflow::CoordinatedTask>& participating_tasks,\n-      BarrierCallback done) ABSL_EXCLUSIVE_LOCKS_REQUIRED(state_mu_);\n+      const std::vector<tensorflow::CoordinatedTask>& participating_tasks)\n+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(state_mu_);\n   // Initialize `BarrierState`'s tasks_at_barrier map.\n-  bool InitializeTasksAtBarrier(\n+  absl::Status InitializeTasksAtBarrier(\n       BarrierState* barrier,\n-      const std::vector<tensorflow::CoordinatedTask>& participating_tasks,\n-      BarrierCallback done) ABSL_EXCLUSIVE_LOCKS_REQUIRED(state_mu_);\n+      const std::vector<tensorflow::CoordinatedTask>& participating_tasks)\n+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(state_mu_);\n   // Adds a callback to be called when the barrier is done.\n   // If there is an existing callback for that task, it will be overwritten,\n   // cancelling the previous callback."
+        }
+    ],
+    "stats": {
+        "total": 56,
+        "additions": 27,
+        "deletions": 29
+    }
+}

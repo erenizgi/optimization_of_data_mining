@@ -1,0 +1,36 @@
+{
+    "author": "apivovarov",
+    "message": "Optimize Stream::GetOrCreateResource. Avoid calling create() on every lookup.\n\n1. Avoid calling create() on every lookup in try_emplace\n\n2. Further Optimize `Stream::GetOrCreateResource` to reduce lock contention.\n\nThe resource creation function is now called outside the critical section, reducing the time the `resource_mutex_` is held. This improves concurrency by allowing potentially expensive resource creation to happen without blocking other threads.\n\n3. On most platforms, locking an uncontested mutex is extremely cheap — usually just a few CPU instructions (comparable to a pointer load/store).\n\nPiperOrigin-RevId: 797144083",
+    "sha": "d4289a1a336fc9989443745540041a157ca75b54",
+    "files": [
+        {
+            "sha": "d28c855a52e9b8d0f199b0d922c7408d7de577d8",
+            "filename": "third_party/xla/xla/stream_executor/stream.cc",
+            "status": "modified",
+            "additions": 29,
+            "deletions": 9,
+            "changes": 38,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/d4289a1a336fc9989443745540041a157ca75b54/third_party%2Fxla%2Fxla%2Fstream_executor%2Fstream.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/d4289a1a336fc9989443745540041a157ca75b54/third_party%2Fxla%2Fxla%2Fstream_executor%2Fstream.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fstream_executor%2Fstream.cc?ref=d4289a1a336fc9989443745540041a157ca75b54",
+            "patch": "@@ -19,6 +19,7 @@ limitations under the License.\n #include <atomic>\n #include <cstdint>\n #include <memory>\n+#include <utility>\n \n #include \"absl/base/no_destructor.h\"\n #include \"absl/base/optimization.h\"\n@@ -34,21 +35,40 @@ Stream::ResourceTypeId Stream::GetNextResourceTypeId() {\n \n Stream::Resource* Stream::GetOrNullResource(ResourceTypeId type_id) {\n   absl::MutexLock lock(&resource_mutex_);\n-  if (auto it = resources_.find(type_id); it != resources_.end()) {\n-    return it->second.get();\n-  }\n-  return nullptr;\n+  auto it = resources_.find(type_id);\n+  return (it != resources_.end()) ? it->second.get() : nullptr;\n }\n \n Stream::Resource* Stream::GetOrCreateResource(\n     ResourceTypeId type_id,\n     absl::FunctionRef<std::unique_ptr<Resource>()> create) {\n-  absl::MutexLock lock(&resource_mutex_);\n-  auto [it, inserted] = resources_.try_emplace(type_id, create());\n-  if (ABSL_PREDICT_FALSE(inserted)) {\n-    it->second = create();\n+  // First, try to find the resource under lock\n+  {\n+    absl::MutexLock lock(&resource_mutex_);\n+    auto it = resources_.find(type_id);\n+    if (ABSL_PREDICT_TRUE(it != resources_.end())) {\n+      return it->second.get();\n+    }\n+  }\n+\n+  // Resource not found, create it outside the lock\n+  auto resource = create();\n+  Resource* ptr = resource.get();\n+\n+  // Acquire lock again to insert the new resource\n+  {\n+    absl::MutexLock lock(&resource_mutex_);\n+    auto it = resources_.find(type_id);\n+    if (ABSL_PREDICT_TRUE(it == resources_.end())) {\n+      // We won the race — insert our resource\n+      resources_.emplace(type_id, std::move(resource));\n+    } else {\n+      // Another thread inserted it in the meantime\n+      ptr = it->second.get();\n+    }\n   }\n-  return it->second.get();\n+\n+  return ptr;\n }\n \n }  // namespace stream_executor"
+        },
+        {
+            "sha": "72da3e66209cd7a178713570d03abcef594be4f6",
+            "filename": "third_party/xla/xla/stream_executor/stream_executor.cc",
+            "status": "modified",
+            "additions": 29,
+            "deletions": 9,
+            "changes": 38,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/d4289a1a336fc9989443745540041a157ca75b54/third_party%2Fxla%2Fxla%2Fstream_executor%2Fstream_executor.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/d4289a1a336fc9989443745540041a157ca75b54/third_party%2Fxla%2Fxla%2Fstream_executor%2Fstream_executor.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fstream_executor%2Fstream_executor.cc?ref=d4289a1a336fc9989443745540041a157ca75b54",
+            "patch": "@@ -18,6 +18,7 @@ limitations under the License.\n #include <atomic>\n #include <cstdint>\n #include <memory>\n+#include <utility>\n \n #include \"absl/base/no_destructor.h\"\n #include \"absl/base/optimization.h\"\n@@ -34,21 +35,40 @@ StreamExecutor::ResourceTypeId StreamExecutor::GetNextResourceTypeId() {\n StreamExecutor::Resource* StreamExecutor::GetOrNullResource(\n     ResourceTypeId type_id) {\n   absl::MutexLock lock(&resource_mutex_);\n-  if (auto it = resources_.find(type_id); it != resources_.end()) {\n-    return it->second.get();\n-  }\n-  return nullptr;\n+  auto it = resources_.find(type_id);\n+  return (it != resources_.end()) ? it->second.get() : nullptr;\n }\n \n StreamExecutor::Resource* StreamExecutor::GetOrCreateResource(\n     ResourceTypeId type_id,\n     absl::FunctionRef<std::unique_ptr<Resource>()> create) {\n-  absl::MutexLock lock(&resource_mutex_);\n-  auto [it, inserted] = resources_.try_emplace(type_id, create());\n-  if (ABSL_PREDICT_FALSE(inserted)) {\n-    it->second = create();\n+  // First, try to find the resource under lock\n+  {\n+    absl::MutexLock lock(&resource_mutex_);\n+    auto it = resources_.find(type_id);\n+    if (ABSL_PREDICT_TRUE(it != resources_.end())) {\n+      return it->second.get();\n+    }\n+  }\n+\n+  // Resource not found, create it outside the lock\n+  auto resource = create();\n+  Resource* ptr = resource.get();\n+\n+  // Acquire lock again to insert the new resource\n+  {\n+    absl::MutexLock lock(&resource_mutex_);\n+    auto it = resources_.find(type_id);\n+    if (ABSL_PREDICT_TRUE(it == resources_.end())) {\n+      // We won the race — insert our resource\n+      resources_.emplace(type_id, std::move(resource));\n+    } else {\n+      // Another thread inserted it in the meantime\n+      ptr = it->second.get();\n+    }\n   }\n-  return it->second.get();\n+\n+  return ptr;\n }\n \n }  // namespace stream_executor"
+        }
+    ],
+    "stats": {
+        "total": 76,
+        "additions": 58,
+        "deletions": 18
+    }
+}

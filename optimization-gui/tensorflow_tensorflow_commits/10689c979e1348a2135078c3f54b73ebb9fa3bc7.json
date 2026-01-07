@@ -1,0 +1,84 @@
+{
+    "author": "pifon2a",
+    "message": "[XLA:GPU] Add early exit after the layout assignment to XLA:GPU.\n\nPiperOrigin-RevId: 843774817",
+    "sha": "10689c979e1348a2135078c3f54b73ebb9fa3bc7",
+    "files": [
+        {
+            "sha": "5de2f37f65a9b443b7ef135b291002f0c8a4683b",
+            "filename": "third_party/xla/xla/service/compiler.h",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 0,
+            "changes": 16,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/10689c979e1348a2135078c3f54b73ebb9fa3bc7/third_party%2Fxla%2Fxla%2Fservice%2Fcompiler.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/10689c979e1348a2135078c3f54b73ebb9fa3bc7/third_party%2Fxla%2Fxla%2Fservice%2Fcompiler.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fcompiler.h?ref=10689c979e1348a2135078c3f54b73ebb9fa3bc7",
+            "patch": "@@ -205,6 +205,9 @@ class Compiler {\n \n     // Embed HLO module in the executable. Only used on GPU at the moment.\n     bool embed_hlo_module = true;\n+\n+    // If true, the compiler will exit after the layout assignment pass.\n+    bool early_exit_with_layouts = false;\n   };\n \n   virtual ~Compiler() = default;\n@@ -506,6 +509,18 @@ class AotCompilationOptions {\n     gpu_target_config_ = gpu_target_config;\n   }\n \n+  // Provides a way to end compilation early and get partial outputs.\n+  enum class EarlyExitPoint {\n+    kNone,\n+    kAfterLayoutAssignment,\n+    kAfterBufferAssignment,\n+  };\n+\n+  EarlyExitPoint early_exit_point() const { return early_exit_point_; }\n+  void set_early_exit_point(EarlyExitPoint early_exit_point) {\n+    early_exit_point_ = early_exit_point;\n+  }\n+\n  protected:\n   AotCompilationOptions();\n \n@@ -525,6 +540,7 @@ class AotCompilationOptions {\n   std::vector<std::string> sanitize_abilists_dataflow_;\n   // Contains target-specific information required by AOT compilation.\n   std::optional<Compiler::GpuTargetConfig> gpu_target_config_;\n+  EarlyExitPoint early_exit_point_ = EarlyExitPoint::kNone;\n };\n \n }  // namespace xla"
+        },
+        {
+            "sha": "4f3ca9e1cc7e67f13fe57ada299895c3a6606dde",
+            "filename": "third_party/xla/xla/service/gpu/gpu_compiler.cc",
+            "status": "modified",
+            "additions": 32,
+            "deletions": 1,
+            "changes": 33,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/10689c979e1348a2135078c3f54b73ebb9fa3bc7/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_compiler.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/10689c979e1348a2135078c3f54b73ebb9fa3bc7/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_compiler.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_compiler.cc?ref=10689c979e1348a2135078c3f54b73ebb9fa3bc7",
+            "patch": "@@ -1435,6 +1435,9 @@ absl::Status GpuCompiler::OptimizeHloModule(\n \n   TF_RETURN_IF_ERROR(RunLayoutAssignmentPasses(\n       hlo_module, gpu_version, dnn_version, device_description));\n+  if (options.early_exit_with_layouts) {\n+    return absl::OkStatus();\n+  }\n \n   TF_RETURN_IF_ERROR(RunLayoutNormalizationPasses(\n       hlo_module,\n@@ -1900,6 +1903,9 @@ absl::StatusOr<std::unique_ptr<HloModule>> GpuCompiler::RunHloPasses(\n   TF_RETURN_IF_ERROR(\n       OptimizeHloModule(module.get(), is_deviceless ? nullptr : stream_exec,\n                         options, gpu_target_config, alias_info.get()));\n+  if (options.early_exit_with_layouts) {\n+    return std::move(module);\n+  }\n \n   TF_RETURN_IF_ERROR(RunPreSchedulingCopyInsertion(*module, device_description,\n                                                    alias_info.get()));\n@@ -2640,6 +2646,11 @@ GpuCompiler::CompileAheadOfTime(std::unique_ptr<HloModule> hlo_module,\n   // compilation.\n   CHECK_EQ(options.PlatformId(), PlatformId());\n \n+  if (options.early_exit_point() !=\n+      AotCompilationOptions::EarlyExitPoint::kNone) {\n+    return EarlyExitCompileAheadOfTime(std::move(hlo_module), options);\n+  }\n+\n   if (hlo_module->config()\n           .debug_options()\n           .xla_gpu_experimental_aot_compiled_thunks()) {\n@@ -2665,6 +2676,26 @@ GpuCompiler::NewCompileAheadOfTime(std::unique_ptr<HloModule> hlo_module,\n   return results;\n }\n \n+absl::StatusOr<std::vector<std::unique_ptr<AotCompilationResult>>>\n+GpuCompiler::EarlyExitCompileAheadOfTime(std::unique_ptr<HloModule> hlo_module,\n+                                         const AotCompilationOptions& options) {\n+  bool early_exit_with_layouts =\n+      options.early_exit_point() ==\n+      AotCompilationOptions::EarlyExitPoint::kAfterLayoutAssignment;\n+  CompileOptions compile_options;\n+  compile_options.device_allocator = options.device_allocator();\n+  compile_options.gpu_target_config = options.gpu_target_config();\n+  compile_options.early_exit_with_layouts = early_exit_with_layouts;\n+\n+  std::vector<std::unique_ptr<AotCompilationResult>> results;\n+  TF_ASSIGN_OR_RETURN(\n+      auto optimized_module,\n+      RunHloPasses(std::move(hlo_module), options.executor(), compile_options));\n+  results.push_back(std::make_unique<EarlyExitCompilationResult>(\n+      std::move(optimized_module)));\n+  return std::move(results);\n+}\n+\n absl::StatusOr<std::vector<std::unique_ptr<AotCompilationResult>>>\n GpuCompiler::LegacyCompileAheadOfTime(std::unique_ptr<HloModule> hlo_module,\n                                       const AotCompilationOptions& options) {\n@@ -2685,7 +2716,6 @@ GpuCompiler::LegacyCompileAheadOfTime(std::unique_ptr<HloModule> hlo_module,\n     optimized_module = std::move(hlo_module);\n   }\n \n-  std::vector<std::unique_ptr<AotCompilationResult>> results;\n \n   const std::optional<Compiler::GpuTargetConfig>& target_config =\n       options.gpu_target_config();\n@@ -2700,6 +2730,7 @@ GpuCompiler::LegacyCompileAheadOfTime(std::unique_ptr<HloModule> hlo_module,\n                              {options.device_allocator()}, gpu_device_info));\n \n   // Create GpuThunkAotCompilationResult if thunk runtime is enabled.\n+  std::vector<std::unique_ptr<AotCompilationResult>> results;\n   TF_ASSIGN_OR_RETURN(\n       results.emplace_back(),\n       LegacyGpuAotCompilationResult::FromModule("
+        },
+        {
+            "sha": "595e9210c8c06121aca9ca2a94d3dc94bef019d8",
+            "filename": "third_party/xla/xla/service/gpu/gpu_compiler.h",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/10689c979e1348a2135078c3f54b73ebb9fa3bc7/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_compiler.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/10689c979e1348a2135078c3f54b73ebb9fa3bc7/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_compiler.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_compiler.h?ref=10689c979e1348a2135078c3f54b73ebb9fa3bc7",
+            "patch": "@@ -284,6 +284,10 @@ class GpuCompiler : public LLVMCompiler {\n   LegacyCompileAheadOfTime(std::unique_ptr<HloModule> hlo_module,\n                            const AotCompilationOptions& options);\n \n+  absl::StatusOr<std::vector<std::unique_ptr<AotCompilationResult>>>\n+  EarlyExitCompileAheadOfTime(std::unique_ptr<HloModule> hlo_module,\n+                              const AotCompilationOptions& options);\n+\n   se::Platform::Id platform_id_;\n \n   // The triple that represents our target."
+        },
+        {
+            "sha": "61c501b9fa8b3f85a11e3d36619da738b0226980",
+            "filename": "third_party/xla/xla/service/gpu/gpu_compiler_test.cc",
+            "status": "modified",
+            "additions": 29,
+            "deletions": 0,
+            "changes": 29,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/10689c979e1348a2135078c3f54b73ebb9fa3bc7/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_compiler_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/10689c979e1348a2135078c3f54b73ebb9fa3bc7/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_compiler_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_compiler_test.cc?ref=10689c979e1348a2135078c3f54b73ebb9fa3bc7",
+            "patch": "@@ -107,6 +107,9 @@ using ::testing::IsEmpty;\n using ::testing::IsSupersetOf;\n using ::testing::Matches;\n using ::testing::Not;\n+using ::testing::NotNull;\n+using ::testing::Pointee;\n+using ::testing::Property;\n using ::testing::SizeIs;\n using ::testing::StartsWith;\n using ::testing::TempDir;\n@@ -1019,6 +1022,32 @@ TEST_P(AotCompilationTest, ExportAndImportAotResult) {\n   EXPECT_TRUE(LiteralTestUtil::Equal(result, literal_expected_result));\n }\n \n+TEST_P(AotCompilationTest, EarlyExitWithLayouts) {\n+  TF_ASSERT_OK_AND_ASSIGN(\n+      std::unique_ptr<HloModule> add_1_hlo,\n+      ParseAndReturnVerifiedModule(R\"hlo(\n+    add1 {\n+      p = s32[] parameter(0)\n+      c = s32[] constant(1)\n+      ROOT a = s32[] add(p, c)\n+    }\n+\n+    ENTRY e {\n+      p = s32[] parameter(0)\n+      ROOT r = s32[] fusion(p), kind=kLoop, calls=add1\n+    })hlo\",\n+                                   GetModuleConfigForTest()));\n+\n+  aot_options_->set_early_exit_point(\n+      AotCompilationOptions::EarlyExitPoint::kAfterLayoutAssignment);\n+  TF_ASSERT_OK_AND_ASSIGN(\n+      std::vector<std::unique_ptr<AotCompilationResult>> aot_results,\n+      compiler_->CompileAheadOfTime(std::move(add_1_hlo), *aot_options_));\n+  EXPECT_THAT(aot_results,\n+              ElementsAre(Pointee(Property(\n+                  &AotCompilationResult::optimized_module, NotNull()))));\n+}\n+\n class KernelCacheTest : public HloTestBase {\n  public:\n   void SetUp() override {"
+        },
+        {
+            "sha": "36c87453f8ba989f8ac0e5544aff19861960505b",
+            "filename": "third_party/xla/xla/service/gpu/legacy_gpu_aot_compilation_result.cc",
+            "status": "modified",
+            "additions": 19,
+            "deletions": 0,
+            "changes": 19,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/10689c979e1348a2135078c3f54b73ebb9fa3bc7/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Flegacy_gpu_aot_compilation_result.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/10689c979e1348a2135078c3f54b73ebb9fa3bc7/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Flegacy_gpu_aot_compilation_result.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Flegacy_gpu_aot_compilation_result.cc?ref=10689c979e1348a2135078c3f54b73ebb9fa3bc7",
+            "patch": "@@ -116,5 +116,24 @@ LegacyGpuAotCompilationResult::buffer_assignment() const {\n                                      buffer_size_bytes_function, &alias_info);\n }\n \n+absl::StatusOr<std::string> EarlyExitCompilationResult::SerializeAsString()\n+    const {\n+  return Unavailable(\n+      \"SerializeAsString() is not supported by EarlyExitCompilationResult.\");\n+}\n+\n+absl::StatusOr<std::unique_ptr<Executable>>\n+EarlyExitCompilationResult::LoadExecutable(\n+    const se::StreamExecutor* stream_exec) && {\n+  return Unavailable(\n+      \"LoadExecutable() is not supported by EarlyExitCompilationResult.\");\n+}\n+\n+absl::StatusOr<std::unique_ptr<BufferAssignment>>\n+EarlyExitCompilationResult::buffer_assignment() const {\n+  return Unavailable(\n+      \"buffer_assignment() is not supported by EarlyExitCompilationResult.\");\n+}\n+\n }  // namespace gpu\n }  // namespace xla"
+        },
+        {
+            "sha": "476cc2b8dd3ec8f478264bc1b7a269b9f79a324b",
+            "filename": "third_party/xla/xla/service/gpu/legacy_gpu_aot_compilation_result.h",
+            "status": "modified",
+            "additions": 22,
+            "deletions": 0,
+            "changes": 22,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/10689c979e1348a2135078c3f54b73ebb9fa3bc7/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Flegacy_gpu_aot_compilation_result.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/10689c979e1348a2135078c3f54b73ebb9fa3bc7/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Flegacy_gpu_aot_compilation_result.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Flegacy_gpu_aot_compilation_result.h?ref=10689c979e1348a2135078c3f54b73ebb9fa3bc7",
+            "patch": "@@ -91,6 +91,28 @@ class LegacyGpuAotCompilationResult : public AotCompilationResult {\n   Compiler* compiler_;\n };\n \n+class EarlyExitCompilationResult : public AotCompilationResult {\n+ public:\n+  explicit EarlyExitCompilationResult(std::unique_ptr<HloModule> module)\n+      : module_(std::move(module)) {}\n+\n+  absl::StatusOr<std::string> SerializeAsString() const override;\n+\n+  absl::StatusOr<std::unique_ptr<Executable>>\n+      LoadExecutable(const se::StreamExecutor* stream_exec) && override;\n+\n+  const HloModule* optimized_module() const override { return module_.get(); }\n+  std::shared_ptr<HloModule> shared_optimized_module() override {\n+    return module_;\n+  }\n+\n+  absl::StatusOr<std::unique_ptr<BufferAssignment>> buffer_assignment()\n+      const override;\n+\n+ private:\n+  std::shared_ptr<HloModule> module_;\n+};\n+\n }  // namespace gpu\n }  // namespace xla\n "
+        }
+    ],
+    "stats": {
+        "total": 123,
+        "additions": 122,
+        "deletions": 1
+    }
+}

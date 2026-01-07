@@ -1,0 +1,36 @@
+{
+    "author": "ezhulenev",
+    "message": "[xla:pjrt] Add an API to pass profiling handlers to MakePromise and to update PjRtFuture profiling handlers\n\nPiperOrigin-RevId: 803936749",
+    "sha": "ac53d3fa48f513985ba68f209462a5c900f5e6b6",
+    "files": [
+        {
+            "sha": "64d9f50c2cb6156dc8d76d402980862ff9f23f11",
+            "filename": "third_party/xla/xla/pjrt/pjrt_future.h",
+            "status": "modified",
+            "additions": 21,
+            "deletions": 3,
+            "changes": 24,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ac53d3fa48f513985ba68f209462a5c900f5e6b6/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_future.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ac53d3fa48f513985ba68f209462a5c900f5e6b6/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_future.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_future.h?ref=ac53d3fa48f513985ba68f209462a5c900f5e6b6",
+            "patch": "@@ -80,7 +80,7 @@ class ScopedAsyncTrackingEvent {\n };\n \n // Helpers for using PjRtFutures.\n-struct PjRtFutureHelpers {\n+class PjRtFutureHelpers {\n  public:\n   // Keys that are returned by an implementation-specific handler when a client\n   // starts to block on a promise.\n@@ -98,6 +98,19 @@ struct PjRtFutureHelpers {\n   // Signature of handler called by the PjRtFuture class after it finishes\n   // blocking a thread.\n   using OnBlockEndFn = std::function<void(ProfilingKeys)>;\n+\n+  // Returns a PjRtFuture<T> with optionally updated profiling handlers. If\n+  // profiling handlers are not provided, the original ones will be used.\n+  template <typename T>\n+  static PjRtFuture<T> WithProfiling(PjRtFuture<T> future,\n+                                     OnBlockStartFn on_block_start = nullptr,\n+                                     OnBlockEndFn on_block_end = nullptr) {\n+    return PjRtFuture<T>(std::move(future.promise_),\n+                         on_block_start ? std::move(on_block_start)\n+                                        : std::move(future.on_block_start_),\n+                         on_block_end ? std::move(on_block_end)\n+                                      : std::move(future.on_block_end_));\n+  }\n };\n \n namespace internal {\n@@ -401,6 +414,8 @@ class PjRtFutureBase : public PjRtFutureMoveControl<is_move_only> {\n   }\n \n  private:\n+  friend class xla::PjRtFutureHelpers;\n+\n   tsl::AsyncValueRef<T> promise_;\n \n   // Function that is called before a thread starts blocking on the promise.\n@@ -489,10 +504,13 @@ class PjRtFuture : public internal::PjRtFutureBase<absl::StatusOr<T>> {\n \n   // Returns a pair of connected Promise and PjRtFuture<T>. Setting the returned\n   // promise will fulfill the connected future.\n-  static std::pair<MoveOnlyPromise, PjRtFuture<T>> MakePromise() {\n+  static std::pair<MoveOnlyPromise, PjRtFuture<T>> MakePromise(\n+      PjRtFutureHelpers::OnBlockStartFn on_block_start = nullptr,\n+      PjRtFutureHelpers::OnBlockEndFn on_block_end = nullptr) {\n     MoveOnlyPromise promise(\n         tsl::MakeUnconstructedAsyncValueRef<absl::StatusOr<T>>());\n-    PjRtFuture<T> future(promise);\n+    PjRtFuture<T> future(promise, std::move(on_block_start),\n+                         std::move(on_block_end));\n     return std::make_pair(std::move(promise), std::move(future));\n   }\n "
+        },
+        {
+            "sha": "2eddcc76a72267f032b161e364a07414745c9dab",
+            "filename": "third_party/xla/xla/pjrt/pjrt_future_test.cc",
+            "status": "modified",
+            "additions": 17,
+            "deletions": 0,
+            "changes": 17,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ac53d3fa48f513985ba68f209462a5c900f5e6b6/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_future_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ac53d3fa48f513985ba68f209462a5c900f5e6b6/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_future_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fpjrt_future_test.cc?ref=ac53d3fa48f513985ba68f209462a5c900f5e6b6",
+            "patch": "@@ -604,6 +604,23 @@ TEST(PjRtFutureTest, JoinErrors) {\n   EXPECT_EQ(join_two.Await(), absl::InternalError(\"error #0\"));\n }\n \n+TEST(PjRtFutureTest, WithProfiling) {\n+  auto [promise, future] = PjRtFuture<int32_t>::MakePromise(\n+      [&] { return PjRtFutureHelpers::ProfilingKeys{}; },\n+      [&](PjRtFutureHelpers::ProfilingKeys) {});\n+\n+  auto update_profiling = PjRtFutureHelpers::WithProfiling(\n+      std::move(future), [&] { return PjRtFutureHelpers::ProfilingKeys{}; },\n+      [&](PjRtFutureHelpers::ProfilingKeys) {});\n+\n+  EXPECT_FALSE(update_profiling.IsReady());\n+\n+  promise.Set(42);\n+\n+  EXPECT_TRUE(update_profiling.IsReady());\n+  EXPECT_EQ(*update_profiling.Await(), 42);\n+}\n+\n //===----------------------------------------------------------------------===//\n // Performance benchmarks.\n //===----------------------------------------------------------------------===//"
+        }
+    ],
+    "stats": {
+        "total": 41,
+        "additions": 38,
+        "deletions": 3
+    }
+}

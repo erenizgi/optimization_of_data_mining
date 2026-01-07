@@ -1,0 +1,36 @@
+{
+    "author": "pschuh",
+    "message": "Transition to an error state more aggressively when the socket reports errors.\n\nPiperOrigin-RevId: 824749937",
+    "sha": "1fc47fae8e12476959ccaaf46b58330766791f80",
+    "files": [
+        {
+            "sha": "b4e8b20831c6095d84a09585a3eb94617bb00734",
+            "filename": "third_party/xla/xla/python/transfer/socket_bulk_transport.cc",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 3,
+            "changes": 13,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/1fc47fae8e12476959ccaaf46b58330766791f80/third_party%2Fxla%2Fxla%2Fpython%2Ftransfer%2Fsocket_bulk_transport.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/1fc47fae8e12476959ccaaf46b58330766791f80/third_party%2Fxla%2Fxla%2Fpython%2Ftransfer%2Fsocket_bulk_transport.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpython%2Ftransfer%2Fsocket_bulk_transport.cc?ref=1fc47fae8e12476959ccaaf46b58330766791f80",
+            "patch": "@@ -262,11 +262,18 @@ class SendConnectionHandler : public PollEventLoop::Handler {\n \n   bool HandleEvents(const pollfd& events) override {\n     if (events.revents & POLLRDHUP) {\n-      HandleRdHup();\n+      TransitionToErrorState();\n       return false;\n     } else if (events.revents & POLLERR) {\n #ifdef MSG_ZEROCOPY\n-      CHECK_OK(table_.HandleSocketErrors(*fd_));\n+      auto status = table_.HandleSocketErrors(*fd_);\n+      if (!status.ok()) {\n+        TransitionToErrorState();\n+        return false;\n+      }\n+#else\n+      TransitionToErrorState();\n+      return false;\n #endif\n     } else if (events.revents & POLLOUT) {\n       if (no_more_messages_.load() == true) {\n@@ -280,7 +287,7 @@ class SendConnectionHandler : public PollEventLoop::Handler {\n     return true;\n   }\n \n-  void HandleRdHup() {\n+  void TransitionToErrorState() {\n     while (true) {\n       auto state = state_.load();\n       if (state == SocketState::kNotReady) {"
+        },
+        {
+            "sha": "d0434425791472877e7030defbb82a4591f4cb39",
+            "filename": "third_party/xla/xla/python/transfer/socket_bulk_transport_test.cc",
+            "status": "modified",
+            "additions": 44,
+            "deletions": 0,
+            "changes": 44,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/1fc47fae8e12476959ccaaf46b58330766791f80/third_party%2Fxla%2Fxla%2Fpython%2Ftransfer%2Fsocket_bulk_transport_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/1fc47fae8e12476959ccaaf46b58330766791f80/third_party%2Fxla%2Fxla%2Fpython%2Ftransfer%2Fsocket_bulk_transport_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpython%2Ftransfer%2Fsocket_bulk_transport_test.cc?ref=1fc47fae8e12476959ccaaf46b58330766791f80",
+            "patch": "@@ -191,6 +191,50 @@ TEST(SendQueue, SendAndRecvQueuesEarlyClose) {\n   }\n }\n \n+TEST(SendQueue, SendAndRecvQueuesRecvEarlyClose) {\n+  size_t packet_size = 1024 * 8;\n+  SlabAllocator uallocator(AllocateAlignedMemory(packet_size * 4).value(),\n+                           packet_size);\n+  auto recv_thread = RecvThreadState::Create(std::nullopt, uallocator);\n+\n+  int send_fd, recv_fd;\n+  auto status = SetupSocketPairUsingEventLoop(send_fd, recv_fd);\n+  ASSERT_TRUE(status.ok()) << status;\n+\n+  close(recv_fd);\n+  auto work_queue = SharedSendWorkQueue::Start();\n+  auto msg_queue = std::make_shared<SharedSendMsgQueue>();\n+\n+  SharedSendMsgQueue::StartSubConnectionSender(WrapSocket(send_fd), 0,\n+                                               msg_queue, work_queue, 64);\n+\n+  std::string txt_msg;\n+\n+  while (txt_msg.size() < packet_size) {\n+    txt_msg += \"hello world\";\n+  }\n+  absl::Mutex mu;\n+  size_t send_count = 10;\n+\n+  for (size_t i = 0; i < 10; ++i) {\n+    txt_msg.resize(packet_size);\n+    BulkTransportInterface::SendMessage msg;\n+    msg.data = txt_msg.data();\n+    msg.size = txt_msg.size();\n+    msg.on_send = [](absl::StatusOr<int> id, size_t size) {};\n+    msg.on_done = [&mu, &send_count]() {\n+      absl::MutexLock l(mu);\n+      --send_count;\n+    };\n+    msg_queue->ScheduleSendWork(std::move(msg));\n+  }\n+  {\n+    absl::MutexLock l(mu);\n+    auto cond = [&]() { return send_count == 0; };\n+    mu.Await(absl::Condition(&cond));\n+  }\n+}\n+\n TEST(SocketBulkTransportFactoryTest, SendAndRecvWithFactory) {\n   size_t packet_size = 1024 * 8;\n   SlabAllocator allocator(AllocateNetworkPinnedMemory(packet_size * 4).value(),"
+        }
+    ],
+    "stats": {
+        "total": 57,
+        "additions": 54,
+        "deletions": 3
+    }
+}

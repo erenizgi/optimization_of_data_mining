@@ -1,0 +1,36 @@
+{
+    "author": "sachinmuradi",
+    "message": "PR #31035: [XLA:CPU] [OneDnn] Bug fix when emitting Parameter in OneDnnFusion\n\nImported from GitHub PR https://github.com/openxla/xla/pull/31035\n\nFor mapping parameter to graph logical tensor, Onednn fusion emitter implementation assigns same id as parameter number. When emitting onednn graph op, with post-order traversal, this may cause assigning wrong/repeated ids for logical tensor. This can cause inaccurate results.\n\nFor ex:\nWhen emitting following fusion:\n\n```\n%fused_computation (param_0: f32[96,768], param_1: f32[768,1000], param_2: f32[96,1000]) -> f32[96,1000] {\n  %param_0 = f32[96,768]{1,0} parameter(0)\n  %param_1 = f32[768,1000]{1,0} parameter(1)\n  %dot_general.0 = f32[96,1000]{1,0} dot(%param_0, %param_1), lhs_contracting_dims={1}, rhs_contracting_dims={0}\n  %param_2 = f32[96,1000]{1,0} parameter(2)\n  ROOT %add.28 = f32[96,1000]{1,0} add(%dot_general.0, %param_2)\n}\n```\nWith current implementation, mapping of tensors will be :\nparam_0 --> creates logical_tensor with id 0\nparam_0 --> creates logical_tensor id 1\ndot_general.0 --> creates logical_tensor id 2\nparam_2 --> **creates logical_tensor id 2** (since id 2 already exists, it will use same logical tensor as of dot_general.0)\nadd.28 --> creates logical tensor with id 3\n\nAs a result of this add.28 will use dot_general.0 as both inputs instead of [ dot_general0, param_2]\n\n**This PR** addresses this bug by assigning unique id to logical tensors for parameter.\nThis also results in improved performance for matmul fusions, as in backend onednn graph can fuse binary ops as post-ops, which previously ran as onednn matmul + onednn binary_add.\n\nCopybara import of the project:\n\n--\n5b588789301b5c9c87d6aa87ee188cfe9edafc3b by Sachin Muradi <sachin.muradi@intel.com>:\n\nfix parameter logic tensor id\n\nMerging this change closes #31035\n\nPiperOrigin-RevId: 804723100",
+    "sha": "997f105e1fa13d79d9ebc11b60ad5ae2619e356d",
+    "files": [
+        {
+            "sha": "7c65323d44e76eecbeda84ea15f53a1af274c982",
+            "filename": "third_party/xla/xla/backends/cpu/onednn_emitter.cc",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 4,
+            "changes": 9,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/997f105e1fa13d79d9ebc11b60ad5ae2619e356d/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fonednn_emitter.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/997f105e1fa13d79d9ebc11b60ad5ae2619e356d/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fonednn_emitter.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fonednn_emitter.cc?ref=997f105e1fa13d79d9ebc11b60ad5ae2619e356d",
+            "patch": "@@ -125,11 +125,11 @@ static absl::StatusOr<dnnl::graph::logical_tensor> CreateLogicalTensor(\n }\n \n static absl::StatusOr<dnnl::graph::logical_tensor> DefineParameter(\n-    const HloInstruction* param) {\n+    LogicalTensorMap& logical_tensors, const HloInstruction* param) {\n   VLOG(3) << absl::StreamFormat(\"Define logical tensor for parameter: %s\",\n                                 param->ToString());\n-\n-  return CreateLogicalTensor(param->parameter_number(), param->shape());\n+  size_t id = logical_tensors.size();\n+  return CreateLogicalTensor(id, param->shape());\n }\n \n static absl::StatusOr<dnnl::graph::logical_tensor> DefineUnaryOp(\n@@ -240,7 +240,8 @@ static absl::StatusOr<OneDnnFusion> EmitOneDnnFusion(\n   for (const HloInstruction* instr : instructions) {\n     switch (instr->opcode()) {\n       case HloOpcode::kParameter: {\n-        TF_ASSIGN_OR_RETURN(logical_tensors[instr], DefineParameter(instr));\n+        TF_ASSIGN_OR_RETURN(logical_tensors[instr],\n+                            DefineParameter(logical_tensors, instr));\n       } break;\n \n       // Unary elementwise ops."
+        },
+        {
+            "sha": "882d6e690692ef6584a92c586918fbbca2c88e02",
+            "filename": "third_party/xla/xla/service/cpu/tests/onednn_fusion_test.cc",
+            "status": "modified",
+            "additions": 27,
+            "deletions": 0,
+            "changes": 27,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/997f105e1fa13d79d9ebc11b60ad5ae2619e356d/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Ftests%2Fonednn_fusion_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/997f105e1fa13d79d9ebc11b60ad5ae2619e356d/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Ftests%2Fonednn_fusion_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Ftests%2Fonednn_fusion_test.cc?ref=997f105e1fa13d79d9ebc11b60ad5ae2619e356d",
+            "patch": "@@ -128,5 +128,32 @@ TEST_F(OneDnnFusionTest, MatMul) {\n   EXPECT_TRUE(RunAndCompare(kModuleStr, ErrorSpec{1e-5}));\n }\n \n+TEST_F(OneDnnFusionTest, MatMulAdd) {\n+  constexpr absl::string_view kModuleStr = R\"(\n+    HloModule mul\n+    onednn_fusion {\n+      %p0 = f32[10,20] parameter(0)\n+      %p1 = f32[20,30] parameter(1)\n+      %dot = f32[10,30] dot(%p0, %p1),\n+        lhs_contracting_dims={1}, rhs_contracting_dims={0}\n+      %p2 = f32[10,30] parameter(2)\n+      ROOT %add = f32[10,30] add(%dot, %p2)\n+    }\n+    ENTRY entry {\n+      %p0 = f32[10,20] parameter(0)\n+      %p1 = f32[20,30] parameter(1)\n+      %p2 = f32[10,30] parameter(2)\n+      ROOT %fusion = f32[10,30] fusion(%p0, %p1, %p2), kind=kCustom,\n+        calls=onednn_fusion,\n+        backend_config={\"fusion_config\": {kind: \"__onednn_fusion\"}}\n+    })\";\n+\n+  if (!IsOneDnnGraphEnabled()) {\n+    GTEST_SKIP() << \"oneDNN fusion is not supported\";\n+  }\n+\n+  EXPECT_TRUE(RunAndCompare(kModuleStr, ErrorSpec{1e-5}));\n+}\n+\n }  // namespace\n }  // namespace xla::cpu"
+        }
+    ],
+    "stats": {
+        "total": 36,
+        "additions": 32,
+        "deletions": 4
+    }
+}

@@ -1,0 +1,36 @@
+{
+    "author": "WillFroom",
+    "message": "[XLA:CPU] Rollback of report compilation features mismatch as errors as opposed to warnings\n\nReverts 31d72c9fabdb5fd6219aeb79822cb7725dc94f6d\n\nPiperOrigin-RevId: 840189019",
+    "sha": "f87682fd101b463da05fcb1a4002096753192222",
+    "files": [
+        {
+            "sha": "b4cfcf897ef4ac5f256d255846606043e51daf3c",
+            "filename": "third_party/xla/xla/service/cpu/BUILD",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 1,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f87682fd101b463da05fcb1a4002096753192222/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f87682fd101b463da05fcb1a4002096753192222/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2FBUILD?ref=f87682fd101b463da05fcb1a4002096753192222",
+            "patch": "@@ -1845,7 +1845,6 @@ cc_library(\n         \"//xla/service/llvm_ir:llvm_command_line_options\",\n         \"//xla/tsl/platform:errors\",\n         \"//xla/tsl/platform:statusor\",\n-        \"@com_google_absl//absl/algorithm:container\",\n         \"@com_google_absl//absl/log\",\n         \"@com_google_absl//absl/status\",\n         \"@com_google_absl//absl/status:statusor\","
+        },
+        {
+            "sha": "21ebdebf6730f2cac8dcbd9fce9532312163d080",
+            "filename": "third_party/xla/xla/service/cpu/cpu_aot_loader.cc",
+            "status": "modified",
+            "additions": 28,
+            "deletions": 20,
+            "changes": 48,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f87682fd101b463da05fcb1a4002096753192222/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fcpu_aot_loader.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f87682fd101b463da05fcb1a4002096753192222/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fcpu_aot_loader.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fcpu%2Fcpu_aot_loader.cc?ref=f87682fd101b463da05fcb1a4002096753192222",
+            "patch": "@@ -21,10 +21,10 @@ limitations under the License.\n #include <utility>\n #include <vector>\n \n-#include \"absl/algorithm/container.h\"\n #include \"absl/log/log.h\"\n #include \"absl/status/statusor.h\"\n #include \"absl/strings/str_join.h\"\n+#include \"absl/strings/str_split.h\"\n #include \"absl/strings/string_view.h\"\n #include \"absl/types/span.h\"\n #include \"llvm/ADT/StringRef.h\"\n@@ -172,42 +172,50 @@ CpuAotLoader::LoadAotCompilationResult(\n       hlo_module->config().debug_options().xla_backend_extra_options());\n   llvm_ir::LLVMCommandLineOptionsLock llvm_lock(llvm_options);\n \n-  TF_ASSIGN_OR_RETURN(TargetMachineOptions compilation_machine_options,\n+  TF_ASSIGN_OR_RETURN(TargetMachineOptions target_machine_options,\n                       TargetMachineOptions::FromProto(\n                           aot_result_proto.target_machine_options()));\n \n-  TargetMachineOptions target_machine_options(\n-      hlo_module->config().debug_options());\n+  TF_ASSIGN_OR_RETURN(\n+      std::unique_ptr<llvm::TargetMachine> target_machine,\n+      IrCompiler::InferTargetMachine(\n+          std::move(CompilerTargetOptions(hlo_module->config())),\n+          IrCompiler::GetCodeGenOptLevel(hlo_module->config()),\n+          target_machine_options));\n \n   llvm::Triple triple(target_machine_options.triple());\n-  llvm::Triple expected_triple(compilation_machine_options.triple());\n+  llvm::Triple expected_triple(target_machine->getTargetTriple());\n   if (triple.getArchName() != expected_triple.getArchName()) {\n     return Internal(\"Target arch mismatch expected %s got %s.\",\n                     expected_triple.getArchName(), triple.getArchName());\n   }\n \n+  llvm::StringMap<bool> host_machine_features = llvm::sys::getHostCPUFeatures();\n   std::vector<std::string> compile_machine_features =\n-      compilation_machine_options.GetTargetMachineFeaturesVector();\n-  // Convert the supported features to a vector of strings.\n-  std::vector<std::string> host_machine_features_vector =\n       target_machine_options.GetTargetMachineFeaturesVector();\n+  // Convert the supported features to a vector of strings.\n+  std::vector<std::string> host_machine_features_vector;\n+  for (const auto& [feature, supported] : host_machine_features) {\n+    if (supported) {\n+      host_machine_features_vector.push_back(feature.str());\n+    }\n+  }\n \n   for (const absl::string_view feature : compile_machine_features) {\n-    // This is quadratic, we can easily optimize by pre-computing the set of\n-    // host_machine_features_vector.\n     if (feature[0] == '+' &&\n-        absl::c_find(host_machine_features_vector, feature) ==\n-            host_machine_features_vector.end()) {\n+        (!host_machine_features.contains(feature.substr(1)) ||\n+         !host_machine_features[feature.substr(1)])) {\n       // TODO: b/457415427 - Turn this warning into an error once a mechanism\n       // for passing target machine features to the CPU compiler is implemented.\n-      return InvalidArgument(\n-          \"Failed to load XLA:CPU AOT result. Target machine feature %s is not \"\n-          \"supported on the host machine. Machine type used for XLA:CPU \"\n-          \"compilation doesn't match the machine type for \"\n-          \"execution. Compile machine features: [%s] vs host machine features: \"\n-          \"[%s].\",\n-          feature, absl::StrJoin(compile_machine_features, \",\"),\n-          absl::StrJoin(host_machine_features_vector, \",\"));\n+      LOG(ERROR)\n+          << \"Loading XLA:CPU AOT result. Target machine feature \" << feature\n+          << \" is not  supported on the host machine. Machine type used for \"\n+             \"XLA:CPU compilation doesn't match the machine type for \"\n+             \"execution. Compile machine features: [\"\n+          << absl::StrJoin(compile_machine_features, \",\")\n+          << \"] vs host machine features: [\"\n+          << absl::StrJoin(host_machine_features_vector, \",\") << \"]\"\n+          << \". This could lead to execution errors such as SIGILL.\";\n     }\n   }\n "
+        }
+    ],
+    "stats": {
+        "total": 49,
+        "additions": 28,
+        "deletions": 21
+    }
+}

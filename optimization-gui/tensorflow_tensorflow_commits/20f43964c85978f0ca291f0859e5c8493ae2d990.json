@@ -1,0 +1,36 @@
+{
+    "author": "hyeontaek",
+    "message": "[PjRT-IFRT] Add caching to `xla::ifrt::PjRtClient::GetDefaultPjRtLayout()`\n\n`xla::ifrt::Client::GetDefaultPjRtLayout()` may be called more frequently once `xla::ifrt::Array::pjrt_layout()` returns `nullptr` to indicate a default layout. To prepare for it, this change adds caching to the method.\n\nPiperOrigin-RevId: 817385756",
+    "sha": "20f43964c85978f0ca291f0859e5c8493ae2d990",
+    "files": [
+        {
+            "sha": "2115d81c3af3b21d56422f08c643c49c46d9eb43",
+            "filename": "third_party/xla/xla/python/pjrt_ifrt/pjrt_client.cc",
+            "status": "modified",
+            "additions": 33,
+            "deletions": 11,
+            "changes": 44,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/20f43964c85978f0ca291f0859e5c8493ae2d990/third_party%2Fxla%2Fxla%2Fpython%2Fpjrt_ifrt%2Fpjrt_client.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/20f43964c85978f0ca291f0859e5c8493ae2d990/third_party%2Fxla%2Fxla%2Fpython%2Fpjrt_ifrt%2Fpjrt_client.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpython%2Fpjrt_ifrt%2Fpjrt_client.cc?ref=20f43964c85978f0ca291f0859e5c8493ae2d990",
+            "patch": "@@ -1623,19 +1623,41 @@ absl::StatusOr<std::shared_ptr<Topology>> PjRtClient::GetTopologyForDevices(\n absl::StatusOr<std::shared_ptr<const xla::PjRtLayout>>\n PjRtClient::GetDefaultPjRtLayout(DType dtype, absl::Span<const int64_t> dims,\n                                  Device* device, MemoryKind memory_kind) const {\n-  static MemoryKind kUnpinnedHostMemoryKind(UnpinnedHostMemorySpace::kKind);\n-  if (memory_kind == kUnpinnedHostMemoryKind) {\n-    return std::make_shared<xla::PjRtLayout>(\n-        LayoutUtil::MakeDescendingLayout(dims.size()));\n+  // PjRt-IFRT devices are currently homogeneous. The cache key omits device\n+  // information.\n+  // TODO(hyeontaek): Add device-specific information (e.g., `device->Kind()`)\n+  // once PjRt-IFRT supports heterogeneous devices.\n+  auto key = std::make_tuple(\n+      dtype, std::vector<int64_t>(dims.begin(), dims.end()), memory_kind);\n+  {\n+    absl::MutexLock lock(default_layout_cache_mu_);\n+    if (auto it = default_layout_cache_.find(key);\n+        it != default_layout_cache_.end()) {\n+      return it->second;\n+    }\n   }\n-  TF_ASSIGN_OR_RETURN(PrimitiveType element_type, ToPrimitiveType(dtype));\n-  if (element_type == PrimitiveType::TOKEN) {\n-    return std::make_shared<PjRtLayout>(\n-        LayoutUtil::MakeDescendingLayout(dims.size()));\n+\n+  auto layout =\n+      [&]() -> absl::StatusOr<std::shared_ptr<const xla::PjRtLayout>> {\n+    static MemoryKind kUnpinnedHostMemoryKind(UnpinnedHostMemorySpace::kKind);\n+    if (memory_kind == kUnpinnedHostMemoryKind) {\n+      return std::make_shared<xla::PjRtLayout>(\n+          LayoutUtil::MakeDescendingLayout(dims.size()));\n+    }\n+    TF_ASSIGN_OR_RETURN(PrimitiveType element_type, ToPrimitiveType(dtype));\n+    if (element_type == PrimitiveType::TOKEN) {\n+      return std::make_shared<PjRtLayout>(\n+          LayoutUtil::MakeDescendingLayout(dims.size()));\n+    }\n+    TF_ASSIGN_OR_RETURN(xla::Layout layout,\n+                        pjrt_client_->GetDefaultLayout(element_type, dims));\n+    return std::make_shared<xla::PjRtLayout>(std::move(layout));\n+  }();\n+  {\n+    absl::MutexLock lock(default_layout_cache_mu_);\n+    default_layout_cache_.insert({std::move(key), layout});\n   }\n-  TF_ASSIGN_OR_RETURN(xla::Layout layout,\n-                      pjrt_client_->GetDefaultLayout(element_type, dims));\n-  return std::make_shared<xla::PjRtLayout>(std::move(layout));\n+  return layout;\n }\n \n absl::Status PjRtClient::TransferToInfeed(PjRtDevice* device,"
+        },
+        {
+            "sha": "7a9fda82f21c24b9ffd56f84350af6d3f599bacb",
+            "filename": "third_party/xla/xla/python/pjrt_ifrt/pjrt_client.h",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 0,
+            "changes": 8,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/20f43964c85978f0ca291f0859e5c8493ae2d990/third_party%2Fxla%2Fxla%2Fpython%2Fpjrt_ifrt%2Fpjrt_client.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/20f43964c85978f0ca291f0859e5c8493ae2d990/third_party%2Fxla%2Fxla%2Fpython%2Fpjrt_ifrt%2Fpjrt_client.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpython%2Fpjrt_ifrt%2Fpjrt_client.h?ref=20f43964c85978f0ca291f0859e5c8493ae2d990",
+            "patch": "@@ -21,6 +21,7 @@ limitations under the License.\n #include <functional>\n #include <memory>\n #include <optional>\n+#include <tuple>\n #include <vector>\n \n #include \"absl/base/thread_annotations.h\"\n@@ -354,6 +355,13 @@ class PjRtClient final\n   absl::flat_hash_map<xla::PjRtMemorySpace*, PjRtMemory*> memory_map_;\n   absl::flat_hash_map<DeviceId, PjRtDevice*> device_id_map_;\n \n+  // Cached concrete default layouts.\n+  mutable absl::Mutex default_layout_cache_mu_;\n+  mutable absl::flat_hash_map<\n+      std::tuple<DType, std::vector<int64_t>, MemoryKind>,\n+      absl::StatusOr<std::shared_ptr<const xla::PjRtLayout>>>\n+      default_layout_cache_ ABSL_GUARDED_BY(default_layout_cache_mu_);\n+\n   // Copies arrays from source to destination devices when at least one of the\n   // (source, destination) pairs is cross-host.\n   absl::StatusOr<std::vector<ArrayRef>> CopyArraysForCrossHost("
+        }
+    ],
+    "stats": {
+        "total": 52,
+        "additions": 41,
+        "deletions": 11
+    }
+}

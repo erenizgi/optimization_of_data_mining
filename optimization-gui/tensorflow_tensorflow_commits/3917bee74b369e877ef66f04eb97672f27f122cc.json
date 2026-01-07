@@ -1,0 +1,48 @@
+{
+    "author": "unknown",
+    "message": "[XLA] Adding new attribute for the scheduler that allows force delaying the start only of async operations\n\nAlso guarantees that the starts are performed in the same order as the scheduling of the dones.\n\nPiperOrigin-RevId: 843492464",
+    "sha": "3917bee74b369e877ef66f04eb97672f27f122cc",
+    "files": [
+        {
+            "sha": "1fd1e01dd9dd1132fa0137ef2d49fce226d659a9",
+            "filename": "third_party/xla/xla/service/latency_hiding_scheduler.cc",
+            "status": "modified",
+            "additions": 22,
+            "deletions": 0,
+            "changes": 22,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/3917bee74b369e877ef66f04eb97672f27f122cc/third_party%2Fxla%2Fxla%2Fservice%2Flatency_hiding_scheduler.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/3917bee74b369e877ef66f04eb97672f27f122cc/third_party%2Fxla%2Fxla%2Fservice%2Flatency_hiding_scheduler.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Flatency_hiding_scheduler.cc?ref=3917bee74b369e877ef66f04eb97672f27f122cc",
+            "patch": "@@ -163,6 +163,23 @@ int GetCustomCallForceDelayPriority(const HloInstruction* instr) {\n   return 0;\n }\n \n+bool HasForceDelayAsyncAttribute(const HloInstruction* instr) {\n+  auto attr = instr->get_frontend_attribute(\"scheduler_hint\");\n+  return attr.has_value() && attr.value() == \"force_delay_async\";\n+}\n+\n+const HloGraphNode* AnyStartHasForceDelay(const HloGraphNode* n) {\n+  CHECK(n->IsSupportedAsyncDone())\n+      << \"Meant to check if any start feeding a done has forced delay\";\n+  for (auto& v : n->GetPredecessors()) {\n+    if (v.Target().IsSupportedAsyncStart() &&\n+        HasForceDelayAsyncAttribute(&v.Target().GetInstr())) {\n+      return v.TargetPtr();\n+    }\n+  }\n+  return nullptr;\n+}\n+\n absl::flat_hash_map<int64_t, int64_t>\n GetNumResourcesNeededForAnnotationWithKeepOriginalOrderAttrs(\n     const DefaultSchedulerCore::SchedulingState& sched_state,\n@@ -2622,6 +2639,9 @@ HloScheduleGraph::HloScheduleGraph(\n       n->SetForceDelay(true);\n       n->SetForceDelayPriority(GetCustomCallForceDelayPriority(instr));\n     }\n+    if (n->IsSupportedAsyncStart() && HasForceDelayAsyncAttribute(instr)) {\n+      n->SetForceDelay(true);\n+    }\n   }\n \n   // num_predecessors[i]: number of predecessors for instruction number \"i\"\n@@ -3001,6 +3021,8 @@ absl::Status DefaultSchedulerCore::InitializeScheduler(\n               continue;\n             }\n             if (count > it->second) {\n+              VLOG(5) << \"Cross overlap limit for resource: \" << resource\n+                      << \" count: \" << count << \" limit: \" << it->second;\n               return true;\n             }\n           }"
+        },
+        {
+            "sha": "5f4f6d449162be85cd757d0efedc5abc88372906",
+            "filename": "third_party/xla/xla/service/latency_hiding_scheduler.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/3917bee74b369e877ef66f04eb97672f27f122cc/third_party%2Fxla%2Fxla%2Fservice%2Flatency_hiding_scheduler.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/3917bee74b369e877ef66f04eb97672f27f122cc/third_party%2Fxla%2Fxla%2Fservice%2Flatency_hiding_scheduler.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Flatency_hiding_scheduler.h?ref=3917bee74b369e877ef66f04eb97672f27f122cc",
+            "patch": "@@ -19,6 +19,7 @@ limitations under the License.\n #include <algorithm>\n #include <cstddef>\n #include <cstdint>\n+#include <deque>\n #include <functional>\n #include <limits>\n #include <memory>"
+        },
+        {
+            "sha": "c1bc14e0268974ca59b68e85ddf37b3eff169c30",
+            "filename": "third_party/xla/xla/service/latency_hiding_scheduler_test.cc",
+            "status": "modified",
+            "additions": 60,
+            "deletions": 0,
+            "changes": 60,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/3917bee74b369e877ef66f04eb97672f27f122cc/third_party%2Fxla%2Fxla%2Fservice%2Flatency_hiding_scheduler_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/3917bee74b369e877ef66f04eb97672f27f122cc/third_party%2Fxla%2Fxla%2Fservice%2Flatency_hiding_scheduler_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Flatency_hiding_scheduler_test.cc?ref=3917bee74b369e877ef66f04eb97672f27f122cc",
+            "patch": "@@ -812,6 +812,66 @@ ENTRY %module {\n   EXPECT_TRUE(result.value());\n }\n \n+TEST_F(LatencyHidingSchedulerTest, ForceDelayAsyncAllGather) {\n+  absl::string_view hlo_string = R\"(\n+HloModule module, is_scheduled=true\n+\n+ENTRY %module {\n+  %constant.19 = u32[] constant(1)\n+  %replica_id = u32[]{:T(128)} replica-id()\n+  %add.1 = u32[]{:T(128)} add(replica_id, constant.19)\n+  %convert = f32[]{:T(128)} convert(u32[]{:T(128)} %replica_id)\n+  %convert.1 = f32[]{:T(128)} convert(u32[]{:T(128)} %add.1)\n+  %color_operand.1 = f32[8,256,256]{2,1,0:T(8,128)} broadcast(f32[]{:T(128)} %convert), dimensions={}\n+  %color_operand.2 = f32[8,256,256]{2,1,0:T(8,128)} broadcast(f32[]{:T(128)} %convert.1), dimensions={}\n+  %ag-start.2 = (f32[8,256,256], f32[16,256,256]) all-gather-start(f32[8,256,256] %color_operand.2), replica_groups={{0,1}}, dimensions={0},\n+    metadata={op_type=\"AllGather\" op_name=\"ag1\"}\n+  %ag-start = (f32[8,256,256], f32[16,256,256]) all-gather-start(f32[8,256,256] %color_operand.1), replica_groups={{0,1}}, dimensions={0},\n+    frontend_attributes={scheduler_hint=\"force_delay_async\"},\n+    metadata={op_type=\"AllGather\" op_name=\"ag0\"}\n+  %ag-done = f32[16,256,256] all-gather-done((f32[8,256,256], f32[16,256,256]) %ag-start),\n+    metadata={op_type=\"AllGather\" op_name=\"ag0\"}\n+  %ag-done.2 = f32[16,256,256] all-gather-done((f32[8,256,256], f32[16,256,256]) %ag-start.2),\n+    metadata={op_type=\"AllGather\" op_name=\"ag1\"}\n+  p0 = f32[16,64,256]{2,1,0} parameter(0)\n+  p1 = f32[16,64,256]{2,1,0} parameter(1)\n+  c0 = f32[16,256,256]{2,1,0} convolution(p0, p1),\n+    window={size=16 stride=15 lhs_dilate=16}, dim_labels=0fb_0io->0fb\n+  ROOT a2 = f32[16,256,256]{2,1,0} add(%ag-done, %ag-done.2)\n+}\n+)\";\n+\n+  TF_ASSERT_OK_AND_ASSIGN(auto hlo_module, ParseHloText(hlo_string));\n+  HloSchedule& module_schedule = hlo_module->schedule();\n+  EXPECT_TRUE(hlo_module->has_entry_computation());\n+  HloComputation* entry_computation = hlo_module->entry_computation();\n+  std::vector<HloInstruction*> original_instruction_sequence =\n+      module_schedule.sequence(entry_computation).instructions();\n+\n+  TF_EXPECT_OK(RunScheduler(hlo_module.get()));\n+  std::vector<HloInstruction*> new_instruction_sequence =\n+      module_schedule.sequence(entry_computation).instructions();\n+\n+  if (VLOG_IS_ON(1)) {\n+    for (auto* new_i : new_instruction_sequence) {\n+      VLOG(1) << new_i->ToString();\n+    }\n+  }\n+\n+  // The all-gather with force_delay_async (ag0) should be scheduled earlier\n+  // than ag1 because force_delay_async affects the scheduling priority.\n+  EXPECT_LT(GetOpcodeIndexUsingMetaData(HloOpcode::kAllGatherStart,\n+                                        new_instruction_sequence, \"ag0\"),\n+            GetOpcodeIndexUsingMetaData(HloOpcode::kAllGatherStart,\n+                                        new_instruction_sequence, \"ag1\"));\n+\n+  // Check the order stays the same for the dones.\n+  EXPECT_LT(GetOpcodeIndexUsingMetaData(HloOpcode::kAllGatherDone,\n+                                        new_instruction_sequence, \"ag0\"),\n+            GetOpcodeIndexUsingMetaData(HloOpcode::kAllGatherDone,\n+                                        new_instruction_sequence, \"ag1\"));\n+}\n+\n TEST_F(LatencyHidingSchedulerTest, WhileLoopAliasingBug2) {\n   // Like WhileLoopAliasingBug above, but this time the input buffer of the\n   // first collective permute aliases with the output buffer of the second"
+        }
+    ],
+    "stats": {
+        "total": 83,
+        "additions": 83,
+        "deletions": 0
+    }
+}

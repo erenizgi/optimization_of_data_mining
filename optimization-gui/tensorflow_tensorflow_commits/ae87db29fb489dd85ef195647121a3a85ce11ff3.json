@@ -1,0 +1,24 @@
+{
+    "author": "yashk2810",
+    "message": "Add support and tests for sharded -> unreduced operation.\n\n**But why do we need such an operation?**\n\nYou might want to use it directly: it's a kind of a lazy (i.e. no-comms) reduce_sum over shards, without changing the logical shape:\n\n```python\nreshard(f32[4@x], P(Unreduced={x})) : f32[4]{U:x}\n```\n\nPhysically, we would zero-pad:\n\n ```\n# f32[4@x] i.e. per-device shape is (2,)\nDevice-0   Device-1\n[0, 1]     [2, 3]\n\n# f32[4]{U:x} i.e. per-device shape is (4,)\nDevice-0         Device-1\n[0, 1, 0, 0]     [0, 0, 2, 3]\n```\n\n(There are other valid physical possibilities because Unreduced is flexible. For example, `Device-0: [0/2, 1/2, 2/2, 3/2]` and `Device-1: [0/2, 1/2, 2/2, 3/2]` is valid, but would require comms and would have weird numeric effects. Terrible.)\n\nThe inverse operation (not the transpose, since those change the types) is `reshard(f32[4]{U:x}, P('x'))` and physically is a reduce-scatter, which naturally has the right effect on the physical buffers.\n\n**But as another motivation**, this operation naturally arises from autodiff, if we allow other reasonable expressions. For example, if we want to allow elementwise multiplication of sharded and Reduced values at the user level (because everything that works with Replicated should work with Reduced):\n\n```python\na: f32[4@x]\nb: f32[4]{R: x}\nc: f32[4@x] = a * b\n```\n\nwe would desugar that as\n\n```python\nb_: f32[4@x] = reshard(b, P('x'))  # Reduced -> Sharded\nc: f32[4@x] = mul(a, b_)\n```\n\nThen the backward pass would require a Sharded -> Unreduced operation:\n\n```python\ndb_: f32[4@x] = mul(a, dc)\ndb: f32[4]{U:x} = reshard(db_, P(Unreduced={x}))  # Sharded -> Unreduced\n```\n\n**Before this change**, we actually had buggy behavior in that autodiff example where we multiply Reduced with Sharded. We would get incorrect gradients because our lowering of the backward pass's Sharded->Unreduced operation used to all-gather instead of zero-pad.\n\nOne very very interesting thing is comparing to varying -> unreduced support inside shard_map, which works via shape-changing rather than zero-padding! How? The varying -> unreduced pcast is shape-preserving operation inside shmap, but when returning shard_map naturally concats so as to increase shapes. If we want exactly the same to be expressible outside shard_map, we might additionally need shape-changing operations like `f32[4@x] -> f32[2]{U:x}` and its transpose. But we'll leave that to future work.\n\nCo-authored-by: Matthew Johnson <mattjj@google.com>\nPiperOrigin-RevId: 843859866",
+    "sha": "ae87db29fb489dd85ef195647121a3a85ce11ff3",
+    "files": [
+        {
+            "sha": "6361abdfe960833a89be69e34a4f00af45bf9ce7",
+            "filename": "third_party/xla/xla/python/version.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ae87db29fb489dd85ef195647121a3a85ce11ff3/third_party%2Fxla%2Fxla%2Fpython%2Fversion.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ae87db29fb489dd85ef195647121a3a85ce11ff3/third_party%2Fxla%2Fxla%2Fpython%2Fversion.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpython%2Fversion.h?ref=ae87db29fb489dd85ef195647121a3a85ce11ff3",
+            "patch": "@@ -18,6 +18,6 @@ limitations under the License.\n \n // An increasing version number to protect jax code against breaking changes.\n // In JAX, reference this via jax._src.lib.ifrt_version.\n-#define JAX_IFRT_VERSION_NUMBER 39  // New coordination service implementation.\n+#define JAX_IFRT_VERSION_NUMBER 40  // Shardy sharded -> unreduced\n \n #endif  // XLA_PYTHON_VERSION_H_"
+        }
+    ],
+    "stats": {
+        "total": 2,
+        "additions": 1,
+        "deletions": 1
+    }
+}

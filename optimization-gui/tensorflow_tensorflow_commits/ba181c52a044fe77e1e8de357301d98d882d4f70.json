@@ -1,0 +1,48 @@
+{
+    "author": "unknown",
+    "message": "[XLA] BufferUse: add support for ReadWrite\n\nAllows reusing BufferUse for Thunk::GetBuffers in GPU backend, needed for\nnondeterministic computation detection via checksumming.\n\nDoes not change behavior for existing uses of BufferUse. The behavior of\nReadWriteSet, which considers write access a superset of read acces, is left\nunchanged.\n\nPiperOrigin-RevId: 814223704",
+    "sha": "ba181c52a044fe77e1e8de357301d98d882d4f70",
+    "files": [
+        {
+            "sha": "b60af57838c26479e99538d5463eb47bb2604115",
+            "filename": "third_party/xla/xla/runtime/buffer_use.cc",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 3,
+            "changes": 9,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ba181c52a044fe77e1e8de357301d98d882d4f70/third_party%2Fxla%2Fxla%2Fruntime%2Fbuffer_use.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ba181c52a044fe77e1e8de357301d98d882d4f70/third_party%2Fxla%2Fxla%2Fruntime%2Fbuffer_use.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fruntime%2Fbuffer_use.cc?ref=ba181c52a044fe77e1e8de357301d98d882d4f70",
+            "patch": "@@ -32,6 +32,10 @@ void BufferUse::ReadWriteSet::Add(BufferUse use) {\n     case BufferUse::kWrite:\n       AddWrite(use.slice());\n       break;\n+    case BufferUse::kReadWrite:\n+      AddRead(use.slice());\n+      AddWrite(use.slice());\n+      break;\n   }\n }\n \n@@ -57,9 +61,8 @@ bool BufferUse::ReadWriteSet::HasConflicts(const BufferUse& use) const {\n            });\n   };\n \n-  return use.access() == MemoryAccess::kWrite\n-             ? overlaps(write_, use) || overlaps(read_, use)\n-             : overlaps(write_, use);\n+  return use.HasWriteAccess() ? overlaps(write_, use) || overlaps(read_, use)\n+                              : overlaps(write_, use);\n }\n \n bool BufferUse::ReadWriteSet::HasConflicts(const ReadWriteSet& other) {"
+        },
+        {
+            "sha": "f01632d5bc8177ab2815fbb4707a1660d0319c3d",
+            "filename": "third_party/xla/xla/runtime/buffer_use.h",
+            "status": "modified",
+            "additions": 26,
+            "deletions": 4,
+            "changes": 30,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ba181c52a044fe77e1e8de357301d98d882d4f70/third_party%2Fxla%2Fxla%2Fruntime%2Fbuffer_use.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ba181c52a044fe77e1e8de357301d98d882d4f70/third_party%2Fxla%2Fxla%2Fruntime%2Fbuffer_use.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fruntime%2Fbuffer_use.h?ref=ba181c52a044fe77e1e8de357301d98d882d4f70",
+            "patch": "@@ -16,21 +16,31 @@ limitations under the License.\n #ifndef XLA_RUNTIME_BUFFER_USE_H_\n #define XLA_RUNTIME_BUFFER_USE_H_\n \n+#include <cstdint>\n+\n #include \"absl/container/flat_hash_set.h\"\n #include \"absl/types/span.h\"\n #include \"xla/service/buffer_assignment.h\"\n \n namespace xla {\n \n-// BufferUse tracks memory access type for a buffer slice, so that XLA can\n-// correctly insert synchronization primitives at run time to avoid read/write\n-// conflicts. Synchronization primitives are specific to the target backend.\n+// BufferUse tracks memory access type for a buffer slice. This is used to\n+// let XLA:\n+// - Correctly insert synchronization primitives at run time to avoid read/write\n+//   conflicts. Synchronization primitives are specific to the target backend.\n+// - Determine whether a buffer has defined contents before/after we execute a\n+//   thunk. This is used to detect non-deterministic behavior via checksumming.\n class BufferUse {\n  public:\n-  enum class MemoryAccess { kRead, kWrite };\n+  enum class MemoryAccess : uint32_t {\n+    kRead = 1 << 0,\n+    kWrite = 1 << 1,\n+    kReadWrite = kRead | kWrite,\n+  };\n \n   static constexpr MemoryAccess kRead = MemoryAccess::kRead;\n   static constexpr MemoryAccess kWrite = MemoryAccess::kWrite;\n+  static constexpr MemoryAccess kReadWrite = MemoryAccess::kReadWrite;\n \n   BufferUse(BufferAllocation::Slice slice, MemoryAccess access)\n       : slice_(slice), access_(access) {}\n@@ -43,6 +53,18 @@ class BufferUse {\n     return BufferUse(slice, MemoryAccess::kWrite);\n   }\n \n+  static BufferUse ReadWrite(BufferAllocation::Slice slice) {\n+    return BufferUse(slice, MemoryAccess::kReadWrite);\n+  }\n+\n+  bool HasReadAccess() const {\n+    return static_cast<uint32_t>(access_) & static_cast<uint32_t>(kRead);\n+  }\n+\n+  bool HasWriteAccess() const {\n+    return static_cast<uint32_t>(access_) & static_cast<uint32_t>(kWrite);\n+  }\n+\n   // ReadWriteSet tracks a set of read and write buffer slices.\n   class ReadWriteSet {\n    public:"
+        },
+        {
+            "sha": "bc308d5cc44553ad19b6ea25a54284e775520840",
+            "filename": "third_party/xla/xla/runtime/buffer_use_test.cc",
+            "status": "modified",
+            "additions": 17,
+            "deletions": 0,
+            "changes": 17,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/ba181c52a044fe77e1e8de357301d98d882d4f70/third_party%2Fxla%2Fxla%2Fruntime%2Fbuffer_use_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/ba181c52a044fe77e1e8de357301d98d882d4f70/third_party%2Fxla%2Fxla%2Fruntime%2Fbuffer_use_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fruntime%2Fbuffer_use_test.cc?ref=ba181c52a044fe77e1e8de357301d98d882d4f70",
+            "patch": "@@ -34,6 +34,23 @@ TEST(BufferUseTest, Equality) {\n   EXPECT_EQ(use0, use2);\n }\n \n+TEST(BufferUseTest, HasReadWriteAccess) {\n+  BufferAllocation alloc(/*index=*/0, /*size=*/1024, /*color=*/0);\n+  BufferAllocation::Slice slice(&alloc, 0, 10);\n+\n+  BufferUse read = BufferUse::Read(slice);\n+  EXPECT_TRUE(read.HasReadAccess());\n+  EXPECT_FALSE(read.HasWriteAccess());\n+\n+  BufferUse write = BufferUse::Write(slice);\n+  EXPECT_FALSE(write.HasReadAccess());\n+  EXPECT_TRUE(write.HasWriteAccess());\n+\n+  BufferUse read_write = BufferUse::ReadWrite(slice);\n+  EXPECT_TRUE(read_write.HasReadAccess());\n+  EXPECT_TRUE(read_write.HasWriteAccess());\n+}\n+\n TEST(BufferUseTest, ReadWriteSet) {\n   BufferUse::ReadWriteSet rwset;\n "
+        }
+    ],
+    "stats": {
+        "total": 56,
+        "additions": 49,
+        "deletions": 7
+    }
+}

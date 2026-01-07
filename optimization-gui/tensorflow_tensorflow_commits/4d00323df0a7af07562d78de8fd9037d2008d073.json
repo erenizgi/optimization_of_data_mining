@@ -1,0 +1,48 @@
+{
+    "author": "WillFroom",
+    "message": "[XLA:GPU] Fix missing to_scalar/to_tensor in bitcast lowering.\n\nPiperOrigin-RevId: 828502719",
+    "sha": "4d00323df0a7af07562d78de8fd9037d2008d073",
+    "files": [
+        {
+            "sha": "0a6ed53a0abcb62ea02193d7b5f6a1cb01a07390",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/transforms/passes.td",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4d00323df0a7af07562d78de8fd9037d2008d073/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Fpasses.td",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4d00323df0a7af07562d78de8fd9037d2008d073/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Fpasses.td",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Fpasses.td?ref=4d00323df0a7af07562d78de8fd9037d2008d073",
+            "patch": "@@ -223,7 +223,8 @@ def TensorLowerToTritonPass\n   let summary = \"Lowers tensor operations to their Triton equivalent.\";\n   let dependentDialects = [\n     \"tensor::TensorDialect\",\n-    \"triton::TritonDialect\"\n+    \"triton::TritonDialect\",\n+    \"::xla::xtile::XTileDialect\",\n   ];\n   let constructor = \"CreateTensorLowerToTritonPass()\";\n }"
+        },
+        {
+            "sha": "de36901c70b8ff6e51c4386c8565b6123ac3c239",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/transforms/tensor_lower_to_triton.cc",
+            "status": "modified",
+            "additions": 22,
+            "deletions": 2,
+            "changes": 24,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4d00323df0a7af07562d78de8fd9037d2008d073/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftensor_lower_to_triton.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4d00323df0a7af07562d78de8fd9037d2008d073/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftensor_lower_to_triton.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftensor_lower_to_triton.cc?ref=4d00323df0a7af07562d78de8fd9037d2008d073",
+            "patch": "@@ -18,13 +18,15 @@ limitations under the License.\n \n #include \"mlir/Dialect/Tensor/IR/Tensor.h\"\n #include \"mlir/IR/BuiltinTypeInterfaces.h\"\n+#include \"mlir/IR/BuiltinTypes.h\"\n #include \"mlir/IR/Diagnostics.h\"\n #include \"mlir/IR/PatternMatch.h\"\n #include \"mlir/Pass/Pass.h\"\n #include \"mlir/Support/LLVM.h\"\n #include \"mlir/Support/LogicalResult.h\"\n #include \"mlir/Transforms/DialectConversion.h\"\n #include \"mlir/Transforms/GreedyPatternRewriteDriver.h\"\n+#include \"xla/codegen/xtile/ir/xtile_ops.h\"\n #include \"triton/Dialect/Triton/IR/Dialect.h\"\n \n namespace mlir::triton::xla {\n@@ -43,8 +45,26 @@ class LowerBitcast : public mlir::OpRewritePattern<tensor::BitcastOp> {\n  private:\n   mlir::LogicalResult matchAndRewrite(\n       tensor::BitcastOp op, mlir::PatternRewriter& rewriter) const override {\n-    rewriter.replaceOpWithNewOp<ttir::BitcastOp>(op, op.getResult().getType(),\n-                                                 op.getOperand());\n+    mlir::Value source = op.getSource();\n+    if (op.getSource().getType().getRank() == 0) {\n+      source = ::xla::xtile::ToScalarOp::create(rewriter, op.getLoc(), source);\n+    }\n+\n+    mlir::TensorType tensor_result_type = op.getResult().getType();\n+    bool is_0d_result = tensor_result_type.getRank() == 0;\n+    mlir::Type triton_result_type =\n+        is_0d_result ? tensor_result_type.getElementType() : tensor_result_type;\n+\n+    auto bitcast = ttir::BitcastOp::create(rewriter, op.getLoc(),\n+                                           triton_result_type, source);\n+\n+    mlir::Value result = bitcast.getResult();\n+    if (is_0d_result) {\n+      result = ::xla::xtile::ToTensorOp::create(rewriter, op.getLoc(), result);\n+    }\n+\n+    rewriter.replaceOp(op, result);\n+\n     return mlir::success();\n   }\n };"
+        },
+        {
+            "sha": "20c872940a2510c361fd02d0800feeae64155c96",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/transforms/tests/tensor_to_triton_lowering.mlir",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 0,
+            "changes": 10,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/4d00323df0a7af07562d78de8fd9037d2008d073/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftests%2Ftensor_to_triton_lowering.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/4d00323df0a7af07562d78de8fd9037d2008d073/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftests%2Ftensor_to_triton_lowering.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ftransforms%2Ftests%2Ftensor_to_triton_lowering.mlir?ref=4d00323df0a7af07562d78de8fd9037d2008d073",
+            "patch": "@@ -11,3 +11,13 @@ func.func @lower_bitcast(%arg0: tensor<2x4x8xf32>) -> tensor<2x4x8xi32> {\n   // CHECK: return %[[RES]] : tensor<2x4x8xi32>\n   return %0 : tensor<2x4x8xi32>\n }\n+\n+// CHECK: func @lower_bitcast_0d(%[[ARG:.*]]: tensor<f32>) -> tensor<i32>\n+func.func @lower_bitcast_0d(%arg0: tensor<f32>) -> tensor<i32> {\n+  // CHECK: %[[SCALAR_ARG:.*]] = xtile.to_scalar %[[ARG]] : tensor<f32>\n+  // CHECK: %[[RES:.*]] = tt.bitcast %[[SCALAR_ARG]] : f32 -> i32\n+  // CHECK: %[[TENSOR_RES:.*]] = xtile.to_tensor %[[RES]] : i32\n+  %0 = tensor.bitcast %arg0 : tensor<f32> to tensor<i32>\n+  // CHECK: return %[[TENSOR_RES]] : tensor<i32>\n+  return %0 : tensor<i32>\n+}"
+        }
+    ],
+    "stats": {
+        "total": 37,
+        "additions": 34,
+        "deletions": 3
+    }
+}

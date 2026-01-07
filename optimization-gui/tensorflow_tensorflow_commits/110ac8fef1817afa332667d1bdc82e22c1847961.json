@@ -1,0 +1,96 @@
+{
+    "author": "hawkinsp",
+    "message": "Change HloModuleGroup so it can only contain at most one module.\n\nPiperOrigin-RevId: 816516738",
+    "sha": "110ac8fef1817afa332667d1bdc82e22c1847961",
+    "files": [
+        {
+            "sha": "ba3c7948a6b6ef67424b5a462aeee64d28815e47",
+            "filename": "third_party/xla/xla/hlo/ir/BUILD",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/110ac8fef1817afa332667d1bdc82e22c1847961/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/110ac8fef1817afa332667d1bdc82e22c1847961/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2FBUILD?ref=110ac8fef1817afa332667d1bdc82e22c1847961",
+            "patch": "@@ -283,6 +283,8 @@ cc_library(\n         \"//xla/service:hlo_module_config\",\n         \"//xla/service:hlo_proto_cc\",\n         \"//xla/tsl/platform:statusor\",\n+        \"@com_google_absl//absl/log:check\",\n+        \"@com_google_absl//absl/status\",\n         \"@com_google_absl//absl/status:statusor\",\n         \"@com_google_absl//absl/strings\",\n         \"@com_google_absl//absl/types:span\","
+        },
+        {
+            "sha": "8d5bf16ef79118a76a2ffb434039146ee030e3fd",
+            "filename": "third_party/xla/xla/hlo/ir/hlo_module_group.cc",
+            "status": "modified",
+            "additions": 24,
+            "deletions": 44,
+            "changes": 68,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/110ac8fef1817afa332667d1bdc82e22c1847961/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_module_group.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/110ac8fef1817afa332667d1bdc82e22c1847961/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_module_group.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_module_group.cc?ref=110ac8fef1817afa332667d1bdc82e22c1847961",
+            "patch": "@@ -22,8 +22,10 @@ limitations under the License.\n #include <utility>\n #include <vector>\n \n+#include \"absl/log/check.h\"\n+#include \"absl/status/status.h\"\n #include \"absl/status/statusor.h\"\n-#include \"absl/strings/string_view.h\"\n+#include \"absl/strings/str_cat.h\"\n #include \"absl/types/span.h\"\n #include \"xla/hlo/ir/hlo_module.h\"\n #include \"xla/service/hlo.pb.h\"\n@@ -34,49 +36,30 @@ limitations under the License.\n namespace xla {\n \n HloModuleGroup::HloModuleGroup(std::unique_ptr<HloModule> module)\n-    : name_(module->name()) {\n-  push_back(std::move(module));\n-}\n-\n-HloModuleGroup::HloModuleGroup(absl::string_view name,\n-                               absl::Span<std::unique_ptr<HloModule>> modules)\n-    : name_(name) {\n-  for (auto& module : modules) {\n-    push_back(std::move(module));\n-  }\n-}\n-\n-HloModuleGroup::HloModuleGroup(\n-    absl::string_view name, std::vector<std::unique_ptr<HloModule>>&& modules)\n-    : name_(name) {\n-  for (auto& module : modules) {\n-    push_back(std::move(module));\n-  }\n+    : name_(module->name()), module_(std::move(module)) {\n+  module_->metadata()->set_module_group_name(name_);\n }\n \n std::vector<std::unique_ptr<HloModule>> HloModuleGroup::ConsumeModules() {\n-  std::vector<std::unique_ptr<HloModule>> ret_modules = std::move(modules_);\n-\n-  // Clear everything so the object state is in a known (empty) state.\n-  modules_.clear();\n-  module_ptrs_.clear();\n+  std::vector<std::unique_ptr<HloModule>> ret_modules;\n+  ret_modules.push_back(std::move(module_));\n   return ret_modules;\n }\n \n std::string HloModuleGroup::ToString() const {\n   std::ostringstream s;\n   s << \"HloModuleGroup \" << name() << \"\\n\\n\";\n-  for (const HloModule* module : modules()) {\n-    s << module->ToString() << \"\\n\";\n+  if (module_) {\n+    s << module_->ToString() << \"\\n\";\n   }\n   return s.str();\n }\n \n HloModuleGroupProto HloModuleGroup::ToProto() const {\n   HloModuleGroupProto proto;\n   proto.set_name(name());\n-  for (const HloModule* module : modules()) {\n-    *proto.add_hlo_modules() = module->ToProto();\n+  if (module_) {\n+    *proto.add_hlo_modules() = module_->ToProto();\n   }\n   return proto;\n }\n@@ -90,28 +73,25 @@ HloModuleGroupProto HloModuleGroup::ToProto() const {\n   TF_RET_CHECK(proto.hlo_modules_size() == module_configs.size());\n \n   std::vector<std::unique_ptr<HloModule>> modules;\n-  for (int i = 0; i < proto.hlo_modules_size(); ++i) {\n-    const HloModuleProto& module_proto = proto.hlo_modules(i);\n-    TF_ASSIGN_OR_RETURN(\n-        std::unique_ptr<HloModule> module,\n-        HloModule::CreateFromProto(module_proto, module_configs[i]));\n-    modules.push_back(std::move(module));\n+  if (proto.hlo_modules_size() != 1) {\n+    return absl::InvalidArgumentError(\n+        absl::StrCat(\"HloModuleGroupProto should have exactly one module, \"\n+                     \"but it has \",\n+                     proto.hlo_modules_size()));\n   }\n+  const HloModuleProto& module_proto = proto.hlo_modules(0);\n+  TF_ASSIGN_OR_RETURN(\n+      std::unique_ptr<HloModule> module,\n+      HloModule::CreateFromProto(module_proto, module_configs[0]));\n \n-  return HloModuleGroup(proto.name(), absl::MakeSpan(modules));\n-}\n-\n-void HloModuleGroup::push_back(std::unique_ptr<HloModule> module) {\n-  module->metadata()->set_module_group_name(name());\n-  modules_.push_back(std::move(module));\n-  module_ptrs_.push_back(modules_.back().get());\n+  return HloModuleGroup(std::move(module));\n }\n \n void HloModuleGroup::ReplaceModule(int index,\n                                    std::unique_ptr<HloModule> module) {\n-  modules_.at(index)->MoveMetadataToModule(module.get());\n-  modules_.at(index) = std::move(module);\n-  module_ptrs_.at(index) = modules_.at(index).get();\n+  CHECK_EQ(index, 0);\n+  module_->MoveMetadataToModule(module.get());\n+  module_ = std::move(module);\n }\n \n std::ostream& operator<<(std::ostream& out, const HloModuleGroup& group) {"
+        },
+        {
+            "sha": "f079bd0dbad624cfc0f155f7722ac41247b9b7ac",
+            "filename": "third_party/xla/xla/hlo/ir/hlo_module_group.h",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 27,
+            "changes": 43,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/110ac8fef1817afa332667d1bdc82e22c1847961/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_module_group.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/110ac8fef1817afa332667d1bdc82e22c1847961/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_module_group.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_module_group.h?ref=110ac8fef1817afa332667d1bdc82e22c1847961",
+            "patch": "@@ -16,11 +16,13 @@ limitations under the License.\n #ifndef XLA_HLO_IR_HLO_MODULE_GROUP_H_\n #define XLA_HLO_IR_HLO_MODULE_GROUP_H_\n \n+#include <array>\n #include <iosfwd>\n #include <memory>\n #include <string>\n #include <vector>\n \n+#include \"absl/log/check.h\"\n #include \"absl/status/statusor.h\"\n #include \"absl/strings/string_view.h\"\n #include \"absl/types/span.h\"\n@@ -43,10 +45,14 @@ class HloModuleGroup {\n   HloModuleGroup& operator=(HloModuleGroup&& other) = default;\n \n   // Returns the modules contained in the group.\n-  const std::vector<HloModule*>& modules() const { return module_ptrs_; }\n+  std::array<HloModule*, 1> modules() const { return {module_.get()}; }\n \n   // Returns a module at a particular index.\n-  HloModule& module(int index) const { return *module_ptrs_.at(index); }\n+  HloModule& module() const { return *module_; }\n+  HloModule& module(int index) const {\n+    CHECK_EQ(index, 0);\n+    return *module_;\n+  }\n \n   // Replaces the existing module at the given index with the given module. The\n   // existing module is discarded.\n@@ -62,17 +68,17 @@ class HloModuleGroup {\n \n   // Deallocate removed instructions in each module.\n   void Cleanup() {\n-    for (auto& module : modules_) {\n-      module->Cleanup();\n+    if (module_) {\n+      module_->Cleanup();\n     }\n   }\n \n   template <typename H>\n   friend H AbslHashValue(H h, const HloModuleGroup& group) {\n-    for (auto& module : group.modules_) {\n-      h = H::combine(std::move(h), *module);\n+    if (!group.module_) {\n+      return h;\n     }\n-    return H::combine(std::move(h), group.modules_.size());\n+    return H::combine(std::move(h), group.module_);\n   }\n \n   // Serialize the module group to/from a proto.\n@@ -82,38 +88,21 @@ class HloModuleGroup {\n       absl::Span<const HloModuleConfig> module_configs);\n \n   // Returns the number of modules in the module group.\n-  int size() const { return modules_.size(); }\n+  int size() const { return module_ ? 1 : 0; }\n \n   // Returns true if there are no modules in the module group.\n-  bool empty() const { return modules_.empty(); }\n+  bool empty() const { return !module_; }\n \n   absl::string_view cache_key() const { return cache_key_; }\n   void set_cache_key(absl::string_view cache_key) {\n     cache_key_ = std::string(cache_key);\n   }\n \n  private:\n-  // Construct an empty module group.\n-  explicit HloModuleGroup(absl::string_view name) : name_(name) {}\n-\n-  // Construct a module group containing any number of modules.\n-  HloModuleGroup(absl::string_view name,\n-                 absl::Span<std::unique_ptr<HloModule>> modules);\n-  HloModuleGroup(absl::string_view name,\n-                 std::vector<std::unique_ptr<HloModule>>&& modules);\n-\n-  // Add a module to the back of vector of modules in the group. Private\n-  // because we no longer want to support > 1 module per group.\n-  void push_back(std::unique_ptr<HloModule> module);\n-\n   std::string name_;\n \n   // Vector of modules as std::unique_ptrs.\n-  std::vector<std::unique_ptr<HloModule>> modules_;\n-\n-  // Vector of modules as normal pointers. This vector is kept in sync with\n-  // modules_ as modules are added to the group with push_back.\n-  std::vector<HloModule*> module_ptrs_;\n+  std::unique_ptr<HloModule> module_;\n \n   std::string cache_key_;\n };"
+        },
+        {
+            "sha": "9a2437acef6766b4f949c7cecc07c6ef608d503f",
+            "filename": "third_party/xla/xla/service/dump.cc",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 13,
+            "changes": 23,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/110ac8fef1817afa332667d1bdc82e22c1847961/third_party%2Fxla%2Fxla%2Fservice%2Fdump.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/110ac8fef1817afa332667d1bdc82e22c1847961/third_party%2Fxla%2Fxla%2Fservice%2Fdump.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fdump.cc?ref=110ac8fef1817afa332667d1bdc82e22c1847961",
+            "patch": "@@ -1169,20 +1169,17 @@ void DumpHloUnoptimizedSnapshotIfEnabled(\n   }\n }\n \n-void DumpHloModuleMetadataIfEnabled(const std::vector<HloModule*>& modules) {\n+void DumpHloModuleMetadataIfEnabled(HloModule* module) {\n   absl::flat_hash_set<int64_t> dumped_module_ids;\n-  for (const HloModule* module : modules) {\n-    CanonicalDebugOptions opts(module->config().debug_options());\n-    if (!module->config().debug_options().xla_dump_module_metadata()) {\n-      continue;\n-    }\n-    DumpHloModuleMetadata(module->metadata().proto(), opts, &dumped_module_ids);\n-    const std::optional<HloModuleMetadataProto>& prepartitioning_metadata =\n-        module->metadata().prepartitioning_metadata();\n-    if (prepartitioning_metadata.has_value()) {\n-      DumpHloModuleMetadata(*prepartitioning_metadata, opts,\n-                            &dumped_module_ids);\n-    }\n+  CanonicalDebugOptions opts(module->config().debug_options());\n+  if (!module->config().debug_options().xla_dump_module_metadata()) {\n+    return;\n+  }\n+  DumpHloModuleMetadata(module->metadata()->proto(), opts, &dumped_module_ids);\n+  const std::optional<HloModuleMetadataProto>& prepartitioning_metadata =\n+      module->metadata()->prepartitioning_metadata();\n+  if (prepartitioning_metadata.has_value()) {\n+    DumpHloModuleMetadata(*prepartitioning_metadata, opts, &dumped_module_ids);\n   }\n }\n "
+        },
+        {
+            "sha": "0ec89f7f32c171c271256ac0741eea564a8ecbcd",
+            "filename": "third_party/xla/xla/service/dump.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/110ac8fef1817afa332667d1bdc82e22c1847961/third_party%2Fxla%2Fxla%2Fservice%2Fdump.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/110ac8fef1817afa332667d1bdc82e22c1847961/third_party%2Fxla%2Fxla%2Fservice%2Fdump.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fdump.h?ref=110ac8fef1817afa332667d1bdc82e22c1847961",
+            "patch": "@@ -167,7 +167,7 @@ void DumpHloSnapshotIfEnabled(const HloSnapshot& snapshot,\n void DumpHloUnoptimizedSnapshotIfEnabled(\n     const HloUnoptimizedSnapshot& hlo_snapshot, const DebugOptions& opts);\n \n-void DumpHloModuleMetadataIfEnabled(const std::vector<HloModule*>& modules);\n+void DumpHloModuleMetadataIfEnabled(HloModule* module);\n \n // Returns true if we should dump data for an HloModule.  This is useful if you\n // want to check if DumpToFileInDir{,OrStdout} will do anything before"
+        },
+        {
+            "sha": "b789cf176d040d510775bd5d6b0923aedc072073",
+            "filename": "third_party/xla/xla/service/gpu/gpu_compiler.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/110ac8fef1817afa332667d1bdc82e22c1847961/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_compiler.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/110ac8fef1817afa332667d1bdc82e22c1847961/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_compiler.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fgpu_compiler.cc?ref=110ac8fef1817afa332667d1bdc82e22c1847961",
+            "patch": "@@ -2047,7 +2047,7 @@ absl::StatusOr<std::unique_ptr<HloModule>> GpuCompiler::RunHloPasses(\n   // out we have no way of telling how far through the process we got).\n   RecordHloPassesDuration(end_usecs - start_usecs);\n \n-  DumpHloModuleMetadataIfEnabled({module.get()});\n+  DumpHloModuleMetadataIfEnabled(module.get());\n \n   AutotuneResults autotune_results;\n   DeviceOrDevicelessConfig device_config ="
+        },
+        {
+            "sha": "d388e04e184ac595b18380f9a3291a3d548dd637",
+            "filename": "third_party/xla/xla/service/hlo_module_group_test.cc",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 1,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/110ac8fef1817afa332667d1bdc82e22c1847961/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_module_group_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/110ac8fef1817afa332667d1bdc82e22c1847961/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_module_group_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fhlo_module_group_test.cc?ref=110ac8fef1817afa332667d1bdc82e22c1847961",
+            "patch": "@@ -68,7 +68,6 @@ ENTRY %entry (x: f32[], y: f32[]) -> f32[] {\n \n   std::vector<std::unique_ptr<HloModule>> modules = group.ConsumeModules();\n   EXPECT_EQ(modules.size(), 1);\n-  EXPECT_EQ(group.modules().size(), 0);\n }\n \n // Test that metadata is transferred when a module is replaced."
+        }
+    ],
+    "stats": {
+        "total": 141,
+        "additions": 54,
+        "deletions": 87
+    }
+}

@@ -1,0 +1,36 @@
+{
+    "author": "ezhulenev",
+    "message": "[xla] Cleanup CommonPjRtClient warnings\n\nPiperOrigin-RevId: 806767900",
+    "sha": "eda9b181cb0db65ad103fba503699b798f8f6551",
+    "files": [
+        {
+            "sha": "9d0622bef28b25b558f77d29d7404859b8a0a4af",
+            "filename": "third_party/xla/xla/pjrt/common_pjrt_client.cc",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 4,
+            "changes": 16,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/eda9b181cb0db65ad103fba503699b798f8f6551/third_party%2Fxla%2Fxla%2Fpjrt%2Fcommon_pjrt_client.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/eda9b181cb0db65ad103fba503699b798f8f6551/third_party%2Fxla%2Fxla%2Fpjrt%2Fcommon_pjrt_client.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fcommon_pjrt_client.cc?ref=eda9b181cb0db65ad103fba503699b798f8f6551",
+            "patch": "@@ -39,6 +39,7 @@ limitations under the License.\n #include \"absl/synchronization/mutex.h\"\n #include \"absl/types/span.h\"\n #include \"xla/layout.h\"\n+#include \"xla/layout_util.h\"\n #include \"xla/literal.h\"\n #include \"xla/pjrt/abstract_tracked_device_buffer.h\"\n #include \"xla/pjrt/device_event.h\"\n@@ -68,14 +69,21 @@ PjRtFuture<>::Promise CommonPjRtClient::CreateUserPromise(\n     PjRtMemorySpace* memory_space, absl::string_view debug_info) {\n   return PjRtFuture<>::CreatePromise();\n }\n+\n PjRtFuture<> CommonPjRtClient::CreateFutureFromUserPromise(\n     PjRtMemorySpace* memory_space, const char* callee_type,\n     const char* callee_method, PjRtFuture<>::Promise promise) {\n-  return PjRtFuture<>(\n-      promise,\n+  return CreateTrackedFuture(memory_space, callee_type, callee_method,\n+                             PjRtFuture<>(std::move(promise)));\n+}\n+\n+PjRtFuture<> CommonPjRtClient::CreateTrackedFuture(\n+    PjRtMemorySpace* memory_space, const char* callee_type,\n+    const char* callee_method, PjRtFuture<> future) {\n+  return PjRtFutureHelpers::WithProfiling(\n+      std::move(future),\n       /*on_block_start=*/\n-      [ready_event = FormRef(promise.async_value()), callee_type,\n-       callee_method]() {\n+      [callee_type, callee_method] {\n         tsl::profiler::TraceMeProducer traceme(\n             [&] { return absl::StrCat(callee_type, \"::\", callee_method); });\n         VLOG(1) << callee_type << \"::\" << callee_method;"
+        },
+        {
+            "sha": "582475a814cd910b8fa8c373e95f42edeabb35aa",
+            "filename": "third_party/xla/xla/pjrt/common_pjrt_client.h",
+            "status": "modified",
+            "additions": 28,
+            "deletions": 0,
+            "changes": 28,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/eda9b181cb0db65ad103fba503699b798f8f6551/third_party%2Fxla%2Fxla%2Fpjrt%2Fcommon_pjrt_client.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/eda9b181cb0db65ad103fba503699b798f8f6551/third_party%2Fxla%2Fxla%2Fpjrt%2Fcommon_pjrt_client.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fpjrt%2Fcommon_pjrt_client.h?ref=eda9b181cb0db65ad103fba503699b798f8f6551",
+            "patch": "@@ -16,17 +16,35 @@ limitations under the License.\n #ifndef XLA_PJRT_COMMON_PJRT_CLIENT_H_\n #define XLA_PJRT_COMMON_PJRT_CLIENT_H_\n \n+#include <cstddef>\n+#include <cstdint>\n+#include <functional>\n+#include <memory>\n+#include <optional>\n+#include <string>\n+#include <type_traits>\n+#include <utility>\n+#include <vector>\n+\n+#include \"absl/base/attributes.h\"\n #include \"absl/container/inlined_vector.h\"\n #include \"absl/functional/any_invocable.h\"\n #include \"absl/status/status.h\"\n #include \"absl/status/statusor.h\"\n #include \"absl/strings/string_view.h\"\n #include \"absl/types/span.h\"\n+#include \"xla/layout.h\"\n+#include \"xla/literal.h\"\n #include \"xla/pjrt/abstract_tracked_device_buffer.h\"\n #include \"xla/pjrt/async_work_runner.h\"\n #include \"xla/pjrt/device_event.h\"\n #include \"xla/pjrt/pjrt_client.h\"\n+#include \"xla/pjrt/pjrt_future.h\"\n #include \"xla/pjrt/raw_buffer.h\"\n+#include \"xla/shape.h\"\n+#include \"xla/tsl/concurrency/async_value.h\"\n+#include \"xla/tsl/concurrency/async_value_ref.h\"\n+#include \"xla/tsl/concurrency/ref_count.h\"\n #include \"xla/xla_data.pb.h\"\n \n namespace xla {\n@@ -107,17 +125,27 @@ class CommonPjRtClient : public PjRtClient {\n   // event_tracking_enabled()).\n   virtual PjRtFuture<>::Promise CreateUserPromise(PjRtMemorySpace* memory_space,\n                                                   absl::string_view debug_info);\n+\n   // Creates a future from a promise PjRtFuture<>(promise) but with event\n   // tracking and traceme scopes.\n   virtual PjRtFuture<> CreateFutureFromUserPromise(\n       PjRtMemorySpace* memory_space, const char* callee_type,\n       const char* callee_method, PjRtFuture<>::Promise promise);\n+\n+  // Creates a future from a user-provided future with event tracking and\n+  // traceme scopes.\n+  virtual PjRtFuture<> CreateTrackedFuture(PjRtMemorySpace* memory_space,\n+                                           const char* callee_type,\n+                                           const char* callee_method,\n+                                           PjRtFuture<> future);\n+\n   // Create a linked PjRtFuture<> and ::Promise pair for operations on\n   // buffers in memory_space which populates debug information like linked\n   // tracmes.\n   std::pair<PjRtFuture<>::Promise, PjRtFuture<>> CreateLinkedUserPromise(\n       PjRtMemorySpace* memory_space, const char* callee_type,\n       const char* callee_method, absl::string_view debug_info);\n+\n   template <typename T, std::enable_if_t<std::is_invocable_v<T>, bool> = true>\n   absl::StatusOr<std::pair<tsl::RCReference<PjRtDeviceEventPromise>,\n                            tsl::RCReference<PjRtDeviceEvent>>>"
+        }
+    ],
+    "stats": {
+        "total": 44,
+        "additions": 40,
+        "deletions": 4
+    }
+}

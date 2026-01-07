@@ -1,0 +1,48 @@
+{
+    "author": "mkuperst",
+    "message": "[XLA] Never uniquify host-transfer send/recv channel IDs.\n\nUnlike other channel IDs, the specific values assigned to send/recv are part of the ABI with the host, and may not be modified.\n\nPiperOrigin-RevId: 800068642",
+    "sha": "3c4cd303e086e29d6e084cc672ceeafe234ba730",
+    "files": [
+        {
+            "sha": "a7f35eaf8b653d18c862232df272389c5fcc4592",
+            "filename": "third_party/xla/xla/service/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/3c4cd303e086e29d6e084cc672ceeafe234ba730/third_party%2Fxla%2Fxla%2Fservice%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/3c4cd303e086e29d6e084cc672ceeafe234ba730/third_party%2Fxla%2Fxla%2Fservice%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2FBUILD?ref=3c4cd303e086e29d6e084cc672ceeafe234ba730",
+            "patch": "@@ -1023,6 +1023,7 @@ xla_cc_test(\n         \"//xla/tsl/platform:status_matchers\",\n         \"//xla/tsl/platform:statusor\",\n         \"@com_google_absl//absl/log\",\n+        \"@com_google_absl//absl/status:status_matchers\",\n         \"@com_google_absl//absl/strings:string_view\",\n         \"@com_google_googletest//:gtest\",\n     ],"
+        },
+        {
+            "sha": "c659b3dc1ef1cecf023c7c967a4e02bf815b3a0a",
+            "filename": "third_party/xla/xla/service/call_inliner.cc",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 2,
+            "changes": 12,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/3c4cd303e086e29d6e084cc672ceeafe234ba730/third_party%2Fxla%2Fxla%2Fservice%2Fcall_inliner.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/3c4cd303e086e29d6e084cc672ceeafe234ba730/third_party%2Fxla%2Fxla%2Fservice%2Fcall_inliner.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fcall_inliner.cc?ref=3c4cd303e086e29d6e084cc672ceeafe234ba730",
+            "patch": "@@ -397,9 +397,17 @@ absl::StatusOr<bool> CallInliner::InlineAndLegalize(\n   if (did_node_mutate && uniquify_channel_ids_) {\n     int unique_channel_id = 1;\n     for (HloInstruction* instruction : computation->instructions()) {\n-      if (dynamic_cast<HloChannelInstruction*>(instruction)) {\n-        instruction->set_channel_id(unique_channel_id++);\n+      if (!dynamic_cast<HloChannelInstruction*>(instruction)) {\n+        continue;\n       }\n+      // Channel IDs for host transfers are part of the ABI, and can never be\n+      // uniquified.\n+      HloSendRecvInstruction* send_recv =\n+          dynamic_cast<HloSendRecvInstruction*>(instruction);\n+      if (send_recv && send_recv->is_host_transfer()) {\n+        continue;\n+      }\n+      instruction->set_channel_id(unique_channel_id++);\n     }\n   }\n   return did_node_mutate;"
+        },
+        {
+            "sha": "c8e8c15e0da12f5c5531baf19eaba8d53681ea15",
+            "filename": "third_party/xla/xla/service/call_inliner_test.cc",
+            "status": "modified",
+            "additions": 34,
+            "deletions": 0,
+            "changes": 34,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/3c4cd303e086e29d6e084cc672ceeafe234ba730/third_party%2Fxla%2Fxla%2Fservice%2Fcall_inliner_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/3c4cd303e086e29d6e084cc672ceeafe234ba730/third_party%2Fxla%2Fxla%2Fservice%2Fcall_inliner_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fcall_inliner_test.cc?ref=3c4cd303e086e29d6e084cc672ceeafe234ba730",
+            "patch": "@@ -23,9 +23,11 @@ limitations under the License.\n #include <gmock/gmock.h>\n #include <gtest/gtest.h>\n #include \"absl/log/log.h\"\n+#include \"absl/status/status_matchers.h\"\n #include \"absl/strings/string_view.h\"\n #include \"xla/hlo/ir/hlo_computation.h\"\n #include \"xla/hlo/ir/hlo_instruction.h\"\n+#include \"xla/hlo/ir/hlo_instructions.h\"\n #include \"xla/hlo/ir/hlo_opcode.h\"\n #include \"xla/hlo/ir/hlo_print_options.h\"\n #include \"xla/hlo/ir/hlo_schedule.h\"\n@@ -953,5 +955,37 @@ ENTRY main {\n               op::Subtract(op::Call(op::Parameter(0)), op::Parameter(0)));\n }\n \n+TEST_F(CallInlinerTest, HostSendChannelIdNotUniquified) {\n+  const char* hlo = R\"(\n+callee {\n+  input = f32[128,32] parameter(0)\n+  token.0 = token[] parameter(1)\n+  send = (f32[128, 32], token[]) send(input, token.0), channel_id=1, is_host_transfer=true\n+  ROOT send-done = token[] send-done(send), channel_id=1, is_host_transfer=true\n+}\n+\n+ENTRY main {\n+  input = f32[128,32] parameter(0)\n+  token.0 = token[] after-all()\n+  call.0 = token[] call(input, token.0), to_apply=callee\n+  ROOT call.1 = token[] call(input, call.0), to_apply=callee\n+})\";\n+\n+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> m,\n+                          ParseAndReturnVerifiedModule(hlo));\n+  CallInliner call_inliner(/*single_call_site=*/false, /*update_domain=*/false,\n+                           /*composites_to_preserve=*/{},\n+                           /*uniquify_channel_ids=*/true);\n+  ASSERT_THAT(call_inliner.Run(m.get()), absl_testing::IsOkAndHolds(true));\n+  HloComputation* entry = m->entry_computation();\n+  for (HloInstruction* inst : entry->instructions()) {\n+    HloSendRecvInstruction* send_recv =\n+        dynamic_cast<HloSendRecvInstruction*>(inst);\n+    if (send_recv && send_recv->is_host_transfer()) {\n+      EXPECT_EQ(send_recv->channel_id(), 1);\n+    }\n+  }\n+}\n+\n }  // namespace\n }  // namespace xla"
+        }
+    ],
+    "stats": {
+        "total": 47,
+        "additions": 45,
+        "deletions": 2
+    }
+}

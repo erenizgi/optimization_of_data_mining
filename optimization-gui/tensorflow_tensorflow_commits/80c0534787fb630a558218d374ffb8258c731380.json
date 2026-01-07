@@ -1,0 +1,60 @@
+{
+    "author": "akuegel",
+    "message": "[XLA:GPU] Add support for no-op bitcast-convert to generic Triton emitter.\n\nRecently we started replacing bitcast-converts that are no-ops with bitcasts.\nThis affected also fusion logic, as we give producer bitcasts infinite\npriority, so we may fuse a bitcast producer with a broadcast consumer first,\npreventing it from being fused into a softmax triton fusion later.\nBy supporting such no-op bitcast-converts (disguised as bitcasts), we restore\n(and even improve) the fusion capabilities.\n\nPiperOrigin-RevId: 800439568",
+    "sha": "80c0534787fb630a558218d374ffb8258c731380",
+    "files": [
+        {
+            "sha": "ec2ff2c21e93d72443797203366862cf4f4602bb",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/fusion_emitter.cc",
+            "status": "modified",
+            "additions": 25,
+            "deletions": 2,
+            "changes": 27,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/80c0534787fb630a558218d374ffb8258c731380/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/80c0534787fb630a558218d374ffb8258c731380/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter.cc?ref=80c0534787fb630a558218d374ffb8258c731380",
+            "patch": "@@ -114,6 +114,7 @@ limitations under the License.\n #include \"xla/layout_util.h\"\n #include \"xla/mlir_hlo/mhlo/IR/hlo_ops.h\"\n #include \"xla/permutation_util.h\"\n+#include \"xla/primitive_util.h\"\n #include \"xla/service/dump.h\"\n #include \"xla/service/gpu/backend_configs.pb.h\"\n #include \"xla/service/gpu/ir_emission_utils.h\"\n@@ -661,9 +662,31 @@ Value EmitTiledTranspose(EmitterLocOpBuilder& b, ArrayRef<int64_t> tile_sizes,\n absl::StatusOr<ScalarOrTensor> EmitTiledBitcast(\n     EmitterLocOpBuilder& b, const TiledHloInstruction& tiled_bitcast,\n     Value input) {\n+  Shape input_shape = tiled_bitcast.hlo()->operand(0)->shape();\n+  const Shape& output_shape = tiled_bitcast.hlo()->shape();\n+  // If the bitcast changes the element type to an element type of the same\n+  // bitwidth, we need to emit a ttir::BitcastOp.\n+  if (input_shape.element_type() != output_shape.element_type()) {\n+    if (primitive_util::BitWidth(input_shape.element_type()) !=\n+        primitive_util::BitWidth(output_shape.element_type())) {\n+      return absl::InvalidArgumentError(\n+          \"Bitcast with different bitwidth for operand and output shape \"\n+          \"element type is not yet supported.\");\n+    }\n+    TF_ASSIGN_OR_RETURN(Type output_element_type,\n+                        TritonType(b, output_shape.element_type()));\n+    Type output_type =\n+        mlir::isa<TensorValue>(input)\n+            ? mlir::RankedTensorType::get(\n+                  GetPaddedTileSizes(tiled_bitcast.operand(0)->tile_sizes()),\n+                  output_element_type)\n+            : output_element_type;\n+    input = b.create<ttir::BitcastOp>(output_type, input);\n+    input_shape.set_element_type(output_shape.element_type());\n+  }\n+\n   // Any Bitcast is decomposable to a transpose+reshape+transpose.\n-  auto trt = ShapeUtil::DecomposeBitcastToTrt(\n-      tiled_bitcast.hlo()->operand(0)->shape(), tiled_bitcast.hlo()->shape());\n+  auto trt = ShapeUtil::DecomposeBitcastToTrt(input_shape, output_shape);\n \n   // When replacing the `bitcast` with `transpose` + `reshape` + `transpose` we\n   // need to provide the tile sizes at output of each op. We already have the"
+        },
+        {
+            "sha": "e82ef81cb6bb4b8b2291f0a69554a994e1ed7151",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/fusion_emitter_device_test.cc",
+            "status": "modified",
+            "additions": 32,
+            "deletions": 0,
+            "changes": 32,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/80c0534787fb630a558218d374ffb8258c731380/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter_device_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/80c0534787fb630a558218d374ffb8258c731380/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter_device_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_emitter_device_test.cc?ref=80c0534787fb630a558218d374ffb8258c731380",
+            "patch": "@@ -1893,6 +1893,38 @@ backend_config={\n   EXPECT_TRUE(RunAndCompareNoHloPasses(hlo_text, kExactMatch));\n }\n \n+// Parameterized the test to make sure that non-canonical layouts are handled\n+// correctly when TMA is enabled.\n+TEST_P(\n+    TmaParameterizedTritonEmitterTest,\n+    SimpleBitcastNonNormalizedOutputLayoutAndBitcastConvertIsLoweredCorrectly) {\n+  constexpr absl::string_view kHloTextTemplate = R\"(\n+triton_computation {\n+p = f32[64,15] parameter(0)\n+bitcast = s32[15,64]{0,1} bitcast(p)\n+ROOT negate = s32[15,64]{0,1} negate(bitcast)\n+}\n+\n+ENTRY entry_computation {\n+p = f32[64,15] parameter(0)\n+ROOT fusion = s32[15,64]{0,1} fusion(p), kind=kCustom, calls=triton_computation,\n+backend_config={\n+\"fusion_backend_config\":{\n+ \"kind\":\"__triton\",\n+ \"block_level_fusion_config\":{\n+   \"output_tiles\":[{\"sizes\":[\"15\",\"32\"]}],\n+   \"num_warps\":\"1\",\n+   \"num_ctas\":\"1\",\n+   \"num_stages\":\"1\",\n+   \"is_tma_allowed\":\"$0\"}}}\n+})\";\n+\n+  const bool is_tma_allowed = GetParam();\n+  const std::string hlo_text =\n+      absl::Substitute(kHloTextTemplate, is_tma_allowed);\n+  EXPECT_TRUE(RunAndCompareNoHloPasses(hlo_text, kExactMatch));\n+}\n+\n // When TMA is enabled, it is important to test this in an end-to-end fashion.\n // This test covers the logic that adjusts box_dims based on the swizzle mode.\n // See tensorflow/compiler/xla/backends/gpu/codegen/triton/tma_utils.cc."
+        },
+        {
+            "sha": "27c1dbe0cf2703ddf5f74072d42b5a6743711cf3",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/support.cc",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 3,
+            "changes": 7,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/80c0534787fb630a558218d374ffb8258c731380/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Fsupport.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/80c0534787fb630a558218d374ffb8258c731380/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Fsupport.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Fsupport.cc?ref=80c0534787fb630a558218d374ffb8258c731380",
+            "patch": "@@ -642,9 +642,10 @@ CodegenDecision IsTritonSupportedInstructionImpl(\n       return CodegenDecision::Forbid(\n           \"dynamic slice is supported but not enabled yet\");\n     case HloOpcode::kBitcast:\n-      if (instr.shape().element_type() !=\n-          instr.operand(0)->shape().element_type()) {\n-        return CodegenDecision::Forbid(\"Bitcast-convert is not supported\");\n+      if (ShapeUtil::ElementsIn(instr.operand(0)->shape()) !=\n+          ShapeUtil::ElementsIn(instr.shape())) {\n+        return CodegenDecision::Forbid(\n+            \"only bitcasts with the same number of elements are supported\");\n       }\n       return CodegenDecision(instr.shape().element_type() != S4,\n                              \"S4 is not supported.\");"
+        },
+        {
+            "sha": "01289f6c49365eb1321fa94ca8f6eabdcfec5e0f",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/support_test.cc",
+            "status": "modified",
+            "additions": 29,
+            "deletions": 10,
+            "changes": 39,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/80c0534787fb630a558218d374ffb8258c731380/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Fsupport_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/80c0534787fb630a558218d374ffb8258c731380/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Fsupport_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Fsupport_test.cc?ref=80c0534787fb630a558218d374ffb8258c731380",
+            "patch": "@@ -2519,29 +2519,48 @@ TEST_P(BitcastConvertTest, BitcastConvertDisguisedAsBitcast) {\n \n   const int bit_width_in = primitive_util::BitWidth(data_type_in);\n   const int bit_width_out = primitive_util::BitWidth(data_type_out);\n-  if (bit_width_in != bit_width_out) {\n-    GTEST_SKIP() << \"We don't replace bitcast-convert with bitcast if the \"\n-                    \"bitwidth is different\";\n-  }\n+  ExpectedFailMode fail_mode = ExpectedFailMode::kFail;\n+  std::vector<int64_t> output_tile_sizes = {1, 32};\n+  std::string hlo_text;\n   const std::string data_type_in_str =\n       primitive_util::LowercasePrimitiveTypeName(data_type_in);\n   const std::string data_type_out_str =\n       primitive_util::LowercasePrimitiveTypeName(data_type_out);\n \n-  std::string hlo_text = absl::Substitute(\n-      R\"(\n+  if (bit_width_in == bit_width_out) {\n+    hlo_text = absl::Substitute(\n+        R\"(\n ENTRY triton_computation {\n   parameter = $0[33,68] parameter(0)\n-  ROOT bc_convert = $1[33,68] bitcast(parameter)\n+  ROOT bc = $1[33,68] bitcast(parameter)\n+})\",\n+        data_type_in_str, data_type_out_str);\n+  } else if (bit_width_in > bit_width_out) {\n+    hlo_text = absl::Substitute(\n+        R\"(\n+ENTRY triton_computation {\n+  parameter = $0[33] parameter(0)\n+  ROOT bc = $1[33, $2] bitcast(parameter)\n })\",\n-      data_type_in_str, data_type_out_str);\n+        data_type_in_str, data_type_out_str, bit_width_in / bit_width_out);\n+    fail_mode = ExpectedFailMode::kFailOrCrash;\n+  } else {  // bit_width_in < bit_width_out\n+    hlo_text = absl::Substitute(\n+        R\"(\n+ENTRY triton_computation {\n+  parameter = $0[33, $1] parameter(0)\n+  ROOT bc = $2[33] bitcast(parameter)\n+})\",\n+        data_type_in_str, bit_width_out / bit_width_in, data_type_out_str);\n+    output_tile_sizes = {1};\n+    fail_mode = ExpectedFailMode::kFailOrCrash;\n+  }\n \n   TF_ASSERT_OK_AND_ASSIGN(TestedInstruction ti,\n                           ParseTemplateAndGetInstruction(hlo_text, data_type_in,\n                                                          HloOpcode::kBitcast));\n \n-  std::vector<int64_t> output_tile_sizes = {1, 32};\n-  RunSupportTest(std::move(ti), output_tile_sizes, cc);\n+  RunSupportTest(std::move(ti), output_tile_sizes, cc, fail_mode);\n }\n \n INSTANTIATE_TEST_SUITE_P("
+        }
+    ],
+    "stats": {
+        "total": 105,
+        "additions": 90,
+        "deletions": 15
+    }
+}

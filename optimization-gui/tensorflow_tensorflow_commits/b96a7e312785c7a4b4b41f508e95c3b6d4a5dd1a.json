@@ -1,0 +1,48 @@
+{
+    "author": "xiaoxlu",
+    "message": "Minor internal change to save repeated proto copies.\n\nPiperOrigin-RevId: 845338656",
+    "sha": "b96a7e312785c7a4b4b41f508e95c3b6d4a5dd1a",
+    "files": [
+        {
+            "sha": "7d0d005b0474dc1f72c1779abf4121c161a080cc",
+            "filename": "tensorflow/core/tfrt/ifrt/BUILD",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 1,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b96a7e312785c7a4b4b41f508e95c3b6d4a5dd1a/tensorflow%2Fcore%2Ftfrt%2Fifrt%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b96a7e312785c7a4b4b41f508e95c3b6d4a5dd1a/tensorflow%2Fcore%2Ftfrt%2Fifrt%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcore%2Ftfrt%2Fifrt%2FBUILD?ref=b96a7e312785c7a4b4b41f508e95c3b6d4a5dd1a",
+            "patch": "@@ -120,7 +120,6 @@ cc_library(\n         \":ifrt_persistent_compilation_cache\",\n         \":ifrt_restore_tensor_registry\",\n         \":ifrt_serving_core_selector\",\n-        \":ifrt_tensor_utils\",\n         \":sharding_utils\",\n         \":tf_host_callback\",\n         \"//tensorflow/compiler/mlir/tensorflow\","
+        },
+        {
+            "sha": "bc376e94d09962257dfc3cc41b46334fd19eff20",
+            "filename": "tensorflow/core/tfrt/ifrt/ifrt_serving_executable.cc",
+            "status": "modified",
+            "additions": 22,
+            "deletions": 21,
+            "changes": 43,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b96a7e312785c7a4b4b41f508e95c3b6d4a5dd1a/tensorflow%2Fcore%2Ftfrt%2Fifrt%2Fifrt_serving_executable.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b96a7e312785c7a4b4b41f508e95c3b6d4a5dd1a/tensorflow%2Fcore%2Ftfrt%2Fifrt%2Fifrt_serving_executable.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcore%2Ftfrt%2Fifrt%2Fifrt_serving_executable.cc?ref=b96a7e312785c7a4b4b41f508e95c3b6d4a5dd1a",
+            "patch": "@@ -97,7 +97,6 @@ limitations under the License.\n #include \"tensorflow/core/tfrt/ifrt/ifrt_persistent_compilation_cache.h\"\n #include \"tensorflow/core/tfrt/ifrt/ifrt_restore_tensor_registry.h\"\n #include \"tensorflow/core/tfrt/ifrt/ifrt_serving_core_selector.h\"\n-#include \"tensorflow/core/tfrt/ifrt/ifrt_tensor_utils.h\"\n #include \"tensorflow/core/tfrt/ifrt/sharding_utils.h\"\n #include \"tensorflow/core/tfrt/ifrt/tf_host_callback.h\"\n #include \"tsl/platform/tstring.h\"\n@@ -504,7 +503,7 @@ IfrtServingExecutable::CreateExecutableSynchronously(\n       compile_metadata.use_shardy_partitioner());\n   xla_compile_options.parameter_is_tupled_arguments = false;\n   // Use portable execution for single device + core selection.\n-  if (UsePortableExecution(compile_metadata)) {\n+  if (UsePortableExecution()) {\n     xla_compile_options.compile_portable_executable = true;\n   } else {\n     TF_ASSIGN_OR_RETURN(\n@@ -555,9 +554,8 @@ IfrtServingExecutable::CreateExecutableSynchronously(\n   return executable_bundle;\n }\n \n-tsl::Future<IfrtServingExecutable::SharedCachedExecutableBundle>\n+absl::StatusOr<tsl::Future<IfrtServingExecutable::SharedCachedExecutableBundle>>\n IfrtServingExecutable::LookUpOrCreateExecutable(\n-    const tensorflow::tpu::TPUCompileMetadataProto& compile_metadata,\n     absl::Span<const DtypeAndShape> dtypes_and_shapes,\n     absl::Span<const int> variable_arg_indices) {\n   std::vector<tensorflow::TensorShape> input_shapes;\n@@ -597,7 +595,18 @@ IfrtServingExecutable::LookUpOrCreateExecutable(\n     // compilation.\n     module_copy = mlir::OwningOpRef<mlir::ModuleOp>(module_->clone());\n   }\n+  tensorflow::tpu::TPUCompileMetadataProto compile_metadata =\n+      original_compile_metadata_;\n+\n+  // b/469105465: Add test coverage for core selection in execution.\n+  if (UsePortableExecution()) {\n+    // Clear device_assignment because portable execution doesn't allow device\n+    // assignment.\n+    compile_metadata.clear_device_assignment();\n+  }\n \n+  TF_RETURN_IF_ERROR(\n+      UpdateCompileMetadata(compile_metadata, dtypes_and_shapes));\n   LOG(INFO) << \"Cache missed. Building executable\";\n   absl::StatusOr<SharedCachedExecutableBundle> executable_bundle =\n       CreateExecutableSynchronously(std::move(module_copy), compile_metadata,\n@@ -613,11 +622,11 @@ void IfrtServingExecutable::Freeze() {\n   module_ = nullptr;\n }\n \n-bool IfrtServingExecutable::UsePortableExecution(\n-    const tensorflow::tpu::TPUCompileMetadataProto& compile_metadata) {\n+bool IfrtServingExecutable::UsePortableExecution() {\n   // TODO(b/335247101) Add a check that the core selector must be non-null if\n   // it is a single-device program after core selection in Ifrt is stable.\n-  return IsSingleDevice(compile_metadata) && ifrt_serving_core_selector_;\n+  return IsSingleDevice(original_compile_metadata_) &&\n+         ifrt_serving_core_selector_;\n }\n \n absl::StatusOr<std::vector<tensorflow::Tensor>> IfrtServingExecutable::Execute(\n@@ -657,20 +666,12 @@ absl::StatusOr<std::vector<tensorflow::Tensor>> IfrtServingExecutable::Execute(\n                       BuildDtypeAndShape(inputs, variable_arg_indices,\n                                          ifrt_restore_tensor_registry_));\n \n-  tensorflow::tpu::TPUCompileMetadataProto compile_metadata =\n-      original_compile_metadata_;\n-  TF_RETURN_IF_ERROR(\n-      UpdateCompileMetadata(compile_metadata, dtypes_and_shapes));\n-\n   // `device_reservation` should be alive before the end of the execution.\n   tsl::DeviceReservation device_reservation(kNoCoreSelectedIndex, nullptr);\n   xla::ifrt::DeviceListRef device_list;\n-  if (UsePortableExecution(compile_metadata)) {\n+  if (UsePortableExecution()) {\n     device_reservation =\n         ifrt_serving_core_selector_->ReserveDevice(program_id_);\n-    // Clear device_assignment because portable execution doesn't allow device\n-    // assignment.\n-    compile_metadata.clear_device_assignment();\n     TF_ASSIGN_OR_RETURN(xla::ifrt::Device * device,\n                         ifrt_client_->LookupDevice(xla::ifrt::DeviceId(\n                             device_reservation.device_index())));\n@@ -679,10 +680,10 @@ absl::StatusOr<std::vector<tensorflow::Tensor>> IfrtServingExecutable::Execute(\n     device_list = assigned_device_list_;\n   }\n   TF_ASSIGN_OR_RETURN(\n-      SharedCachedExecutableBundle executable_bundle,\n-      LookUpOrCreateExecutable(compile_metadata, dtypes_and_shapes,\n-                               variable_arg_indices)\n-          .Await());\n+      tsl::Future<SharedCachedExecutableBundle> executable_bundle_future,\n+      LookUpOrCreateExecutable(dtypes_and_shapes, variable_arg_indices));\n+  TF_ASSIGN_OR_RETURN(SharedCachedExecutableBundle executable_bundle,\n+                      executable_bundle_future.Await());\n \n   if (executable_bundle->compile_metadata.args().size() !=\n       dtypes_and_shapes.size()) {\n@@ -775,7 +776,7 @@ absl::StatusOr<std::vector<tensorflow::Tensor>> IfrtServingExecutable::Execute(\n   VLOG(2) << \"Start Execution\";\n \n   std::optional<xla::ifrt::DeviceListRef> execution_device_list;\n-  if (UsePortableExecution(compile_metadata)) {\n+  if (UsePortableExecution()) {\n     execution_device_list = device_list;\n   }\n "
+        },
+        {
+            "sha": "ac772ae89d89be2cb32bf0f85b95ab5cec2e7cba",
+            "filename": "tensorflow/core/tfrt/ifrt/ifrt_serving_executable.h",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 6,
+            "changes": 10,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/b96a7e312785c7a4b4b41f508e95c3b6d4a5dd1a/tensorflow%2Fcore%2Ftfrt%2Fifrt%2Fifrt_serving_executable.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/b96a7e312785c7a4b4b41f508e95c3b6d4a5dd1a/tensorflow%2Fcore%2Ftfrt%2Fifrt%2Fifrt_serving_executable.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcore%2Ftfrt%2Fifrt%2Fifrt_serving_executable.h?ref=b96a7e312785c7a4b4b41f508e95c3b6d4a5dd1a",
+            "patch": "@@ -230,10 +230,9 @@ class IfrtServingExecutable {\n       const CachedExecutableBundle& executable_bundle,\n       const xla::ifrt::DeviceListRef& devices);\n \n-  tsl::Future<SharedCachedExecutableBundle> LookUpOrCreateExecutable(\n-      const tensorflow::tpu::TPUCompileMetadataProto& compile_metadata,\n-      absl::Span<const DtypeAndShape> dtypes_and_shapes,\n-      absl::Span<const int> variable_arg_indices);\n+  absl::StatusOr<tsl::Future<SharedCachedExecutableBundle>>\n+  LookUpOrCreateExecutable(absl::Span<const DtypeAndShape> dtypes_and_shapes,\n+                           absl::Span<const int> variable_arg_indices);\n   absl::StatusOr<IfrtServingExecutable::SharedCachedExecutableBundle>\n   CreateExecutableSynchronously(\n       mlir::OwningOpRef<mlir::ModuleOp> module_copy,\n@@ -248,8 +247,7 @@ class IfrtServingExecutable {\n   std::vector<xla::ifrt::Shape> GetArgShape(\n       int arg_index, const CachedExecutableBundle& entry);\n \n-  bool UsePortableExecution(\n-      const tensorflow::tpu::TPUCompileMetadataProto& compile_metadata);\n+  bool UsePortableExecution();\n };\n \n }  // namespace ifrt_serving"
+        }
+    ],
+    "stats": {
+        "total": 54,
+        "additions": 26,
+        "deletions": 28
+    }
+}

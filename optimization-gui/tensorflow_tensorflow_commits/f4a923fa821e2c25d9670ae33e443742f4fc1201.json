@@ -1,0 +1,36 @@
+{
+    "author": "ZixuanJiang",
+    "message": "Add a walk to convert unreduced `sdy.constant` to replicated `sdy.constant` and `sdy.replicated_to_unreduced`.\n\nPiperOrigin-RevId: 846916791",
+    "sha": "f4a923fa821e2c25d9670ae33e443742f4fc1201",
+    "files": [
+        {
+            "sha": "876cc3de21b4f82a0289e53515b7bfe545a90392",
+            "filename": "third_party/xla/xla/service/spmd/shardy/stablehlo_round_trip/export_manual_reduction_collectives.cc",
+            "status": "modified",
+            "additions": 20,
+            "deletions": 0,
+            "changes": 20,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f4a923fa821e2c25d9670ae33e443742f4fc1201/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Fstablehlo_round_trip%2Fexport_manual_reduction_collectives.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f4a923fa821e2c25d9670ae33e443742f4fc1201/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Fstablehlo_round_trip%2Fexport_manual_reduction_collectives.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Fstablehlo_round_trip%2Fexport_manual_reduction_collectives.cc?ref=f4a923fa821e2c25d9670ae33e443742f4fc1201",
+            "patch": "@@ -437,6 +437,26 @@ class StablehloExportManualReductionCollectivesPass\n     ModuleOp moduleOp = getOperation();\n     mlir::IRRewriter rewriter(moduleOp.getContext());\n \n+    moduleOp.walk([&](mlir::Operation* op) {\n+      if (auto constant = mlir::dyn_cast<sdy::ConstantOp>(op)) {\n+        TensorShardingAttr oldSharding = sdy::getSharding(constant);\n+        if (!oldSharding || oldSharding.getUnreducedAxes().empty()) {\n+          return;\n+        }\n+\n+        TensorShardingAttr newSharding = oldSharding.replaceUnreducedAxes({});\n+        sdy::setSharding(constant, newSharding);\n+\n+        rewriter.setInsertionPointAfter(constant);\n+        sdy::ReplicatedToUnreducedOp replicatedToUnreduced =\n+            sdy::ReplicatedToUnreducedOp::create(\n+                rewriter, constant.getLoc(), constant,\n+                oldSharding.getUnreducedAxes(), oldSharding);\n+        rewriter.replaceAllUsesExcept(constant, replicatedToUnreduced,\n+                                      replicatedToUnreduced);\n+      }\n+    });\n+\n     // Do very restricted backward propagation of unreduced axes along specific\n     // ops that don't modify the data.\n     moduleOp.walk<mlir::WalkOrder::PostOrder, mlir::ReverseIterator>("
+        },
+        {
+            "sha": "6b3b04dda62b93434855a6b81505d1ad1cc74ef4",
+            "filename": "third_party/xla/xla/service/spmd/shardy/test/stablehlo_export_manual_reduction_collectives.mlir",
+            "status": "modified",
+            "additions": 31,
+            "deletions": 0,
+            "changes": 31,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/f4a923fa821e2c25d9670ae33e443742f4fc1201/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Ftest%2Fstablehlo_export_manual_reduction_collectives.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/f4a923fa821e2c25d9670ae33e443742f4fc1201/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Ftest%2Fstablehlo_export_manual_reduction_collectives.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fspmd%2Fshardy%2Ftest%2Fstablehlo_export_manual_reduction_collectives.mlir?ref=f4a923fa821e2c25d9670ae33e443742f4fc1201",
+            "patch": "@@ -406,3 +406,34 @@ func.func @replicated_to_unreduced(%arg0: tensor<16x16xf32> {sdy.sharding = #sdy\n   %0 = sdy.replicated_to_unreduced {\"x\", \"z\"} %arg0 out_sharding=<@mesh, [{}, {}], unreduced={\"x\", \"y\", \"z\"}> : tensor<16x16xf32>\n   return %0 : tensor<16x16xf32>\n }\n+\n+// -----\n+\n+sdy.mesh @mesh = <[\"x\"=2, \"y\"=2]>\n+\n+// CHECK-LABEL: func @unreduced_constant\n+func.func @unreduced_constant() -> tensor<2x2xf32> {\n+  // CHECK-NEXT: %[[CONST:.*]] = sdy.constant {sdy.sharding = #sdy.sharding_per_value<[<@mesh, [{\"x\"}, {}]>]>} dense<{{\\[\\[}}0.000000e+00, 1.000000e+00], [2.000000e+00, 3.000000e+00]]> : tensor<2x2xf32>\n+  // CHECK-NEXT: %[[MANUAL_COMP:.*]] = sdy.manual_computation(%[[CONST]])\n+  // CHECK-SAME:     in_shardings=[<@mesh, [{\"x\"}, {}]>]\n+  // CHECK-SAME:     out_shardings=[<@mesh, [{\"x\"}, {}], unreduced={\"y\"}>]\n+  // CHECK-SAME:     manual_axes={\"x\", \"y\"} (%arg0: tensor<1x2xf32>) {\n+  // CHECK-NEXT:   %[[PID:.*]] = stablehlo.partition_id : tensor<ui32>\n+  // CHECK-NEXT:   %[[PID_I32:.*]] = stablehlo.convert %[[PID]] : (tensor<ui32>) -> tensor<i32>\n+  // CHECK-NEXT:   %[[C2:.*]] = stablehlo.constant dense<2> : tensor<i32>\n+  // CHECK-NEXT:   %[[REM:.*]] = stablehlo.remainder %[[PID_I32]], %[[C2]] : tensor<i32>\n+  // CHECK-NEXT:   %[[DIV:.*]] = stablehlo.divide %[[PID_I32]], %[[C2]] : tensor<i32>\n+  // CHECK-NEXT:   %[[C2_0:.*]] = stablehlo.constant dense<2> : tensor<i32>\n+  // CHECK-NEXT:   %[[REM_0:.*]] = stablehlo.remainder %[[DIV]], %[[C2_0]] : tensor<i32>\n+  // CHECK-NEXT:   %[[DIV_0:.*]] = stablehlo.divide %[[DIV]], %[[C2_0]] : tensor<i32>\n+  // CHECK-NEXT:   %[[C0:.*]] = stablehlo.constant dense<0> : tensor<i32>\n+  // CHECK-NEXT:   %[[CMP:.*]] = stablehlo.compare  EQ, %[[REM]], %[[C0]] : (tensor<i32>, tensor<i32>) -> tensor<i1>\n+  // CHECK-NEXT:   %[[ZERO:.*]] = stablehlo.constant dense<0.000000e+00> : tensor<f32>\n+  // CHECK-NEXT:   %[[ZERO_BCAST:.*]] = stablehlo.broadcast %[[ZERO]], sizes = [1, 2] : (tensor<f32>) -> tensor<1x2xf32>\n+  // CHECK-NEXT:   %[[SELECT:.*]] = stablehlo.select %[[CMP]], %arg0, %[[ZERO_BCAST]] : tensor<i1>, tensor<1x2xf32>\n+  // CHECK-NEXT:   sdy.return %[[SELECT]] : tensor<1x2xf32>\n+  // CHECK-NEXT: } : (tensor<2x2xf32>) -> tensor<2x2xf32>\n+  // CHECK-NEXT: return %[[MANUAL_COMP]] : tensor<2x2xf32>\n+  %0 = sdy.constant {sdy.sharding = #sdy.sharding_per_value<[<@mesh, [{\"x\"}, {}], unreduced={\"y\"}>]>} dense<[[0.0, 1.0], [2.0, 3.0]]> : tensor<2x2xf32>\n+  return %0 : tensor<2x2xf32>\n+}"
+        }
+    ],
+    "stats": {
+        "total": 51,
+        "additions": 51,
+        "deletions": 0
+    }
+}

@@ -1,0 +1,84 @@
+{
+    "author": "mooskagh",
+    "message": "[XLA:GPU] Support start_index_map in ComputeOutputToInputGatherOpIndexing and in the gather emitter\n\nPiperOrigin-RevId: 828439076",
+    "sha": "16334aae999dd59865cd1b5d23e4798ceff5a99d",
+    "files": [
+        {
+            "sha": "8b9d42d4863e3abb8884bb422c3b49d6f548e8bd",
+            "filename": "third_party/xla/xla/codegen/emitters/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/16334aae999dd59865cd1b5d23e4798ceff5a99d/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/16334aae999dd59865cd1b5d23e4798ceff5a99d/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2FBUILD?ref=16334aae999dd59865cd1b5d23e4798ceff5a99d",
+            "patch": "@@ -93,6 +93,7 @@ cc_library(\n         \"//xla/hlo/analysis:indexing_analysis\",\n         \"//xla/hlo/analysis:symbolic_expr\",\n         \"//xla/hlo/ir:hlo\",\n+        \"//xla/hlo/transforms/simplifiers:gather_simplifier\",\n         \"//xla/hlo/translate/hlo_to_mhlo:hlo_utils\",\n         \"//xla/hlo/utils:hlo_traversal\",\n         \"//xla/mlir_hlo\","
+        },
+        {
+            "sha": "46218a226a7481ce7a5614bd4cc05940cd1f791a",
+            "filename": "third_party/xla/xla/codegen/emitters/elemental_hlo_to_mlir.cc",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 6,
+            "changes": 16,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/16334aae999dd59865cd1b5d23e4798ceff5a99d/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Felemental_hlo_to_mlir.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/16334aae999dd59865cd1b5d23e4798ceff5a99d/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Felemental_hlo_to_mlir.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Felemental_hlo_to_mlir.cc?ref=16334aae999dd59865cd1b5d23e4798ceff5a99d",
+            "patch": "@@ -73,6 +73,7 @@ limitations under the License.\n #include \"xla/hlo/ir/hlo_instruction.h\"\n #include \"xla/hlo/ir/hlo_instructions.h\"\n #include \"xla/hlo/ir/hlo_opcode.h\"\n+#include \"xla/hlo/transforms/simplifiers/gather_simplifier.h\"\n #include \"xla/hlo/translate/hlo_to_mhlo/hlo_utils.h\"\n #include \"xla/mlir_hlo/mhlo/IR/hlo_ops.h\"\n #include \"xla/mlir_hlo/mhlo/transforms/map_mhlo_to_scalar_op.h\"\n@@ -392,6 +393,9 @@ absl::StatusOr<SmallVector<Value, 1>> EmitDynamicUpdateSlice(\n absl::StatusOr<SmallVector<Value, 1>> EmitGather(\n     const HloInstruction* instr, ValueRange indices,\n     const OperandProvider& operand_provider, ImplicitLocOpBuilder& b) {\n+  const auto* gather = Cast<HloGatherInstruction>(instr);\n+  CHECK(GatherSimplifier::IsSimplifiedGather(gather))\n+      << \"Non-simplified HLO Gather is not supported.\";\n   auto row = indices[0];\n   auto zero = b.create<ConstantIndexOp>(0);\n   // Gather allows the index vector to contain fewer elements than the rank\n@@ -404,12 +408,12 @@ absl::StatusOr<SmallVector<Value, 1>> EmitGather(\n   // simplifier prefers this form. Therefore, we need to check the rank of the\n   // indices here and do the implicit reshape in place.\n   const auto& indices_shape = instr->operand(1)->shape();\n-  int num_indices =\n-      indices_shape.dimensions().size() == 1 ? 1 : indices_shape.dimensions(1);\n-  for (int i = 0; i < num_indices; ++i) {\n+  const auto& dim_numbers = gather->gather_dimension_numbers();\n+  const auto& start_index_map = dim_numbers.start_index_map();\n+  for (auto [i, operand_dim] : llvm::enumerate(start_index_map)) {\n     auto i_val = i == 0 ? zero : b.create<ConstantIndexOp>(i);\n-    int64_t slice_size = instr->gather_slice_sizes()[i];\n-    int64_t input_size = instr->operand(0)->shape().dimensions()[i];\n+    int64_t slice_size = gather->gather_slice_sizes()[operand_dim];\n+    int64_t input_size = gather->operand(0)->shape().dimensions()[operand_dim];\n     // Read and clamp index.\n     TF_ASSIGN_OR_RETURN(auto input_index,\n                         operand_provider(instr, 1,\n@@ -418,7 +422,7 @@ absl::StatusOr<SmallVector<Value, 1>> EmitGather(\n                                              : ValueRange{row, i_val}));\n     TF_RET_CHECK(input_index.size() == 1)\n         << \"Expected operand to be a single value.\";\n-    operand_indices[i] =\n+    operand_indices[operand_dim] =\n         ClampIndex(input_index.front(),\n                    primitive_util::IsUnsignedIntegralType(\n                        instr->operand(1)->shape().element_type()),"
+        },
+        {
+            "sha": "f8140e0f8c3f99d3d45829882edf7d8e2e856302",
+            "filename": "third_party/xla/xla/codegen/emitters/tests/loop/gather_start_index_map.hlo",
+            "status": "added",
+            "additions": 33,
+            "deletions": 0,
+            "changes": 33,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/16334aae999dd59865cd1b5d23e4798ceff5a99d/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftests%2Floop%2Fgather_start_index_map.hlo",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/16334aae999dd59865cd1b5d23e4798ceff5a99d/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftests%2Floop%2Fgather_start_index_map.hlo",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fcodegen%2Femitters%2Ftests%2Floop%2Fgather_start_index_map.hlo?ref=16334aae999dd59865cd1b5d23e4798ceff5a99d",
+            "patch": "@@ -0,0 +1,33 @@\n+HloModule gather_start_index_map\n+// A canonicalized (simplified) gather with non-normalized start_index_map.\n+\n+ENTRY main {\n+  %operand = f32[30,20] parameter(0)\n+  %indices = s32[10,2] parameter(1)\n+  ROOT %gather = f32[10,4,8] gather(%operand, %indices),\n+    offset_dims={1,2},\n+    collapsed_slice_dims={},\n+    start_index_map={1,0},\n+    index_vector_dim=1,\n+    slice_sizes={4,8}\n+}\n+\n+// RUN: gpu_fusion_to_mlir %s | FileCheck %s\n+// RUN: cpu_fusion_to_mlir %s | FileCheck %s\n+// RUN: gpu_test_correctness %s\n+// RUN: cpu_test_correctness %s\n+\n+// CHECK-LABEL: func.func @main\n+// CHECK-SAME: %arg0: tensor<30x20xf32>\n+// CHECK-SAME: %arg1: tensor<10x2xi32>\n+// CHECK-SAME: %arg2: tensor<10x4x8xf32>\n+// CHECK: %[[C0:.*]] = arith.constant 0 : index\n+// CHECK: %[[IDX0:.*]] = tensor.extract %arg1[{{.*}}, %[[C0]]]\n+// CHECK: %[[IDX0_I:.*]] = arith.index_cast %[[IDX0]]\n+// CHECK: %[[C12:.*]] = arith.constant 12 : index\n+// CHECK: arith.minsi %[[IDX0_I]], %[[C12]]\n+// CHECK: %[[C1:.*]] = arith.constant 1 : index\n+// CHECK: %[[IDX1:.*]] = tensor.extract %arg1[{{.*}}, %[[C1]]]\n+// CHECK: %[[IDX1_I:.*]] = arith.index_cast %[[IDX1]]\n+// CHECK: %[[C26:.*]] = arith.constant 26 : index\n+// CHECK: arith.minsi %[[IDX1_I]], %[[C26]]"
+        },
+        {
+            "sha": "4569924f0cf2b25cf1c46f6729fd3c64c185fb73",
+            "filename": "third_party/xla/xla/hlo/analysis/indexing_analysis.cc",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 7,
+            "changes": 20,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/16334aae999dd59865cd1b5d23e4798ceff5a99d/third_party%2Fxla%2Fxla%2Fhlo%2Fanalysis%2Findexing_analysis.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/16334aae999dd59865cd1b5d23e4798ceff5a99d/third_party%2Fxla%2Fxla%2Fhlo%2Fanalysis%2Findexing_analysis.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fanalysis%2Findexing_analysis.cc?ref=16334aae999dd59865cd1b5d23e4798ceff5a99d",
+            "patch": "@@ -602,34 +602,40 @@ HloInstructionIndexing ComputeOutputToInputGatherOpIndexing(\n       /*rt_vars=*/{}};\n \n   // A map for the `operand` operand of gather, from which we extract slices.\n-  // (d0, ... d{rank - 1}) -> (d1 + rt0, d2 + rt1, ...),\n-  // where rt{i} are RTVars that extract indices from the `indices` operand.\n+  // If operand dimension `i` corresponds to `start_index_map[j]`, then i-th\n+  // dimension of operand is indexed as d_{offset_dims[i]} + start_indices[d0,\n+  // j], otherwise it's d_{offset_dims[i]}.\n   std::vector<HLORTVar> rt_vars;\n   std::vector<AffineExpr> exprs;\n   exprs.reserve(operand_shape.dimensions().size());\n+  const auto& start_index_map = dimension_numbers.start_index_map();\n   for (auto [operand_dim_id, slice_size] :\n        llvm::enumerate(gather->gather_slice_sizes())) {\n     int64_t output_dim_id = dimension_numbers.offset_dims(operand_dim_id);\n     exprs.push_back(getAffineDimExpr(output_dim_id, mlir_context));\n \n-    if (operand_dim_id >= index_vector_length) {\n+    int64_t start_index_map_idx =\n+        absl::c_find(start_index_map, operand_dim_id) - start_index_map.begin();\n+    if (start_index_map_idx == start_index_map.size()) {\n       continue;\n     }\n     AffineMap rt_var_map = AffineMap::get(\n         output_rank, /*symbolCount=*/0,\n-        {indices_id_dim, getAffineConstantExpr(operand_dim_id, mlir_context)},\n+        {indices_id_dim,\n+         getAffineConstantExpr(start_index_map_idx, mlir_context)},\n         mlir_context);\n     rt_vars.push_back(HLORTVar{\n         Interval{0, operand_shape.dimensions(operand_dim_id) - slice_size},\n         gather->operand(1), rt_var_map,\n         ShapeUtil::CreateDimensionVectorFromShape(output_shape)});\n     exprs.back() =\n-        exprs.back() + getAffineSymbolExpr(operand_dim_id, mlir_context);\n+        exprs.back() + getAffineSymbolExpr(rt_vars.size() - 1, mlir_context);\n   }\n   OperandIndexing operand_indexing = CreateOperandIndexingWithRTVars(\n       AffineMap::get(/*dimCount=*/output_rank,\n-                     /*symbolCount=*/index_vector_length, exprs, mlir_context),\n-      std::move(dim_vars), std::move(rt_vars));\n+                     /*symbolCount=*/start_index_map.size(), exprs,\n+                     mlir_context),\n+      dim_vars, std::move(rt_vars));\n \n   return HloInstructionIndexing::FromOperandIndexing(\n       {operand_indexing, OperandIndexing(indices_map)});"
+        },
+        {
+            "sha": "fc29e95f59e4de6bba5506a79b363ef8d4696f68",
+            "filename": "third_party/xla/xla/hlo/analysis/indexing_analysis_test.cc",
+            "status": "modified",
+            "additions": 37,
+            "deletions": 0,
+            "changes": 37,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/16334aae999dd59865cd1b5d23e4798ceff5a99d/third_party%2Fxla%2Fxla%2Fhlo%2Fanalysis%2Findexing_analysis_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/16334aae999dd59865cd1b5d23e4798ceff5a99d/third_party%2Fxla%2Fxla%2Fhlo%2Fanalysis%2Findexing_analysis_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fanalysis%2Findexing_analysis_test.cc?ref=16334aae999dd59865cd1b5d23e4798ceff5a99d",
+            "patch": "@@ -1084,6 +1084,43 @@ TEST_F(IndexingAnalysisTest, GatherOp) {\n     )\"));\n }\n \n+TEST_F(IndexingAnalysisTest, GatherOpWithShuffledStartIndexMap) {\n+  auto input_indexing = GetOutputToInputIndexing(ParseAndGetRoot(R\"(\n+    HloModule m\n+    ENTRY main {\n+      operand = f32[33,76,70] parameter(0)\n+      indices = s32[1806,2] parameter(1)\n+      ROOT r = f32[1806,7,8,4] gather(operand, indices), offset_dims={1,2,3},\n+                                 collapsed_slice_dims={}, start_index_map={1,0},\n+                                 index_vector_dim=1, slice_sizes={7,8,4}\n+    }\n+  )\"));\n+  EXPECT_THAT(input_indexing.ToString(), MatchIndexingString(R\"(\n+    operand id = 0\n+      (d0, d1, d2, d3){rt0, rt1} -> (d1 + rt0, d2 + rt1, d3),\n+      domain:\n+        d0 in [0, 1805],\n+        d1 in [0, 6],\n+        d2 in [0, 7],\n+        d3 in [0, 3],\n+        rt0 in [0, 26],\n+        rt1 in [0, 68]\n+      runtime variables:\n+        rt0: %indices = s32[1806,2]{1,0} parameter(1); (d0, d1, d2, d3) -> (d0, 1),\n+          domain: d0 in [0, 1805], d1 in [0, 6], d2 in [0, 7], d3 in [0, 3]\n+        rt1: %indices = s32[1806,2]{1,0} parameter(1); (d0, d1, d2, d3) -> (d0, 0),\n+          domain: d0 in [0, 1805], d1 in [0, 6], d2 in [0, 7], d3 in [0, 3]\n+    operand id = 1\n+      (d0, d1, d2, d3)[s0] -> (d0, s0),\n+      domain:\n+        d0 in [0, 1805],\n+        d1 in [0, 6],\n+        d2 in [0, 7],\n+        d3 in [0, 3],\n+        s0 in [0, 1]\n+    )\"));\n+}\n+\n TEST_F(IndexingAnalysisTest, FusionOpWithReduceOfReduce) {\n   auto input_indexing = GetOutputToInputIndexing(ParseAndGetRoot(R\"(\n     HloModule m"
+        },
+        {
+            "sha": "55a6bcef71c8e96db9944ebee6e57d5ac4fc13a8",
+            "filename": "third_party/xla/xla/hlo/transforms/simplifiers/gather_simplifier.cc",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 4,
+            "changes": 10,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/16334aae999dd59865cd1b5d23e4798ceff5a99d/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fsimplifiers%2Fgather_simplifier.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/16334aae999dd59865cd1b5d23e4798ceff5a99d/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fsimplifiers%2Fgather_simplifier.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fsimplifiers%2Fgather_simplifier.cc?ref=16334aae999dd59865cd1b5d23e4798ceff5a99d",
+            "patch": "@@ -131,16 +131,18 @@ bool GatherSimplifier::IsSimplifiedGather(const HloGatherInstruction* gather) {\n   auto* start_indices = gather->operands()[1];\n   const auto& dims = gather->gather_dimension_numbers();\n   return start_indices->shape().dimensions().size() == 2 &&\n-         dims.index_vector_dim() == 1 &&\n-         IsIdentityPermutation(dims.start_index_map()) &&\n-         dims.collapsed_slice_dims().empty() &&\n+         dims.index_vector_dim() == 1 && dims.collapsed_slice_dims().empty() &&\n          *dims.offset_dims().begin() == 1 &&\n          *dims.offset_dims().rbegin() == dims.offset_dims().size();\n }\n \n bool GatherSimplifier::InstructionMatchesPattern(HloInstruction* inst) {\n   auto* gather = DynCast<HloGatherInstruction>(inst);\n-  return gather && !IsSimplifiedGather(gather);\n+  // TODO(crem): Remove the IsIdentityPermutation check once the\n+  // GatherSimplifier pass is updated to handle non-trivial start_index_maps.\n+  return gather && !(IsSimplifiedGather(gather) &&\n+                     IsIdentityPermutation(\n+                         gather->gather_dimension_numbers().start_index_map()));\n }\n \n }  // namespace xla"
+        }
+    ],
+    "stats": {
+        "total": 117,
+        "additions": 100,
+        "deletions": 17
+    }
+}

@@ -1,0 +1,60 @@
+{
+    "author": "sergachev",
+    "message": "PR #30821: Normalize layouts of some bitcast-converts between different bit widths.\n\nImported from GitHub PR https://github.com/openxla/xla/pull/30821\n\nCopybara import of the project:\n\n--\n0d26d3f5fdf3207b79c497d6377c661b96ed9114 by Ilia Sergachev <isergachev@nvidia.com>:\n\nNormalize layouts of some bitcast-converts between different bit widths.\n\nMerging this change closes #30821\n\nPiperOrigin-RevId: 802039302",
+    "sha": "eb49964687e17075a5ff48d6ffe30715a1da146f",
+    "files": [
+        {
+            "sha": "4cc6507e5f2ae35e73d12662cdc9a138ccfe9e01",
+            "filename": "third_party/xla/xla/service/layout_normalization.cc",
+            "status": "modified",
+            "additions": 27,
+            "deletions": 2,
+            "changes": 29,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/eb49964687e17075a5ff48d6ffe30715a1da146f/third_party%2Fxla%2Fxla%2Fservice%2Flayout_normalization.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/eb49964687e17075a5ff48d6ffe30715a1da146f/third_party%2Fxla%2Fxla%2Fservice%2Flayout_normalization.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Flayout_normalization.cc?ref=eb49964687e17075a5ff48d6ffe30715a1da146f",
+            "patch": "@@ -118,7 +118,6 @@ class LayoutNormalizationVisitor : public DfsHloRewriteVisitor {\n     TF_ASSIGN_OR_RETURN(HloInstruction * normalized_input,\n                         GetNormalizedInput(operand));\n \n-    Shape normalized = Normalize(operand_shape);\n     std::vector<int64_t> layout_as_permutation =\n         ToTransposeDimensions(hlo->shape().layout());\n \n@@ -287,12 +286,38 @@ class LayoutNormalizationVisitor : public DfsHloRewriteVisitor {\n \n   // BitcastConvert is only layout-preserving if it doesn't change the rank.\n   absl::Status HandleBitcastConvert(HloInstruction* hlo) override {\n+    HloInstruction* operand = hlo->mutable_operand(0);\n     // If the rank isn't changing this is just an unary op.\n     if (hlo->shape().dimensions().size() ==\n-        hlo->operand(0)->shape().dimensions().size()) {\n+        operand->shape().dimensions().size()) {\n       return HandleElementwiseUnary(hlo);\n     }\n \n+    // When bitcast-convert adds or removes a dimension, it's the last one\n+    // either in the input or the output. If this dimension is already\n+    // minor-most, normalizing input and output layouts together will keep it\n+    // that way. Handling of the other situations might be possible too but\n+    // wasn't the goal so far.\n+\n+    const Shape& shape_with_extra_dimension =\n+        operand->shape().dimensions().size() > hlo->shape().dimensions().size()\n+            ? operand->shape()\n+            : hlo->shape();\n+\n+    if (ShapeUtil::LastDimIsMinorMost(shape_with_extra_dimension)) {\n+      const Shape original_shape = hlo->shape();\n+      TF_ASSIGN_OR_RETURN(HloInstruction * normalized_input,\n+                          GetNormalizedInput(operand));\n+      HloInstruction* normalized = hlo->parent()->AddInstruction(\n+          HloInstruction::CreateBitcastConvert(Normalize(hlo->shape()),\n+                                               normalized_input),\n+          &hlo->metadata());\n+      SetVisited(*normalized);\n+      HloInstruction* bitcast_back = MaybeBitcast(normalized, original_shape);\n+      TF_RETURN_IF_ERROR(ReplaceInstruction(hlo, bitcast_back));\n+      return absl::OkStatus();\n+    }\n+\n     return DefaultAction(hlo);\n   }\n "
+        },
+        {
+            "sha": "cbb8fcabbed34b96ca86770e7b47e669d7035518",
+            "filename": "third_party/xla/xla/service/layout_normalization_test.cc",
+            "status": "modified",
+            "additions": 38,
+            "deletions": 24,
+            "changes": 62,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/eb49964687e17075a5ff48d6ffe30715a1da146f/third_party%2Fxla%2Fxla%2Fservice%2Flayout_normalization_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/eb49964687e17075a5ff48d6ffe30715a1da146f/third_party%2Fxla%2Fxla%2Fservice%2Flayout_normalization_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Flayout_normalization_test.cc?ref=eb49964687e17075a5ff48d6ffe30715a1da146f",
+            "patch": "@@ -801,35 +801,49 @@ ENTRY main {\n )\");\n }\n \n-TEST_F(LayoutNormalizationTest, BitcastConvertToBiggerType) {\n-  const char* hlo = R\"(\n-HloModule m\n-\n-ENTRY main {\n-  p0 = u32[4,2]{0,1} parameter(0)\n-  ROOT out = u64[4]{0} bitcast-convert(u32[4,2]{0,1} p0), metadata={op_name=\"test\"}\n-}\n-)\";\n-\n-  CheckLayoutNormalization(hlo, R\"(\n-// CHECK: bitcast-convert({{.*}}), metadata={op_name=\"test\"}\n+TEST_F(LayoutNormalizationTest,\n+       BitcastConvertToWiderTypeGetsDefaultOutputLayout) {\n+  CheckLayoutNormalization(R\"(\n+e {\n+  a = u32[3,5,2]{2,0,1} parameter(0)\n+  b = u64[3,5]{0,1} bitcast-convert(a)\n+})\",\n+                           R\"(\n+CHECK: u32[3,5,2]{2,0,1} parameter(0)\n+CHECK-NEXT: u32[5,3,2]{2,1,0} bitcast\n+CHECK-NEXT: u64[5,3]{1,0} bitcast-convert\n+CHECK-NEXT: u64[3,5]{0,1} bitcast\n )\");\n }\n \n-TEST_F(LayoutNormalizationTest, BitcastConvertToSmallerType) {\n-  const char* hlo = R\"(\n-HloModule m\n-\n-ENTRY main {\n-  p0 = u64[3,4]{0,1} parameter(0)\n-  bc_convert = u32[3,4,2]{1,0,2} bitcast-convert(p0), metadata={op_name=\"test\"}\n-  ROOT out = u32[3,4,2]{1,0,2} reverse(bc_convert), dimensions={0}\n+TEST_F(LayoutNormalizationTest,\n+       BitcastConvertToNarrowerTypeGetsDefaultOutputLayout) {\n+  CheckLayoutNormalization(R\"(\n+e {\n+  a = u64[3,5]{0,1} parameter(0)\n+  b = u32[3,5,2]{2,0,1} bitcast-convert(a)\n+})\",\n+                           R\"(\n+CHECK: u64[3,5]{0,1} parameter(0)\n+CHECK-NEXT: u64[5,3]{1,0} bitcast\n+CHECK-NEXT: u32[5,3,2]{2,1,0} bitcast-convert\n+CHECK-NEXT: u32[3,5,2]{2,0,1} bitcast\n+)\");\n }\n-)\";\n \n-  CheckLayoutNormalization(hlo, R\"(\n-// CHECK: bitcast-convert({{.*}}), metadata={op_name=\"test\"}\n-  )\");\n+TEST_F(LayoutNormalizationTest,\n+       BitcastConvertFromNonContiguousDimensionIsNotNormalized) {\n+  CheckLayoutNormalization(R\"(\n+e {\n+a = u32[3,5,2]{0,2,1} parameter(0)\n+b = u64[3,5]{0,1} bitcast-convert(a)\n+})\",\n+                           R\"(\n+CHECK: u32[3,5,2]{0,2,1} parameter(0)\n+CHECK-NEXT: u32[5,2,3]{2,1,0} bitcast\n+CHECK-NEXT: u32[3,5,2]{0,2,1} bitcast\n+CHECK-NEXT: u64[3,5]{0,1} bitcast-convert\n+)\");\n }\n \n TEST_F(LayoutNormalizationTest, Scatter) {"
+        },
+        {
+            "sha": "6e9e5fdac51f7888935d7cc6e95e8d5bea62ea38",
+            "filename": "third_party/xla/xla/shape_util.h",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 0,
+            "changes": 8,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/eb49964687e17075a5ff48d6ffe30715a1da146f/third_party%2Fxla%2Fxla%2Fshape_util.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/eb49964687e17075a5ff48d6ffe30715a1da146f/third_party%2Fxla%2Fxla%2Fshape_util.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fshape_util.h?ref=eb49964687e17075a5ff48d6ffe30715a1da146f",
+            "patch": "@@ -1159,6 +1159,14 @@ class ShapeUtil {\n                                 std::vector<const Shape*>& flattened);\n   static std::vector<const Shape*> FlattenTupleShape(const Shape& shape);\n \n+  static inline bool LastDimIsMinorMost(const Shape& shape) {\n+    if (!shape.has_layout()) {\n+      return true;\n+    }\n+    return LayoutUtil::Minor(shape.layout(), 0) ==\n+           shape.dimensions().size() - 1;\n+  };\n+\n  private:\n   // Helper for ForEachSubshape which visits the subshapes of the given shape in\n   // DFS pre-order starting with the index."
+        },
+        {
+            "sha": "db60ea4e7ceb1c1e5e2f0e691dbaa88c6793efd1",
+            "filename": "third_party/xla/xla/shape_util_test.cc",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 0,
+            "changes": 8,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/eb49964687e17075a5ff48d6ffe30715a1da146f/third_party%2Fxla%2Fxla%2Fshape_util_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/eb49964687e17075a5ff48d6ffe30715a1da146f/third_party%2Fxla%2Fxla%2Fshape_util_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fshape_util_test.cc?ref=eb49964687e17075a5ff48d6ffe30715a1da146f",
+            "patch": "@@ -1628,6 +1628,14 @@ TEST(ShapeUtilTest, FlattenTupleShape) {\n   EXPECT_EQ(flattened_shapes[3]->ToString(), \"f32[8,9]\");\n }\n \n+TEST(ShapeUtilTest, LastDimIsMinorMost) {\n+  EXPECT_TRUE(ShapeUtil::LastDimIsMinorMost(ShapeUtil::MakeShape(S8, {1, 2})));\n+  EXPECT_TRUE(ShapeUtil::LastDimIsMinorMost(\n+      ShapeUtil::MakeShapeWithDescendingLayout(S8, {3, 4})));\n+  EXPECT_FALSE(ShapeUtil::LastDimIsMinorMost(\n+      ShapeUtil::MakeShapeWithDenseLayout(S8, {5, 6}, {0, 1})));\n+}\n+\n TEST(ShapeUtilTest, ShapeIndexProtoSerialization) {\n   ShapeIndex empty{};\n   EXPECT_EQ(empty, ShapeIndex::FromProto(empty.ToProto()));"
+        }
+    ],
+    "stats": {
+        "total": 107,
+        "additions": 81,
+        "deletions": 26
+    }
+}

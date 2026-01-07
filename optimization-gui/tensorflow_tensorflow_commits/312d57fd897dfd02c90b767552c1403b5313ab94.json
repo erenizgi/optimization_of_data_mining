@@ -1,0 +1,36 @@
+{
+    "author": "unknown",
+    "message": "Follow replacement chains when setting deduplicated names for HLO OpMetadata\n\nPiperOrigin-RevId: 842629932",
+    "sha": "312d57fd897dfd02c90b767552c1403b5313ab94",
+    "files": [
+        {
+            "sha": "d67349ea44e39337402c3d2317dd1f0da2dccb33",
+            "filename": "third_party/xla/xla/hlo/ir/hlo_module.cc",
+            "status": "modified",
+            "additions": 20,
+            "deletions": 13,
+            "changes": 33,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/312d57fd897dfd02c90b767552c1403b5313ab94/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_module.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/312d57fd897dfd02c90b767552c1403b5313ab94/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_module.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Fir%2Fhlo_module.cc?ref=312d57fd897dfd02c90b767552c1403b5313ab94",
+            "patch": "@@ -267,20 +267,27 @@ void HloModule::MarkFusionDuplications(\n     const {\n   for (const HloComputation* computation : computations()) {\n     for (auto* instruction : computation->instructions()) {\n-      if (instruction->opcode() == HloOpcode::kFusion) {\n-        auto rep =\n-            replacements.find(instruction->fused_instructions_computation());\n-        if (rep != replacements.end()) {\n-          xla::HloComputation* new_comp = rep->second;\n-          if (new_comp->IsFusionComputation()) {\n-            auto dedup_name = new_comp->FusionInstruction()->name();\n-            new_comp->FusionInstruction()->set_metadata_deduplicated_name(\n-                std::string(dedup_name));\n-            instruction->set_metadata_deduplicated_name(\n-                std::string(dedup_name));\n-          }\n-        }\n+      if (instruction->opcode() != HloOpcode::kFusion) {\n+        continue;\n+      }\n+      auto it =\n+          replacements.find(instruction->fused_instructions_computation());\n+      if (it == replacements.end()) {\n+        continue;\n+      }\n+      HloComputation* representative = it->second;\n+      // Follow chain to find the root representative.\n+      for (auto it2 = replacements.find(representative);\n+           it2 != replacements.end(); it2 = replacements.find(representative)) {\n+        representative = it2->second;\n+      }\n+      if (!representative->IsFusionComputation()) {\n+        continue;\n       }\n+      std::string dedup_name(representative->FusionInstruction()->name());\n+      representative->FusionInstruction()->set_metadata_deduplicated_name(\n+          dedup_name);\n+      instruction->set_metadata_deduplicated_name(dedup_name);\n     }\n   }\n }"
+        },
+        {
+            "sha": "9e0b3c860400f99a4e2aab995f3569d0313c1245",
+            "filename": "third_party/xla/xla/hlo/transforms/simplifiers/hlo_computation_deduplicator_test.cc",
+            "status": "modified",
+            "additions": 49,
+            "deletions": 1,
+            "changes": 50,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/312d57fd897dfd02c90b767552c1403b5313ab94/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fsimplifiers%2Fhlo_computation_deduplicator_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/312d57fd897dfd02c90b767552c1403b5313ab94/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fsimplifiers%2Fhlo_computation_deduplicator_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fhlo%2Ftransforms%2Fsimplifiers%2Fhlo_computation_deduplicator_test.cc?ref=312d57fd897dfd02c90b767552c1403b5313ab94",
+            "patch": "@@ -25,6 +25,7 @@ limitations under the License.\n #include \"absl/strings/string_view.h\"\n #include \"xla/hlo/ir/hlo_computation.h\"\n #include \"xla/hlo/ir/hlo_instruction.h\"\n+#include \"xla/hlo/ir/hlo_module.h\"\n #include \"xla/hlo/ir/hlo_opcode.h\"\n #include \"xla/hlo/testlib/hlo_hardware_independent_test_base.h\"\n #include \"xla/literal_util.h\"\n@@ -663,5 +664,52 @@ TEST_F(HloComputationDeduplicatorTest, DontDeduplicateReduceAllReduce) {\n   EXPECT_EQ(computation_names.size(), 3);\n }\n \n-}  //  namespace\n+TEST_F(HloComputationDeduplicatorTest, DeduplicateChain) {\n+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,\n+                          ParseAndReturnVerifiedModule(R\"(\n+HloModule module\n+\n+fusion0 {\n+  p0 = f32[] parameter(0)\n+  p1 = f32[] parameter(1)\n+  ROOT add = f32[] add(p0, p1)\n+}\n+\n+fusion1 {\n+  p0 = f32[] parameter(0)\n+  p1 = f32[] parameter(1)\n+  ROOT add = f32[] add(p0, p1)\n+}\n+\n+fusion2 {\n+  p0 = f32[] parameter(0)\n+  p1 = f32[] parameter(1)\n+  ROOT add = f32[] add(p0, p1)\n+}\n+\n+ENTRY entry {\n+  p0 = f32[] parameter(0)\n+  p1 = f32[] parameter(1)\n+  fusion.2 = f32[] fusion(p0, p1), kind=kLoop, calls=fusion2\n+  fusion.1 = f32[] fusion(fusion.2, p1), kind=kLoop, calls=fusion1\n+  fusion.0 = f32[] fusion(fusion.1, p1), kind=kLoop, calls=fusion0\n+  ROOT add = f32[] add(fusion.0, p1)\n+}\n+)\"));\n+  HloComputationDeduplicator dedup(/*mark_fusion_duplications=*/true);\n+  TF_ASSERT_OK_AND_ASSIGN(bool changed, dedup.Run(module.get()));\n+  EXPECT_TRUE(changed);\n+  EXPECT_EQ(module->computation_count(), 4);\n+  HloInstruction* fusion0 =\n+      module->entry_computation()->GetInstructionWithName(\"fusion.0\");\n+  HloInstruction* fusion1 =\n+      module->entry_computation()->GetInstructionWithName(\"fusion.1\");\n+  HloInstruction* fusion2 =\n+      module->entry_computation()->GetInstructionWithName(\"fusion.2\");\n+  EXPECT_EQ(fusion0->metadata().deduplicated_name(), \"fusion.0\");\n+  EXPECT_EQ(fusion1->metadata().deduplicated_name(), \"fusion.0\");\n+  EXPECT_EQ(fusion2->metadata().deduplicated_name(), \"fusion.0\");\n+}\n+\n+}  // namespace\n }  //  namespace xla"
+        }
+    ],
+    "stats": {
+        "total": 83,
+        "additions": 69,
+        "deletions": 14
+    }
+}

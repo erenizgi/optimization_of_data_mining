@@ -1,0 +1,36 @@
+{
+    "author": "WillFroom",
+    "message": "[XLA:CPU][XTile] Add more constraints to workgroup id in tiled lowering.\n\nThis gives enough information to LLVM such that it can remove a lot of dead code as it can do range analysis on the indexing.\n\nPiperOrigin-RevId: 834230204",
+    "sha": "c14f07f28dd6a2a62dafab2e4acc65775f617224",
+    "files": [
+        {
+            "sha": "6ae31ae3594c00c525f39c2846885f685e1743ad",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/tiled/transforms/lower_xtile_entry.cc",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 6,
+            "changes": 21,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/c14f07f28dd6a2a62dafab2e4acc65775f617224/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Flower_xtile_entry.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/c14f07f28dd6a2a62dafab2e4acc65775f617224/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Flower_xtile_entry.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Flower_xtile_entry.cc?ref=c14f07f28dd6a2a62dafab2e4acc65775f617224",
+            "patch": "@@ -183,15 +183,24 @@ class LowerXTileEntryPass\n       mlir::Value workgroup_id = builder.create<ExtractWorkgroupIdOp>(\n           builder.getIndexType(), call_frame, WorkGroupDimension::x);\n \n+      auto flags = mlir::arith::IntegerOverflowFlags::nsw |\n+                   mlir::arith::IntegerOverflowFlags::nuw;\n+\n+      // This isn't needed for correctness as the workgroup id passed from the\n+      // runtime will always be in bounds but it constrains the range which LLVM\n+      // can then take advantage of.\n+      mlir::Value bounded_workgroup_id = builder.create<mlir::arith::MaxSIOp>(\n+          workgroup_id, builder.create<mlir::arith::ConstantIndexOp>(0));\n+\n       mlir::Value start_tile_id = builder.create<mlir::arith::MulIOp>(\n-          builder.getIndexType(), workgroup_id, tiles_per_workgroup_value);\n-      mlir::Value bounded_start_tile_id = builder.create<mlir::arith::MinSIOp>(\n-          builder.getIndexType(), start_tile_id, tile_count_value);\n+          bounded_workgroup_id, tiles_per_workgroup_value, flags);\n+      mlir::Value bounded_start_tile_id =\n+          builder.create<mlir::arith::MinSIOp>(start_tile_id, tile_count_value);\n \n       mlir::Value end_tile_id = builder.create<mlir::arith::AddIOp>(\n-          builder.getIndexType(), start_tile_id, tiles_per_workgroup_value);\n-      mlir::Value bounded_end_tile_id = builder.create<mlir::arith::MinSIOp>(\n-          builder.getIndexType(), end_tile_id, tile_count_value);\n+          start_tile_id, tiles_per_workgroup_value, flags);\n+      mlir::Value bounded_end_tile_id =\n+          builder.create<mlir::arith::MinSIOp>(end_tile_id, tile_count_value);\n \n       mlir::Value step = builder.create<mlir::arith::ConstantIndexOp>(1);\n "
+        },
+        {
+            "sha": "b0e3e4702c241bfe9ad1d3c119bea4ae7200f170",
+            "filename": "third_party/xla/xla/backends/cpu/codegen/tiled/transforms/tests/lower_xtile_entry.mlir",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 2,
+            "changes": 6,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/c14f07f28dd6a2a62dafab2e4acc65775f617224/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Flower_xtile_entry.mlir",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/c14f07f28dd6a2a62dafab2e4acc65775f617224/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Flower_xtile_entry.mlir",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fcpu%2Fcodegen%2Ftiled%2Ftransforms%2Ftests%2Flower_xtile_entry.mlir?ref=c14f07f28dd6a2a62dafab2e4acc65775f617224",
+            "patch": "@@ -8,6 +8,7 @@ xtile.entry_func @simple_wrap(%input: memref<1024xf32> {xla.some_attr = 1},\n \n // CHECK: func.func @simple_wrap(%[[CALL_FRAME:.*]]: !xla_cpu.call_frame) -> !xla_cpu.error {\n \n+// CHECK-DAG: %[[C0:.*]] = arith.constant 0 : index\n // CHECK-DAG: %[[STEP:.*]] = arith.constant 1 : index\n // CHECK-DAG: %[[TILES_PER_WORKGROUP:.*]] = arith.constant 64 : index\n // CHECK-DAG: %[[TILE_COUNT:.*]] = arith.constant 1012 : index\n@@ -16,9 +17,10 @@ xtile.entry_func @simple_wrap(%input: memref<1024xf32> {xla.some_attr = 1},\n // CHECK: %[[OUTPUT:.*]] = xla_cpu.load %[[CALL_FRAME]], 1 : memref<32xf64>\n // CHECK: %[[WORKGROUP_ID:.*]] = xla_cpu.extract_workgroup_id %[[CALL_FRAME]], x\n \n-// CHECK: %[[START_IDX:.*]] = arith.muli %[[WORKGROUP_ID]], %[[TILES_PER_WORKGROUP]] : index\n+// CHECK: %[[BOUNDED_WORKGROUP_ID:.*]] = arith.maxsi %[[WORKGROUP_ID]], %[[C0]] : index\n+// CHECK: %[[START_IDX:.*]] = arith.muli %[[BOUNDED_WORKGROUP_ID]], %[[TILES_PER_WORKGROUP]] overflow<nsw, nuw> : index\n // CHECK: %[[CLAMPED_START_IDX:.*]] = arith.minsi %[[START_IDX]], %[[TILE_COUNT]] : index\n-// CHECK: %[[END_IDX:.*]] = arith.addi %[[START_IDX]], %[[TILES_PER_WORKGROUP]] : index\n+// CHECK: %[[END_IDX:.*]] = arith.addi %[[START_IDX]], %[[TILES_PER_WORKGROUP]] overflow<nsw, nuw> : index\n // CHECK: %[[CLAMPED_END_IDX:.*]] = arith.minsi %[[END_IDX]], %[[TILE_COUNT]] : index\n // CHECK: scf.for %[[IDX:.*]] = %[[CLAMPED_START_IDX]] to %[[CLAMPED_END_IDX]] step %[[STEP]] {\n // CHECK:   func.call @[[IMPL_FUNC:.*]](%[[INPUT]], %[[OUTPUT]], %[[IDX]]) : (memref<1024xf32>, memref<32xf64>, index) -> ()"
+        }
+    ],
+    "stats": {
+        "total": 27,
+        "additions": 19,
+        "deletions": 8
+    }
+}

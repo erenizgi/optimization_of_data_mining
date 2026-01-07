@@ -1,0 +1,72 @@
+{
+    "author": "SiqiaoWu1993",
+    "message": "Refactor the H2D transfer for user input in TFRT/IFRT.\n\nPiperOrigin-RevId: 819009095",
+    "sha": "537502aeaa3978b3b4f5b307828e3e8eda4ab9aa",
+    "files": [
+        {
+            "sha": "4715f68de956d278e4b7f3da2f17c8ca59615a35",
+            "filename": "tensorflow/core/tfrt/ifrt/BUILD",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/537502aeaa3978b3b4f5b307828e3e8eda4ab9aa/tensorflow%2Fcore%2Ftfrt%2Fifrt%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/537502aeaa3978b3b4f5b307828e3e8eda4ab9aa/tensorflow%2Fcore%2Ftfrt%2Fifrt%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcore%2Ftfrt%2Fifrt%2FBUILD?ref=537502aeaa3978b3b4f5b307828e3e8eda4ab9aa",
+            "patch": "@@ -346,6 +346,7 @@ cc_library(\n         \"@com_google_absl//absl/types:span\",\n         \"@eigen_archive//:eigen3\",\n         \"@local_xla//xla:shape_util\",\n+        \"@local_xla//xla:xla_data_proto_cc\",\n         \"@local_xla//xla/hlo/ir:hlo\",\n         \"@local_xla//xla/python/ifrt\",\n         \"@local_xla//xla/python/pjrt_ifrt:xla_ifrt\","
+        },
+        {
+            "sha": "d8c2064e5f6f8107907ca3aaef30be78e096d408",
+            "filename": "tensorflow/core/tfrt/ifrt/ifrt_serving_executable.cc",
+            "status": "modified",
+            "additions": 29,
+            "deletions": 24,
+            "changes": 53,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/537502aeaa3978b3b4f5b307828e3e8eda4ab9aa/tensorflow%2Fcore%2Ftfrt%2Fifrt%2Fifrt_serving_executable.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/537502aeaa3978b3b4f5b307828e3e8eda4ab9aa/tensorflow%2Fcore%2Ftfrt%2Fifrt%2Fifrt_serving_executable.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcore%2Ftfrt%2Fifrt%2Fifrt_serving_executable.cc?ref=537502aeaa3978b3b4f5b307828e3e8eda4ab9aa",
+            "patch": "@@ -268,19 +268,6 @@ IfrtServingExecutable::Create(\n   return executable;\n }\n \n-absl::StatusOr<xla::ifrt::ArrayRef> IfrtServingExecutable::ConvertTensorToArray(\n-    const tensorflow::Tensor& tensor,\n-    const xla::ifrt::DeviceListRef& device_list,\n-    const xla::OpSharding& sharding) {\n-  xla::ifrt::Shape input_shape = ToIfrtShape(tensor.shape());\n-  VLOG(2) << \"Converting tensor of shape \" << input_shape;\n-\n-  TF_ASSIGN_OR_RETURN(auto hlo_sharding, xla::HloSharding::FromProto(sharding));\n-\n-  return MakeArrayFromTensor(*ifrt_client_, tensor, device_list,\n-                             std::move(hlo_sharding), thread_pool_);\n-}\n-\n absl::StatusOr<std::vector<tensorflow::FunctionDef>> BuildFunctionDef(\n     mlir::ModuleOp module) {\n   std::vector<tensorflow::FunctionDef> function_defs;\n@@ -721,9 +708,19 @@ absl::StatusOr<std::vector<tensorflow::Tensor>> IfrtServingExecutable::Execute(\n   for (xla::ifrt::Device* device : device_list->devices()) {\n     device_ids.push_back(device->Id().value());\n   }\n-  std::vector<xla::ifrt::ArrayRef> args;\n+  std::vector<tsl::Future<xla::ifrt::ArrayRef>> args;\n   args.reserve(inputs.size());\n   int variable_arg_index = 0;\n+  // TODO(b/445201291): Plumb the H2DTransferExecutorFactory from the\n+  // IfrtServingExecutable constructor.\n+  absl::StatusOr<std::unique_ptr<H2DTransferExecutor>>\n+      user_inputs_h2d_transfer_executor =\n+          h2d_transfer_executor_factory_ != nullptr\n+              ? h2d_transfer_executor_factory_->CreateH2DTransferExecutor(\n+                    *ifrt_client_)\n+              : std::make_unique<H2DTransferExecutor>(*ifrt_client_);\n+  TF_RETURN_IF_ERROR(user_inputs_h2d_transfer_executor.status());\n+\n   for (int i = 0; i < inputs.size(); i++) {\n     if (variable_arg_index < variable_arg_indices.size() &&\n         i == variable_arg_indices[variable_arg_index]) {\n@@ -739,9 +736,7 @@ absl::StatusOr<std::vector<tensorflow::Tensor>> IfrtServingExecutable::Execute(\n       TF_ASSIGN_OR_RETURN(\n           auto loaded_variable,\n           ifrt_loaded_variable_registry_.GetLoadedVariable(key));\n-      TF_ASSIGN_OR_RETURN(xla::ifrt::ArrayRef single_array,\n-                          loaded_variable.array.Await());\n-      args.push_back(std::move(single_array));\n+      args.push_back(std::move(loaded_variable.array));\n       variable_arg_index++;\n     } else {\n       // If the input shape is not the same as the shape after Tf2Hlo\n@@ -756,17 +751,27 @@ absl::StatusOr<std::vector<tensorflow::Tensor>> IfrtServingExecutable::Execute(\n           !reshaped.CopyFrom(inputs[i], reshaped_shape)) {\n         return absl::InternalError(\"Failed to reshape tensor\");\n       }\n-\n       TF_ASSIGN_OR_RETURN(\n-          auto single_array,\n-          ConvertTensorToArray(\n-              reshaped, device_list,\n-              executable_bundle->compile_metadata.args()[i].sharding()));\n-      args.push_back(single_array);\n+          tsl::Future<xla::ifrt::ArrayRef> array_ref,\n+          (*user_inputs_h2d_transfer_executor)\n+              ->ScheduledH2DTransfer(\n+                  reshaped, device_list,\n+                  executable_bundle->compile_metadata.args()[i].sharding(),\n+                  thread_pool_));\n+      args.push_back(std::move(array_ref));\n     }\n   }\n   DCHECK_EQ(args.size(), executable_bundle->compile_metadata.args().size());\n \n+  TF_RETURN_IF_ERROR((*user_inputs_h2d_transfer_executor)->RunH2DTransfers());\n+\n+  std::vector<xla::ifrt::ArrayRef> transfer_result;\n+  transfer_result.reserve(args.size());\n+  for (auto& arg : args) {\n+    TF_ASSIGN_OR_RETURN(auto array_ref, arg.Await());\n+    transfer_result.push_back(std::move(array_ref));\n+  }\n+\n   VLOG(2) << \"Start Execution\";\n \n   std::optional<xla::ifrt::DeviceListRef> execution_device_list;\n@@ -778,7 +783,7 @@ absl::StatusOr<std::vector<tensorflow::Tensor>> IfrtServingExecutable::Execute(\n   {\n     tsl::profiler::TraceMe traceme(\"Execute\");\n     execution_result = executable_bundle->ifrt_executable->Execute(\n-        absl::MakeSpan(args), /*options=*/{.fill_status = true},\n+        absl::MakeSpan(transfer_result), /*options=*/{.fill_status = true},\n         std::move(execution_device_list));\n     TF_RETURN_IF_ERROR(execution_result.status());\n   }"
+        },
+        {
+            "sha": "8e29544fd01d78343d65f36149faf75a3e66869f",
+            "filename": "tensorflow/core/tfrt/ifrt/ifrt_serving_executable.h",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 5,
+            "changes": 8,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/537502aeaa3978b3b4f5b307828e3e8eda4ab9aa/tensorflow%2Fcore%2Ftfrt%2Fifrt%2Fifrt_serving_executable.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/537502aeaa3978b3b4f5b307828e3e8eda4ab9aa/tensorflow%2Fcore%2Ftfrt%2Fifrt%2Fifrt_serving_executable.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcore%2Ftfrt%2Fifrt%2Fifrt_serving_executable.h?ref=537502aeaa3978b3b4f5b307828e3e8eda4ab9aa",
+            "patch": "@@ -57,6 +57,7 @@ limitations under the License.\n #include \"tensorflow/core/tfrt/ifrt/ifrt_persistent_compilation_cache.h\"\n #include \"tensorflow/core/tfrt/ifrt/ifrt_restore_tensor_registry.h\"\n #include \"tensorflow/core/tfrt/ifrt/ifrt_serving_core_selector.h\"\n+#include \"tensorflow/core/tfrt/ifrt/sharding_utils.h\"\n #include \"tensorflow/core/tfrt/ifrt/tf_host_callback.h\"\n #include \"tfrt/host_context/concurrent_work_queue.h\"  // from @tf_runtime\n \n@@ -220,18 +221,15 @@ class IfrtServingExecutable {\n   // disabled at ifrt serving level.\n   IfrtPersistentCompilationCache* persistent_compilation_cache_;\n \n+  H2DTransferExecutorFactory* h2d_transfer_executor_factory_ = nullptr;\n+\n   // Asynchronously load the restored variable tensors to Ifrt array.\n   absl::Status AsyncLoadIfrtArray(\n       absl::Span<const tensorflow::Tensor> inputs,\n       absl::Span<const int> variable_arg_indices,\n       const CachedExecutableBundle& executable_bundle,\n       const xla::ifrt::DeviceListRef& devices);\n \n-  absl::StatusOr<xla::ifrt::ArrayRef> ConvertTensorToArray(\n-      const tensorflow::Tensor& tensor,\n-      const xla::ifrt::DeviceListRef& device_list,\n-      const xla::OpSharding& sharding);\n-\n   tsl::Future<SharedCachedExecutableBundle> LookUpOrCreateExecutable(\n       const tensorflow::tpu::TPUCompileMetadataProto& compile_metadata,\n       absl::Span<const DtypeAndShape> dtypes_and_shapes,"
+        },
+        {
+            "sha": "7db387987f46b591cd0e069b5762da8bd153970b",
+            "filename": "tensorflow/core/tfrt/ifrt/sharding_utils.cc",
+            "status": "modified",
+            "additions": 23,
+            "deletions": 0,
+            "changes": 23,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/537502aeaa3978b3b4f5b307828e3e8eda4ab9aa/tensorflow%2Fcore%2Ftfrt%2Fifrt%2Fsharding_utils.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/537502aeaa3978b3b4f5b307828e3e8eda4ab9aa/tensorflow%2Fcore%2Ftfrt%2Fifrt%2Fsharding_utils.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcore%2Ftfrt%2Fifrt%2Fsharding_utils.cc?ref=537502aeaa3978b3b4f5b307828e3e8eda4ab9aa",
+            "patch": "@@ -645,6 +645,29 @@ absl::StatusOr<tsl::Future<tensorflow::Tensor>> MakeTensorFromArrayHelper(\n \n }  // namespace\n \n+absl::StatusOr<std::unique_ptr<H2DTransferExecutor>>\n+H2DTransferExecutorFactory::CreateH2DTransferExecutor(\n+    xla::ifrt::Client& ifrt_client) {\n+  return std::make_unique<H2DTransferExecutor>(ifrt_client);\n+}\n+\n+H2DTransferExecutor::H2DTransferExecutor(xla::ifrt::Client& ifrt_client)\n+    : ifrt_client_(ifrt_client) {}\n+\n+absl::StatusOr<tsl::Future<xla::ifrt::ArrayRef>>\n+H2DTransferExecutor::ScheduledH2DTransfer(\n+    const tensorflow::Tensor& tensor,\n+    const xla::ifrt::DeviceListRef& device_list,\n+    const xla::OpSharding& sharding, tsl::thread::ThreadPool& thread_pool) {\n+  TF_ASSIGN_OR_RETURN(auto hlo_sharding, xla::HloSharding::FromProto(sharding));\n+  TF_ASSIGN_OR_RETURN(xla::ifrt::ArrayRef array_ref,\n+                      MakeArrayFromTensor(ifrt_client_, tensor, device_list,\n+                                          hlo_sharding, thread_pool));\n+  return tsl::Future<xla::ifrt::ArrayRef>(std::move(array_ref));\n+}\n+\n+absl::Status H2DTransferExecutor::RunH2DTransfers() { return absl::OkStatus(); }\n+\n tsl::Future<tensorflow::Tensor> MakeTensorFromArray(\n     xla::ifrt::Client& ifrt_client, xla::ifrt::Array& input_array,\n     const xla::HloSharding& hlo_sharding,"
+        },
+        {
+            "sha": "13ee0c3cee481595412e6a9b6b2825f7920756be",
+            "filename": "tensorflow/core/tfrt/ifrt/sharding_utils.h",
+            "status": "modified",
+            "additions": 37,
+            "deletions": 1,
+            "changes": 38,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/537502aeaa3978b3b4f5b307828e3e8eda4ab9aa/tensorflow%2Fcore%2Ftfrt%2Fifrt%2Fsharding_utils.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/537502aeaa3978b3b4f5b307828e3e8eda4ab9aa/tensorflow%2Fcore%2Ftfrt%2Fifrt%2Fsharding_utils.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/tensorflow%2Fcore%2Ftfrt%2Fifrt%2Fsharding_utils.h?ref=537502aeaa3978b3b4f5b307828e3e8eda4ab9aa",
+            "patch": "@@ -17,26 +17,62 @@ limitations under the License.\n #define TENSORFLOW_CORE_TFRT_IFRT_SHARDING_UTILS_H_\n \n #include <cstdint>\n+#include <memory>\n #include <optional>\n \n #include \"absl/container/inlined_vector.h\"\n+#include \"absl/status/status.h\"\n #include \"absl/status/statusor.h\"\n #include \"absl/types/span.h\"\n #include \"xla/hlo/ir/hlo_sharding.h\"\n #include \"xla/python/ifrt/array.h\"\n #include \"xla/python/ifrt/client.h\"\n #include \"xla/python/ifrt/device.h\"\n #include \"xla/python/ifrt/device_list.h\"\n+#include \"xla/python/ifrt/dtype.h\"\n #include \"xla/tsl/concurrency/future.h\"\n-#include \"xla/tsl/concurrency/ref_count.h\"\n #include \"xla/tsl/platform/threadpool.h\"\n+#include \"xla/xla_data.pb.h\"\n #include \"tensorflow/core/framework/tensor.h\"\n #include \"tensorflow/core/framework/tensor_shape.h\"\n #include \"tensorflow/core/framework/types.pb.h\"\n \n namespace tensorflow {\n namespace ifrt_serving {\n \n+// A per-request H2D transfer executor. The caller should call\n+// `RegisterH2DTransfer` to register tensors to be transferred, and then call\n+// `RunH2DTransfers` to start the transfers. The futures returned by\n+// `RegisterH2DTransfer` will only be guaranteed to be fulfilled after\n+// `RunH2DTransfers` returns OK.\n+class H2DTransferExecutor {\n+ public:\n+  // TODO(b/445201291): Make the constructor private once the\n+  // H2DTransferExecutorFactory is plumbed through the stack.\n+  explicit H2DTransferExecutor(xla::ifrt::Client& ifrt_client);\n+  virtual ~H2DTransferExecutor() = default;\n+\n+  // Registers a tensor to be transferred to devices. The H2D transfer can be\n+  // started in this call or in a later call of `RunH2DTransfers`.\n+  virtual absl::StatusOr<tsl::Future<xla::ifrt::ArrayRef>> ScheduledH2DTransfer(\n+      const tensorflow::Tensor& tensor,\n+      const xla::ifrt::DeviceListRef& device_list,\n+      const xla::OpSharding& sharding, tsl::thread::ThreadPool& thread_pool);\n+\n+  // Executes the H2D transfers for all registered tensors.\n+  virtual absl::Status RunH2DTransfers();\n+\n+ protected:\n+  xla::ifrt::Client& ifrt_client_;\n+};\n+\n+class H2DTransferExecutorFactory {\n+ public:\n+  virtual ~H2DTransferExecutorFactory() = default;\n+  virtual absl::StatusOr<std::unique_ptr<H2DTransferExecutor>>\n+  CreateH2DTransferExecutor(xla::ifrt::Client& ifrt_client) = 0;\n+};\n+\n // Create a tensor from the given host tensor based on given device ids and\n // sharding information.\n absl::StatusOr<xla::ifrt::ArrayRef> MakeArrayFromTensor("
+        }
+    ],
+    "stats": {
+        "total": 123,
+        "additions": 93,
+        "deletions": 30
+    }
+}

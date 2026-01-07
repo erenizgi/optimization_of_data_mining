@@ -1,0 +1,60 @@
+{
+    "author": "seantalts",
+    "message": "[XLA:CPU] Optimize rsqrt precision on AMD CPUs.\n\nReduce the number of Newton-Raphson iterations for rsqrt on AMD platforms, as the intrinsic provides higher initial precision. Add a helper to check for AMD features and cache host CPU features in tests. Results in 16.67% fewer instructions on AMD for <8 x float> and narrower.\n\nPiperOrigin-RevId: 797027299",
+    "sha": "adbee0b863a0c7b6c62a30d4b2f4bdebcbe4158d",
+    "files": [
+        {
+            "sha": "30f72fbeba2b8fba4929d3643e9e29938e1fb6ec",
+            "filename": "third_party/xla/xla/codegen/intrinsic/BUILD",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/adbee0b863a0c7b6c62a30d4b2f4bdebcbe4158d/third_party%2Fxla%2Fxla%2Fcodegen%2Fintrinsic%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/adbee0b863a0c7b6c62a30d4b2f4bdebcbe4158d/third_party%2Fxla%2Fxla%2Fcodegen%2Fintrinsic%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fcodegen%2Fintrinsic%2FBUILD?ref=adbee0b863a0c7b6c62a30d4b2f4bdebcbe4158d",
+            "patch": "@@ -363,6 +363,7 @@ xla_cc_test(\n         \":test_matchers\",\n         \"//xla:shape_util\",\n         \"//xla:xla_data_proto_cc\",\n+        \"@com_google_absl//absl/base:no_destructor\",\n         \"@com_google_absl//absl/log\",\n         \"@com_google_googletest//:gtest_main\",\n         \"@llvm-project//llvm:JITLink\",\n@@ -386,6 +387,7 @@ xla_cc_test(\n         \"//xla/tsl/platform:test_benchmark\",\n         \"//xla/tsl/platform:test_main\",\n         \"@llvm-project//llvm:Target\",\n+        \"@llvm-project//llvm:TargetParser\",\n         \"@llvm-project//llvm:ir_headers\",\n     ],\n )"
+        },
+        {
+            "sha": "50eca6e2b246de66c732528e168f8154b53f3fd6",
+            "filename": "third_party/xla/xla/codegen/intrinsic/intrinsic.h",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/adbee0b863a0c7b6c62a30d4b2f4bdebcbe4158d/third_party%2Fxla%2Fxla%2Fcodegen%2Fintrinsic%2Fintrinsic.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/adbee0b863a0c7b6c62a30d4b2f4bdebcbe4158d/third_party%2Fxla%2Fxla%2Fcodegen%2Fintrinsic%2Fintrinsic.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fcodegen%2Fintrinsic%2Fintrinsic.h?ref=adbee0b863a0c7b6c62a30d4b2f4bdebcbe4158d",
+            "patch": "@@ -25,6 +25,7 @@ limitations under the License.\n \n #include \"absl/status/status.h\"\n #include \"absl/status/statusor.h\"\n+#include \"absl/strings/match.h\"\n #include \"absl/strings/str_cat.h\"\n #include \"absl/strings/str_join.h\"\n #include \"absl/strings/string_view.h\"\n@@ -104,6 +105,10 @@ struct IntrinsicOptions {\n   // Disables math functions that do not have the same results across e.g.\n   // AMD vs. Intel CPUs.\n   bool disable_platform_dependent_math = false;\n+\n+  bool Contains(absl::string_view feature) const {\n+    return absl::StrContains(features, feature);\n+  }\n };\n \n // Intrinsics are provided by XLA to expose special features (functions) that"
+        },
+        {
+            "sha": "3100ef68174bdb1abf2c8c7ff8935aa35455e888",
+            "filename": "third_party/xla/xla/codegen/intrinsic/rsqrt.cc",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 6,
+            "changes": 22,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/adbee0b863a0c7b6c62a30d4b2f4bdebcbe4158d/third_party%2Fxla%2Fxla%2Fcodegen%2Fintrinsic%2Frsqrt.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/adbee0b863a0c7b6c62a30d4b2f4bdebcbe4158d/third_party%2Fxla%2Fxla%2Fcodegen%2Fintrinsic%2Frsqrt.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fcodegen%2Fintrinsic%2Frsqrt.cc?ref=adbee0b863a0c7b6c62a30d4b2f4bdebcbe4158d",
+            "patch": "@@ -21,7 +21,6 @@ limitations under the License.\n #include \"absl/log/check.h\"\n #include \"absl/log/log.h\"\n #include \"absl/status/statusor.h\"\n-#include \"absl/strings/match.h\"\n #include \"absl/strings/string_view.h\"\n #include \"llvm/ADT/APInt.h\"\n #include \"llvm/IR/Argument.h\"\n@@ -175,9 +174,8 @@ absl::StatusOr<llvm::Function*> Rsqrt::CreateDefinition(\n   // 2. The target CPU does not support AVX512F for F64, or\n   // 3. The target CPU does not support AVX for F32.\n   if (options.disable_platform_dependent_math ||\n-      (type.element_type() == F64 &&\n-       !absl::StrContains(options.features, \"+avx512f\")) ||\n-      !absl::StrContains(options.features, \"+avx\")) {\n+      (type.element_type() == F64 && !options.Contains(\"+avx512f\")) ||\n+      !options.Contains(\"+avx\")) {\n     LOG_EVERY_N(INFO, 1000) << \"Falling back to 1 / sqrt(x) for \" << type.name()\n                             << \" \" << options.disable_platform_dependent_math;\n     // We can't use the same approximation algorithm for F64 without AVX512 or\n@@ -196,8 +194,20 @@ absl::StatusOr<llvm::Function*> Rsqrt::CreateDefinition(\n   llvm::Value* y_approx = rsqrt_intrinsic.CreateCall(builder, x);\n \n   // Eigen only does 1 step for F32, but that only gives within 2 ULPs and we\n-  // are targeting 1.\n-  const size_t num_steps = 2;\n+  // are targeting 1. AMD's SSE/AVX rsqrt intrinsics are more accurate; their\n+  // avx512f intrinsics have the same accuracy as Intel's avx512f intrinsics.\n+  const bool using_avx512 =\n+      options.Contains(\"+avx512f\") &&\n+      (type.element_type() == F64 ||\n+       (type.element_type() == F32 && type.vector_width().value_or(1) > 8));\n+  // As a heuristic, we check for SSE4a to determine if we are on AMD.\n+  // This feature was added in 2007 and is set on all AMD CPUs since then, and\n+  // no intel cpus. This is a bit of a hack though, as there is no strict link\n+  // between increased precision and SSE4a; Intel could decide to add it in the\n+  // future but they are very unlikely to do so as they haven't in the past 18\n+  // years.\n+  const bool is_amd = options.Contains(\"+sse4a\");\n+  const size_t num_steps = (is_amd && !using_avx512) ? 1 : 2;\n   llvm::Value* refined_result =\n       NewtonRaphsonRsqrtIteration(builder, x, y_approx, input_type, num_steps);\n "
+        },
+        {
+            "sha": "c8c17ab25dd1c5e4f4c0f7ed3387f12de145e4e4",
+            "filename": "third_party/xla/xla/codegen/intrinsic/rsqrt_test.cc",
+            "status": "modified",
+            "additions": 38,
+            "deletions": 8,
+            "changes": 46,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/adbee0b863a0c7b6c62a30d4b2f4bdebcbe4158d/third_party%2Fxla%2Fxla%2Fcodegen%2Fintrinsic%2Frsqrt_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/adbee0b863a0c7b6c62a30d4b2f4bdebcbe4158d/third_party%2Fxla%2Fxla%2Fcodegen%2Fintrinsic%2Frsqrt_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fcodegen%2Fintrinsic%2Frsqrt_test.cc?ref=adbee0b863a0c7b6c62a30d4b2f4bdebcbe4158d",
+            "patch": "@@ -23,6 +23,7 @@ limitations under the License.\n \n #include <gmock/gmock.h>\n #include <gtest/gtest.h>\n+#include \"absl/base/no_destructor.h\"\n #include \"absl/log/log.h\"\n #include \"llvm/ADT/StringMap.h\"\n #include \"llvm/ExecutionEngine/Orc/CompileUtils.h\"\n@@ -92,19 +93,22 @@ JitRunner CreateJitRunnerWithRsqrt(\n   return JitRunner(std::move(module), std::move(context));\n }\n \n-bool hasAvx() {\n-  llvm::StringMap<bool> HostFeatures = llvm::sys::getHostCPUFeatures();\n-  return HostFeatures.lookup(\"avx\");\n+llvm::StringMap<bool> GetHostCPUFeatures() {\n+  static const absl::NoDestructor<llvm::StringMap<bool>> features(\n+      llvm::sys::getHostCPUFeatures());\n+  return *features;\n }\n \n-bool hasAvx512Support() {\n-  llvm::StringMap<bool> HostFeatures = llvm::sys::getHostCPUFeatures();\n-  return HostFeatures.lookup(\"avx512f\");\n-}\n+bool hasAvx() { return GetHostCPUFeatures().lookup(\"avx\"); }\n+bool hasAvx512Support() { return GetHostCPUFeatures().lookup(\"avx512f\"); }\n+bool isAmd() { return GetHostCPUFeatures().lookup(\"sse4a\"); }\n \n TEST(FeaturesTest, HostFeatures) {\n+  std::cout << \"CPU: \" << llvm::sys::getHostCPUName().str() << \"\\n\";\n+  const llvm::StringMap<bool> features = llvm::sys::getHostCPUFeatures();\n   std::cout << \"Host features x86:\" << hasAvx()\n-            << \", avx512f:\" << hasAvx512Support() << \"\\n\";\n+            << \", avx512f:\" << hasAvx512Support() << \", IsAmd: \" << isAmd()\n+            << \"\\n\";\n }\n \n TEST(RsqrtTest, EmitRsqrtF32) {\n@@ -331,5 +335,31 @@ TEST(RsqrtTest, DisablePlatformDependentMath) {\n   EXPECT_EQ(rsqrt(13.0), one_over_sqrt(13.0));\n }\n \n+TEST(RsqrtTest, AmdRsqrtF64) {\n+  if (isAmd()) {\n+    Type type = Type::S(F64);\n+    JitRunner jit = CreateJitRunnerWithRsqrt(type);\n+    auto rsqrt = jit.GetScalarFn<double(double)>(Rsqrt::Name(type));\n+    double inf = std::numeric_limits<double>::infinity();\n+    EXPECT_THAT(rsqrt(inf), NearUlps<double>(0.0, kF64UlpsPrecision));\n+    EXPECT_THAT(rsqrt(1.0), NearUlps<double>(1.0, kF64UlpsPrecision));\n+    EXPECT_THAT(rsqrt(13.0),\n+                NearUlps<double>(1.0 / std::sqrt(13.0), kF64UlpsPrecision));\n+  }\n+}\n+\n+TEST(RsqrtTest, AmdRsqrtF32) {\n+  if (isAmd()) {\n+    Type type = Type::S(F32);\n+    JitRunner jit = CreateJitRunnerWithRsqrt(type);\n+    auto rsqrt = jit.GetScalarFn<float(float)>(Rsqrt::Name(type));\n+    float inf = std::numeric_limits<float>::infinity();\n+    EXPECT_THAT(rsqrt(inf), NearUlps<float>(0.0, kF32UlpsPrecision));\n+    EXPECT_THAT(rsqrt(1.0), NearUlps<float>(1.0, kF32UlpsPrecision));\n+    EXPECT_THAT(rsqrt(13.0),\n+                NearUlps<float>(1.0 / std::sqrt(13.0), kF32UlpsPrecision));\n+  }\n+}\n+\n }  // namespace\n }  // namespace xla::codegen::intrinsics"
+        }
+    ],
+    "stats": {
+        "total": 75,
+        "additions": 61,
+        "deletions": 14
+    }
+}

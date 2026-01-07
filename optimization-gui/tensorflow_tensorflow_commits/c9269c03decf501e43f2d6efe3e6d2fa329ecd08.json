@@ -1,0 +1,48 @@
+{
+    "author": "ezhulenev",
+    "message": "[xla:cpu] Delete unused APIs from cpu_function_runtime\n\nPiperOrigin-RevId: 817825043",
+    "sha": "c9269c03decf501e43f2d6efe3e6d2fa329ecd08",
+    "files": [
+        {
+            "sha": "e68bc390e678458eccadc4943d7bb7cda0779218",
+            "filename": "third_party/xla/xla/BUILD",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 2,
+            "changes": 2,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/c9269c03decf501e43f2d6efe3e6d2fa329ecd08/third_party%2Fxla%2Fxla%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/c9269c03decf501e43f2d6efe3e6d2fa329ecd08/third_party%2Fxla%2Fxla%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2FBUILD?ref=c9269c03decf501e43f2d6efe3e6d2fa329ecd08",
+            "patch": "@@ -43,7 +43,6 @@ filegroup(\n filegroup(\n     name = \"cpu_runtime_srcs\",\n     srcs = [\n-        \"cpu_function_runtime.cc\",\n         \"executable_run_options.cc\",\n     ],\n     visibility = internal_visibility([\":friends\"]),\n@@ -1259,7 +1258,6 @@ xla_cc_test(\n \n cc_library(\n     name = \"cpu_function_runtime\",\n-    srcs = [\"cpu_function_runtime.cc\"],\n     hdrs = [\"cpu_function_runtime.h\"],\n     compatible_with = get_compatible_with_portable(),\n     visibility = internal_visibility([\":friends\"]),"
+        },
+        {
+            "sha": "e022e12ba9815a690244f8b65ea6a9351fbfd2d8",
+            "filename": "third_party/xla/xla/cpu_function_runtime.cc",
+            "status": "removed",
+            "additions": 0,
+            "deletions": 114,
+            "changes": 114,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/48dc889dddb2cb89579719b2a6e824a01ec8c52d/third_party%2Fxla%2Fxla%2Fcpu_function_runtime.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/48dc889dddb2cb89579719b2a6e824a01ec8c52d/third_party%2Fxla%2Fxla%2Fcpu_function_runtime.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fcpu_function_runtime.cc?ref=48dc889dddb2cb89579719b2a6e824a01ec8c52d",
+            "patch": "@@ -1,114 +0,0 @@\n-/* Copyright 2018 The OpenXLA Authors.\n-\n-Licensed under the Apache License, Version 2.0 (the \"License\");\n-you may not use this file except in compliance with the License.\n-You may obtain a copy of the License at\n-\n-    http://www.apache.org/licenses/LICENSE-2.0\n-\n-Unless required by applicable law or agreed to in writing, software\n-distributed under the License is distributed on an \"AS IS\" BASIS,\n-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n-See the License for the specific language governing permissions and\n-limitations under the License.\n-==============================================================================*/\n-\n-#include \"xla/cpu_function_runtime.h\"\n-\n-#include <cstdint>\n-#include <cstdlib>\n-\n-#include \"absl/base/dynamic_annotations.h\"\n-#include \"xla/backends/cpu/alignment.h\"\n-\n-namespace xla {\n-namespace {\n-// Inline memory allocation routines here, because depending on 'base' brings\n-// in libraries which use c++ streams, which adds considerable code size on\n-// android.\n-void* aligned_malloc(size_t size, int minimum_alignment) {\n-#if defined(__ANDROID__) || defined(OS_ANDROID) || defined(OS_CYGWIN)\n-  return memalign(minimum_alignment, size);\n-#elif defined(_WIN32)\n-  return _aligned_malloc(size, minimum_alignment);\n-#else  // !__ANDROID__ && !OS_ANDROID && !OS_CYGWIN\n-  void* ptr = nullptr;\n-  // posix_memalign requires that the requested alignment be at least\n-  // sizeof(void*). In this case, fall back on malloc which should return memory\n-  // aligned to at least the size of a pointer.\n-  const int required_alignment = sizeof(void*);\n-  if (minimum_alignment < required_alignment) {\n-    return malloc(size);\n-  }\n-  if (posix_memalign(&ptr, minimum_alignment, size) != 0) {\n-    return nullptr;\n-  }\n-  return ptr;\n-#endif\n-}\n-\n-void aligned_free(void* aligned_memory) {\n-#if defined(_WIN32)\n-  _aligned_free(aligned_memory);\n-#else\n-  free(aligned_memory);\n-#endif\n-}\n-\n-size_t align_to(size_t n, size_t align) {\n-  return (((n - 1) / align) + 1) * align;\n-}\n-}  // namespace\n-\n-namespace cpu_function_runtime {\n-size_t AlignedBufferBytes(const BufferInfo* buffer_infos, size_t n,\n-                          bool allocate_entry_params) {\n-  size_t total = 0;\n-  for (size_t i = 0; i < n; ++i) {\n-    bool should_allocate =\n-        buffer_infos[i].is_temp_buffer() ||\n-        (buffer_infos[i].is_entry_parameter() && allocate_entry_params);\n-\n-    if (should_allocate) {\n-      total += align_to(buffer_infos[i].size(), cpu::Align());\n-    }\n-  }\n-  return total;\n-}\n-\n-void* MallocContiguousBuffers(const BufferInfo* buffer_infos, size_t n,\n-                              bool allocate_entry_params, void** bufs,\n-                              bool annotate_initialized) {\n-  const size_t total =\n-      AlignedBufferBytes(buffer_infos, n, allocate_entry_params);\n-  void* contiguous = nullptr;\n-  if (total > 0) {\n-    contiguous = aligned_malloc(total, cpu::Align());\n-    if (annotate_initialized) {\n-      // Since the memory for temp buffers is written to by JITed code, msan has\n-      // no way of knowing the memory was initialized, so explicitly mark it.\n-      ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(contiguous, total);\n-    }\n-  }\n-  uintptr_t pos = reinterpret_cast<uintptr_t>(contiguous);\n-  for (size_t i = 0; i < n; ++i) {\n-    bool should_allocate =\n-        buffer_infos[i].is_temp_buffer() ||\n-        (buffer_infos[i].is_entry_parameter() && allocate_entry_params);\n-    if (should_allocate) {\n-      bufs[i] = reinterpret_cast<void*>(pos);\n-      pos += align_to(buffer_infos[i].size(), cpu::Align());\n-    } else {\n-      bufs[i] = nullptr;\n-    }\n-  }\n-  return contiguous;\n-}\n-\n-void FreeContiguous(void* contiguous) {\n-  if (contiguous != nullptr) {\n-    aligned_free(contiguous);\n-  }\n-}\n-}  // namespace cpu_function_runtime\n-}  // namespace xla"
+        },
+        {
+            "sha": "6ab0a9ad981ec2068730d51bcf8344b1aac2ad3f",
+            "filename": "third_party/xla/xla/cpu_function_runtime.h",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 26,
+            "changes": 26,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/c9269c03decf501e43f2d6efe3e6d2fa329ecd08/third_party%2Fxla%2Fxla%2Fcpu_function_runtime.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/c9269c03decf501e43f2d6efe3e6d2fa329ecd08/third_party%2Fxla%2Fxla%2Fcpu_function_runtime.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fcpu_function_runtime.h?ref=c9269c03decf501e43f2d6efe3e6d2fa329ecd08",
+            "patch": "@@ -174,32 +174,6 @@ class BufferInfo {\n   int32_t result_param_number_ = -1;\n };\n \n-// AlignedBufferBytes returns the sum of the size of each buffer in\n-// `buffer_infos`, skipping constants, on-stack buffers and, if\n-// allocate_entry_params is false, entry parameters.  There are `n` entries in\n-// `buffer_infos`.  Each buffer is aligned to Align() byte boundaries.\n-size_t AlignedBufferBytes(const BufferInfo* buffer_infos, size_t n,\n-                          bool allocate_entry_params);\n-\n-// MallocContiguousBuffers allocates buffers for use by the entry point\n-// generated by tfcompile.  There are `n` entries in `buffer_infos`.  If\n-// `annotate_initialized` is set, the allocated memory will be annotated as\n-// having been initialized - this is useful when allocating temporary buffers.\n-// If allocate_entry_params is true then allocates temp buffers and entry\n-// parameters, otherwise allocated only temp buffers.  Slots in `bufs`\n-// corresponding to unallocated buffers are set to nullptr.\n-//\n-// A single contiguous block of memory is allocated, and portions of it are\n-// parceled out into `bufs`, which must have space for `n` entries.  Returns\n-// the head of the allocated contiguous block, which should be passed to\n-// FreeContiguous when the buffers are no longer in use.\n-void* MallocContiguousBuffers(const BufferInfo* buffer_infos, size_t n,\n-                              bool allocate_entry_params, void** bufs,\n-                              bool annotate_initialized);\n-\n-// FreeContiguous frees the contiguous block of memory allocated by\n-// MallocContiguousBuffers.\n-void FreeContiguous(void* contiguous);\n }  // namespace cpu_function_runtime\n }  // namespace xla\n "
+        }
+    ],
+    "stats": {
+        "total": 142,
+        "additions": 0,
+        "deletions": 142
+    }
+}

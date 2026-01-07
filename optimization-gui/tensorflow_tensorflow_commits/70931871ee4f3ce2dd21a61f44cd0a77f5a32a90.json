@@ -1,0 +1,108 @@
+{
+    "author": "sohaibiftikhar",
+    "message": "[XLA:GPU]: Add a kTritonCollectiveFusion kind.\n\nA new type of fusion kind is introduced to emit collectives.\nIf kTritonCollectiveFusionKind is set as the backend config then FusionEmitter()\nreturns an instance of the triton Fusion emitter.\n\nActual code emission will be added in followups.\n\nPiperOrigin-RevId: 831317556",
+    "sha": "70931871ee4f3ce2dd21a61f44cd0a77f5a32a90",
+    "files": [
+        {
+            "sha": "1444c149892bdb01fdd2759987c33f22a7ba9904",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/BUILD",
+            "status": "modified",
+            "additions": 14,
+            "deletions": 2,
+            "changes": 16,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/70931871ee4f3ce2dd21a61f44cd0a77f5a32a90/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2FBUILD",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/70931871ee4f3ce2dd21a61f44cd0a77f5a32a90/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2FBUILD",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2FBUILD?ref=70931871ee4f3ce2dd21a61f44cd0a77f5a32a90",
+            "patch": "@@ -89,11 +89,11 @@ xla_cc_test(\n         \"//xla/stream_executor:device_description\",\n         \"//xla/stream_executor:launch_dim\",\n         \"//xla/tests:xla_internal_test_main\",\n+        \"//xla/tsl/platform:statusor\",\n         \"@com_google_absl//absl/status\",\n+        \"@com_google_absl//absl/status:status_matchers\",\n         \"@com_google_googletest//:gtest\",\n         \"@llvm-project//mlir:IR\",\n-        \"@local_tsl//tsl/platform:status_matchers\",\n-        \"@local_tsl//tsl/platform:statusor\",\n     ],\n )\n \n@@ -1199,6 +1199,8 @@ cc_library(\n         \"//xla/service/gpu:launch_dimensions\",\n         \"//xla/stream_executor:device_description\",\n         \"//xla/stream_executor/gpu:all_reduce_kernel\",\n+        \"//xla/tsl/platform:errors\",\n+        \"//xla/tsl/platform:statusor\",\n         \"@com_google_absl//absl/base\",\n         \"@com_google_absl//absl/status\",\n         \"@com_google_absl//absl/status:statusor\",\n@@ -1211,18 +1213,28 @@ xla_cc_test(\n     srcs = [\"collective_emitter_test.cc\"],\n     deps = [\n         \":collective_emitter\",\n+        \":fusion\",\n         \"//xla:shape_util\",\n+        \"//xla:status_macros\",\n+        \"//xla/backends/gpu/codegen:fusion_emitter\",\n+        \"//xla/backends/gpu/codegen:fusions\",\n+        \"//xla/hlo/analysis:symbolic_expr\",\n         \"//xla/hlo/ir:hlo\",\n         \"//xla/hlo/testlib:hlo_hardware_independent_test_base\",\n         \"//xla/hlo/utils:hlo_query\",\n         \"//xla/service:hlo_creation_utils\",\n         \"//xla/service/gpu:gpu_device_info_for_tests\",\n+        \"//xla/service/gpu:hlo_fusion_analysis\",\n         \"//xla/stream_executor:device_description\",\n         \"//xla/tsl/platform:statusor\",\n         \"//xla/tsl/util/proto:proto_matchers\",\n+        \"@com_google_absl//absl/log:check\",\n+        \"@com_google_absl//absl/memory\",\n+        \"@com_google_absl//absl/status\",\n         \"@com_google_absl//absl/status:statusor\",\n         \"@com_google_absl//absl/strings:str_format\",\n         \"@com_google_googletest//:gtest_main\",\n+        \"@llvm-project//mlir:IR\",\n     ],\n )\n "
+        },
+        {
+            "sha": "59ff6840023242ef18dce785439130ed1552843b",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/collective_emitter.cc",
+            "status": "modified",
+            "additions": 22,
+            "deletions": 0,
+            "changes": 22,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/70931871ee4f3ce2dd21a61f44cd0a77f5a32a90/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Fcollective_emitter.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/70931871ee4f3ce2dd21a61f44cd0a77f5a32a90/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Fcollective_emitter.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Fcollective_emitter.cc?ref=70931871ee4f3ce2dd21a61f44cd0a77f5a32a90",
+            "patch": "@@ -17,6 +17,7 @@ limitations under the License.\n \n #include <cstdint>\n #include <optional>\n+#include <utility>\n \n #include \"absl/base/casts.h\"\n #include \"absl/status/status.h\"\n@@ -35,6 +36,8 @@ limitations under the License.\n #include \"xla/shape_util.h\"\n #include \"xla/stream_executor/device_description.h\"\n #include \"xla/stream_executor/gpu/all_reduce_kernel.h\"\n+#include \"xla/tsl/platform/errors.h\"\n+#include \"xla/tsl/platform/statusor.h\"\n #include \"xla/util.h\"\n \n namespace xla::gpu {\n@@ -131,4 +134,23 @@ GetCollectiveBlockLevelFusionConfig(const se::DeviceDescription& device_info,\n   }\n }\n \n+absl::StatusOr<bool> TrySetGpuBackendConfigForCollective(\n+    const se::DeviceDescription& device_info,\n+    HloFusionInstruction* fusion_instr) {\n+  TF_ASSIGN_OR_RETURN(\n+      const std::optional<BlockLevelFusionConfig> block_config,\n+      GetCollectiveBlockLevelFusionConfig(device_info, fusion_instr));\n+  if (!block_config.has_value()) {\n+    return false;\n+  }\n+  TF_ASSIGN_OR_RETURN(GpuBackendConfig gpu_backend_config,\n+                      fusion_instr->backend_config<GpuBackendConfig>());\n+  gpu_backend_config.mutable_fusion_backend_config()->set_kind(\n+      kTritonCollectiveFusionKind);\n+  *gpu_backend_config.mutable_fusion_backend_config()\n+       ->mutable_block_level_fusion_config() = *std::move(block_config);\n+  TF_RETURN_IF_ERROR(\n+      fusion_instr->set_backend_config(std::move(gpu_backend_config)));\n+  return true;\n+}\n }  // namespace xla::gpu"
+        },
+        {
+            "sha": "692a93a2df1dfb739cc588ce579f236314029a69",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/collective_emitter.h",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 0,
+            "changes": 10,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/70931871ee4f3ce2dd21a61f44cd0a77f5a32a90/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Fcollective_emitter.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/70931871ee4f3ce2dd21a61f44cd0a77f5a32a90/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Fcollective_emitter.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Fcollective_emitter.h?ref=70931871ee4f3ce2dd21a61f44cd0a77f5a32a90",
+            "patch": "@@ -34,5 +34,15 @@ absl::StatusOr<std::optional<xla::gpu::BlockLevelFusionConfig>>\n GetCollectiveBlockLevelFusionConfig(const se::DeviceDescription& device_info,\n                                     const HloFusionInstruction* fusion_instr);\n \n+// Sets the BlockLevelFusionConfig for a collective op inside the\n+// GpuBackendConfig for the fusion instruction.\n+// Returns true if the collective op is supported and the config is set.\n+// Returns false if the collective op is not supported. No backend config is set\n+// in this case.\n+// Returns an error in case of an internal error or invalid arguments.\n+absl::StatusOr<bool> TrySetGpuBackendConfigForCollective(\n+    const se::DeviceDescription& device_info,\n+    HloFusionInstruction* fusion_instr);\n+\n }  // namespace xla::gpu\n #endif  // XLA_BACKENDS_GPU_CODEGEN_TRITON_COLLECTIVE_EMITTER_H_"
+        },
+        {
+            "sha": "c949b5e101c5f6645e6ed9e1c7de875245c1b3d3",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/collective_emitter_test.cc",
+            "status": "modified",
+            "additions": 70,
+            "deletions": 0,
+            "changes": 70,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/70931871ee4f3ce2dd21a61f44cd0a77f5a32a90/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Fcollective_emitter_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/70931871ee4f3ce2dd21a61f44cd0a77f5a32a90/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Fcollective_emitter_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Fcollective_emitter_test.cc?ref=70931871ee4f3ce2dd21a61f44cd0a77f5a32a90",
+            "patch": "@@ -15,24 +15,35 @@ limitations under the License.\n #include \"xla/backends/gpu/codegen/triton/collective_emitter.h\"\n \n #include <memory>\n+#include <optional>\n #include <ostream>\n #include <string>\n #include <utility>\n \n #include <gmock/gmock.h>\n #include <gtest/gtest.h>\n+#include \"absl/log/check.h\"\n+#include \"absl/memory/memory.h\"\n+#include \"absl/status/status.h\"\n #include \"absl/status/statusor.h\"\n #include \"absl/strings/str_format.h\"\n+#include \"mlir/IR/MLIRContext.h\"\n+#include \"xla/backends/gpu/codegen/fusion_emitter.h\"\n+#include \"xla/backends/gpu/codegen/fusions.h\"\n+#include \"xla/backends/gpu/codegen/triton/fusion.h\"\n+#include \"xla/hlo/analysis/symbolic_expr.h\"\n #include \"xla/hlo/ir/hlo_casting_utils.h\"\n #include \"xla/hlo/ir/hlo_instruction.h\"\n #include \"xla/hlo/ir/hlo_instructions.h\"\n #include \"xla/hlo/ir/hlo_opcode.h\"\n #include \"xla/hlo/testlib/hlo_hardware_independent_test_base.h\"\n #include \"xla/hlo/utils/hlo_query.h\"\n #include \"xla/service/gpu/gpu_device_info_for_tests.h\"\n+#include \"xla/service/gpu/hlo_fusion_analysis.h\"\n #include \"xla/service/hlo_creation_utils.h\"\n #include \"xla/shape.h\"\n #include \"xla/shape_util.h\"\n+#include \"xla/status_macros.h\"\n #include \"xla/stream_executor/device_description.h\"\n #include \"xla/tsl/platform/statusor.h\"\n #include \"xla/tsl/util/proto/proto_matchers.h\"\n@@ -50,6 +61,20 @@ struct ModuleWithFusion {\n     return Cast<HloFusionInstruction>(\n         module->entry_computation()->root_instruction());\n   }\n+  HloFusionInstruction* MutableFusionInstr() {\n+    return Cast<HloFusionInstruction>(\n+        module->entry_computation()->root_instruction());\n+  }\n+};\n+\n+struct ModuleWithEmitter : public ModuleWithFusion {\n+  mlir::MLIRContext mlir_context;\n+  SymbolicExprContext symbolic_expr_context{&mlir_context};\n+  std::optional<HloFusionAnalysis> analysis;\n+  std::unique_ptr<TritonFusion> emitter;\n+\n+  explicit ModuleWithEmitter(std::unique_ptr<HloModule> module_arg)\n+      : ModuleWithFusion{std::move(module_arg)} {}\n };\n \n class CollectiveBlockLevelConfigTest : public HloHardwareIndependentTestBase {\n@@ -94,6 +119,37 @@ class CollectiveBlockLevelConfigTest : public HloHardwareIndependentTestBase {\n   const se::DeviceDescription device_info_;\n };\n \n+class CollectiveEmitterTest : public CollectiveBlockLevelConfigTest {\n+ public:\n+  absl::StatusOr<std::unique_ptr<ModuleWithEmitter>> BuildModuleWithEmitter(\n+      const Shape& shape, const se::DeviceDescription& device_info) const {\n+    TF_ASSIGN_OR_RETURN(ModuleWithFusion module_with_fusion,\n+                        BuildModuleWithFusion(shape));\n+    TF_ASSIGN_OR_RETURN(\n+        bool collective_fusion_config_set,\n+        TrySetGpuBackendConfigForCollective(\n+            device_info_, module_with_fusion.MutableFusionInstr()));\n+    if (!collective_fusion_config_set) {\n+      return absl::InternalError(\n+          \"Failed to set collective fusion config. \"\n+          \"TrySetGpuBackendConfigForCollective returned false.\");\n+    }\n+    auto result = std::make_unique<ModuleWithEmitter>(\n+        std::move(module_with_fusion.module));\n+    result->analysis =\n+        HloFusionAnalysis::Create(*result->FusionInstr(), device_info);\n+    std::unique_ptr<FusionInterface> fusion_emitter =\n+        GetFusionEmitter(PreBufferAssignmentFusionInfo{*result->analysis},\n+                         &result->symbolic_expr_context);\n+    TritonFusion* triton_emitter =\n+        dynamic_cast<TritonFusion*>(fusion_emitter.get());\n+    TF_RET_CHECK(triton_emitter != nullptr);\n+    fusion_emitter.release();\n+    result->emitter = absl::WrapUnique(triton_emitter);\n+    return std::move(result);\n+  }\n+};\n+\n struct AllReduceBlockLevelConfigTestCase {\n   std::string test_name;\n   Shape shape;\n@@ -148,6 +204,20 @@ INSTANTIATE_TEST_SUITE_P(\n         CollectiveEmitterParameterizedTest::ParamType>& info) {\n       return info.param.test_name;\n     });\n+\n+TEST_F(CollectiveEmitterTest, AllReduceWithTritonGetLaunchConfig) {\n+  TF_ASSERT_OK_AND_ASSIGN(\n+      std::unique_ptr<ModuleWithEmitter> result_ptr,\n+      BuildModuleWithEmitter(ShapeUtil::MakeShape(F32, {65536}), device_info_));\n+  auto& result = *result_ptr;\n+  const TritonFusion* triton_fusion = result.emitter.get();\n+  ASSERT_NE(triton_fusion, nullptr);\n+  auto const launch_config = triton_fusion->GetLaunchConfig();\n+  ASSERT_NE(launch_config, std::nullopt);\n+  EXPECT_EQ(launch_config->launch_dimensions.num_blocks(), 16);\n+  EXPECT_EQ(launch_config->launch_dimensions.num_threads_per_block(), 512);\n+}\n+\n }  // namespace\n \n }  // namespace xla::gpu"
+        },
+        {
+            "sha": "7ac9dc05a9f712e9913b154d00215369021be3ab",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/fusion.cc",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/70931871ee4f3ce2dd21a61f44cd0a77f5a32a90/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/70931871ee4f3ce2dd21a61f44cd0a77f5a32a90/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion.cc?ref=70931871ee4f3ce2dd21a61f44cd0a77f5a32a90",
+            "patch": "@@ -178,7 +178,8 @@ absl::StatusOr<FusionEmissionResult> TritonFusion::Emit(\n     LaunchDimensions launch_dimensions;\n     if (fusion_kind == kTritonFusionKind ||\n         fusion_kind == kTritonNestedGemmFusionKind ||\n-        fusion_kind == kTritonScaledDotFusionKind) {\n+        fusion_kind == kTritonScaledDotFusionKind ||\n+        fusion_kind == kTritonCollectiveFusionKind) {\n       std::optional<LaunchConfig> launch_config;\n       // Currently GetLaunchConfig will compute the same value as the extracted\n       // one. They are different only when warp specialization is enabled."
+        },
+        {
+            "sha": "85ff158b16868dfe6c58a8aeca27077e2ca94f6f",
+            "filename": "third_party/xla/xla/backends/gpu/codegen/triton/fusion_test.cc",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 3,
+            "changes": 5,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/70931871ee4f3ce2dd21a61f44cd0a77f5a32a90/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_test.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/70931871ee4f3ce2dd21a61f44cd0a77f5a32a90/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_test.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fbackends%2Fgpu%2Fcodegen%2Ftriton%2Ffusion_test.cc?ref=70931871ee4f3ce2dd21a61f44cd0a77f5a32a90",
+            "patch": "@@ -20,6 +20,7 @@ limitations under the License.\n #include <gmock/gmock.h>\n #include <gtest/gtest.h>\n #include \"absl/status/status.h\"\n+#include \"absl/status/status_matchers.h\"\n #include \"mlir/IR/MLIRContext.h\"\n #include \"xla/backends/gpu/codegen/fusion_emitter.h\"\n #include \"xla/backends/gpu/codegen/fusions.h\"\n@@ -32,15 +33,13 @@ limitations under the License.\n #include \"xla/service/gpu/hlo_fusion_analysis.h\"\n #include \"xla/stream_executor/device_description.h\"\n #include \"xla/stream_executor/launch_dim.h\"\n-#include \"tsl/platform/status_matchers.h\"\n-#include \"tsl/platform/statusor.h\"\n+#include \"xla/tsl/platform/statusor.h\"\n \n namespace xla {\n namespace gpu {\n namespace {\n \n using ::testing::ElementsAre;\n-using ::tsl::testing::StatusIs;\n \n class TritonFusionTest : public HloHardwareIndependentTestBase {};\n "
+        },
+        {
+            "sha": "aef79222c29ee612db833da568f750944c2928f3",
+            "filename": "third_party/xla/xla/service/gpu/hlo_fusion_analysis.cc",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/70931871ee4f3ce2dd21a61f44cd0a77f5a32a90/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fhlo_fusion_analysis.cc",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/70931871ee4f3ce2dd21a61f44cd0a77f5a32a90/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fhlo_fusion_analysis.cc",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fhlo_fusion_analysis.cc?ref=70931871ee4f3ce2dd21a61f44cd0a77f5a32a90",
+            "patch": "@@ -114,7 +114,8 @@ HloFusionAnalysis::EmitterFusionKind GetEmitterFusionKind(\n   if (fusion_backend_config.kind() == kTritonFusionKind ||\n       fusion_backend_config.kind() == kTritonGemmFusionKind ||\n       fusion_backend_config.kind() == kTritonNestedGemmFusionKind ||\n-      fusion_backend_config.kind() == kTritonScaledDotFusionKind) {\n+      fusion_backend_config.kind() == kTritonScaledDotFusionKind ||\n+      fusion_backend_config.kind() == kTritonCollectiveFusionKind) {\n     return HloFusionAnalysis::EmitterFusionKind::kTriton;\n   }\n "
+        },
+        {
+            "sha": "81206e6d205e2a6d7c4aa691e8a8083e3c25cd09",
+            "filename": "third_party/xla/xla/service/gpu/ir_emission_utils.h",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/tensorflow/tensorflow/blob/70931871ee4f3ce2dd21a61f44cd0a77f5a32a90/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fir_emission_utils.h",
+            "raw_url": "https://github.com/tensorflow/tensorflow/raw/70931871ee4f3ce2dd21a61f44cd0a77f5a32a90/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fir_emission_utils.h",
+            "contents_url": "https://api.github.com/repos/tensorflow/tensorflow/contents/third_party%2Fxla%2Fxla%2Fservice%2Fgpu%2Fir_emission_utils.h?ref=70931871ee4f3ce2dd21a61f44cd0a77f5a32a90",
+            "patch": "@@ -86,6 +86,10 @@ inline constexpr absl::string_view kCustomFusionKind = \"__custom_fusion\";\n // kTritonGemmFusionKind.\n inline constexpr absl::string_view kTritonFusionKind = \"__triton\";\n \n+// Used for fusions that codegen a collective.\n+inline constexpr absl::string_view kTritonCollectiveFusionKind =\n+    \"__triton_collective\";\n+\n // Fusions that use Triton have FusionBackendConfig.kind equal to this string.\n inline constexpr absl::string_view kTritonGemmFusionKind = \"__triton_gemm\";\n "
+        }
+    ],
+    "stats": {
+        "total": 133,
+        "additions": 126,
+        "deletions": 7
+    }
+}
