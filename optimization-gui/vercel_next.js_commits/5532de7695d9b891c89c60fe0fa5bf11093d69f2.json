@@ -1,0 +1,72 @@
+{
+    "author": "lubieowoce",
+    "message": "fix: amphtml-validator WASM errors (for real) (#78379)\n\nRejoice! The day has come. Hopefully, we'll never see `AssertionError:\nAssertion failed: WebAssembly is uninitialized` ever again. I dug into\namphtml-validator's code, and discovered that they have a race condition\nwhen initializing. This PR works around it.\n\nThe root problem is that `AmpValidator.getInstance` is buggy when\nmultiple calls to it occur in parallel.\nSee, the point of `AmpValidator.getInstance(validatorPath)` is to re-use\ninstances across multiple calls. It attempts to do that by stashing\ncreated instances in `instanceByValidatorJs`.\nHowever, when creating a fresh instance, it is added to\n`instanceByValidatorJs` **before `instance.init()` is finished**:\n\nhttps://github.com/ampproject/amphtml/blob/0c8eaba73ca8f5c462a642fa91901a29e6304f6e/validator/js/nodejs/index.js#L309-L313\n\nwhich means that, if a concurrent call to\n`AmpValidator.getInstance(validatorPath)` happens before the original\n`instance.init()` is done, then we'll get back an uninitialized or\npartially initialized instance:\n\nhttps://github.com/ampproject/amphtml/blob/0c8eaba73ca8f5c462a642fa91901a29e6304f6e/validator/js/nodejs/index.js#L292-L294\n\nAnd, since `instance.init()` is the part that handles loading the\nwebassembly code, this race results in the dreaded `AssertionError:\nAssertion failed: WebAssembly is uninitialized` error when calling\nmethods on the not-yet-initialized validator.\n\nAs a workaround, we properly dedupe instance creation on our own. I'll\nsubmit a fix to the original repo as well, but this should solve the\nproblem for us.",
+    "sha": "5532de7695d9b891c89c60fe0fa5bf11093d69f2",
+    "files": [
+        {
+            "sha": "88ae2ea801d707ef1f86af7a6b146742a0926893",
+            "filename": "packages/next/src/export/helpers/get-amp-html-validator.ts",
+            "status": "added",
+            "additions": 40,
+            "deletions": 0,
+            "changes": 40,
+            "blob_url": "https://github.com/vercel/next.js/blob/5532de7695d9b891c89c60fe0fa5bf11093d69f2/packages%2Fnext%2Fsrc%2Fexport%2Fhelpers%2Fget-amp-html-validator.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/5532de7695d9b891c89c60fe0fa5bf11093d69f2/packages%2Fnext%2Fsrc%2Fexport%2Fhelpers%2Fget-amp-html-validator.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fexport%2Fhelpers%2Fget-amp-html-validator.ts?ref=5532de7695d9b891c89c60fe0fa5bf11093d69f2",
+            "patch": "@@ -0,0 +1,40 @@\n+import AmpHtmlValidator, {\n+  type Validator,\n+} from 'next/dist/compiled/amphtml-validator'\n+\n+const instancePromises = new Map<string | undefined, Promise<Validator>>()\n+\n+/**\n+ * `AmpHtmlValidator.getInstance` is buggy when multiple calls to getInstance occur in parallel.\n+ * This wrapper is a workaround for that.\n+ *\n+ * `AmpHtmlValidator.getInstance(validatorPath)` attempts to re-use the instances across multiple calls\n+ * by stashing existing instances in `instanceByValidatorJs`.\n+ * However, when creating a fresh instance, it is added to `instanceByValidatorJs` before `instance.init()` is finished:\n+ * https://github.com/ampproject/amphtml/blob/0c8eaba73ca8f5c462a642fa91901a29e6304f6e/validator/js/nodejs/index.js#L309-L313\n+ *\n+ * which means that, if a concurrent call to `AmpHtmlValidator.getInstance(validatorPath)` happens before the original `init()` is done,\n+ * then we'll get back an uninitialized or partially initialized instance:\n+ * https://github.com/ampproject/amphtml/blob/0c8eaba73ca8f5c462a642fa91901a29e6304f6e/validator/js/nodejs/index.js#L292-L294\n+ *\n+ * And, since `instance.init()` is the part that handles loading the webassembly code, this race results in\n+ * the dreaded \"AssertionError: Assertion failed: WebAssembly is uninitialized\" error.\n+ * As a workaround, we properly dedupe instance creation on our own.\n+ * */\n+export function getAmpValidatorInstance(\n+  validatorPath: string | undefined\n+): Promise<Validator> {\n+  let promise = instancePromises.get(validatorPath)\n+  if (!promise) {\n+    // NOTE: if `validatorPath` is undefined, `AmpHtmlValidator` will load the code from its default URL\n+    promise = AmpHtmlValidator.getInstance(validatorPath)\n+    instancePromises.set(validatorPath, promise)\n+  }\n+  return promise\n+}\n+\n+export function getBundledAmpValidatorFilepath() {\n+  return require.resolve(\n+    'next/dist/compiled/amphtml-validator/validator_wasm.js'\n+  )\n+}"
+        },
+        {
+            "sha": "22b22987b725303ef0954eff61df3342d3edd6ab",
+            "filename": "packages/next/src/export/routes/pages.ts",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 5,
+            "changes": 11,
+            "blob_url": "https://github.com/vercel/next.js/blob/5532de7695d9b891c89c60fe0fa5bf11093d69f2/packages%2Fnext%2Fsrc%2Fexport%2Froutes%2Fpages.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/5532de7695d9b891c89c60fe0fa5bf11093d69f2/packages%2Fnext%2Fsrc%2Fexport%2Froutes%2Fpages.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fexport%2Froutes%2Fpages.ts?ref=5532de7695d9b891c89c60fe0fa5bf11093d69f2",
+            "patch": "@@ -21,10 +21,13 @@ import {\n   SERVER_PROPS_EXPORT_ERROR,\n } from '../../lib/constants'\n import { isBailoutToCSRError } from '../../shared/lib/lazy-dynamic/bailout-to-csr'\n-import AmpHtmlValidator from 'next/dist/compiled/amphtml-validator'\n import { FileType, fileExists } from '../../lib/file-exists'\n import { lazyRenderPagesPage } from '../../server/route-modules/pages/module.render'\n import type { MultiFileWriter } from '../../lib/multi-file-writer'\n+import {\n+  getAmpValidatorInstance,\n+  getBundledAmpValidatorFilepath,\n+} from '../helpers/get-amp-html-validator'\n \n /**\n  * Renders & exports a page associated with the /pages directory\n@@ -59,9 +62,7 @@ export async function exportPagesPage(\n   }\n \n   if (!ampValidatorPath) {\n-    ampValidatorPath = require.resolve(\n-      'next/dist/compiled/amphtml-validator/validator_wasm.js'\n-    )\n+    ampValidatorPath = getBundledAmpValidatorFilepath()\n   }\n \n   const inAmpMode = isInAmpMode(ampState)\n@@ -135,7 +136,7 @@ export async function exportPagesPage(\n     ampPageName: string,\n     validatorPath: string | undefined\n   ) => {\n-    const validator = await AmpHtmlValidator.getInstance(validatorPath)\n+    const validator = await getAmpValidatorInstance(validatorPath)\n     const result = validator.validateString(rawAmpHtml)\n     const errors = result.errors.filter((e) => e.severity === 'ERROR')\n     const warnings = result.errors.filter((e) => e.severity !== 'ERROR')"
+        },
+        {
+            "sha": "b430c35a9d187deda78645dc4380843a8ae276e6",
+            "filename": "packages/next/src/server/dev/next-dev-server.ts",
+            "status": "modified",
+            "additions": 17,
+            "deletions": 20,
+            "changes": 37,
+            "blob_url": "https://github.com/vercel/next.js/blob/5532de7695d9b891c89c60fe0fa5bf11093d69f2/packages%2Fnext%2Fsrc%2Fserver%2Fdev%2Fnext-dev-server.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/5532de7695d9b891c89c60fe0fa5bf11093d69f2/packages%2Fnext%2Fsrc%2Fserver%2Fdev%2Fnext-dev-server.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fdev%2Fnext-dev-server.ts?ref=5532de7695d9b891c89c60fe0fa5bf11093d69f2",
+            "patch": "@@ -174,27 +174,24 @@ export default class DevServer extends Server {\n     )\n     this.renderOpts.ampSkipValidation =\n       this.nextConfig.experimental?.amp?.skipValidation ?? false\n-    this.renderOpts.ampValidator = (html: string, pathname: string) => {\n-      const validatorPath =\n-        (this.nextConfig.experimental &&\n-          this.nextConfig.experimental.amp &&\n-          this.nextConfig.experimental.amp.validator) ||\n-        require.resolve(\n-          'next/dist/compiled/amphtml-validator/validator_wasm.js'\n-        )\n+    this.renderOpts.ampValidator = async (html: string, pathname: string) => {\n+      const { getAmpValidatorInstance, getBundledAmpValidatorFilepath } =\n+        require('../../export/helpers/get-amp-html-validator') as typeof import('../../export/helpers/get-amp-html-validator')\n \n-      const AmpHtmlValidator =\n-        require('next/dist/compiled/amphtml-validator') as typeof import('next/dist/compiled/amphtml-validator')\n-      return AmpHtmlValidator.getInstance(validatorPath).then((validator) => {\n-        const result = validator.validateString(html)\n-        ampValidation(\n-          pathname,\n-          result.errors\n-            .filter((e) => e.severity === 'ERROR')\n-            .filter((e) => this._filterAmpDevelopmentScript(html, e)),\n-          result.errors.filter((e) => e.severity !== 'ERROR')\n-        )\n-      })\n+      const validatorPath =\n+        this.nextConfig.experimental?.amp?.validator ||\n+        getBundledAmpValidatorFilepath()\n+\n+      const validator = await getAmpValidatorInstance(validatorPath)\n+\n+      const result = validator.validateString(html)\n+      ampValidation(\n+        pathname,\n+        result.errors\n+          .filter((e) => e.severity === 'ERROR')\n+          .filter((e) => this._filterAmpDevelopmentScript(html, e)),\n+        result.errors.filter((e) => e.severity !== 'ERROR')\n+      )\n     }\n \n     const { pagesDir, appDir } = findPagesDir(this.dir)"
+        },
+        {
+            "sha": "3e3ebbe88491c4d8f7d35fed19642e4a12ac4166",
+            "filename": "packages/next/types/compiled.d.ts",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/vercel/next.js/blob/5532de7695d9b891c89c60fe0fa5bf11093d69f2/packages%2Fnext%2Ftypes%2Fcompiled.d.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/5532de7695d9b891c89c60fe0fa5bf11093d69f2/packages%2Fnext%2Ftypes%2Fcompiled.d.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Ftypes%2Fcompiled.d.ts?ref=5532de7695d9b891c89c60fe0fa5bf11093d69f2",
+            "patch": "@@ -55,6 +55,10 @@ declare module 'next/dist/compiled/jest-worker' {\n }\n \n declare module 'next/dist/compiled/amphtml-validator' {\n+  export type Validator = {\n+    validateString(html: string): Promise<any>\n+  }\n+  export function getInstance(validatorPath: string): Promise<Validator>\n   export type ValidationError = any\n }\n "
+        },
+        {
+            "sha": "6a99a3e513ad7d463ff0e7ad98ee7e38cbefe2e7",
+            "filename": "test/lib/amp-test-utils.js",
+            "status": "modified",
+            "additions": 38,
+            "deletions": 8,
+            "changes": 46,
+            "blob_url": "https://github.com/vercel/next.js/blob/5532de7695d9b891c89c60fe0fa5bf11093d69f2/test%2Flib%2Famp-test-utils.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/5532de7695d9b891c89c60fe0fa5bf11093d69f2/test%2Flib%2Famp-test-utils.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Flib%2Famp-test-utils.js?ref=5532de7695d9b891c89c60fe0fa5bf11093d69f2",
+            "patch": "@@ -1,14 +1,9 @@\n /* eslint-env jest */\n-import amphtmlValidator from 'next/dist/compiled/amphtml-validator'\n+import AmpHtmlValidator from 'next/dist/compiled/amphtml-validator'\n \n-// Use the same validator that we use for builds.\n-// This avoids trying to load one from the network, which can cause random test flakiness.\n-// (duplicated from 'packages/next/src/export/routes/pages.ts')\n-const validatorPath = require.resolve(\n-  'next/dist/compiled/amphtml-validator/validator_wasm.js'\n-)\n export async function validateAMP(/** @type {string} */ html) {\n-  const validator = await amphtmlValidator.getInstance(validatorPath)\n+  const validatorPath = getBundledAmpValidatorFilepath()\n+  const validator = await getAmpValidatorInstance(validatorPath)\n   const result = validator.validateString(html)\n   if (result.status !== 'PASS') {\n     for (let ii = 0; ii < result.errors.length; ii++) {\n@@ -23,3 +18,38 @@ export async function validateAMP(/** @type {string} */ html) {\n   }\n   expect(result.status).toBe('PASS')\n }\n+\n+/** @typedef {import('next/dist/compiled/amphtml-validator').Validator} Validator */\n+\n+/** @type {Map<string | undefined, Promise<Validator>>} */\n+const instancePromises = new Map()\n+\n+/**\n+ * This is a workaround for issues with concurrent `AmpHtmlValidator.getInstance()` calls,\n+ * duplicated from 'packages/next/src/export/helpers/get-amp-html-validator.ts'.\n+ * see original code for explanation.\n+ *\n+ * @returns {Promise<Validator>}\n+ * */\n+function getAmpValidatorInstance(\n+  /** @type {string | undefined} */ validatorPath\n+) {\n+  let promise = instancePromises.get(validatorPath)\n+  if (!promise) {\n+    // NOTE: if `validatorPath` is undefined, `AmpHtmlValidator` will load the code from its default URL\n+    promise = AmpHtmlValidator.getInstance(validatorPath)\n+    instancePromises.set(validatorPath, promise)\n+  }\n+  return promise\n+}\n+\n+/**\n+ * Use the same validator that we use for builds.\n+ * This avoids trying to load one from the network, which can cause random test flakiness.\n+ * (duplicated from 'packages/next/src/export/helpers/get-amp-html-validator.ts')\n+ */\n+function getBundledAmpValidatorFilepath() {\n+  return require.resolve(\n+    'next/dist/compiled/amphtml-validator/validator_wasm.js'\n+  )\n+}"
+        }
+    ],
+    "stats": {
+        "total": 138,
+        "additions": 105,
+        "deletions": 33
+    }
+}

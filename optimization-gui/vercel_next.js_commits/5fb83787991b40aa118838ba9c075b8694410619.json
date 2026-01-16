@@ -1,0 +1,144 @@
+{
+    "author": "huozhi",
+    "message": "[metadata] handle navigation API in streaming metadata (#76156)\n\n### What\n\nWhen streaming metadata is enabled, the whole metadata result is under\nthe suspense boundary and will be streamed to client if it takes some\ntime. Right now we only had the metadata itself rendered under the\nsuspense boundary. But we also need to deal with the errors, when\nthere're errors of `notFound()` or `redirect()` it should still be\nthrown to trigger the proper error boundary.\n\nOne special case needs to be taken care of is when we passing down the\nerror caught during metadata from RSC layer to client layer, the\n`digest` property will be lost as it's not serialized by React now.\nHence we also send both of the error itself and its digest to client and\nlet client compose them when both present. In this way we can keep the\noriginal error digest of `notFound` and `redirect` navigation errors. We\ndon't have this case in non-streaming metadata as the metatdata\nresolving was all done on the RSC side.\n\nWhen streaming metadata is disabled, we should not re-throw the errors\non client, let everything works like before in the blocking way.\n\nThe metadata re-throw strategy is called `StreamingMetadataOutlet` in\nthe code, reviewers can focus on that.\n\nCloses NDX-847",
+    "sha": "5fb83787991b40aa118838ba9c075b8694410619",
+    "files": [
+        {
+            "sha": "91141e7c5e47c8f1a080496fbc9a2cc8e95e965f",
+            "filename": "packages/next/src/lib/metadata/async-metadata.tsx",
+            "status": "modified",
+            "additions": 54,
+            "deletions": 6,
+            "changes": 60,
+            "blob_url": "https://github.com/vercel/next.js/blob/5fb83787991b40aa118838ba9c075b8694410619/packages%2Fnext%2Fsrc%2Flib%2Fmetadata%2Fasync-metadata.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/5fb83787991b40aa118838ba9c075b8694410619/packages%2Fnext%2Fsrc%2Flib%2Fmetadata%2Fasync-metadata.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Flib%2Fmetadata%2Fasync-metadata.tsx?ref=5fb83787991b40aa118838ba9c075b8694410619",
+            "patch": "@@ -1,22 +1,41 @@\n 'use client'\n \n-import { use, type JSX } from 'react'\n+import { Suspense, use } from 'react'\n import { useServerInsertedMetadata } from '../../server/app-render/metadata-insertion/use-server-inserted-metadata'\n \n-function ServerInsertMetadata({ promise }: { promise: Promise<JSX.Element> }) {\n+export type StreamingMetadataResolvedState = {\n+  metadata: React.ReactNode\n+  error: unknown | null\n+  digest: string | undefined\n+}\n+\n+function ServerInsertMetadata({\n+  promise,\n+}: {\n+  promise: Promise<StreamingMetadataResolvedState>\n+}) {\n   // Apply use() to the metadata promise to suspend the rendering in SSR.\n-  const metadata = use(promise)\n+  const { metadata } = use(promise)\n   // Insert metadata into the HTML stream through the `useServerInsertedMetadata`\n   useServerInsertedMetadata(() => metadata)\n \n   return null\n }\n \n-function BrowserResolvedMetadata({ promise }: { promise: Promise<any> }) {\n-  return use(promise)\n+function BrowserResolvedMetadata({\n+  promise,\n+}: {\n+  promise: Promise<StreamingMetadataResolvedState>\n+}) {\n+  const { metadata } = use(promise)\n+  return metadata\n }\n \n-export function AsyncMetadata({ promise }: { promise: Promise<any> }) {\n+export function AsyncMetadata({\n+  promise,\n+}: {\n+  promise: Promise<StreamingMetadataResolvedState>\n+}) {\n   return (\n     <>\n       {typeof window === 'undefined' ? (\n@@ -27,3 +46,32 @@ export function AsyncMetadata({ promise }: { promise: Promise<any> }) {\n     </>\n   )\n }\n+\n+function MetadataOutlet({\n+  promise,\n+}: {\n+  promise: Promise<StreamingMetadataResolvedState>\n+}) {\n+  const { error, digest } = use(promise)\n+  if (error) {\n+    if (digest) {\n+      // The error will lose its original digest after passing from server layer to client layer；\n+      // We recover the digest property here to override the React created one if original digest exists.\n+      ;(error as any).digest = digest\n+    }\n+    throw error\n+  }\n+  return null\n+}\n+\n+export function AsyncMetadataOutlet({\n+  promise,\n+}: {\n+  promise: Promise<StreamingMetadataResolvedState>\n+}) {\n+  return (\n+    <Suspense fallback={null}>\n+      <MetadataOutlet promise={promise} />\n+    </Suspense>\n+  )\n+}"
+        },
+        {
+            "sha": "8241954d394d2230e4db8900f2915ae3efe9183d",
+            "filename": "packages/next/src/lib/metadata/metadata.tsx",
+            "status": "modified",
+            "additions": 36,
+            "deletions": 8,
+            "changes": 44,
+            "blob_url": "https://github.com/vercel/next.js/blob/5fb83787991b40aa118838ba9c075b8694410619/packages%2Fnext%2Fsrc%2Flib%2Fmetadata%2Fmetadata.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/5fb83787991b40aa118838ba9c075b8694410619/packages%2Fnext%2Fsrc%2Flib%2Fmetadata%2Fmetadata.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Flib%2Fmetadata%2Fmetadata.tsx?ref=5fb83787991b40aa118838ba9c075b8694410619",
+            "patch": "@@ -1,9 +1,9 @@\n+import React, { Suspense, cache, cloneElement } from 'react'\n import type { ParsedUrlQuery } from 'querystring'\n import type { GetDynamicParamFromSegment } from '../../server/app-render/app-render'\n import type { LoaderTree } from '../../server/lib/app-dir-module'\n import type { CreateServerParamsForMetadata } from '../../server/request/params'\n-\n-import { Suspense, cache, cloneElement } from 'react'\n+import type { StreamingMetadataResolvedState } from './async-metadata'\n import {\n   AppleWebAppMeta,\n   FormatDetectionMeta,\n@@ -37,7 +37,7 @@ import {\n   METADATA_BOUNDARY_NAME,\n   VIEWPORT_BOUNDARY_NAME,\n } from './metadata-constants'\n-import { AsyncMetadata } from './async-metadata'\n+import { AsyncMetadata, AsyncMetadataOutlet } from './async-metadata'\n import { isPostpone } from '../../server/lib/router-utils/is-postpone'\n \n // Use a promise to share the status of the metadata resolving,\n@@ -75,6 +75,7 @@ export function createMetadataComponents({\n   ViewportTree: React.ComponentType\n   getMetadataReady: () => Promise<void>\n   getViewportReady: () => Promise<void>\n+  StreamingMetadataOutlet: React.ComponentType\n } {\n   function ViewportTree() {\n     return (\n@@ -145,21 +146,35 @@ export function createMetadataComponents({\n     )\n   }\n \n-  async function resolveFinalMetadata() {\n+  async function resolveFinalMetadata(): Promise<StreamingMetadataResolvedState> {\n+    let result: React.ReactNode\n+    let error = null\n     try {\n-      return await metadata()\n+      result = await metadata()\n+      return {\n+        metadata: result,\n+        error: null,\n+        digest: undefined,\n+      }\n     } catch (metadataErr) {\n+      error = metadataErr\n       if (!errorType && isHTTPAccessFallbackError(metadataErr)) {\n         try {\n-          return await getNotFoundMetadata(\n+          result = await getNotFoundMetadata(\n             tree,\n             searchParams,\n             getDynamicParamFromSegment,\n             metadataContext,\n             createServerParamsForMetadata,\n             workStore\n           )\n+          return {\n+            metadata: result,\n+            error,\n+            digest: (error as any)?.digest,\n+          }\n         } catch (notFoundMetadataErr) {\n+          error = notFoundMetadataErr\n           // In PPR rendering we still need to throw the postpone error.\n           // If metadata is postponed, React needs to be aware of the location of error.\n           if (serveStreamingMetadata && isPostpone(notFoundMetadataErr)) {\n@@ -176,7 +191,11 @@ export function createMetadataComponents({\n       // also error in the MetadataOutlet which causes the error to\n       // bubble from the right position in the page to be caught by the\n       // appropriate boundaries\n-      return null\n+      return {\n+        metadata: result,\n+        error,\n+        digest: (error as any)?.digest,\n+      }\n     }\n   }\n   async function Metadata() {\n@@ -188,7 +207,8 @@ export function createMetadataComponents({\n         </Suspense>\n       )\n     }\n-    return await promise\n+    const metadataState = await promise\n+    return metadataState.metadata\n   }\n \n   Metadata.displayName = METADATA_BOUNDARY_NAME\n@@ -207,11 +227,19 @@ export function createMetadataComponents({\n     return undefined\n   }\n \n+  function StreamingMetadataOutlet() {\n+    if (serveStreamingMetadata) {\n+      return <AsyncMetadataOutlet promise={resolveFinalMetadata()} />\n+    }\n+    return null\n+  }\n+\n   return {\n     ViewportTree,\n     MetadataTree,\n     getViewportReady,\n     getMetadataReady,\n+    StreamingMetadataOutlet,\n   }\n }\n "
+        },
+        {
+            "sha": "f4e9394e6f65c801c499455021bdc281463eefde",
+            "filename": "packages/next/src/server/app-render/app-render.tsx",
+            "status": "modified",
+            "additions": 51,
+            "deletions": 42,
+            "changes": 93,
+            "blob_url": "https://github.com/vercel/next.js/blob/5fb83787991b40aa118838ba9c075b8694410619/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fapp-render.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/5fb83787991b40aa118838ba9c075b8694410619/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fapp-render.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fapp-render.tsx?ref=5fb83787991b40aa118838ba9c075b8694410619",
+            "patch": "@@ -321,14 +321,13 @@ function createDivergedMetadataComponents(\n   serveStreamingMetadata: boolean\n ): {\n   StaticMetadata: React.ComponentType<{}>\n-  StreamingMetadata: React.ComponentType<{}>\n+  StreamingMetadata: React.ComponentType<{}> | null\n } {\n   function EmptyMetadata() {\n     return null\n   }\n-  const StreamingMetadata: React.ComponentType<{}> = serveStreamingMetadata\n-    ? Metadata\n-    : EmptyMetadata\n+  const StreamingMetadata: React.ComponentType<{}> | null =\n+    serveStreamingMetadata ? Metadata : null\n \n   const StaticMetadata: React.ComponentType<{}> = serveStreamingMetadata\n     ? EmptyMetadata\n@@ -490,23 +489,28 @@ async function generateDynamicRSCPayload(\n     const preloadCallbacks: PreloadCallbacks = []\n \n     const searchParams = createServerSearchParamsForMetadata(query, workStore)\n-    const { ViewportTree, MetadataTree, getViewportReady, getMetadataReady } =\n-      createMetadataComponents({\n-        tree: loaderTree,\n-        searchParams,\n-        metadataContext: createTrackedMetadataContext(\n-          url.pathname,\n-          ctx.renderOpts,\n-          workStore\n-        ),\n-        getDynamicParamFromSegment,\n-        appUsingSizeAdjustment,\n-        createServerParamsForMetadata,\n-        workStore,\n-        MetadataBoundary,\n-        ViewportBoundary,\n-        serveStreamingMetadata,\n-      })\n+    const {\n+      ViewportTree,\n+      MetadataTree,\n+      getViewportReady,\n+      getMetadataReady,\n+      StreamingMetadataOutlet,\n+    } = createMetadataComponents({\n+      tree: loaderTree,\n+      searchParams,\n+      metadataContext: createTrackedMetadataContext(\n+        url.pathname,\n+        ctx.renderOpts,\n+        workStore\n+      ),\n+      getDynamicParamFromSegment,\n+      appUsingSizeAdjustment,\n+      createServerParamsForMetadata,\n+      workStore,\n+      MetadataBoundary,\n+      ViewportBoundary,\n+      serveStreamingMetadata,\n+    })\n \n     const { StreamingMetadata, StaticMetadata } =\n       createDivergedMetadataComponents(() => {\n@@ -540,6 +544,7 @@ async function generateDynamicRSCPayload(\n         getMetadataReady,\n         preloadCallbacks,\n         StreamingMetadata,\n+        StreamingMetadataOutlet,\n       })\n     ).map((path) => path.slice(1)) // remove the '' (root) segment\n   }\n@@ -801,24 +806,29 @@ async function getRSCPayload(\n   const serveStreamingMetadata = getServeStreamingMetadata(ctx)\n \n   const searchParams = createServerSearchParamsForMetadata(query, workStore)\n-  const { ViewportTree, MetadataTree, getViewportReady, getMetadataReady } =\n-    createMetadataComponents({\n-      tree,\n-      errorType: is404 ? 'not-found' : undefined,\n-      searchParams,\n-      metadataContext: createTrackedMetadataContext(\n-        url.pathname,\n-        ctx.renderOpts,\n-        workStore\n-      ),\n-      getDynamicParamFromSegment,\n-      appUsingSizeAdjustment,\n-      createServerParamsForMetadata,\n-      workStore,\n-      MetadataBoundary,\n-      ViewportBoundary,\n-      serveStreamingMetadata: serveStreamingMetadata,\n-    })\n+  const {\n+    ViewportTree,\n+    MetadataTree,\n+    getViewportReady,\n+    getMetadataReady,\n+    StreamingMetadataOutlet,\n+  } = createMetadataComponents({\n+    tree,\n+    errorType: is404 ? 'not-found' : undefined,\n+    searchParams,\n+    metadataContext: createTrackedMetadataContext(\n+      url.pathname,\n+      ctx.renderOpts,\n+      workStore\n+    ),\n+    getDynamicParamFromSegment,\n+    appUsingSizeAdjustment,\n+    createServerParamsForMetadata,\n+    workStore,\n+    MetadataBoundary,\n+    ViewportBoundary,\n+    serveStreamingMetadata,\n+  })\n \n   const preloadCallbacks: PreloadCallbacks = []\n \n@@ -844,6 +854,7 @@ async function getRSCPayload(\n     preloadCallbacks,\n     authInterrupts: ctx.renderOpts.experimental.authInterrupts,\n     StreamingMetadata,\n+    StreamingMetadataOutlet,\n   })\n \n   // When the `vary` response header is present with `Next-URL`, that means there's a chance\n@@ -987,9 +998,7 @@ async function getErrorRSCPayload(\n   const seedData: CacheNodeSeedData = [\n     initialTree[0],\n     <html id=\"__next_error__\">\n-      <head>\n-        <StreamingMetadata />\n-      </head>\n+      <head>{StreamingMetadata ? <StreamingMetadata /> : null}</head>\n       <body>\n         {process.env.NODE_ENV !== 'production' && err ? (\n           <template"
+        },
+        {
+            "sha": "6b6ab029fc4930b425364084a4fd9ca661ecdae3",
+            "filename": "packages/next/src/server/app-render/create-component-tree.tsx",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 4,
+            "changes": 14,
+            "blob_url": "https://github.com/vercel/next.js/blob/5fb83787991b40aa118838ba9c075b8694410619/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fcreate-component-tree.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/5fb83787991b40aa118838ba9c075b8694410619/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fcreate-component-tree.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fcreate-component-tree.tsx?ref=5fb83787991b40aa118838ba9c075b8694410619",
+            "patch": "@@ -40,7 +40,8 @@ export function createComponentTree(props: {\n   missingSlots?: Set<string>\n   preloadCallbacks: PreloadCallbacks\n   authInterrupts: boolean\n-  StreamingMetadata: React.ComponentType<{}>\n+  StreamingMetadata: React.ComponentType<{}> | null\n+  StreamingMetadataOutlet: React.ComponentType\n }): Promise<CacheNodeSeedData> {\n   return getTracer().trace(\n     NextNodeServerSpan.createComponentTree,\n@@ -77,6 +78,7 @@ async function createComponentTreeInternal({\n   preloadCallbacks,\n   authInterrupts,\n   StreamingMetadata,\n+  StreamingMetadataOutlet,\n }: {\n   loaderTree: LoaderTree\n   parentParams: Params\n@@ -90,7 +92,8 @@ async function createComponentTreeInternal({\n   missingSlots?: Set<string>\n   preloadCallbacks: PreloadCallbacks\n   authInterrupts: boolean\n-  StreamingMetadata: React.ComponentType<{}>\n+  StreamingMetadata: React.ComponentType<{}> | null\n+  StreamingMetadataOutlet: React.ComponentType\n }): Promise<CacheNodeSeedData> {\n   const {\n     renderOpts: { nextConfigOutput, experimental },\n@@ -395,7 +398,9 @@ async function createComponentTreeInternal({\n   // Only render metadata on the actual SSR'd segment not the `default` segment,\n   // as it's used as a placeholder for navigation.\n   const metadata =\n-    actualSegment !== DEFAULT_SEGMENT_KEY ? <StreamingMetadata /> : undefined\n+    actualSegment !== DEFAULT_SEGMENT_KEY && StreamingMetadata ? (\n+      <StreamingMetadata />\n+    ) : undefined\n \n   const notFoundElement = NotFound ? (\n     <>\n@@ -517,6 +522,7 @@ async function createComponentTreeInternal({\n             preloadCallbacks,\n             authInterrupts,\n             StreamingMetadata,\n+            StreamingMetadataOutlet,\n           })\n \n           childCacheNodeSeedData = seedData\n@@ -578,7 +584,6 @@ async function createComponentTreeInternal({\n   }\n \n   const Component = MaybeComponent\n-\n   // If force-dynamic is used and the current render supports postponing, we\n   // replace it with a node that will postpone the render. This ensures that the\n   // postpone is invoked during the react render phase and not during the next\n@@ -705,6 +710,7 @@ async function createComponentTreeInternal({\n         <OutletBoundary>\n           <MetadataOutlet ready={getViewportReady} />\n           <MetadataOutlet ready={getMetadataReady} />\n+          <StreamingMetadataOutlet />\n         </OutletBoundary>\n       </React.Fragment>,\n       parallelRouteCacheNodeSeedData,"
+        },
+        {
+            "sha": "4f1a66c7f9455914d7bef0198d68ce63ddcf62e2",
+            "filename": "packages/next/src/server/app-render/metadata-insertion/create-server-inserted-metadata.tsx",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/vercel/next.js/blob/5fb83787991b40aa118838ba9c075b8694410619/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fmetadata-insertion%2Fcreate-server-inserted-metadata.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/5fb83787991b40aa118838ba9c075b8694410619/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fmetadata-insertion%2Fcreate-server-inserted-metadata.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fmetadata-insertion%2Fcreate-server-inserted-metadata.tsx?ref=5fb83787991b40aa118838ba9c075b8694410619",
+            "patch": "@@ -1,4 +1,4 @@\n-import React, { type JSX } from 'react'\n+import React from 'react'\n import { renderToReadableStream } from 'react-dom/server.edge'\n import {\n   ServerInsertedMetadataContext,\n@@ -8,7 +8,7 @@ import { renderToString } from '../render-to-string'\n \n export function createServerInsertedMetadata() {\n   let metadataResolver: MetadataResolver | null = null\n-  let metadataToFlush: JSX.Element | null = null\n+  let metadataToFlush: React.ReactNode = null\n   const setMetadataResolver = (resolver: MetadataResolver): void => {\n     metadataResolver = resolver\n   }"
+        },
+        {
+            "sha": "a8a74cac7cb0c8848f1bb1f129e72298ce15d4a8",
+            "filename": "packages/next/src/server/app-render/walk-tree-with-flight-router-state.tsx",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 1,
+            "changes": 6,
+            "blob_url": "https://github.com/vercel/next.js/blob/5fb83787991b40aa118838ba9c075b8694410619/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fwalk-tree-with-flight-router-state.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/5fb83787991b40aa118838ba9c075b8694410619/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fwalk-tree-with-flight-router-state.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fwalk-tree-with-flight-router-state.tsx?ref=5fb83787991b40aa118838ba9c075b8694410619",
+            "patch": "@@ -41,6 +41,7 @@ export async function walkTreeWithFlightRouterState({\n   ctx,\n   preloadCallbacks,\n   StreamingMetadata,\n+  StreamingMetadataOutlet,\n }: {\n   loaderTreeToFilter: LoaderTree\n   parentParams: { [key: string]: string | string[] }\n@@ -55,7 +56,8 @@ export async function walkTreeWithFlightRouterState({\n   getViewportReady: () => Promise<void>\n   ctx: AppRenderContext\n   preloadCallbacks: PreloadCallbacks\n-  StreamingMetadata: React.ComponentType<{}>\n+  StreamingMetadata: React.ComponentType<{}> | null\n+  StreamingMetadataOutlet: React.ComponentType<{}>\n }): Promise<FlightDataPath[]> {\n   const {\n     renderOpts: { nextFontManifest, experimental },\n@@ -205,6 +207,7 @@ export async function walkTreeWithFlightRouterState({\n         preloadCallbacks,\n         authInterrupts: experimental.authInterrupts,\n         StreamingMetadata,\n+        StreamingMetadataOutlet,\n       }\n     )\n \n@@ -265,6 +268,7 @@ export async function walkTreeWithFlightRouterState({\n       getMetadataReady,\n       preloadCallbacks,\n       StreamingMetadata,\n+      StreamingMetadataOutlet,\n     })\n \n     for (const subPath of subPaths) {"
+        },
+        {
+            "sha": "3ad44c908f22fa7f86d8e413510b1165e3c766a3",
+            "filename": "packages/next/src/shared/lib/server-inserted-metadata.shared-runtime.ts",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 2,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/5fb83787991b40aa118838ba9c075b8694410619/packages%2Fnext%2Fsrc%2Fshared%2Flib%2Fserver-inserted-metadata.shared-runtime.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/5fb83787991b40aa118838ba9c075b8694410619/packages%2Fnext%2Fsrc%2Fshared%2Flib%2Fserver-inserted-metadata.shared-runtime.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fshared%2Flib%2Fserver-inserted-metadata.shared-runtime.ts?ref=5fb83787991b40aa118838ba9c075b8694410619",
+            "patch": "@@ -1,8 +1,9 @@\n 'use client'\n \n-import { type JSX, createContext } from 'react'\n+import type React from 'react'\n+import { createContext } from 'react'\n \n-export type MetadataResolver = () => JSX.Element\n+export type MetadataResolver = () => React.ReactNode\n type MetadataResolverSetter = (m: MetadataResolver) => void\n \n export const ServerInsertedMetadataContext ="
+        },
+        {
+            "sha": "6390e6bb069e1b1c814513f42ca81487d54b4392",
+            "filename": "test/e2e/app-dir/metadata-streaming/app/notfound/page.tsx",
+            "status": "added",
+            "additions": 14,
+            "deletions": 0,
+            "changes": 14,
+            "blob_url": "https://github.com/vercel/next.js/blob/5fb83787991b40aa118838ba9c075b8694410619/test%2Fe2e%2Fapp-dir%2Fmetadata-streaming%2Fapp%2Fnotfound%2Fpage.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/5fb83787991b40aa118838ba9c075b8694410619/test%2Fe2e%2Fapp-dir%2Fmetadata-streaming%2Fapp%2Fnotfound%2Fpage.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fmetadata-streaming%2Fapp%2Fnotfound%2Fpage.tsx?ref=5fb83787991b40aa118838ba9c075b8694410619",
+            "patch": "@@ -0,0 +1,14 @@\n+import { connection } from 'next/server'\n+import { notFound } from 'next/navigation'\n+\n+export default function Page() {\n+  return <p>notfound page</p>\n+}\n+\n+export async function generateMetadata() {\n+  await connection()\n+  await new Promise((resolve) => setTimeout(resolve, 2 * 1000))\n+  notFound()\n+}\n+\n+export const dynamic = 'force-dynamic'"
+        },
+        {
+            "sha": "101b2d74bd0d511ced98ea1484357c31ce85a580",
+            "filename": "test/e2e/app-dir/metadata-streaming/app/page.tsx",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/5fb83787991b40aa118838ba9c075b8694410619/test%2Fe2e%2Fapp-dir%2Fmetadata-streaming%2Fapp%2Fpage.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/5fb83787991b40aa118838ba9c075b8694410619/test%2Fe2e%2Fapp-dir%2Fmetadata-streaming%2Fapp%2Fpage.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fmetadata-streaming%2Fapp%2Fpage.tsx?ref=5fb83787991b40aa118838ba9c075b8694410619",
+            "patch": "@@ -1,5 +1,5 @@\n export default function Page() {\n-  return <p>index</p>\n+  return <p>index page</p>\n }\n \n export async function generateMetadata() {"
+        },
+        {
+            "sha": "717db3ee63af19e2fc215cf395f3f53a04247499",
+            "filename": "test/e2e/app-dir/metadata-streaming/app/redirect/page.tsx",
+            "status": "added",
+            "additions": 14,
+            "deletions": 0,
+            "changes": 14,
+            "blob_url": "https://github.com/vercel/next.js/blob/5fb83787991b40aa118838ba9c075b8694410619/test%2Fe2e%2Fapp-dir%2Fmetadata-streaming%2Fapp%2Fredirect%2Fpage.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/5fb83787991b40aa118838ba9c075b8694410619/test%2Fe2e%2Fapp-dir%2Fmetadata-streaming%2Fapp%2Fredirect%2Fpage.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fmetadata-streaming%2Fapp%2Fredirect%2Fpage.tsx?ref=5fb83787991b40aa118838ba9c075b8694410619",
+            "patch": "@@ -0,0 +1,14 @@\n+import { connection } from 'next/server'\n+import { redirect } from 'next/navigation'\n+\n+export default function Page() {\n+  return <p>redirect page</p>\n+}\n+\n+export async function generateMetadata() {\n+  await connection()\n+  await new Promise((resolve) => setTimeout(resolve, 2 * 1000))\n+  redirect('/')\n+}\n+\n+export const dynamic = 'force-dynamic'"
+        },
+        {
+            "sha": "ed14bdbe9a5542b538b7354e21f3d1d07dcc2d9c",
+            "filename": "test/e2e/app-dir/metadata-streaming/metadata-streaming.test.ts",
+            "status": "modified",
+            "additions": 36,
+            "deletions": 0,
+            "changes": 36,
+            "blob_url": "https://github.com/vercel/next.js/blob/5fb83787991b40aa118838ba9c075b8694410619/test%2Fe2e%2Fapp-dir%2Fmetadata-streaming%2Fmetadata-streaming.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/5fb83787991b40aa118838ba9c075b8694410619/test%2Fe2e%2Fapp-dir%2Fmetadata-streaming%2Fmetadata-streaming.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fmetadata-streaming%2Fmetadata-streaming.test.ts?ref=5fb83787991b40aa118838ba9c075b8694410619",
+            "patch": "@@ -104,4 +104,40 @@ describe('app-dir - metadata-streaming', () => {\n       })\n     })\n   })\n+\n+  describe('navigation API', () => {\n+    it('should trigger not-found boundary when call notFound', async () => {\n+      const browser = await next.browser('/notfound')\n+\n+      // Show 404 page\n+      await retry(async () => {\n+        expect(await browser.elementByCss('h1').text()).toBe('404')\n+      })\n+    })\n+\n+    it('should trigger redirection when call redirect', async () => {\n+      const browser = await next.browser('/redirect')\n+      // Redirect to home page\n+      expect(await browser.elementByCss('p').text()).toBe('index page')\n+    })\n+\n+    it('should render blocking 404 response status when html limited bots access notFound', async () => {\n+      const { status } = await next.fetch('/notfound', {\n+        headers: {\n+          'user-agent': 'Twitterbot',\n+        },\n+      })\n+      expect(status).toBe(404)\n+    })\n+\n+    it('should render blocking 307 response status when html limited bots access redirect', async () => {\n+      const { status } = await next.fetch('/redirect', {\n+        headers: {\n+          'user-agent': 'Twitterbot',\n+        },\n+        redirect: 'manual',\n+      })\n+      expect(status).toBe(307)\n+    })\n+  })\n })"
+        }
+    ],
+    "stats": {
+        "total": 292,
+        "additions": 226,
+        "deletions": 66
+    }
+}

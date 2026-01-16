@@ -1,0 +1,36 @@
+{
+    "author": "efsotr",
+    "message": "Fix tot update in trainer (#37923)\n\n* fix total updates in epoch\n\n* add test; fix max_steps\n\n* replace with multi-gpu decorator",
+    "sha": "e387821a96ce23f4ba57d5d11a6c328500af3f98",
+    "files": [
+        {
+            "sha": "ccbb4ebe440ff20203c78666374876abc31f0e9a",
+            "filename": "src/transformers/trainer.py",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 5,
+            "changes": 14,
+            "blob_url": "https://github.com/huggingface/transformers/blob/e387821a96ce23f4ba57d5d11a6c328500af3f98/src%2Ftransformers%2Ftrainer.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/e387821a96ce23f4ba57d5d11a6c328500af3f98/src%2Ftransformers%2Ftrainer.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Ftrainer.py?ref=e387821a96ce23f4ba57d5d11a6c328500af3f98",
+            "patch": "@@ -2495,13 +2495,13 @@ def _inner_training_loop(\n             step = -1\n             epoch_iterator = iter(epoch_dataloader)\n             # We chunkify the epoch iterator into gradient accumulation steps `n` batches\n-            remainder = num_examples % args.gradient_accumulation_steps\n+            remainder = steps_in_epoch % args.gradient_accumulation_steps\n             if remainder == 0:\n                 remainder = args.gradient_accumulation_steps\n             update_step = -1\n-            total_updates = steps_in_epoch // args.gradient_accumulation_steps + 1\n-            if args.gradient_accumulation_steps == 1:\n-                total_updates -= 1\n+            total_updates = steps_in_epoch // args.gradient_accumulation_steps + int(\n+                remainder < args.gradient_accumulation_steps\n+            )\n             for _ in range(total_updates):\n                 update_step += 1\n                 num_batches = args.gradient_accumulation_steps if update_step != (total_updates - 1) else remainder\n@@ -5319,7 +5319,11 @@ def set_initial_training_values(\n \n         # Case 2: We have a dataloader length and can extrapolate\n         if len_dataloader is not None:\n-            num_update_steps_per_epoch = max(len_dataloader // args.gradient_accumulation_steps, 1)\n+            num_update_steps_per_epoch = max(\n+                len_dataloader // args.gradient_accumulation_steps\n+                + int(len_dataloader % args.gradient_accumulation_steps > 0),\n+                1,\n+            )\n             # Case 3: We have a length but are using epochs, we can extrapolate the number of steps\n             if epoch_based:\n                 max_steps = math.ceil(args.num_train_epochs * num_update_steps_per_epoch)"
+        },
+        {
+            "sha": "f34374a44cd5738c2ded3d86db5de1b2f4c6551b",
+            "filename": "tests/trainer/test_trainer.py",
+            "status": "modified",
+            "additions": 32,
+            "deletions": 0,
+            "changes": 32,
+            "blob_url": "https://github.com/huggingface/transformers/blob/e387821a96ce23f4ba57d5d11a6c328500af3f98/tests%2Ftrainer%2Ftest_trainer.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/e387821a96ce23f4ba57d5d11a6c328500af3f98/tests%2Ftrainer%2Ftest_trainer.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Ftrainer%2Ftest_trainer.py?ref=e387821a96ce23f4ba57d5d11a6c328500af3f98",
+            "patch": "@@ -97,6 +97,7 @@\n     require_torch_fp16,\n     require_torch_gpu,\n     require_torch_multi_accelerator,\n+    require_torch_multi_gpu,\n     require_torch_non_multi_accelerator,\n     require_torch_non_multi_gpu,\n     require_torch_tensorrt_fx,\n@@ -3763,6 +3764,37 @@ def test_num_train_epochs_in_training(self):\n             train_output = trainer.train()\n             self.assertEqual(train_output.global_step, int(self.n_epochs))\n \n+    @require_torch_multi_gpu\n+    def test_num_batches_in_training_with_gradient_accumulation(self):\n+        with tempfile.TemporaryDirectory() as tmp_dir:\n+            for num_train_epochs in [1, 2]:\n+                for train_len in [123, 120]:\n+                    trainer = get_regression_trainer(\n+                        train_len=train_len,\n+                        per_device_train_batch_size=4,\n+                        gradient_accumulation_steps=5,\n+                        num_train_epochs=num_train_epochs,\n+                        output_dir=tmp_dir,\n+                    )\n+\n+                    total_batch_samples = []\n+\n+                    def wrap_get_batch_samples(fn):\n+                        def wrapped_fn(epoch_iterator, num_batches, device):\n+                            self.assertGreater(num_batches, 0)\n+                            batch_samples, num_items_in_batch = fn(epoch_iterator, num_batches, device)\n+                            self.assertEqual(len(batch_samples), num_batches)\n+                            total_batch_samples.append(num_batches)\n+                            return batch_samples, num_items_in_batch\n+\n+                        return wrapped_fn\n+\n+                    trainer.get_batch_samples = wrap_get_batch_samples(trainer.get_batch_samples)\n+\n+                    trainer.train()\n+\n+                    self.assertEqual(len(trainer.get_train_dataloader()) * num_train_epochs, sum(total_batch_samples))\n+\n     def test_early_stopping_callback(self):\n         # early stopping stops training before num_training_epochs\n         with tempfile.TemporaryDirectory() as tmp_dir:"
+        }
+    ],
+    "stats": {
+        "total": 46,
+        "additions": 41,
+        "deletions": 5
+    }
+}

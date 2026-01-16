@@ -1,0 +1,60 @@
+{
+    "author": "kdy1",
+    "message": "perf(turbopack/rcstr): Precompute hash for equality bailout (#78943)\n\n### What?\n\nPrecompute hash for `RcStr` and use it for equality bailout.\n\n### Why?\n\n\nWe have lots of `RcStr` in key positions of the hashmap, so adding a fast bailout path to `==` improved the performance.\n\nx-ref: https://vercel.slack.com/archives/C06PPGZ0FD3/p1746715835436899?thread_ts=1746658944.635819&cid=C06PPGZ0FD3",
+    "sha": "7d3e330af54468b903e1767a11c9e839b09aa0ab",
+    "files": [
+        {
+            "sha": "33e14e2321b6c1affddfaff03ff1a9d43a7c7512",
+            "filename": "Cargo.lock",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/7d3e330af54468b903e1767a11c9e839b09aa0ab/Cargo.lock",
+            "raw_url": "https://github.com/vercel/next.js/raw/7d3e330af54468b903e1767a11c9e839b09aa0ab/Cargo.lock",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/Cargo.lock?ref=7d3e330af54468b903e1767a11c9e839b09aa0ab",
+            "patch": "@@ -9562,6 +9562,7 @@ dependencies = [\n  \"codspeed-criterion-compat\",\n  \"napi\",\n  \"new_debug_unreachable\",\n+ \"rustc-hash 2.1.1\",\n  \"serde\",\n  \"shrink-to-fit\",\n  \"triomphe 0.1.12\","
+        },
+        {
+            "sha": "70dbe340941fadd87fe209962489e3170fb56867",
+            "filename": "turbopack/crates/turbo-rcstr/Cargo.toml",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/7d3e330af54468b903e1767a11c9e839b09aa0ab/turbopack%2Fcrates%2Fturbo-rcstr%2FCargo.toml",
+            "raw_url": "https://github.com/vercel/next.js/raw/7d3e330af54468b903e1767a11c9e839b09aa0ab/turbopack%2Fcrates%2Fturbo-rcstr%2FCargo.toml",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-rcstr%2FCargo.toml?ref=7d3e330af54468b903e1767a11c9e839b09aa0ab",
+            "patch": "@@ -16,6 +16,7 @@ serde = { workspace = true }\n new_debug_unreachable = \"1.0.6\"\n shrink-to-fit = { workspace = true }\n napi = { workspace = true, optional = true }\n+rustc-hash = { workspace = true }\n \n [dev-dependencies]\n criterion = { workspace = true }"
+        },
+        {
+            "sha": "6e1f4480e96ed06ac157bb8e12de82fde8580ddb",
+            "filename": "turbopack/crates/turbo-rcstr/src/dynamic.rs",
+            "status": "modified",
+            "additions": 29,
+            "deletions": 8,
+            "changes": 37,
+            "blob_url": "https://github.com/vercel/next.js/blob/7d3e330af54468b903e1767a11c9e839b09aa0ab/turbopack%2Fcrates%2Fturbo-rcstr%2Fsrc%2Fdynamic.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/7d3e330af54468b903e1767a11c9e839b09aa0ab/turbopack%2Fcrates%2Fturbo-rcstr%2Fsrc%2Fdynamic.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-rcstr%2Fsrc%2Fdynamic.rs?ref=7d3e330af54468b903e1767a11c9e839b09aa0ab",
+            "patch": "@@ -1,23 +1,33 @@\n-use std::{num::NonZeroU8, ptr::NonNull};\n+use std::{\n+    hash::{Hash, Hasher},\n+    num::NonZeroU8,\n+    ptr::NonNull,\n+};\n \n+use rustc_hash::FxHasher;\n use triomphe::Arc;\n \n use crate::{\n     INLINE_TAG, INLINE_TAG_INIT, LEN_OFFSET, RcStr, TAG_MASK,\n     tagged_value::{MAX_INLINE_LEN, TaggedValue},\n };\n \n-pub unsafe fn cast(ptr: TaggedValue) -> *const String {\n+pub(crate) struct PrehashedString {\n+    pub value: String,\n+    pub hash: u64,\n+}\n+\n+pub unsafe fn cast(ptr: TaggedValue) -> *const PrehashedString {\n     ptr.get_ptr().cast()\n }\n \n-pub unsafe fn deref_from<'i>(ptr: TaggedValue) -> &'i String {\n+pub(crate) unsafe fn deref_from<'i>(ptr: TaggedValue) -> &'i PrehashedString {\n     unsafe { &*cast(ptr) }\n }\n \n /// Caller should call `forget` (or `clone`) on the returned `Arc`\n-pub unsafe fn restore_arc(v: TaggedValue) -> Arc<String> {\n-    let ptr = v.get_ptr() as *const String;\n+pub unsafe fn restore_arc(v: TaggedValue) -> Arc<PrehashedString> {\n+    let ptr = v.get_ptr() as *const PrehashedString;\n     unsafe { Arc::from_raw(ptr) }\n }\n \n@@ -36,12 +46,17 @@ pub(crate) fn new_atom<T: AsRef<str> + Into<String>>(text: T) -> RcStr {\n         return RcStr { unsafe_data };\n     }\n \n-    let entry = Arc::new(text.into());\n+    let hash = compute_fxhash(text.as_ref());\n+\n+    let entry: Arc<PrehashedString> = Arc::new(PrehashedString {\n+        value: text.into(),\n+        hash,\n+    });\n     let entry = Arc::into_raw(entry);\n \n-    let ptr: NonNull<String> = unsafe {\n+    let ptr: NonNull<PrehashedString> = unsafe {\n         // Safety: Arc::into_raw returns a non-null pointer\n-        NonNull::new_unchecked(entry as *mut String)\n+        NonNull::new_unchecked(entry as *mut _)\n     };\n     debug_assert!(0 == ptr.as_ptr() as u8 & TAG_MASK);\n     RcStr {\n@@ -71,3 +86,9 @@ pub(crate) const fn inline_atom(text: &str) -> Option<RcStr> {\n     }\n     None\n }\n+\n+fn compute_fxhash(s: &str) -> u64 {\n+    let mut hasher = FxHasher::default();\n+    s.hash(&mut hasher);\n+    hasher.finish()\n+}"
+        },
+        {
+            "sha": "8b2d0ccca582790a054a5bf3103e8609cb3c91a5",
+            "filename": "turbopack/crates/turbo-rcstr/src/lib.rs",
+            "status": "modified",
+            "additions": 26,
+            "deletions": 6,
+            "changes": 32,
+            "blob_url": "https://github.com/vercel/next.js/blob/7d3e330af54468b903e1767a11c9e839b09aa0ab/turbopack%2Fcrates%2Fturbo-rcstr%2Fsrc%2Flib.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/7d3e330af54468b903e1767a11c9e839b09aa0ab/turbopack%2Fcrates%2Fturbo-rcstr%2Fsrc%2Flib.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-rcstr%2Fsrc%2Flib.rs?ref=7d3e330af54468b903e1767a11c9e839b09aa0ab",
+            "patch": "@@ -15,7 +15,10 @@ use shrink_to_fit::ShrinkToFit;\n use triomphe::Arc;\n use turbo_tasks_hash::{DeterministicHash, DeterministicHasher};\n \n-use crate::{dynamic::new_atom, tagged_value::TaggedValue};\n+use crate::{\n+    dynamic::{deref_from, new_atom},\n+    tagged_value::TaggedValue,\n+};\n \n mod dynamic;\n mod tagged_value;\n@@ -80,7 +83,7 @@ impl RcStr {\n     #[inline(never)]\n     pub fn as_str(&self) -> &str {\n         match self.tag() {\n-            DYNAMIC_TAG => unsafe { dynamic::deref_from(self.unsafe_data) },\n+            DYNAMIC_TAG => unsafe { dynamic::deref_from(self.unsafe_data).value.as_str() },\n             INLINE_TAG => {\n                 let len = (self.unsafe_data.tag() & LEN_MASK) >> LEN_OFFSET;\n                 let src = self.unsafe_data.data();\n@@ -103,8 +106,8 @@ impl RcStr {\n                 // convert `self` into `arc`\n                 let arc = unsafe { dynamic::restore_arc(ManuallyDrop::new(self).unsafe_data) };\n                 match Arc::try_unwrap(arc) {\n-                    Ok(v) => v,\n-                    Err(arc) => arc.to_string(),\n+                    Ok(v) => v.value,\n+                    Err(arc) => arc.value.to_string(),\n                 }\n             }\n             INLINE_TAG => self.as_str().to_string(),\n@@ -256,7 +259,15 @@ impl Default for RcStr {\n \n impl PartialEq for RcStr {\n     fn eq(&self, other: &Self) -> bool {\n-        self.as_str() == other.as_str()\n+        match (self.tag(), other.tag()) {\n+            (DYNAMIC_TAG, DYNAMIC_TAG) => {\n+                let l = unsafe { deref_from(self.unsafe_data) };\n+                let r = unsafe { deref_from(other.unsafe_data) };\n+                l.hash == r.hash && l.value == r.value\n+            }\n+            (INLINE_TAG, INLINE_TAG) => self.unsafe_data == other.unsafe_data,\n+            _ => false,\n+        }\n     }\n }\n \n@@ -276,7 +287,16 @@ impl Ord for RcStr {\n \n impl Hash for RcStr {\n     fn hash<H: Hasher>(&self, state: &mut H) {\n-        self.as_str().hash(state);\n+        match self.tag() {\n+            DYNAMIC_TAG => {\n+                let l = unsafe { deref_from(self.unsafe_data) };\n+                l.value.as_str().hash(state);\n+            }\n+            INLINE_TAG => {\n+                self.as_str().hash(state);\n+            }\n+            _ => unsafe { debug_unreachable!() },\n+        }\n     }\n }\n "
+        }
+    ],
+    "stats": {
+        "total": 71,
+        "additions": 57,
+        "deletions": 14
+    }
+}

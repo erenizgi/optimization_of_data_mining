@@ -1,0 +1,36 @@
+{
+    "author": "sokra",
+    "message": "Turbopack: fix hanging of persistent caching with webpack loaders (#83201)\n\n### What?\n\nWhen webpack loaders where invalidated after restoring from persistent cache, the process pool is not correctly recreated. It doesn't rewrite the output files to disk before creating the pool.",
+    "sha": "186174a73ffe702072c5a38b3efba1703cec4a58",
+    "files": [
+        {
+            "sha": "0da4173018bfb1e0e58fd6035b37ab939d02f85a",
+            "filename": "turbopack/crates/turbopack-node/src/evaluate.rs",
+            "status": "modified",
+            "additions": 27,
+            "deletions": 16,
+            "changes": 43,
+            "blob_url": "https://github.com/vercel/next.js/blob/186174a73ffe702072c5a38b3efba1703cec4a58/turbopack%2Fcrates%2Fturbopack-node%2Fsrc%2Fevaluate.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/186174a73ffe702072c5a38b3efba1703cec4a58/turbopack%2Fcrates%2Fturbopack-node%2Fsrc%2Fevaluate.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-node%2Fsrc%2Fevaluate.rs?ref=186174a73ffe702072c5a38b3efba1703cec4a58",
+            "patch": "@@ -1,4 +1,6 @@\n-use std::{borrow::Cow, iter, ops::ControlFlow, thread::available_parallelism, time::Duration};\n+use std::{\n+    borrow::Cow, iter, ops::ControlFlow, sync::Arc, thread::available_parallelism, time::Duration,\n+};\n \n use anyhow::{Result, anyhow, bail};\n use async_stream::try_stream as generator;\n@@ -13,9 +15,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};\n use serde_json::Value as JsonValue;\n use turbo_rcstr::rcstr;\n use turbo_tasks::{\n-    Completion, FxIndexMap, NonLocalValue, OperationVc, RawVc, ResolvedVc, TaskInput,\n-    TryJoinIterExt, Vc, VcValueType, apply_effects, duration_span, fxindexmap, mark_finished,\n-    prevent_gc, trace::TraceRawVcs, util::SharedError,\n+    Completion, Effects, FxIndexMap, NonLocalValue, OperationVc, RawVc, ReadRef, ResolvedVc,\n+    TaskInput, TryJoinIterExt, Vc, VcValueType, duration_span, fxindexmap, get_effects,\n+    mark_finished, prevent_gc, trace::TraceRawVcs, util::SharedError,\n };\n use turbo_tasks_bytes::{Bytes, Stream};\n use turbo_tasks_env::{EnvMap, ProcessEnv};\n@@ -193,22 +195,28 @@ async fn emit_evaluate_pool_assets_operation(\n     .cell())\n }\n \n+#[turbo_tasks::value(serialization = \"none\")]\n+struct EmittedEvaluatePoolAssetsWithEffects {\n+    assets: ReadRef<EmittedEvaluatePoolAssets>,\n+    effects: Arc<Effects>,\n+}\n+\n #[turbo_tasks::function(operation)]\n async fn emit_evaluate_pool_assets_with_effects_operation(\n     module_asset: ResolvedVc<Box<dyn Module>>,\n     asset_context: ResolvedVc<Box<dyn AssetContext>>,\n     chunking_context: ResolvedVc<Box<dyn ChunkingContext>>,\n     runtime_entries: Option<ResolvedVc<EvaluatableAssets>>,\n-) -> Result<Vc<EmittedEvaluatePoolAssets>> {\n+) -> Result<Vc<EmittedEvaluatePoolAssetsWithEffects>> {\n     let operation = emit_evaluate_pool_assets_operation(\n         module_asset,\n         asset_context,\n         chunking_context,\n         runtime_entries,\n     );\n-    let result = operation.resolve_strongly_consistent().await?;\n-    apply_effects(operation).await?;\n-    Ok(*result)\n+    let assets = operation.read_strongly_consistent().await?;\n+    let effects = Arc::new(get_effects(operation).await?);\n+    Ok(EmittedEvaluatePoolAssetsWithEffects { assets, effects }.cell())\n }\n \n #[derive(\n@@ -243,18 +251,21 @@ pub async fn get_evaluate_pool(\n     debug: bool,\n     env_var_tracking: EnvVarTracking,\n ) -> Result<Vc<NodeJsPool>> {\n-    let EmittedEvaluatePoolAssets {\n-        bootstrap,\n-        output_root,\n-        entrypoint,\n-    } = &*emit_evaluate_pool_assets_with_effects_operation(\n+    let operation = emit_evaluate_pool_assets_with_effects_operation(\n         module_asset,\n         asset_context,\n         chunking_context,\n         runtime_entries,\n-    )\n-    .read_strongly_consistent()\n-    .await?;\n+    );\n+    let EmittedEvaluatePoolAssetsWithEffects { assets, effects } =\n+        &*operation.read_strongly_consistent().await?;\n+    effects.apply().await?;\n+\n+    let EmittedEvaluatePoolAssets {\n+        bootstrap,\n+        output_root,\n+        entrypoint,\n+    } = &**assets;\n \n     let (Some(cwd), Some(entrypoint)) = (\n         to_sys_path(cwd.clone()).await?,"
+        },
+        {
+            "sha": "5fe4ab37e681d183ee4a347f2bf201ae74804a07",
+            "filename": "turbopack/crates/turbopack-node/src/pool.rs",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/186174a73ffe702072c5a38b3efba1703cec4a58/turbopack%2Fcrates%2Fturbopack-node%2Fsrc%2Fpool.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/186174a73ffe702072c5a38b3efba1703cec4a58/turbopack%2Fcrates%2Fturbopack-node%2Fsrc%2Fpool.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-node%2Fsrc%2Fpool.rs?ref=186174a73ffe702072c5a38b3efba1703cec4a58",
+            "patch": "@@ -347,7 +347,7 @@ impl NodeJsPoolProcess {\n         shared_stderr: SharedOutputSet,\n         debug: bool,\n     ) -> Result<Self> {\n-        let guard = Box::new(duration_span!(\"Node.js process startup\"));\n+        let guard = duration_span!(\"Node.js process startup\");\n         let listener = TcpListener::bind(\"127.0.0.1:0\")\n             .await\n             .context(\"binding to a port\")?;"
+        }
+    ],
+    "stats": {
+        "total": 45,
+        "additions": 28,
+        "deletions": 17
+    }
+}

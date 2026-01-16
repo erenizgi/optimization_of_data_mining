@@ -1,0 +1,24 @@
+{
+    "author": "bgw",
+    "message": "Turbopack: Watch parent directories before watching children in `non_recursive_helpers::start_watching_dir_and_parents` (#82454)\n\nFixes a potential race condition https://github.com/vercel/next.js/pull/82130#discussion_r2249131891:\r\n\r\n> I think there is a race condition here, when the child dir is created while we are walking the parent directories.\r\n>\r\n> 1. we try to watch /path/to/dir but it doesn't exist.\r\n> 2. /path/to/dir is created\r\n> 3. we move to the parent directory (`path/to`) and start watching it.\r\n> 4. But we already missed the event that path/to/dir was created.\r\n>\r\n> I think we need to run the loop reverse direction, watching parent directories first before watching the child directories. This way we already have the parent directory watcher setup before \"reading\" the child directory (reading in the sense of starting to watch it).\r\n\r\nTested by putting a `println!()` in `start_watching_dir` and observing that the parents were watched first when running\r\n\r\n```\r\nrm -rf /tmp/fuzz && cargo run -p turbo-tasks-fuzz -- fs-watcher --fs-root /tmp/fuzz\r\n```",
+    "sha": "4ade2cf4c389933f434d3ea8cd9d8d8453daf0ef",
+    "files": [
+        {
+            "sha": "e39a7a022d7007ebc017d5d328e2d0b70b55b1f8",
+            "filename": "turbopack/crates/turbo-tasks-fs/src/watcher.rs",
+            "status": "modified",
+            "additions": 32,
+            "deletions": 16,
+            "changes": 48,
+            "blob_url": "https://github.com/vercel/next.js/blob/4ade2cf4c389933f434d3ea8cd9d8d8453daf0ef/turbopack%2Fcrates%2Fturbo-tasks-fs%2Fsrc%2Fwatcher.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/4ade2cf4c389933f434d3ea8cd9d8d8453daf0ef/turbopack%2Fcrates%2Fturbo-tasks-fs%2Fsrc%2Fwatcher.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks-fs%2Fsrc%2Fwatcher.rs?ref=4ade2cf4c389933f434d3ea8cd9d8d8453daf0ef",
+            "patch": "@@ -287,23 +287,39 @@ mod non_recursive_helpers {\n         dir_path: &Path,\n         root_path: &Path,\n     ) -> Result<()> {\n-        let mut cur_path = dir_path;\n-        loop {\n-            start_watching_dir(&mut state.notify_watcher, cur_path, root_path)?;\n-\n-            let Some(parent_path) = cur_path.parent() else {\n-                // this should never happen as we break before we reach the root path\n-                anyhow::bail!(\n-                    \"failed to compute parent path of {cur_path:?} while watching {dir_path:?} in \\\n-                     root {root_path:?}\"\n-                );\n-            };\n-\n-            if parent_path == root_path || !state.watched.insert(parent_path.to_path_buf()) {\n-                break;\n-            }\n+        let mut found_watched_ancestor = false;\n+\n+        // NOTE: `Path::ancestors` yields ancestors from longest to shortest path.\n+        let dir_and_ancestor_paths: Vec<_> = [dir_path]\n+            .into_iter()\n+            .chain(\n+                dir_path\n+                    .ancestors()\n+                    // skip: `ancestors` includes `dir_path` itself, as well as the ancestors, but\n+                    // we only want to apply the `take_while` check to parents\n+                    .skip(1)\n+                    .take_while(|p| {\n+                        found_watched_ancestor = *p == root_path || state.watched.contains(*p);\n+                        !found_watched_ancestor\n+                    }),\n+            )\n+            .collect();\n+\n+        if !found_watched_ancestor {\n+            // this should never happen, as we should eventually hit the `root_path`\n+            anyhow::bail!(\n+                \"failed to find the fs root of {root_path:?} while watching {dir_path:?}\"\n+            );\n+        }\n \n-            cur_path = parent_path;\n+        // Reverse the iterator: We want to start closest to the root and work towards `dir_path`\n+        // (opposite of `Path::ancestors`), to avoid a potential race condition if directories are\n+        // removed and re-added before we've watched their parent.\n+        for path in dir_and_ancestor_paths.into_iter().rev() {\n+            // this will silently ignore if the path is not found, expecting that we've watched the\n+            // parent directory\n+            start_watching_dir(&mut state.notify_watcher, path, root_path)?;\n+            state.watched.insert(path.to_owned());\n         }\n \n         Ok(())"
+        }
+    ],
+    "stats": {
+        "total": 48,
+        "additions": 32,
+        "deletions": 16
+    }
+}

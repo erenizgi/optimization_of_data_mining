@@ -1,0 +1,36 @@
+{
+    "author": "Itssshikhar",
+    "message": "Fix FSDP resume Initialization issue (#34032)\n\n* Fix FSDP Initialization for resume training\r\n\r\n* Added init_fsdp function to work with dummy values\r\n\r\n* Fix FSDP initialization for resuming training\r\n\r\n* Added CUDA decorator for tests\r\n\r\n* Added torch_gpu decorator to FSDP tests\r\n\r\n* Fixup for failing code quality tests",
+    "sha": "4de1bdbf637fe6411c104c62ab385f660bfb1064",
+    "files": [
+        {
+            "sha": "5131676c953dc1d5edd8c2c44da7e93eb65a8d6d",
+            "filename": "src/transformers/trainer.py",
+            "status": "modified",
+            "additions": 37,
+            "deletions": 0,
+            "changes": 37,
+            "blob_url": "https://github.com/huggingface/transformers/blob/4de1bdbf637fe6411c104c62ab385f660bfb1064/src%2Ftransformers%2Ftrainer.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/4de1bdbf637fe6411c104c62ab385f660bfb1064/src%2Ftransformers%2Ftrainer.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Ftrainer.py?ref=4de1bdbf637fe6411c104c62ab385f660bfb1064",
+            "patch": "@@ -273,6 +273,39 @@ def _get_fsdp_ckpt_kwargs():\n         return {}\n \n \n+def _init_fsdp(model, accelerator, device):\n+    \"\"\"\n+    Initialize Fully Sharded Data Parallel (FSDP) for the model.\n+\n+    This function is needed to properly initialize FSDP when resuming from a checkpoint.\n+    It runs a forward pass with dummy inputs to ensure FSDP is fully initialized.\n+    See https://github.com/huggingface/transformers/issues/31892 for more details.\n+\n+    Args:\n+        model: The model to initialize with FSDP.\n+        accelerator: The Accelerator object.\n+        device: The device to run the model on.\n+\n+    Returns:\n+        The initialized FSDP model.\n+    \"\"\"\n+    model = accelerator.prepare(model)\n+    model.train()\n+    with torch.no_grad():\n+        # Run a forward pass with dummy inputs to initialize FSDP\n+        dummy_input = {\n+            name: torch.ones(\n+                (1, 512),\n+                dtype=torch.long,\n+                device=device,\n+            )\n+            for name in model.forward.__code__.co_varnames\n+            if name != \"self\"\n+        }\n+        _ = model(**dummy_input)\n+    return model\n+\n+\n if TYPE_CHECKING:\n     import optuna\n \n@@ -601,6 +634,10 @@ def __init__(\n                     \" `Trainer`. Make sure the lines `import torch_xla.core.xla_model as xm` and\"\n                     \" `model.to(xm.xla_device())` is performed before the optimizer creation in your script.\"\n                 )\n+\n+        if self.is_fsdp_enabled:\n+            self.model = _init_fsdp(self.model, self.accelerator, self.args.device)\n+\n         if (self.is_fsdp_xla_enabled or self.is_fsdp_enabled) and (\n             self.optimizer is not None or self.lr_scheduler is not None\n         ):"
+        },
+        {
+            "sha": "8feb5d92e89e43f142c1b32558496a08b4ef8892",
+            "filename": "tests/trainer/test_trainer.py",
+            "status": "modified",
+            "additions": 31,
+            "deletions": 0,
+            "changes": 31,
+            "blob_url": "https://github.com/huggingface/transformers/blob/4de1bdbf637fe6411c104c62ab385f660bfb1064/tests%2Ftrainer%2Ftest_trainer.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/4de1bdbf637fe6411c104c62ab385f660bfb1064/tests%2Ftrainer%2Ftest_trainer.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Ftrainer%2Ftest_trainer.py?ref=4de1bdbf637fe6411c104c62ab385f660bfb1064",
+            "patch": "@@ -4914,3 +4914,34 @@ def test_get_optimizer_group(self):\n             param = next(model.parameters())\n             group = trainer.get_optimizer_group(param)\n             self.assertIn(param, group[\"params\"])\n+\n+\n+@require_torch_gpu\n+@require_torch\n+@require_accelerate\n+class TestFSDPInitialization(unittest.TestCase):\n+    def test_fsdp_initialization(self):\n+        config = RegressionModelConfig(a=1, b=1, double_output=False)\n+        model = RegressionPreTrainedModel(config)\n+\n+        with tempfile.TemporaryDirectory() as tmp_dir:\n+            training_args = TrainingArguments(\n+                output_dir=tmp_dir,\n+                fsdp=True,\n+                fsdp_config={\"min_num_params\": 1},\n+                no_cuda=True,\n+            )\n+            trainer = Trainer(model=model, args=training_args)\n+\n+            # Check for FSDP enabled\n+            self.assertTrue(trainer.is_fsdp_enabled)\n+\n+            # Check if model is wrapped with FSDP\n+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP\n+\n+            self.assertTrue(trainer.model, FSDP)\n+\n+            # Running a forward pass to ensure FSDP is initialized\n+            dummy_input = torch.ones((1, 1), dtype=torch.float)\n+            output = trainer.model(dummy_input)\n+            self.assertTrue(output)"
+        }
+    ],
+    "stats": {
+        "total": 68,
+        "additions": 68,
+        "deletions": 0
+    }
+}

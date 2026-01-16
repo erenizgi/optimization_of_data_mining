@@ -1,0 +1,36 @@
+{
+    "author": "corentin-ryr",
+    "message": "Fix hyperparameter search when optuna+deepseed (#34642)\n\n* Fix hyperparameter search when optuna+deepseed\r\n\r\n* Adding free_memory to the search setup\r\n\r\n---------\r\n\r\nCo-authored-by: Corentin-Royer <corentin.royer@ibm.com>",
+    "sha": "bf42c3bd4b088fd9df1086e63d47a8e33048e5e1",
+    "files": [
+        {
+            "sha": "0cc2685a55206fa026b745ea259bf37969930ae3",
+            "filename": "src/transformers/integrations/integration_utils.py",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 13,
+            "changes": 23,
+            "blob_url": "https://github.com/huggingface/transformers/blob/bf42c3bd4b088fd9df1086e63d47a8e33048e5e1/src%2Ftransformers%2Fintegrations%2Fintegration_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/bf42c3bd4b088fd9df1086e63d47a8e33048e5e1/src%2Ftransformers%2Fintegrations%2Fintegration_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fintegrations%2Fintegration_utils.py?ref=bf42c3bd4b088fd9df1086e63d47a8e33048e5e1",
+            "patch": "@@ -208,7 +208,7 @@ def hp_params(trial):\n     if is_optuna_available():\n         import optuna\n \n-        if isinstance(trial, optuna.Trial):\n+        if isinstance(trial, optuna.trial.BaseTrial):\n             return trial.params\n     if is_ray_tune_available():\n         if isinstance(trial, dict):\n@@ -230,7 +230,7 @@ def run_hp_search_optuna(trainer, n_trials: int, direction: str, **kwargs) -> Be\n \n     if trainer.args.process_index == 0:\n \n-        def _objective(trial, checkpoint_dir=None):\n+        def _objective(trial: optuna.Trial, checkpoint_dir=None):\n             checkpoint = None\n             if checkpoint_dir:\n                 for subdir in os.listdir(checkpoint_dir):\n@@ -240,10 +240,11 @@ def _objective(trial, checkpoint_dir=None):\n             if trainer.args.world_size > 1:\n                 if trainer.args.parallel_mode != ParallelMode.DISTRIBUTED:\n                     raise RuntimeError(\"only support DDP optuna HPO for ParallelMode.DISTRIBUTED currently.\")\n-                trainer._hp_search_setup(trial)\n-                args_main_rank_list = [pickle.dumps(trainer.args)]\n-                torch.distributed.broadcast_object_list(args_main_rank_list, src=0)\n-                trainer.train(resume_from_checkpoint=checkpoint)\n+                trainer.hp_space(trial)\n+                fixed_trial = optuna.trial.FixedTrial(trial.params, trial.number)\n+                trial_main_rank_list = [fixed_trial]\n+                torch.distributed.broadcast_object_list(trial_main_rank_list, src=0)\n+                trainer.train(resume_from_checkpoint=checkpoint, trial=trial)\n             else:\n                 trainer.train(resume_from_checkpoint=checkpoint, trial=trial)\n             # If there hasn't been any evaluation during the training loop.\n@@ -268,15 +269,11 @@ def _objective(trial, checkpoint_dir=None):\n     else:\n         for i in range(n_trials):\n             trainer.objective = None\n-            args_main_rank_list = [None]\n+            trial_main_rank_list = [None]\n             if trainer.args.parallel_mode != ParallelMode.DISTRIBUTED:\n                 raise RuntimeError(\"only support DDP optuna HPO for ParallelMode.DISTRIBUTED currently.\")\n-            torch.distributed.broadcast_object_list(args_main_rank_list, src=0)\n-            args = pickle.loads(bytes(args_main_rank_list[0]))\n-            for key, value in asdict(args).items():\n-                if key != \"local_rank\":\n-                    setattr(trainer.args, key, value)\n-            trainer.train(resume_from_checkpoint=None)\n+            torch.distributed.broadcast_object_list(trial_main_rank_list, src=0)\n+            trainer.train(resume_from_checkpoint=None, trial=trial_main_rank_list[0])\n             # If there hasn't been any evaluation during the training loop.\n             if getattr(trainer, \"objective\", None) is None:\n                 metrics = trainer.evaluate()"
+        },
+        {
+            "sha": "f2e0a90acddd162eb05126c80c691a5252dda734",
+            "filename": "src/transformers/trainer.py",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 1,
+            "changes": 5,
+            "blob_url": "https://github.com/huggingface/transformers/blob/bf42c3bd4b088fd9df1086e63d47a8e33048e5e1/src%2Ftransformers%2Ftrainer.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/bf42c3bd4b088fd9df1086e63d47a8e33048e5e1/src%2Ftransformers%2Ftrainer.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Ftrainer.py?ref=bf42c3bd4b088fd9df1086e63d47a8e33048e5e1",
+            "patch": "@@ -1725,6 +1725,9 @@ def _hp_search_setup(self, trial: Union[\"optuna.Trial\", Dict[str, Any]]):\n         if self.is_deepspeed_enabled:\n             if self.args.deepspeed is None:\n                 raise ValueError(\"For sweeps with deepspeed, `args.deepspeed` must be set\")\n+\n+            self.accelerator.free_memory()\n+\n             # Rebuild the deepspeed config to reflect the updated training parameters\n             from accelerate.utils import DeepSpeedPlugin\n \n@@ -1748,7 +1751,7 @@ def _report_to_hp_search(self, trial: Union[\"optuna.Trial\", Dict[str, Any]], ste\n         if self.hp_search_backend == HPSearchBackend.OPTUNA:\n             import optuna\n \n-            if not trial.study._is_multi_objective():\n+            if hasattr(trial, \"study\") and not trial.study._is_multi_objective():\n                 trial.report(self.objective, step)\n                 if trial.should_prune():\n                     self.callback_handler.on_train_end(self.args, self.state, self.control)"
+        }
+    ],
+    "stats": {
+        "total": 28,
+        "additions": 14,
+        "deletions": 14
+    }
+}

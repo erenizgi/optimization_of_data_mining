@@ -1,0 +1,36 @@
+{
+    "author": "vasqu",
+    "message": "[`Attn Masks`] Add skip option for non-packed sequences (#42367)\n\nskip option",
+    "sha": "672dc07527e10ce8197b0756527d99ee622ff24d",
+    "files": [
+        {
+            "sha": "6ae8eab541449d0d460a07e577f068ffeb7b985e",
+            "filename": "src/transformers/masking_utils.py",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 3,
+            "changes": 11,
+            "blob_url": "https://github.com/huggingface/transformers/blob/672dc07527e10ce8197b0756527d99ee622ff24d/src%2Ftransformers%2Fmasking_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/672dc07527e10ce8197b0756527d99ee622ff24d/src%2Ftransformers%2Fmasking_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmasking_utils.py?ref=672dc07527e10ce8197b0756527d99ee622ff24d",
+            "patch": "@@ -644,7 +644,7 @@ class AttentionMaskInterface(GeneralInterface):\n ALL_MASK_ATTENTION_FUNCTIONS: AttentionMaskInterface = AttentionMaskInterface()\n \n \n-def find_packed_sequence_indices(position_ids: torch.Tensor) -> torch.Tensor:\n+def find_packed_sequence_indices(position_ids: torch.Tensor) -> Optional[torch.Tensor]:\n     \"\"\"\n     Find the indices of the sequence to which each new query token in the sequence belongs when using packed\n     tensor format (i.e. several sequences packed in the same batch dimension).\n@@ -656,6 +656,9 @@ def find_packed_sequence_indices(position_ids: torch.Tensor) -> torch.Tensor:\n     Returns:\n         A 2D tensor where each similar integer indicates that the tokens belong to the same sequence. For example, if we\n         pack 3 sequences of 2, 3 and 1 tokens respectively along a single batch dim, this will return [[0, 0, 1, 1, 1, 2]].\n+\n+        If the there is only one sequence in each batch item (and we don't compile), then we return `None` indicating\n+        no packed sequences. This is the same as [[0, 0, 0, 0, 0, 0]] for the example above.\n     \"\"\"\n     # What separate different sequences is when 2 consecutive positions_ids are separated by more than 1. So\n     # taking the diff (by prepending the first value - 1 to keep correct indexing) and applying cumsum to the result\n@@ -666,8 +669,10 @@ def find_packed_sequence_indices(position_ids: torch.Tensor) -> torch.Tensor:\n     position_diff = torch.diff(position_ids, prepend=first_dummy_value, dim=-1)\n     packed_sequence_mask = (position_diff != 1).cumsum(-1)\n \n-    # Here it would be nice to return None if we did not detect packed sequence format, i.e. if `packed_sequence_mask[:, -1] == 0`\n-    # but it causes issues with export\n+    # Sadly this is a dynamic control flow, so we cannot enable this check on anything compile related\n+    if not is_tracing(packed_sequence_mask) and (packed_sequence_mask[:, -1] == 0).all():\n+        return None\n+\n     return packed_sequence_mask\n \n "
+        },
+        {
+            "sha": "bd9d4429303f924ef33ef43765f26ed52ec44dc7",
+            "filename": "tests/utils/test_masking_utils.py",
+            "status": "modified",
+            "additions": 36,
+            "deletions": 0,
+            "changes": 36,
+            "blob_url": "https://github.com/huggingface/transformers/blob/672dc07527e10ce8197b0756527d99ee622ff24d/tests%2Futils%2Ftest_masking_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/672dc07527e10ce8197b0756527d99ee622ff24d/tests%2Futils%2Ftest_masking_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Futils%2Ftest_masking_utils.py?ref=672dc07527e10ce8197b0756527d99ee622ff24d",
+            "patch": "@@ -153,6 +153,42 @@ def test_find_packed_sequence_indices(self):\n         EXPECTED_SEQUENCE_INDICES = torch.tensor([[0, 0, 0, 0, 1, 1, 2, 2, 2, 2], [0, 0, 0, 0, 0, 0, 1, 1, 1, 1]])\n         self.assertTrue((find_packed_sequence_indices(position_ids) == EXPECTED_SEQUENCE_INDICES).all())\n \n+    def test_nonpacked_sequence_mask_skip(self):\n+        config = LlamaConfig()\n+        config._attn_implementation = \"sdpa\"\n+\n+        batch_size = 2\n+        sequence_length = 10\n+        cache_position = torch.arange(sequence_length)\n+\n+        # Non-packed sequences\n+        position_ids = torch.arange(sequence_length)[None, :]\n+\n+        causal_mask = create_causal_mask(\n+            config=config,\n+            # we only need batch size, seq_length and dtype here - we don't care about the values of the embeddings\n+            input_embeds=torch.empty((batch_size, sequence_length), dtype=torch.float16),\n+            attention_mask=None,\n+            cache_position=cache_position,\n+            past_key_values=None,\n+            position_ids=position_ids,\n+        )\n+        # packed sequence should be skipped\n+        self.assertTrue(causal_mask is None)\n+\n+        create_causal_mask_compiled = torch.compile(create_causal_mask, mode=\"reduce-overhead\")\n+        causal_mask = create_causal_mask_compiled(\n+            config=config,\n+            # we only need batch size, seq_length and dtype here - we don't care about the values of the embeddings\n+            input_embeds=torch.empty((batch_size, sequence_length), dtype=torch.float16),\n+            attention_mask=None,\n+            cache_position=cache_position,\n+            past_key_values=None,\n+            position_ids=position_ids,\n+        )\n+        # cannot be skipped under compile, should result into a triu mask\n+        self.assertTrue(torch.equal(~torch.ones(*causal_mask.shape).triu(diagonal=1).bool(), causal_mask))\n+\n     def test_chunked_mask_with_left_padding_and_large_prefill(self):\n         # Make sure we have an attention_chunk_size in the config\n         config = LlamaConfig(attention_chunk_size=3, attn_implementation=\"sdpa\")"
+        }
+    ],
+    "stats": {
+        "total": 47,
+        "additions": 44,
+        "deletions": 3
+    }
+}

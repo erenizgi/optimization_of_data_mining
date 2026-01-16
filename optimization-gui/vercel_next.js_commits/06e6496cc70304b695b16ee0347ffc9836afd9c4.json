@@ -1,0 +1,60 @@
+{
+    "author": "mischnic",
+    "message": "Turbopack: don't revisit nodes (#80455)\n\nDon't revisit the nodes repeatedly because of differing `ExportUsage`.",
+    "sha": "06e6496cc70304b695b16ee0347ffc9836afd9c4",
+    "files": [
+        {
+            "sha": "cf1385b2e04b2e8f40cea68149677f402e2d9d2e",
+            "filename": "turbopack/crates/turbo-tasks/src/graph/graph_store.rs",
+            "status": "modified",
+            "additions": 80,
+            "deletions": 0,
+            "changes": 80,
+            "blob_url": "https://github.com/vercel/next.js/blob/06e6496cc70304b695b16ee0347ffc9836afd9c4/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fgraph%2Fgraph_store.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/06e6496cc70304b695b16ee0347ffc9836afd9c4/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fgraph%2Fgraph_store.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fgraph%2Fgraph_store.rs?ref=06e6496cc70304b695b16ee0347ffc9836afd9c4",
+            "patch": "@@ -114,3 +114,83 @@ where\n         (self.store, VisitedNodes(self.visited))\n     }\n }\n+\n+/// A [`GraphStore`] wrapper that skips nodes that have already been\n+/// visited, based on a key extracted from the node.\n+///\n+/// This is necessary to avoid repeated work when traversing non-tree\n+/// graphs (i.e. where a node can have more than one incoming edge).\n+#[derive(Debug)]\n+pub struct SkipDuplicatesWithKey<StoreImpl, Key, KeyExtractor>\n+where\n+    StoreImpl: GraphStore,\n+    Key: Send + Eq + Hash,\n+    KeyExtractor: Send + Fn(&StoreImpl::Node) -> &Key,\n+{\n+    store: StoreImpl,\n+    visited: FxHashSet<Key>,\n+    key_extractor: KeyExtractor,\n+}\n+\n+impl<StoreImpl, Key, KeyExtractor> SkipDuplicatesWithKey<StoreImpl, Key, KeyExtractor>\n+where\n+    StoreImpl: GraphStore,\n+    Key: Send + Eq + std::hash::Hash + Clone,\n+    KeyExtractor: Send + Fn(&StoreImpl::Node) -> &Key,\n+{\n+    pub fn new(store: StoreImpl, key_extractor: KeyExtractor) -> Self {\n+        Self {\n+            store,\n+            visited: FxHashSet::default(),\n+            key_extractor,\n+        }\n+    }\n+}\n+\n+impl<StoreImpl, Key, KeyExtractor> GraphStore\n+    for SkipDuplicatesWithKey<StoreImpl, Key, KeyExtractor>\n+where\n+    StoreImpl: GraphStore,\n+    StoreImpl::Node: Eq + std::hash::Hash + Clone,\n+    Key: Send + Eq + std::hash::Hash + Clone,\n+    KeyExtractor: Send + Fn(&StoreImpl::Node) -> &Key,\n+{\n+    type Node = StoreImpl::Node;\n+    type Handle = StoreImpl::Handle;\n+\n+    fn insert(\n+        &mut self,\n+        from_handle: Option<Self::Handle>,\n+        node: GraphNode<StoreImpl::Node>,\n+    ) -> Option<(Self::Handle, &StoreImpl::Node)> {\n+        let key = (self.key_extractor)(node.node());\n+\n+        if !self.visited.contains(key) {\n+            self.visited.insert(key.clone());\n+            self.store.insert(from_handle, node)\n+        } else {\n+            // Always insert the node into the store, even if we've already\n+            // visited it. This is necessary to ensure that the store sees all\n+            // edges.\n+            self.store.insert(from_handle, node);\n+            None\n+        }\n+    }\n+}\n+\n+impl<StoreImpl, Key, KeyExtractor> SkipDuplicatesWithKey<StoreImpl, Key, KeyExtractor>\n+where\n+    StoreImpl: GraphStore,\n+    Key: Send + Eq + std::hash::Hash + Clone,\n+    KeyExtractor: Send + Fn(&StoreImpl::Node) -> &Key,\n+{\n+    /// Consumes the wrapper and returns the underlying store.\n+    pub fn into_inner(self) -> StoreImpl {\n+        self.store\n+    }\n+\n+    /// Consumes the wrapper and returns the underlying store along with the visited nodes.\n+    pub fn into_inner_with_visited(self) -> (StoreImpl, VisitedNodes<Key>) {\n+        (self.store, VisitedNodes(self.visited))\n+    }\n+}"
+        },
+        {
+            "sha": "0afad0eb2c687ee653f72ba50a5e9a43dedf6709",
+            "filename": "turbopack/crates/turbo-tasks/src/graph/graph_traversal.rs",
+            "status": "modified",
+            "additions": 19,
+            "deletions": 1,
+            "changes": 20,
+            "blob_url": "https://github.com/vercel/next.js/blob/06e6496cc70304b695b16ee0347ffc9836afd9c4/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fgraph%2Fgraph_traversal.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/06e6496cc70304b695b16ee0347ffc9836afd9c4/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fgraph%2Fgraph_traversal.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fgraph%2Fgraph_traversal.rs?ref=06e6496cc70304b695b16ee0347ffc9836afd9c4",
+            "patch": "@@ -6,7 +6,7 @@ use rustc_hash::FxHashSet;\n \n use super::{\n     SkipDuplicates, Visit, VisitControlFlow,\n-    graph_store::{GraphNode, GraphStore},\n+    graph_store::{GraphNode, GraphStore, SkipDuplicatesWithKey},\n     with_future::With,\n };\n \n@@ -35,6 +35,14 @@ pub trait GraphTraversal: GraphStore + Sized {\n         self,\n         visited: VisitedNodes<Self::Node>,\n     ) -> SkipDuplicates<Self>;\n+\n+    fn skip_duplicates_with_key<\n+        Key: Send + Eq + std::hash::Hash + Clone,\n+        KeyExtractor: Send + Fn(&Self::Node) -> &Key,\n+    >(\n+        self,\n+        key_extractor: KeyExtractor,\n+    ) -> SkipDuplicatesWithKey<Self, Key, KeyExtractor>;\n }\n \n impl<Store> GraphTraversal for Store\n@@ -130,6 +138,16 @@ where\n     ) -> SkipDuplicates<Self> {\n         SkipDuplicates::new_with_visited_nodes(self, visited.0)\n     }\n+\n+    fn skip_duplicates_with_key<\n+        Key: Send + Eq + std::hash::Hash + Clone,\n+        KeyExtractor: Send + Fn(&Self::Node) -> &Key,\n+    >(\n+        self,\n+        key_extractor: KeyExtractor,\n+    ) -> SkipDuplicatesWithKey<Self, Key, KeyExtractor> {\n+        SkipDuplicatesWithKey::new(self, key_extractor)\n+    }\n }\n \n pub enum GraphTraversalResult<Completed, Aborted> {"
+        },
+        {
+            "sha": "c6392e541d6e159f4197d4dacc8f3a7151e95ac0",
+            "filename": "turbopack/crates/turbopack-core/src/module_graph/mod.rs",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 1,
+            "changes": 4,
+            "blob_url": "https://github.com/vercel/next.js/blob/06e6496cc70304b695b16ee0347ffc9836afd9c4/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fmodule_graph%2Fmod.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/06e6496cc70304b695b16ee0347ffc9836afd9c4/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fmodule_graph%2Fmod.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fmodule_graph%2Fmod.rs?ref=06e6496cc70304b695b16ee0347ffc9836afd9c4",
+            "patch": "@@ -233,7 +233,7 @@ impl SingleModuleGraph {\n             .await?;\n \n         let (children_nodes_iter, visited_nodes) = AdjacencyMap::new()\n-            .skip_duplicates()\n+            .skip_duplicates_with_key(|node: &(SingleModuleGraphBuilderNode, ExportUsage)| &node.0)\n             .visit(\n                 root_edges,\n                 SingleModuleGraphBuilder {\n@@ -1669,6 +1669,8 @@ impl Visit<(SingleModuleGraphBuilderNode, ExportUsage)> for SingleModuleGraphBui\n \n     fn edges(\n         &mut self,\n+        // The `skip_duplicates_with_key()` above ensures only a single `edges()` call per module\n+        // (and not per `(module, export)` pair), so the export must not be read here!\n         (node, _): &(SingleModuleGraphBuilderNode, ExportUsage),\n     ) -> Self::EdgesFuture {\n         // Destructure beforehand to not have to clone the whole node when entering the async block"
+        },
+        {
+            "sha": "b0f0df2deafaa8cdc3670ed27f1a551b6a601603",
+            "filename": "turbopack/crates/turbopack-core/src/reference/mod.rs",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/06e6496cc70304b695b16ee0347ffc9836afd9c4/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Freference%2Fmod.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/06e6496cc70304b695b16ee0347ffc9836afd9c4/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Freference%2Fmod.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Freference%2Fmod.rs?ref=06e6496cc70304b695b16ee0347ffc9836afd9c4",
+            "patch": "@@ -290,7 +290,7 @@ type ModulesVec = Vec<ResolvedVc<Box<dyn Module>>>;\n pub struct ModulesWithRefData(Vec<(ChunkingType, ExportUsage, ModulesVec)>);\n \n /// Aggregates all primary [Module]s referenced by an [Module] via [ChunkableModuleReference]s.\n-/// This does not include transitively references [Module]s, only includes\n+/// This does not include transitively referenced [Module]s, only includes\n /// primary [Module]s referenced.\n ///\n /// [Module]: crate::module::Module"
+        }
+    ],
+    "stats": {
+        "total": 106,
+        "additions": 103,
+        "deletions": 3
+    }
+}

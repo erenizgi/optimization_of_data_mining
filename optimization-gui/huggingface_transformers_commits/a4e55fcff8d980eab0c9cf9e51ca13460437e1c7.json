@@ -1,0 +1,36 @@
+{
+    "author": "byi8220",
+    "message": "Disable delay_optimizer_creation in `Trainer` to support fsdp2 (#37147)\n\n* github why you do this\n\n* fix\n\n* make fixup\n\n* disable cpu offload test\n\n* fixup\n\n* tmp reworks\n\n* git branch movement\n\n* make fixup\n\n* add require_fsdp_v2_version\n\n* dep issues\n\n* update ruff and fixup",
+    "sha": "a4e55fcff8d980eab0c9cf9e51ca13460437e1c7",
+    "files": [
+        {
+            "sha": "727c2ca7fefffa8c5255bc3999bf145e02a557d3",
+            "filename": "src/transformers/trainer.py",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/huggingface/transformers/blob/a4e55fcff8d980eab0c9cf9e51ca13460437e1c7/src%2Ftransformers%2Ftrainer.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/a4e55fcff8d980eab0c9cf9e51ca13460437e1c7/src%2Ftransformers%2Ftrainer.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Ftrainer.py?ref=a4e55fcff8d980eab0c9cf9e51ca13460437e1c7",
+            "patch": "@@ -2313,6 +2313,11 @@ def _inner_training_loop(\n \n         delay_optimizer_creation = is_sagemaker_mp_enabled() or self.is_fsdp_xla_enabled or self.is_fsdp_enabled\n \n+        # Can't delay optimizer creation when using FSDP2: https://github.com/huggingface/accelerate/blob/3f636d626063ffcf9a337c7d3624d61b7d187d59/src/accelerate/accelerator.py#L1404\n+        is_fsdp2 = self.is_fsdp_enabled and (getattr(self.accelerator.state.fsdp_plugin, \"fsdp_version\", 1) == 2)\n+        if is_fsdp2:\n+            delay_optimizer_creation = False\n+\n         # We need to reset the scheduler, as its parameters may be different on subsequent calls\n         if self._created_lr_scheduler:\n             self.lr_scheduler = None"
+        },
+        {
+            "sha": "48024298ed48a4cab8ab8edb5545e0ca91eee1ee",
+            "filename": "tests/fsdp/test_fsdp.py",
+            "status": "modified",
+            "additions": 76,
+            "deletions": 0,
+            "changes": 76,
+            "blob_url": "https://github.com/huggingface/transformers/blob/a4e55fcff8d980eab0c9cf9e51ca13460437e1c7/tests%2Ffsdp%2Ftest_fsdp.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/a4e55fcff8d980eab0c9cf9e51ca13460437e1c7/tests%2Ffsdp%2Ftest_fsdp.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Ffsdp%2Ftest_fsdp.py?ref=a4e55fcff8d980eab0c9cf9e51ca13460437e1c7",
+            "patch": "@@ -109,6 +109,15 @@ def get_master_port(real_launcher=False):\n     require_fsdp_version = partial(require_fsdp, min_version=FSDP_PYTORCH_VERSION)\n \n \n+FSDP2_ACCELERATE_VERSION = \"1.6.0\"\n+require_accelerate_fsdp2 = partial(require_accelerate, min_version=FSDP2_ACCELERATE_VERSION)\n+require_fsdp_v2_version = require_fsdp\n+if is_accelerate_available(min_version=FSDP2_ACCELERATE_VERSION):\n+    from accelerate.utils.constants import FSDP2_PYTORCH_VERSION\n+\n+    require_fsdp_v2_version = partial(require_fsdp, min_version=FSDP2_PYTORCH_VERSION)\n+\n+\n def get_launcher(distributed=False, use_accelerate=False):\n     # 1. explicitly set --num_nodes=1 just in case these tests end up run on a multi-node setup\n     # - it won't be able to handle that\n@@ -316,6 +325,73 @@ def test_fsdp_cpu_offloading(self):\n         except:  # noqa\n             raise AssertionError(\"CPU offloading failed with FSDP!\")\n \n+    @require_torch_multi_accelerator\n+    @slow\n+    @require_fsdp\n+    @require_fsdp_v2_version\n+    @require_accelerate_fsdp2\n+    def test_accelerate_fsdp2_integration(self):\n+        output_dir = self.get_auto_remove_tmp_dir(\"./xxx\", after=False)\n+        sharding_strategy = \"full_shard\"\n+        use_accelerate = True\n+\n+        num_gpus = min(2, backend_device_count(torch_device))\n+        master_port = get_master_port(real_launcher=True)\n+        launcher = f\"\"\"accelerate launch\n+            --num_processes {num_gpus}\n+            --main_process_port {master_port}\n+            --use_fsdp\n+            --fsdp_version 2\n+            --fsdp_auto_wrap_policy TRANSFORMER_BASED_WRAP\n+            --fsdp_state_dict_type SHARDED_STATE_DICT\n+            --fsdp_transformer_layer_cls_to_wrap BertLayer\"\"\".split()\n+        args = self.get_base_args(output_dir, 2, 25).split()\n+        script = [f\"{self.examples_dir_str}/pytorch/text-classification/run_glue.py\"]\n+        logs = self.run_cmd_and_get_logs(use_accelerate, sharding_strategy, launcher, script, args, output_dir)\n+\n+        # resume from ckpt\n+        checkpoint = os.path.join(output_dir, \"checkpoint-115\")\n+        resume_args = args + f\"--resume_from_checkpoint {checkpoint}\".split()\n+\n+        is_fsdp_ckpt = os.path.isdir(checkpoint) and (\n+            # this checks the FSDP state dict when `SHARDED_STATE_DICT` is used\n+            any(\n+                FSDP_MODEL_NAME in folder_name\n+                for folder_name in os.listdir(checkpoint)\n+                if os.path.isdir(os.path.join(checkpoint, folder_name))\n+            )\n+            # this checks the FSDP state dict when `FULL_STATE_DICT` is used\n+            or os.path.isfile(os.path.join(checkpoint, f\"{FSDP_MODEL_NAME}.bin\"))\n+        )\n+        self.assertTrue(is_fsdp_ckpt)\n+\n+        logs_resume = self.run_cmd_and_get_logs(\n+            use_accelerate, sharding_strategy, launcher, script, resume_args, output_dir\n+        )\n+\n+        for log, log1 in zip(logs, logs_resume):\n+            if \"learning_rate\" in log:\n+                self.assertAlmostEqual(log[\"learning_rate\"], log1[\"learning_rate\"], delta=1e-5)\n+\n+    @require_torch_multi_accelerator\n+    @slow\n+    @require_fsdp\n+    @require_fsdp_v2_version\n+    @require_accelerate_fsdp2\n+    def test_fsdp2_cpu_offloading(self):\n+        # TODO: This file is missing and should be added or the test should be removed\n+        if not os.path.exists(\"utils/testing_scripts/fsdp_cpu_offloading.py\"):\n+            raise unittest.SkipTest(\"FSDP 2 CPU offloading script not found!\")\n+\n+        try:\n+            subprocess.run(\n+                \"accelerate launch --fsdp_version 2 utils/testing_scripts/fsdp_cpu_offloading.py --config utils/testing_scripts/dummy_fsdp_config.yml\",\n+                shell=True,\n+                check=True,\n+            )\n+        except:  # noqa\n+            raise AssertionError(\"CPU offloading failed with FSDP!\")\n+\n     def run_cmd_and_get_logs(self, use_accelerate, sharding_strategy, launcher, script, args, output_dir):\n         if not use_accelerate:\n             fsdp_args = ["
+        }
+    ],
+    "stats": {
+        "total": 81,
+        "additions": 81,
+        "deletions": 0
+    }
+}

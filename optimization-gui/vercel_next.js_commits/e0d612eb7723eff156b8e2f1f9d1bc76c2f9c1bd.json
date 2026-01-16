@@ -1,0 +1,96 @@
+{
+    "author": "wyattjoh",
+    "message": "Fix build crash with parallel routes and root-level dynamic parameters (#85074)\n\n### What?\n\nFixes a build-time crash that occurs when using parallel routes (`@slot`\nsyntax) combined with root-level dynamic parameters (e.g., `[locale]`)\nin the App Router.\n\n### Why?\n\nWhen building static paths for routes with both parallel routes and\nroot-level dynamic parameters, the build would crash during pathname\ngeneration. This happened because the code was using `RouteRegex.groups`\nto determine parameter properties (`repeat`/`optional`), but the regex\ngroups didn't properly handle segment names for nested parallel route\nstructures. The pathname replacement logic would fail when trying to\nmatch segment patterns, causing the build to abort.\n\nThis is a critical issue because it blocks developers from using a\ncommon pattern: internationalization with parallel routes (e.g.,\n`/[locale]/@modal/...`).\n\n### How?\n\nThe fix refactors the parameter validation logic to use\n`DynamicParamTypes` directly instead of relying on `RouteRegex`:\n\n1. Created a new `getParamProperties()` utility in\n`get-segment-param.tsx` that determines `repeat` and `optional`\nproperties based on the parameter type (catchall, optional-catchall,\ndynamic, etc.)\n2. Updated `buildAppStaticPaths()` to use this utility instead of\n`RouteRegex.groups`\n3. Changed pathname replacement to use the segment name from\n`childrenRouteParamSegments` rather than reconstructing it from the\nregex pattern\n\nThis approach:\n- Eliminates the mismatch between regex-based pattern matching and\nactual segment structure\n- Properly handles parallel route segment names\n- Makes the code more maintainable by using the type system instead of\nregex internals\n\nFixes #84509",
+    "sha": "e0d612eb7723eff156b8e2f1f9d1bc76c2f9c1bd",
+    "files": [
+        {
+            "sha": "16b7d2a9916049a99ad102dda5a54e8832c5b8d6",
+            "filename": "packages/next/errors.json",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/e0d612eb7723eff156b8e2f1f9d1bc76c2f9c1bd/packages%2Fnext%2Ferrors.json",
+            "raw_url": "https://github.com/vercel/next.js/raw/e0d612eb7723eff156b8e2f1f9d1bc76c2f9c1bd/packages%2Fnext%2Ferrors.json",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Ferrors.json?ref=e0d612eb7723eff156b8e2f1f9d1bc76c2f9c1bd",
+            "patch": "@@ -891,5 +891,6 @@\n   \"890\": \"Received an underlying cookies object that does not match either `cookies` or `mutableCookies`\",\n   \"891\": \"Failed to read build paths file \\\"%s\\\": %s\",\n   \"892\": \"Failed to resolve glob pattern \\\"%s\\\": %s\",\n-  \"893\": \"The \\\"sassOptions.functions\\\" option is not supported when using Turbopack. Custom Sass functions are only available with webpack. Please remove the \\\"functions\\\" property from your sassOptions in %s.\"\n+  \"893\": \"The \\\"sassOptions.functions\\\" option is not supported when using Turbopack. Custom Sass functions are only available with webpack. Please remove the \\\"functions\\\" property from your sassOptions in %s.\",\n+  \"894\": \"Param %s not found in childrenRouteParamSegments %s\"\n }"
+        },
+        {
+            "sha": "3dac9c0f65d81e402dd90e62a2e09f862d912960",
+            "filename": "packages/next/src/build/static-paths/app.ts",
+            "status": "modified",
+            "additions": 17,
+            "deletions": 27,
+            "changes": 44,
+            "blob_url": "https://github.com/vercel/next.js/blob/e0d612eb7723eff156b8e2f1f9d1bc76c2f9c1bd/packages%2Fnext%2Fsrc%2Fbuild%2Fstatic-paths%2Fapp.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/e0d612eb7723eff156b8e2f1f9d1bc76c2f9c1bd/packages%2Fnext%2Fsrc%2Fbuild%2Fstatic-paths%2Fapp.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Fstatic-paths%2Fapp.ts?ref=e0d612eb7723eff156b8e2f1f9d1bc76c2f9c1bd",
+            "patch": "@@ -11,10 +11,6 @@ import path from 'node:path'\n import { AfterRunner } from '../../server/after/run-with-after'\n import { createWorkStore } from '../../server/async-storage/work-store'\n import { FallbackMode } from '../../lib/fallback'\n-import {\n-  getRouteRegex,\n-  type RouteRegex,\n-} from '../../shared/lib/router/utils/route-regex'\n import type { IncrementalCache } from '../../server/lib/incremental-cache'\n import {\n   normalizePathname,\n@@ -27,6 +23,7 @@ import type { NextConfigComplete } from '../../server/config-shared'\n import type { WorkStore } from '../../server/app-render/work-async-storage.external'\n import type { DynamicParamTypes } from '../../shared/lib/app-router-types'\n import { InvariantError } from '../../shared/lib/invariant-error'\n+import { getParamProperties } from '../../shared/lib/router/utils/get-segment-param'\n \n /**\n  * Filters out duplicate parameters from a list of parameters.\n@@ -301,17 +298,17 @@ export function calculateFallbackMode(\n  * @param page - The page to validate.\n  * @param regex - The route regex.\n  * @param isRoutePPREnabled - Whether the route has partial prerendering enabled.\n- * @param childrenRouteParams - The keys of the parameters.\n+ * @param childrenRouteParamSegments - The keys of the parameters.\n  * @param rootParamKeys - The keys of the root params.\n  * @param routeParams - The list of parameters to validate.\n  * @returns The list of validated parameters.\n  */\n function validateParams(\n   page: string,\n-  regex: RouteRegex,\n   isRoutePPREnabled: boolean,\n-  childrenRouteParams: ReadonlyArray<{\n+  childrenRouteParamSegments: ReadonlyArray<{\n     readonly paramName: string\n+    readonly paramType: DynamicParamTypes\n   }>,\n   rootParamKeys: readonly string[],\n   routeParams: readonly Params[]\n@@ -342,8 +339,8 @@ function validateParams(\n   for (const params of routeParams) {\n     const item: Params = {}\n \n-    for (const { paramName: key } of childrenRouteParams) {\n-      const { repeat, optional } = regex.groups[key]\n+    for (const { paramName: key, paramType } of childrenRouteParamSegments) {\n+      const { repeat, optional } = getParamProperties(paramType)\n \n       let paramValue = params[key]\n \n@@ -776,8 +773,6 @@ export async function buildAppStaticPaths({\n     cacheMaxMemorySize: maxMemoryCacheSize,\n   })\n \n-  const regex = getRouteRegex(page)\n-\n   const childrenRouteParamSegments: Array<{\n     readonly name: string\n     readonly paramName: string\n@@ -927,17 +922,6 @@ export async function buildAppStaticPaths({\n \n   const prerenderedRoutesByPathname = new Map<string, PrerenderedRoute>()\n \n-  // Precompile the regex patterns for the route params.\n-  const paramPatterns = new Map<string, string>()\n-  for (const { paramName } of childrenRouteParamSegments) {\n-    const { repeat, optional } = regex.groups[paramName]\n-    let pattern = `[${repeat ? '...' : ''}${paramName}]`\n-    if (optional) {\n-      pattern = `[${pattern}]`\n-    }\n-    paramPatterns.set(paramName, pattern)\n-  }\n-\n   // Convert rootParamKeys to Set for O(1) lookup.\n   const rootParamSet = new Set(rootParamKeys)\n \n@@ -984,7 +968,6 @@ export async function buildAppStaticPaths({\n       childrenRouteParamSegments,\n       validateParams(\n         page,\n-        regex,\n         isRoutePPREnabled,\n         childrenRouteParamSegments,\n         rootParamKeys,\n@@ -1030,14 +1013,21 @@ export async function buildAppStaticPaths({\n           }\n         }\n \n-        // Use pre-compiled pattern for replacement\n-        const pattern = paramPatterns.get(key)!\n+        const segment = childrenRouteParamSegments.find(\n+          ({ paramName }) => paramName === key\n+        )\n+        if (!segment) {\n+          throw new InvariantError(\n+            `Param ${key} not found in childrenRouteParamSegments ${childrenRouteParamSegments.map(({ paramName }) => paramName).join(', ')}`\n+          )\n+        }\n+\n         pathname = pathname.replace(\n-          pattern,\n+          segment.name,\n           encodeParam(paramValue, (value) => escapePathDelimiters(value, true))\n         )\n         encodedPathname = encodedPathname.replace(\n-          pattern,\n+          segment.name,\n           encodeParam(paramValue, encodeURIComponent)\n         )\n       }"
+        },
+        {
+            "sha": "af7ce9d19aaf858263d88276062260f607df4923",
+            "filename": "packages/next/src/shared/lib/router/utils/get-segment-param.tsx",
+            "status": "modified",
+            "additions": 26,
+            "deletions": 0,
+            "changes": 26,
+            "blob_url": "https://github.com/vercel/next.js/blob/e0d612eb7723eff156b8e2f1f9d1bc76c2f9c1bd/packages%2Fnext%2Fsrc%2Fshared%2Flib%2Frouter%2Futils%2Fget-segment-param.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/e0d612eb7723eff156b8e2f1f9d1bc76c2f9c1bd/packages%2Fnext%2Fsrc%2Fshared%2Flib%2Frouter%2Futils%2Fget-segment-param.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fshared%2Flib%2Frouter%2Futils%2Fget-segment-param.tsx?ref=e0d612eb7723eff156b8e2f1f9d1bc76c2f9c1bd",
+            "patch": "@@ -53,3 +53,29 @@ export function isCatchAll(\n     type === 'optional-catchall'\n   )\n }\n+\n+export function getParamProperties(paramType: DynamicParamTypes): {\n+  repeat: boolean\n+  optional: boolean\n+} {\n+  let repeat = false\n+  let optional = false\n+\n+  switch (paramType) {\n+    case 'catchall':\n+    case 'catchall-intercepted':\n+      repeat = true\n+      break\n+    case 'optional-catchall':\n+      repeat = true\n+      optional = true\n+      break\n+    case 'dynamic':\n+    case 'dynamic-intercepted':\n+      break\n+    default:\n+      paramType satisfies never\n+  }\n+\n+  return { repeat, optional }\n+}"
+        },
+        {
+            "sha": "c2e345e6f7ffe3fd2239f813ac3d6353fde988c1",
+            "filename": "test/e2e/app-dir/parallel-routes-catchall-slotted-non-catchalls/app/[locale]/@slot/default.tsx",
+            "status": "added",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/e0d612eb7723eff156b8e2f1f9d1bc76c2f9c1bd/test%2Fe2e%2Fapp-dir%2Fparallel-routes-catchall-slotted-non-catchalls%2Fapp%2F%5Blocale%5D%2F%40slot%2Fdefault.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/e0d612eb7723eff156b8e2f1f9d1bc76c2f9c1bd/test%2Fe2e%2Fapp-dir%2Fparallel-routes-catchall-slotted-non-catchalls%2Fapp%2F%5Blocale%5D%2F%40slot%2Fdefault.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fparallel-routes-catchall-slotted-non-catchalls%2Fapp%2F%5Blocale%5D%2F%40slot%2Fdefault.tsx?ref=e0d612eb7723eff156b8e2f1f9d1bc76c2f9c1bd",
+            "patch": "@@ -0,0 +1,3 @@\n+export default function Default() {\n+  return <div>/[locale]/@slot/default.tsx</div>\n+}"
+        },
+        {
+            "sha": "6713b7c797a7b6aaf71c4c549f8d879e41ec7516",
+            "filename": "test/e2e/app-dir/parallel-routes-catchall-slotted-non-catchalls/app/[locale]/@slot/other/page.tsx",
+            "status": "added",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/e0d612eb7723eff156b8e2f1f9d1bc76c2f9c1bd/test%2Fe2e%2Fapp-dir%2Fparallel-routes-catchall-slotted-non-catchalls%2Fapp%2F%5Blocale%5D%2F%40slot%2Fother%2Fpage.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/e0d612eb7723eff156b8e2f1f9d1bc76c2f9c1bd/test%2Fe2e%2Fapp-dir%2Fparallel-routes-catchall-slotted-non-catchalls%2Fapp%2F%5Blocale%5D%2F%40slot%2Fother%2Fpage.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fparallel-routes-catchall-slotted-non-catchalls%2Fapp%2F%5Blocale%5D%2F%40slot%2Fother%2Fpage.tsx?ref=e0d612eb7723eff156b8e2f1f9d1bc76c2f9c1bd",
+            "patch": "@@ -0,0 +1,3 @@\n+export default function Page() {\n+  return <div>/[locale]/@slot/other/page.tsx</div>\n+}"
+        },
+        {
+            "sha": "c9ac7fb34198c31ccf78ee7ded12dc516aee0f7f",
+            "filename": "test/e2e/app-dir/parallel-routes-catchall-slotted-non-catchalls/app/[locale]/layout.tsx",
+            "status": "added",
+            "additions": 14,
+            "deletions": 0,
+            "changes": 14,
+            "blob_url": "https://github.com/vercel/next.js/blob/e0d612eb7723eff156b8e2f1f9d1bc76c2f9c1bd/test%2Fe2e%2Fapp-dir%2Fparallel-routes-catchall-slotted-non-catchalls%2Fapp%2F%5Blocale%5D%2Flayout.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/e0d612eb7723eff156b8e2f1f9d1bc76c2f9c1bd/test%2Fe2e%2Fapp-dir%2Fparallel-routes-catchall-slotted-non-catchalls%2Fapp%2F%5Blocale%5D%2Flayout.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fparallel-routes-catchall-slotted-non-catchalls%2Fapp%2F%5Blocale%5D%2Flayout.tsx?ref=e0d612eb7723eff156b8e2f1f9d1bc76c2f9c1bd",
+            "patch": "@@ -0,0 +1,14 @@\n+export default function Layout({\n+  children,\n+  slot,\n+}: {\n+  children: React.ReactNode\n+  slot: React.ReactNode\n+}) {\n+  return (\n+    <>\n+      Children: <div id=\"children\">{children}</div>\n+      Slot: <div id=\"slot\">{slot}</div>\n+    </>\n+  )\n+}"
+        },
+        {
+            "sha": "4535b91aaae928840b6861cc69b5177551cb80e5",
+            "filename": "test/e2e/app-dir/parallel-routes-catchall-slotted-non-catchalls/app/layout.tsx",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 3,
+            "changes": 4,
+            "blob_url": "https://github.com/vercel/next.js/blob/e0d612eb7723eff156b8e2f1f9d1bc76c2f9c1bd/test%2Fe2e%2Fapp-dir%2Fparallel-routes-catchall-slotted-non-catchalls%2Fapp%2Flayout.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/e0d612eb7723eff156b8e2f1f9d1bc76c2f9c1bd/test%2Fe2e%2Fapp-dir%2Fparallel-routes-catchall-slotted-non-catchalls%2Fapp%2Flayout.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fparallel-routes-catchall-slotted-non-catchalls%2Fapp%2Flayout.tsx?ref=e0d612eb7723eff156b8e2f1f9d1bc76c2f9c1bd",
+            "patch": "@@ -3,9 +3,7 @@ import React from 'react'\n export default function Root({ children }: { children: React.ReactNode }) {\n   return (\n     <html>\n-      <body>\n-        Children: <div id=\"children\">{children}</div>\n-      </body>\n+      <body>{children}</body>\n     </html>\n   )\n }"
+        }
+    ],
+    "stats": {
+        "total": 97,
+        "additions": 66,
+        "deletions": 31
+    }
+}

@@ -1,0 +1,36 @@
+{
+    "author": "bgw",
+    "message": "perf: Use a more aggressive retry loop for `recursiveDelete` (#84444)\n\n**Update:** This also fixes a bug pointed out by Graphite where the deletion function could hang forever because the `t` variable used for tracking attempts wasn't properly incremented.\n\n---\n\nhttps://vercel.slack.com/archives/C04KC8A53T7/p1759360239193629\n\nThis is a critical path for `next dev` and `next build` initialization.\n\nOn Windows, it's quite common to get an error while trying to recursively delete directories for one of two reasons:\n\n**Temporarily open files:**\n1. You open the directory.\n2. The user's AV detects the directory as opened and quickly scans the files in that directory.\n3. You try to delete a file, but on Windows, files cannot be deleted when open.\n\n**Deletion is not instant/atomic:** It can take some time after deleting files for the directory to become empty.\n\nFor this reason, we perform two retries with a 100ms delay after the first attempt and a 200ms delay after the second attempt.\n\n* Node does not use retries by default, but has an option to do so with a `100ms * attemptNumber` (linear backoff) delay, similar to what we do: https://github.com/nodejs/node/blob/b5638e1765d3d1241d07457e767f27e3ee6b9dd2/lib/internal/fs/utils.js#L774-L779\n* Node used to use 3 retries by default, but that was changed in v14: https://github.com/nodejs/node/commit/7e85f068a48b284a253abcb5eb3173320869b8fe\n* Rust tries to delete 64 times in a loop without sleeping, but with a call to `thread::yield_now`: https://github.com/rust-lang/rust/blob/4da69dfff1929cc79872b3d05ab7112d84753dba/library/std/src/sys/fs/windows/remove_dir_all.rs#L154-L171\n\nIn the vein of reducing time spent sleeping in the critical initialization path (@timneutkens), I think we should be more aggressive, I'm thinking using a 10ms delay (arbitrary number), but with an exponential backoff, so that we still retry over the same 300ms period as we currently do? Thoughts?\n\nThe difficulty is that this is on Windows, so it's hard for me to get good numbers about what impact this would have (if any).",
+    "sha": "f53da7131335f49a4edfa21611d161e79990a99b",
+    "files": [
+        {
+            "sha": "798f2ca336e8b9b4eb6f5e8ecabf933e1b5a78dc",
+            "filename": "packages/next/src/lib/recursive-delete.ts",
+            "status": "modified",
+            "additions": 29,
+            "deletions": 4,
+            "changes": 33,
+            "blob_url": "https://github.com/vercel/next.js/blob/f53da7131335f49a4edfa21611d161e79990a99b/packages%2Fnext%2Fsrc%2Flib%2Frecursive-delete.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/f53da7131335f49a4edfa21611d161e79990a99b/packages%2Fnext%2Fsrc%2Flib%2Frecursive-delete.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Flib%2Frecursive-delete.ts?ref=f53da7131335f49a4edfa21611d161e79990a99b",
+            "patch": "@@ -4,7 +4,30 @@ import { join, isAbsolute, dirname } from 'path'\n import isError from './is-error'\n import { wait } from './wait'\n \n-const unlinkPath = async (p: string, isDir = false, t = 1): Promise<void> => {\n+// We use an exponential backoff. See the unit test for example values.\n+//\n+// - Node's `fs` module uses a linear backoff, starting with 100ms.\n+// - Rust tries 64 times with only a `thread::yield_now` in between.\n+//\n+// We want something more aggressive, as `recursiveDelete` is in the critical\n+// path of `next dev` and `next build` startup.\n+const INITIAL_RETRY_MS = 8\n+const MAX_RETRY_MS = 64\n+const MAX_RETRIES = 6\n+\n+/**\n+ * Used in unit test.\n+ * @ignore\n+ */\n+export function calcBackoffMs(attempt: number): number {\n+  return Math.min(INITIAL_RETRY_MS * Math.pow(2, attempt), MAX_RETRY_MS)\n+}\n+\n+const unlinkPath = async (\n+  p: string,\n+  isDir = false,\n+  attempt = 0\n+): Promise<void> => {\n   try {\n     if (isDir) {\n       await promises.rmdir(p)\n@@ -18,10 +41,12 @@ const unlinkPath = async (p: string, isDir = false, t = 1): Promise<void> => {\n         code === 'ENOTEMPTY' ||\n         code === 'EPERM' ||\n         code === 'EMFILE') &&\n-      t < 3\n+      attempt < MAX_RETRIES\n     ) {\n-      await wait(t * 100)\n-      return unlinkPath(p, isDir, t++)\n+      // retrying is unlikely to succeed on POSIX platforms, but Windows can\n+      // fail due to temporarily-open files or due to\n+      await wait(calcBackoffMs(attempt))\n+      return unlinkPath(p, isDir, attempt + 1)\n     }\n \n     if (code === 'ENOENT') {"
+        },
+        {
+            "sha": "f6156f33adb82931d6c4100a9dd13db31bbe9b2f",
+            "filename": "test/unit/recursive-delete.test.ts",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 1,
+            "changes": 11,
+            "blob_url": "https://github.com/vercel/next.js/blob/f53da7131335f49a4edfa21611d161e79990a99b/test%2Funit%2Frecursive-delete.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/f53da7131335f49a4edfa21611d161e79990a99b/test%2Funit%2Frecursive-delete.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Funit%2Frecursive-delete.test.ts?ref=f53da7131335f49a4edfa21611d161e79990a99b",
+            "patch": "@@ -1,6 +1,6 @@\n /* eslint-env jest */\n import fs from 'fs-extra'\n-import { recursiveDelete } from 'next/dist/lib/recursive-delete'\n+import { recursiveDelete, calcBackoffMs } from 'next/dist/lib/recursive-delete'\n import { recursiveReadDir } from 'next/dist/lib/recursive-readdir'\n import { recursiveCopy } from 'next/dist/lib/recursive-copy'\n import { join } from 'path'\n@@ -48,3 +48,12 @@ describe('recursiveDelete', () => {\n     }\n   })\n })\n+\n+describe('calcBackoffMs', () => {\n+  it('returns expected values', () => {\n+    let backoffValuesMs = Array.from({ length: 6 }, (_, attempt) =>\n+      calcBackoffMs(attempt)\n+    )\n+    expect(backoffValuesMs).toEqual([8, 16, 32, 64, 64, 64])\n+  })\n+})"
+        }
+    ],
+    "stats": {
+        "total": 44,
+        "additions": 39,
+        "deletions": 5
+    }
+}

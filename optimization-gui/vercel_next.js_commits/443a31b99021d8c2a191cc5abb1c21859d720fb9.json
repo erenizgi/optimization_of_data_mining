@@ -1,0 +1,168 @@
+{
+    "author": "mischnic",
+    "message": "Turbopack: fix dist dir on Windows (#81758)\n\nRegression from #80683\r\n\r\nCloses PACK-5071\r\nCloses https://github.com/vercel/next.js/issues/81628",
+    "sha": "443a31b99021d8c2a191cc5abb1c21859d720fb9",
+    "files": [
+        {
+            "sha": "7b172febda96d72406bda17ac3fb0bcf35c05d25",
+            "filename": ".github/workflows/build_and_test.yml",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 2,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/443a31b99021d8c2a191cc5abb1c21859d720fb9/.github%2Fworkflows%2Fbuild_and_test.yml",
+            "raw_url": "https://github.com/vercel/next.js/raw/443a31b99021d8c2a191cc5abb1c21859d720fb9/.github%2Fworkflows%2Fbuild_and_test.yml",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/.github%2Fworkflows%2Fbuild_and_test.yml?ref=443a31b99021d8c2a191cc5abb1c21859d720fb9",
+            "patch": "@@ -705,10 +705,11 @@ jobs:\n       afterBuild: |\n         export NEXT_TEST_MODE=start\n \n-        node run-tests.js \\\n+        node run-tests.js --type production \\\n           test/e2e/app-dir/app/index.test.ts \\\n           test/e2e/app-dir/app-edge/app-edge.test.ts \\\n-          test/e2e/app-dir/metadata-edge/index.test.ts\n+          test/e2e/app-dir/metadata-edge/index.test.ts \\\n+          test/e2e/app-dir/non-root-project-monorepo/non-root-project-monorepo.test.ts\n       stepName: 'test-prod-windows'\n       runs_on_labels: '[\"windows\",\"self-hosted\",\"x64\"]'\n       buildNativeTarget: 'x86_64-pc-windows-msvc'"
+        },
+        {
+            "sha": "1e3232b7aac71203fd474fd476903ebf3a84d150",
+            "filename": "crates/napi/src/next_api/project.rs",
+            "status": "modified",
+            "additions": 23,
+            "deletions": 18,
+            "changes": 41,
+            "blob_url": "https://github.com/vercel/next.js/blob/443a31b99021d8c2a191cc5abb1c21859d720fb9/crates%2Fnapi%2Fsrc%2Fnext_api%2Fproject.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/443a31b99021d8c2a191cc5abb1c21859d720fb9/crates%2Fnapi%2Fsrc%2Fnext_api%2Fproject.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/crates%2Fnapi%2Fsrc%2Fnext_api%2Fproject.rs?ref=443a31b99021d8c2a191cc5abb1c21859d720fb9",
+            "patch": "@@ -126,15 +126,18 @@ pub struct NapiWatchOptions {\n \n #[napi(object)]\n pub struct NapiProjectOptions {\n-    /// A root path from which all files must be nested under. Trying to access\n-    /// a file outside this root will fail. Think of this as a chroot.\n+    /// An absolute root path (Unix or Windows path) from which all files must be nested under.\n+    /// Trying to access a file outside this root will fail, so think of this as a chroot.\n+    /// E.g. `/home/user/projects/my-repo`.\n     pub root_path: RcStr,\n \n-    /// A path inside the root_path which contains the app/pages directories.\n+    /// A path which contains the app/pages directories, relative to [`Project::root_path`], always\n+    /// Unix path. E.g. `apps/my-app`\n     pub project_path: RcStr,\n \n-    /// next.config's distDir. Project initialization occurs earlier than\n-    /// deserializing next.config, so passing it as separate option.\n+    /// A path where to emit the build outputs, relative to [`Project::project_path`], always Unix\n+    /// path. Corresponds to next.config.js's `distDir`.\n+    /// E.g. `.next`\n     pub dist_dir: RcStr,\n \n     /// Filesystem watcher options.\n@@ -180,15 +183,19 @@ pub struct NapiProjectOptions {\n /// [NapiProjectOptions] with all fields optional.\n #[napi(object)]\n pub struct NapiPartialProjectOptions {\n-    /// A root path from which all files must be nested under. Trying to access\n-    /// a file outside this root will fail. Think of this as a chroot.\n+    /// An absolute root path  (Unix or Windows path) from which all files must be nested under.\n+    /// Trying to access a file outside this root will fail, so think of this as a chroot.\n+    /// E.g. `/home/user/projects/my-repo`.\n     pub root_path: Option<RcStr>,\n \n-    /// A path inside the root_path which contains the app/pages directories.\n+    /// A path which contains the app/pages directories, relative to [`Project::root_path`], always\n+    /// a Unix path.\n+    /// E.g. `apps/my-app`\n     pub project_path: Option<RcStr>,\n \n-    /// next.config's distDir. Project initialization occurs earlier than\n-    /// deserializing next.config, so passing it as separate option.\n+    /// A path where to emit the build outputs, relative to [`Project::project_path`], always a\n+    /// Unix path. Corresponds to next.config.js's `distDir`.\n+    /// E.g. `.next`\n     pub dist_dir: Option<Option<RcStr>>,\n \n     /// Filesystem watcher options.\n@@ -392,7 +399,9 @@ pub fn project_new(\n \n             let subscriber = subscriber.with(FilterLayer::try_new(&trace).unwrap());\n \n-            let internal_dir = PathBuf::from(&options.project_path).join(&options.dist_dir);\n+            let internal_dir = PathBuf::from(&options.root_path)\n+                .join(&options.project_path)\n+                .join(&options.dist_dir);\n             std::fs::create_dir_all(&internal_dir)\n                 .context(\"Unable to create .next directory\")\n                 .unwrap();\n@@ -1424,13 +1433,9 @@ pub async fn get_source_map_rope(\n         Err(_) => (file_path.to_string(), None),\n     };\n \n-    let Some(chunk_base) = file.strip_prefix(\n-        &(format!(\n-            \"{}/{}/\",\n-            container.project().await?.project_path,\n-            container.project().dist_dir().await?\n-        )),\n-    ) else {\n+    let Some(chunk_base) =\n+        file.strip_prefix(container.project().dist_dir_absolute().await?.as_str())\n+    else {\n         // File doesn't exist within the dist dir\n         return Ok(OptionStringifiedSourceMap::none());\n     };"
+        },
+        {
+            "sha": "7f1f0394ab40c78c8897d4242e72a9ea8463c307",
+            "filename": "crates/next-api/src/project.rs",
+            "status": "modified",
+            "additions": 44,
+            "deletions": 32,
+            "changes": 76,
+            "blob_url": "https://github.com/vercel/next.js/blob/443a31b99021d8c2a191cc5abb1c21859d720fb9/crates%2Fnext-api%2Fsrc%2Fproject.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/443a31b99021d8c2a191cc5abb1c21859d720fb9/crates%2Fnext-api%2Fsrc%2Fproject.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/crates%2Fnext-api%2Fsrc%2Fproject.rs?ref=443a31b99021d8c2a191cc5abb1c21859d720fb9",
+            "patch": "@@ -1,4 +1,4 @@\n-use std::{path::MAIN_SEPARATOR, time::Duration};\n+use std::time::Duration;\n \n use anyhow::{Context, Result, bail};\n use indexmap::map::Entry;\n@@ -37,8 +37,8 @@ use turbo_tasks::{\n };\n use turbo_tasks_env::{EnvMap, ProcessEnv};\n use turbo_tasks_fs::{\n-    DiskFileSystem, FileSystem, FileSystemPath, VirtualFileSystem, get_relative_path_to,\n-    invalidation,\n+    DiskFileSystem, FileSystem, FileSystemPath, VirtualFileSystem, invalidation,\n+    util::{join_path, unix_to_sys},\n };\n use turbopack::{\n     ModuleAssetContext, evaluate_context::node_build_environment,\n@@ -149,11 +149,13 @@ pub struct WatchOptions {\n )]\n #[serde(rename_all = \"camelCase\")]\n pub struct ProjectOptions {\n-    /// A root path from which all files must be nested under. Trying to access\n-    /// a file outside this root will fail. Think of this as a chroot.\n+    /// An absolute root path (Unix or Windows path) from which all files must be nested under.\n+    /// Trying to access a file outside this root will fail, so think of this as a chroot.\n+    /// E.g. `/home/user/projects/my-repo`.\n     pub root_path: RcStr,\n \n-    /// A path inside the root_path which contains the app/pages directories.\n+    /// A path which contains the app/pages directories, relative to [`Project::root_path`], always\n+    /// Unix path. E.g. `apps/my-app`\n     pub project_path: RcStr,\n \n     /// The contents of next.config.js, serialized to JSON.\n@@ -538,15 +540,20 @@ impl ProjectContainer {\n \n #[turbo_tasks::value]\n pub struct Project {\n-    /// A root path from which all files must be nested under. Trying to access\n-    /// a file outside this root will fail. Think of this as a chroot.\n+    /// An absolute root path (Windows or Unix path) from which all files must be nested under.\n+    /// Trying to access a file outside this root will fail, so think of this as a chroot.\n+    /// E.g. `/home/user/projects/my-repo`.\n     root_path: RcStr,\n \n-    /// A path where to emit the build outputs. next.config.js's distDir.\n-    dist_dir: RcStr,\n+    /// A path which contains the app/pages directories, relative to [`Project::root_path`], always\n+    /// a Unix path.\n+    /// E.g. `apps/my-app`\n+    project_path: RcStr,\n \n-    /// A path inside the root_path which contains the app/pages directories.\n-    pub project_path: RcStr,\n+    /// A path where to emit the build outputs, relative to [`Project::project_path`], always a\n+    /// Unix path. Corresponds to next.config.js's `distDir`.\n+    /// E.g. `.next`\n+    dist_dir: RcStr,\n \n     /// Filesystem watcher options.\n     watch: WatchOptions,\n@@ -685,21 +692,30 @@ impl Project {\n     }\n \n     #[turbo_tasks::function]\n-    pub fn dist_dir(&self) -> Vc<RcStr> {\n-        Vc::cell(self.dist_dir.clone())\n+    pub fn dist_dir_absolute(&self) -> Result<Vc<RcStr>> {\n+        Ok(Vc::cell(\n+            format!(\n+                \"{}{}{}\",\n+                self.root_path,\n+                std::path::MAIN_SEPARATOR,\n+                unix_to_sys(\n+                    &join_path(&self.project_path, &self.dist_dir)\n+                        .context(\"expected project_path to be inside of root_path\")?\n+                )\n+            )\n+            .into(),\n+        ))\n     }\n \n     #[turbo_tasks::function]\n     pub async fn node_root(self: Vc<Self>) -> Result<Vc<FileSystemPath>> {\n         let this = self.await?;\n-        let relative_from_root_to_project_path =\n-            get_relative_path_to(&this.root_path, &this.project_path);\n         Ok(self\n             .output_fs()\n             .root()\n             .await?\n-            .join(&relative_from_root_to_project_path)?\n-            .join(&this.dist_dir.clone())?\n+            .join(&this.project_path)?\n+            .join(&this.dist_dir)?\n             .cell())\n     }\n \n@@ -726,28 +742,24 @@ impl Project {\n             .cell())\n     }\n \n+    /// Returns the relative path from the node root to the output root.\n+    /// E.g. from `[project]/test/e2e/app-dir/non-root-project-monorepo/apps/web/app/\n+    /// import-meta-url-ssr/page.tsx` to `[project]/`.\n     #[turbo_tasks::function]\n     pub async fn node_root_to_root_path(self: Vc<Self>) -> Result<Vc<RcStr>> {\n-        let this = self.await?;\n-        let output_root_to_root_path = self\n-            .project_path()\n-            .await?\n-            .join(&this.dist_dir.clone())?\n-            .get_relative_path_to(&*self.project_root_path().await?)\n-            .context(\"Project path need to be in root path\")?;\n-        Ok(Vc::cell(output_root_to_root_path))\n+        Ok(Vc::cell(\n+            self.node_root()\n+                .await?\n+                .get_relative_path_to(&*self.output_fs().root().await?)\n+                .context(\"Expected node root to be inside of output fs\")?,\n+        ))\n     }\n \n     #[turbo_tasks::function]\n     pub async fn project_path(self: Vc<Self>) -> Result<Vc<FileSystemPath>> {\n         let this = self.await?;\n         let root = self.project_root_path().await?;\n-        let project_relative = this.project_path.strip_prefix(&*this.root_path).unwrap();\n-        let project_relative = project_relative\n-            .strip_prefix(MAIN_SEPARATOR)\n-            .unwrap_or(project_relative)\n-            .replace(MAIN_SEPARATOR, \"/\");\n-        Ok(root.join(&project_relative)?.cell())\n+        Ok(root.join(&this.project_path)?.cell())\n     }\n \n     #[turbo_tasks::function]"
+        },
+        {
+            "sha": "539d828eeba91d06789c28207fdc35500b7a59cf",
+            "filename": "packages/next/src/build/swc/generated-native.d.ts",
+            "status": "modified",
+            "additions": 20,
+            "deletions": 10,
+            "changes": 30,
+            "blob_url": "https://github.com/vercel/next.js/blob/443a31b99021d8c2a191cc5abb1c21859d720fb9/packages%2Fnext%2Fsrc%2Fbuild%2Fswc%2Fgenerated-native.d.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/443a31b99021d8c2a191cc5abb1c21859d720fb9/packages%2Fnext%2Fsrc%2Fbuild%2Fswc%2Fgenerated-native.d.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Fswc%2Fgenerated-native.d.ts?ref=443a31b99021d8c2a191cc5abb1c21859d720fb9",
+            "patch": "@@ -100,15 +100,20 @@ export interface NapiWatchOptions {\n }\n export interface NapiProjectOptions {\n   /**\n-   * A root path from which all files must be nested under. Trying to access\n-   * a file outside this root will fail. Think of this as a chroot.\n+   * An absolute root path from which all files must be nested under. Trying to access\n+   * a file outside this root will fail, so think of this as a chroot.\n+   * E.g. `/home/user/projects/my-repo`.\n    */\n   rootPath: RcStr\n-  /** A path inside the root_path which contains the app/pages directories. */\n+  /**\n+   * A path which contains the app/pages directories, relative to [`Project::root_path`].\n+   * E.g. `apps/my-app`\n+   */\n   projectPath: RcStr\n   /**\n-   * next.config's distDir. Project initialization occurs earlier than\n-   * deserializing next.config, so passing it as separate option.\n+   * A path where to emit the build outputs, relative to [`Project::project_path`].\n+   * Corresponds to next.config.js's `distDir`.\n+   * E.g. `.next`\n    */\n   distDir: RcStr\n   /** Filesystem watcher options. */\n@@ -146,15 +151,20 @@ export interface NapiProjectOptions {\n /** [NapiProjectOptions] with all fields optional. */\n export interface NapiPartialProjectOptions {\n   /**\n-   * A root path from which all files must be nested under. Trying to access\n-   * a file outside this root will fail. Think of this as a chroot.\n+   * An absolute root path from which all files must be nested under. Trying to access\n+   * a file outside this root will fail, so think of this as a chroot.\n+   * E.g. `/home/user/projects/my-repo`.\n    */\n   rootPath?: RcStr\n-  /** A path inside the root_path which contains the app/pages directories. */\n+  /**\n+   * A path which contains the app/pages directories, relative to [`Project::root_path`].\n+   * E.g. `apps/my-app`\n+   */\n   projectPath?: RcStr\n   /**\n-   * next.config's distDir. Project initialization occurs earlier than\n-   * deserializing next.config, so passing it as separate option.\n+   * A path where to emit the build outputs, relative to [`Project::project_path`].\n+   * Corresponds to next.config.js's `distDir`.\n+   * E.g. `.next`\n    */\n   distDir?: RcStr | undefined | null\n   /** Filesystem watcher options. */"
+        },
+        {
+            "sha": "0299b04ad697afbf71b6d62119d15421d2549c79",
+            "filename": "packages/next/src/build/swc/index.ts",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 2,
+            "changes": 7,
+            "blob_url": "https://github.com/vercel/next.js/blob/443a31b99021d8c2a191cc5abb1c21859d720fb9/packages%2Fnext%2Fsrc%2Fbuild%2Fswc%2Findex.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/443a31b99021d8c2a191cc5abb1c21859d720fb9/packages%2Fnext%2Fsrc%2Fbuild%2Fswc%2Findex.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Fswc%2Findex.ts?ref=443a31b99021d8c2a191cc5abb1c21859d720fb9",
+            "patch": "@@ -621,7 +621,7 @@ function bindingToApi(\n       ...options,\n       nextConfig: await serializeNextConfig(\n         options.nextConfig,\n-        options.projectPath!\n+        path.join(options.rootPath, options.projectPath)\n       ),\n       jsConfig: JSON.stringify(options.jsConfig),\n       env: rustifyEnv(options.env),\n@@ -635,7 +635,10 @@ function bindingToApi(\n       ...options,\n       nextConfig:\n         options.nextConfig &&\n-        (await serializeNextConfig(options.nextConfig, options.projectPath!)),\n+        (await serializeNextConfig(\n+          options.nextConfig,\n+          path.join(options.rootPath!, options.projectPath!)\n+        )),\n       jsConfig: options.jsConfig && JSON.stringify(options.jsConfig),\n       env: options.env && rustifyEnv(options.env),\n     }"
+        },
+        {
+            "sha": "6af182f331a393e146c9f7616c34e25862ffcecb",
+            "filename": "packages/next/src/build/swc/types.ts",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 4,
+            "changes": 12,
+            "blob_url": "https://github.com/vercel/next.js/blob/443a31b99021d8c2a191cc5abb1c21859d720fb9/packages%2Fnext%2Fsrc%2Fbuild%2Fswc%2Ftypes.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/443a31b99021d8c2a191cc5abb1c21859d720fb9/packages%2Fnext%2Fsrc%2Fbuild%2Fswc%2Ftypes.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Fswc%2Ftypes.ts?ref=443a31b99021d8c2a191cc5abb1c21859d720fb9",
+            "patch": "@@ -346,18 +346,22 @@ export type WrittenEndpoint =\n \n export interface ProjectOptions {\n   /**\n-   * A root path from which all files must be nested under. Trying to access\n-   * a file outside this root will fail. Think of this as a chroot.\n+   * An absolute root path (Unix or Windows path) from which all files must be nested under. Trying\n+   * to access a file outside this root will fail, so think of this as a chroot.\n+   * E.g. `/home/user/projects/my-repo`.\n    */\n   rootPath: string\n \n   /**\n-   * A path inside the root_path which contains the app/pages directories.\n+   * A path which contains the app/pages directories, relative to `root_path`, always a Unix path.\n+   * E.g. `apps/my-app`\n    */\n   projectPath: string\n \n   /**\n-   * The path to the .next directory.\n+   * A path where to emit the build outputs, relative to [`Project::project_path`], always a Unix\n+   * path. Corresponds to next.config.js's `distDir`.\n+   * E.g. `.next`\n    */\n   distDir: string\n "
+        },
+        {
+            "sha": "b2e86aceea4d6aaba6e9540f485c42eeae203bbd",
+            "filename": "packages/next/src/build/turbopack-build/impl.ts",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 1,
+            "changes": 4,
+            "blob_url": "https://github.com/vercel/next.js/blob/443a31b99021d8c2a191cc5abb1c21859d720fb9/packages%2Fnext%2Fsrc%2Fbuild%2Fturbopack-build%2Fimpl.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/443a31b99021d8c2a191cc5abb1c21859d720fb9/packages%2Fnext%2Fsrc%2Fbuild%2Fturbopack-build%2Fimpl.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Fturbopack-build%2Fimpl.ts?ref=443a31b99021d8c2a191cc5abb1c21859d720fb9",
+            "patch": "@@ -22,6 +22,7 @@ import { setGlobal } from '../../trace'\n import { isCI } from '../../server/ci-info'\n import { backgroundLogCompilationEvents } from '../../shared/lib/turbopack/compilation-events'\n import { getSupportedBrowsers } from '../utils'\n+import { normalizePath } from '../../lib/normalize-path'\n \n export async function turbopackBuild(): Promise<{\n   duration: number\n@@ -52,10 +53,11 @@ export async function turbopackBuild(): Promise<{\n   const supportedBrowsers = getSupportedBrowsers(dir, dev)\n \n   const persistentCaching = isPersistentCachingEnabled(config)\n+  const rootPath = config.turbopack?.root || config.outputFileTracingRoot || dir\n   const project = await bindings.turbo.createProject(\n     {\n-      projectPath: dir,\n       rootPath: config.turbopack?.root || config.outputFileTracingRoot || dir,\n+      projectPath: normalizePath(path.relative(rootPath, dir) || '.'),\n       distDir,\n       nextConfig: config,\n       jsConfig: await getTurbopackJsConfig(dir, config),"
+        },
+        {
+            "sha": "aeb1487cc5e8909fae5bf9ec2559b60be1815041",
+            "filename": "packages/next/src/build/webpack/loaders/css-loader/src/utils.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 4,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/443a31b99021d8c2a191cc5abb1c21859d720fb9/packages%2Fnext%2Fsrc%2Fbuild%2Fwebpack%2Floaders%2Fcss-loader%2Fsrc%2Futils.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/443a31b99021d8c2a191cc5abb1c21859d720fb9/packages%2Fnext%2Fsrc%2Fbuild%2Fwebpack%2Floaders%2Fcss-loader%2Fsrc%2Futils.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Fwebpack%2Floaders%2Fcss-loader%2Fsrc%2Futils.ts?ref=443a31b99021d8c2a191cc5abb1c21859d720fb9",
+            "patch": "@@ -11,6 +11,7 @@ import localByDefault from 'next/dist/compiled/postcss-modules-local-by-default'\n import extractImports from 'next/dist/compiled/postcss-modules-extract-imports'\n import modulesScope from 'next/dist/compiled/postcss-modules-scope'\n import camelCase from './camelcase'\n+import { normalizePath } from '../../../../../lib/normalize-path'\n \n const whitespace = '[\\\\x20\\\\t\\\\r\\\\n\\\\f]'\n const unescapeRegExp = new RegExp(\n@@ -39,10 +40,6 @@ function unescape(str: string) {\n   })\n }\n \n-function normalizePath(file: string) {\n-  return path.sep === '\\\\' ? file.replace(/\\\\/g, '/') : file\n-}\n-\n function fixedEncodeURIComponent(str: string) {\n   return str.replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16)}`)\n }"
+        },
+        {
+            "sha": "4f9e91f4242f8433bd1f297220702026ac125d6e",
+            "filename": "packages/next/src/lib/normalize-path.ts",
+            "status": "added",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/443a31b99021d8c2a191cc5abb1c21859d720fb9/packages%2Fnext%2Fsrc%2Flib%2Fnormalize-path.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/443a31b99021d8c2a191cc5abb1c21859d720fb9/packages%2Fnext%2Fsrc%2Flib%2Fnormalize-path.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Flib%2Fnormalize-path.ts?ref=443a31b99021d8c2a191cc5abb1c21859d720fb9",
+            "patch": "@@ -0,0 +1,5 @@\n+import path from 'path'\n+\n+export function normalizePath(file: string) {\n+  return path.sep === '\\\\' ? file.replace(/\\\\/g, '/') : file\n+}"
+        },
+        {
+            "sha": "2bb80d874496538caf6c1023d2194283ab6c8131",
+            "filename": "packages/next/src/server/dev/hot-reloader-turbopack.ts",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 6,
+            "changes": 14,
+            "blob_url": "https://github.com/vercel/next.js/blob/443a31b99021d8c2a191cc5abb1c21859d720fb9/packages%2Fnext%2Fsrc%2Fserver%2Fdev%2Fhot-reloader-turbopack.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/443a31b99021d8c2a191cc5abb1c21859d720fb9/packages%2Fnext%2Fsrc%2Fserver%2Fdev%2Fhot-reloader-turbopack.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fdev%2Fhot-reloader-turbopack.ts?ref=443a31b99021d8c2a191cc5abb1c21859d720fb9",
+            "patch": "@@ -1,6 +1,6 @@\n import type { Socket } from 'net'\n import { mkdir, writeFile } from 'fs/promises'\n-import { join, extname } from 'path'\n+import { join, extname, relative } from 'path'\n import { pathToFileURL } from 'url'\n \n import ws from 'next/dist/compiled/ws'\n@@ -99,6 +99,7 @@ import { getRestartDevServerMiddleware } from '../../next-devtools/server/restar\n import { backgroundLogCompilationEvents } from '../../shared/lib/turbopack/compilation-events'\n import { getSupportedBrowsers } from '../../build/utils'\n import { receiveBrowserLogsTurbopack } from './browser-logs/receive-logs'\n+import { normalizePath } from '../../lib/normalize-path'\n \n const wsServer = new ws.Server({ noServer: true })\n const isTestMode = !!(\n@@ -209,13 +210,14 @@ export async function createHotReloaderTurbopack(\n   const supportedBrowsers = getSupportedBrowsers(projectPath, dev)\n   const currentNodeJsVersion = process.versions.node\n \n+  const rootPath =\n+    opts.nextConfig.turbopack?.root ||\n+    opts.nextConfig.outputFileTracingRoot ||\n+    projectPath\n   const project = await bindings.turbo.createProject(\n     {\n-      projectPath: projectPath,\n-      rootPath:\n-        opts.nextConfig.turbopack?.root ||\n-        opts.nextConfig.outputFileTracingRoot ||\n-        projectPath,\n+      rootPath,\n+      projectPath: normalizePath(relative(rootPath, projectPath) || '.'),\n       distDir,\n       nextConfig: opts.nextConfig,\n       jsConfig: await getTurbopackJsConfig(projectPath, nextConfig),"
+        },
+        {
+            "sha": "9fa2953c11a36826ac00aecfb4e6436f2a297cf9",
+            "filename": "packages/next/src/server/lib/router-utils/setup-dev-bundler.ts",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/vercel/next.js/blob/443a31b99021d8c2a191cc5abb1c21859d720fb9/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Frouter-utils%2Fsetup-dev-bundler.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/443a31b99021d8c2a191cc5abb1c21859d720fb9/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Frouter-utils%2Fsetup-dev-bundler.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Frouter-utils%2Fsetup-dev-bundler.ts?ref=443a31b99021d8c2a191cc5abb1c21859d720fb9",
+            "patch": "@@ -83,6 +83,7 @@ import {\n } from '../../../shared/lib/turbopack/utils'\n import { getDefineEnv } from '../../../build/define-env'\n import { TurbopackInternalError } from '../../../shared/lib/turbopack/internal-error'\n+import { normalizePath } from '../../../lib/normalize-path'\n \n export type SetupOpts = {\n   renderServer: LazyRenderServerInstance\n@@ -664,6 +665,10 @@ async function startWatcher(\n             opts.fsChecker.rewrites.beforeFiles.length > 0 ||\n             opts.fsChecker.rewrites.fallback.length > 0\n \n+          const rootPath =\n+            opts.nextConfig.turbopack?.root ||\n+            opts.nextConfig.outputFileTracingRoot ||\n+            opts.dir\n           await hotReloader.turbopackProject.update({\n             defineEnv: createDefineEnv({\n               isTurbopack: true,\n@@ -679,6 +684,8 @@ async function startWatcher(\n               projectPath: opts.dir,\n               rewrites: opts.fsChecker.rewrites,\n             }),\n+            rootPath,\n+            projectPath: normalizePath(path.relative(rootPath, dir)),\n           })\n         }\n "
+        },
+        {
+            "sha": "31785cd9444e45d0b613e9c8895bea5a6b08f382",
+            "filename": "test/development/basic/next-rs-api.test.ts",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 13,
+            "changes": 21,
+            "blob_url": "https://github.com/vercel/next.js/blob/443a31b99021d8c2a191cc5abb1c21859d720fb9/test%2Fdevelopment%2Fbasic%2Fnext-rs-api.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/443a31b99021d8c2a191cc5abb1c21859d720fb9/test%2Fdevelopment%2Fbasic%2Fnext-rs-api.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fdevelopment%2Fbasic%2Fnext-rs-api.test.ts?ref=443a31b99021d8c2a191cc5abb1c21859d720fb9",
+            "patch": "@@ -187,26 +187,21 @@ describe('next.rs api', () => {\n   let project: Project\n   let projectUpdateSubscription: AsyncIterableIterator<UpdateInfo>\n   beforeAll(async () => {\n-    console.log(next.testDir)\n     const nextConfig = await loadConfig(PHASE_DEVELOPMENT_SERVER, next.testDir)\n     const bindings = await loadBindings()\n-    const distDir = path.join(\n-      process.env.NEXT_SKIP_ISOLATE\n-        ? path.resolve(__dirname, '../../..')\n-        : next.testDir,\n-      '.next'\n-    )\n+    const rootPath = process.env.NEXT_SKIP_ISOLATE\n+      ? path.resolve(__dirname, '../../..')\n+      : next.testDir\n+    const distDir = '.next'\n     project = await bindings.turbo.createProject({\n       env: {},\n       jsConfig: {\n         compilerOptions: {},\n       },\n       nextConfig: nextConfig,\n-      projectPath: next.testDir,\n+      rootPath,\n+      projectPath: path.relative(rootPath, next.testDir) || '.',\n       distDir,\n-      rootPath: process.env.NEXT_SKIP_ISOLATE\n-        ? path.resolve(__dirname, '../../..')\n-        : next.testDir,\n       watch: {\n         enable: true,\n       },\n@@ -217,7 +212,7 @@ describe('next.rs api', () => {\n         clientRouterFilters: undefined,\n         config: nextConfig,\n         dev: true,\n-        distDir: distDir,\n+        distDir: path.join(rootPath, distDir),\n         fetchCacheKeyPrefix: undefined,\n         hasRewrites: false,\n         middlewareMatchers: undefined,\n@@ -265,7 +260,7 @@ describe('next.rs api', () => {\n     expect(normalizeDiagnostics(entrypoints.value.diagnostics)).toMatchSnapshot(\n       'diagnostics'\n     )\n-    entrypointsSubscription.return()\n+    await entrypointsSubscription.return()\n   })\n \n   const routes = ["
+        },
+        {
+            "sha": "83d718a52b1b2dcb1c8c48925d6f7e6a19ed1114",
+            "filename": "turbopack/crates/turbo-tasks-fs/src/lib.rs",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/443a31b99021d8c2a191cc5abb1c21859d720fb9/turbopack%2Fcrates%2Fturbo-tasks-fs%2Fsrc%2Flib.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/443a31b99021d8c2a191cc5abb1c21859d720fb9/turbopack%2Fcrates%2Fturbo-tasks-fs%2Fsrc%2Flib.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks-fs%2Fsrc%2Flib.rs?ref=443a31b99021d8c2a191cc5abb1c21859d720fb9",
+            "patch": "@@ -997,6 +997,7 @@ impl ValueToString for DiskFileSystem {\n     }\n }\n \n+/// Note: this only works for Unix-style paths (with `/` as a separator).\n pub fn get_relative_path_to(path: &str, other_path: &str) -> String {\n     fn split(s: &str) -> impl Iterator<Item = &str> {\n         let empty = s.is_empty();"
+        }
+    ],
+    "stats": {
+        "total": 228,
+        "additions": 136,
+        "deletions": 92
+    }
+}

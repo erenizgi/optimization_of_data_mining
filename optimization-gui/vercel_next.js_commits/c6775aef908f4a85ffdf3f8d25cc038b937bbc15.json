@@ -1,0 +1,120 @@
+{
+    "author": "kdy1",
+    "message": "perf(turbopack): Introduce static analysis for immutable tasks (#80415)\n\n### What?\r\n\r\nImplement a basic form of Immutable turbo tasks. At this stage, we only detect statically analyzble turbo tasks, and handle them specially. We only skip activeness tracking with this PR.",
+    "sha": "c6775aef908f4a85ffdf3f8d25cc038b937bbc15",
+    "files": [
+        {
+            "sha": "5b30ee9c8cf5741bf16bd202523e43514733eaf8",
+            "filename": "turbopack/crates/turbo-tasks-backend/src/backend/mod.rs",
+            "status": "modified",
+            "additions": 18,
+            "deletions": 9,
+            "changes": 27,
+            "blob_url": "https://github.com/vercel/next.js/blob/c6775aef908f4a85ffdf3f8d25cc038b937bbc15/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fbackend%2Fmod.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/c6775aef908f4a85ffdf3f8d25cc038b937bbc15/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fbackend%2Fmod.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fbackend%2Fmod.rs?ref=c6775aef908f4a85ffdf3f8d25cc038b937bbc15",
+            "patch": "@@ -407,9 +407,10 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n         tx: Option<&'l B::ReadTransaction<'tx>>,\n         parent_task: TaskId,\n         child_task: TaskId,\n+        is_immutable: bool,\n         turbo_tasks: &'l dyn TurboTasksBackendApi<TurboTasksBackend<B>>,\n     ) {\n-        operation::ConnectChildOperation::run(parent_task, child_task, unsafe {\n+        operation::ConnectChildOperation::run(parent_task, child_task, is_immutable, unsafe {\n             self.execute_context_with_tx(tx, turbo_tasks)\n         });\n     }\n@@ -418,11 +419,13 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n         &self,\n         parent_task: TaskId,\n         child_task: TaskId,\n+        is_immutable: bool,\n         turbo_tasks: &dyn TurboTasksBackendApi<TurboTasksBackend<B>>,\n     ) {\n         operation::ConnectChildOperation::run(\n             parent_task,\n             child_task,\n+            is_immutable,\n             self.execute_context(turbo_tasks),\n         );\n     }\n@@ -1135,11 +1138,12 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n         &self,\n         task_type: CachedTaskType,\n         parent_task: TaskId,\n+        is_immutable: bool,\n         turbo_tasks: &dyn TurboTasksBackendApi<TurboTasksBackend<B>>,\n     ) -> TaskId {\n         if let Some(task_id) = self.task_cache.lookup_forward(&task_type) {\n             self.track_cache_hit(&task_type);\n-            self.connect_child(parent_task, task_id, turbo_tasks);\n+            self.connect_child(parent_task, task_id, is_immutable, turbo_tasks);\n             return task_id;\n         }\n \n@@ -1179,7 +1183,9 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n         };\n \n         // Safety: `tx` is a valid transaction from `self.backend.backing_storage`.\n-        unsafe { self.connect_child_with_tx(tx.as_ref(), parent_task, task_id, turbo_tasks) };\n+        unsafe {\n+            self.connect_child_with_tx(tx.as_ref(), parent_task, task_id, is_immutable, turbo_tasks)\n+        };\n \n         task_id\n     }\n@@ -1188,6 +1194,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n         &self,\n         task_type: CachedTaskType,\n         parent_task: TaskId,\n+        is_immutable: bool,\n         turbo_tasks: &dyn TurboTasksBackendApi<TurboTasksBackend<B>>,\n     ) -> TaskId {\n         if !parent_task.is_transient() {\n@@ -1199,7 +1206,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n         }\n         if let Some(task_id) = self.task_cache.lookup_forward(&task_type) {\n             self.track_cache_hit(&task_type);\n-            self.connect_child(parent_task, task_id, turbo_tasks);\n+            self.connect_child(parent_task, task_id, is_immutable, turbo_tasks);\n             return task_id;\n         }\n \n@@ -1211,11 +1218,11 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n             unsafe {\n                 self.transient_task_id_factory.reuse(task_id);\n             }\n-            self.connect_child(parent_task, existing_task_id, turbo_tasks);\n+            self.connect_child(parent_task, existing_task_id, is_immutable, turbo_tasks);\n             return existing_task_id;\n         }\n \n-        self.connect_child(parent_task, task_id, turbo_tasks);\n+        self.connect_child(parent_task, task_id, is_immutable, turbo_tasks);\n \n         task_id\n     }\n@@ -2249,7 +2256,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n         turbo_tasks: &dyn TurboTasksBackendApi<TurboTasksBackend<B>>,\n     ) {\n         self.assert_not_persistent_calling_transient(parent_task, task, None);\n-        ConnectChildOperation::run(parent_task, task, self.execute_context(turbo_tasks));\n+        ConnectChildOperation::run(parent_task, task, false, self.execute_context(turbo_tasks));\n     }\n \n     fn create_transient_task(&self, task_type: TransientTaskType) -> TaskId {\n@@ -2584,20 +2591,22 @@ impl<B: BackingStorage> Backend for TurboTasksBackend<B> {\n         &self,\n         task_type: CachedTaskType,\n         parent_task: TaskId,\n+        is_immutable: bool,\n         turbo_tasks: &dyn TurboTasksBackendApi<Self>,\n     ) -> TaskId {\n         self.0\n-            .get_or_create_persistent_task(task_type, parent_task, turbo_tasks)\n+            .get_or_create_persistent_task(task_type, parent_task, is_immutable, turbo_tasks)\n     }\n \n     fn get_or_create_transient_task(\n         &self,\n         task_type: CachedTaskType,\n         parent_task: TaskId,\n+        is_immutable: bool,\n         turbo_tasks: &dyn TurboTasksBackendApi<Self>,\n     ) -> TaskId {\n         self.0\n-            .get_or_create_transient_task(task_type, parent_task, turbo_tasks)\n+            .get_or_create_transient_task(task_type, parent_task, is_immutable, turbo_tasks)\n     }\n \n     fn invalidate_task(&self, task_id: TaskId, turbo_tasks: &dyn TurboTasksBackendApi<Self>) {"
+        },
+        {
+            "sha": "4c24b8ec4a4600206e93aef730b564a8b7469ccb",
+            "filename": "turbopack/crates/turbo-tasks-backend/src/backend/operation/connect_child.rs",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 2,
+            "changes": 10,
+            "blob_url": "https://github.com/vercel/next.js/blob/c6775aef908f4a85ffdf3f8d25cc038b937bbc15/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fbackend%2Foperation%2Fconnect_child.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/c6775aef908f4a85ffdf3f8d25cc038b937bbc15/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fbackend%2Foperation%2Fconnect_child.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fbackend%2Foperation%2Fconnect_child.rs?ref=c6775aef908f4a85ffdf3f8d25cc038b937bbc15",
+            "patch": "@@ -23,7 +23,12 @@ pub enum ConnectChildOperation {\n }\n \n impl ConnectChildOperation {\n-    pub fn run(parent_task_id: TaskId, child_task_id: TaskId, mut ctx: impl ExecuteContext) {\n+    pub fn run(\n+        parent_task_id: TaskId,\n+        child_task_id: TaskId,\n+        is_immutable: bool,\n+        mut ctx: impl ExecuteContext,\n+    ) {\n         if !ctx.should_track_children() {\n             let mut task = ctx.task(child_task_id, TaskDataCategory::All);\n             if !task.has_key(&CachedDataItemKey::Output {}) {\n@@ -66,7 +71,8 @@ impl ConnectChildOperation {\n             });\n         }\n \n-        if ctx.should_track_activeness() {\n+        // Immutable tasks cannot be invalidated, meaning that we never reschedule them.\n+        if !is_immutable && ctx.should_track_activeness() {\n             queue.push(AggregationUpdateJob::IncreaseActiveCount {\n                 task: child_task_id,\n             });"
+        },
+        {
+            "sha": "c3bf14fa3a164f449acfdca92a61ef1f171283b3",
+            "filename": "turbopack/crates/turbo-tasks-macros/src/func.rs",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/c6775aef908f4a85ffdf3f8d25cc038b937bbc15/turbopack%2Fcrates%2Fturbo-tasks-macros%2Fsrc%2Ffunc.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/c6775aef908f4a85ffdf3f8d25cc038b937bbc15/turbopack%2Fcrates%2Fturbo-tasks-macros%2Fsrc%2Ffunc.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks-macros%2Fsrc%2Ffunc.rs?ref=c6775aef908f4a85ffdf3f8d25cc038b937bbc15",
+            "patch": "@@ -1099,6 +1099,7 @@ pub struct NativeFn {\n     pub filter_trait_call_args: Option<FilterTraitCallArgsTokens>,\n     pub local: bool,\n     pub invalidator: bool,\n+    pub immutable: bool,\n }\n \n impl NativeFn {\n@@ -1115,6 +1116,7 @@ impl NativeFn {\n             filter_trait_call_args,\n             local,\n             invalidator,\n+            immutable,\n         } = self;\n \n         if *is_method {\n@@ -1142,6 +1144,7 @@ impl NativeFn {\n                             turbo_tasks::macro_helpers::FunctionMeta {\n                                 local: #local,\n                                 invalidator: #invalidator,\n+                                immutable: #immutable,\n                             },\n                             #arg_filter,\n                             #function_path,\n@@ -1157,6 +1160,7 @@ impl NativeFn {\n                             turbo_tasks::macro_helpers::FunctionMeta {\n                                 local: #local,\n                                 invalidator: #invalidator,\n+                                immutable: #immutable,\n                             },\n                             #arg_filter,\n                             #function_path,\n@@ -1173,6 +1177,7 @@ impl NativeFn {\n                         turbo_tasks::macro_helpers::FunctionMeta {\n                             local: #local,\n                             invalidator: #invalidator,\n+                            immutable: #immutable,\n                         },\n                         #function_path,\n                     )"
+        },
+        {
+            "sha": "f2a304075065ecb5bea7335d92dfe0c2b13ef4df",
+            "filename": "turbopack/crates/turbo-tasks-macros/src/function_macro.rs",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/c6775aef908f4a85ffdf3f8d25cc038b937bbc15/turbopack%2Fcrates%2Fturbo-tasks-macros%2Fsrc%2Ffunction_macro.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/c6775aef908f4a85ffdf3f8d25cc038b937bbc15/turbopack%2Fcrates%2Fturbo-tasks-macros%2Fsrc%2Ffunction_macro.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks-macros%2Fsrc%2Ffunction_macro.rs?ref=c6775aef908f4a85ffdf3f8d25cc038b937bbc15",
+            "patch": "@@ -67,6 +67,7 @@ pub fn function(args: TokenStream, input: TokenStream) -> TokenStream {\n         filter_trait_call_args: None, // not a trait method\n         local,\n         invalidator,\n+        immutable: sig.asyncness.is_none() && !invalidator,\n     };\n     let native_function_ident = get_native_function_ident(ident);\n     let native_function_ty = native_fn.ty();"
+        },
+        {
+            "sha": "ff714842f2f53757b511ac546517f74347eed61f",
+            "filename": "turbopack/crates/turbo-tasks-macros/src/value_impl_macro.rs",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/c6775aef908f4a85ffdf3f8d25cc038b937bbc15/turbopack%2Fcrates%2Fturbo-tasks-macros%2Fsrc%2Fvalue_impl_macro.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/c6775aef908f4a85ffdf3f8d25cc038b937bbc15/turbopack%2Fcrates%2Fturbo-tasks-macros%2Fsrc%2Fvalue_impl_macro.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks-macros%2Fsrc%2Fvalue_impl_macro.rs?ref=c6775aef908f4a85ffdf3f8d25cc038b937bbc15",
+            "patch": "@@ -119,6 +119,7 @@ pub fn value_impl(args: TokenStream, input: TokenStream) -> TokenStream {\n                     filter_trait_call_args: None, // not a trait method\n                     local,\n                     invalidator,\n+                    immutable: sig.asyncness.is_none() && !invalidator,\n                 };\n \n                 let native_function_ident = get_inherent_impl_function_ident(ty_ident, ident);\n@@ -248,6 +249,7 @@ pub fn value_impl(args: TokenStream, input: TokenStream) -> TokenStream {\n                     filter_trait_call_args: turbo_fn.filter_trait_call_args(),\n                     local,\n                     invalidator,\n+                    immutable: sig.asyncness.is_none() && !invalidator,\n                 };\n \n                 let native_function_ident ="
+        },
+        {
+            "sha": "46efcdd979bb1cbabf63cc7f6aaf19501024c4b7",
+            "filename": "turbopack/crates/turbo-tasks-macros/src/value_trait_macro.rs",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/c6775aef908f4a85ffdf3f8d25cc038b937bbc15/turbopack%2Fcrates%2Fturbo-tasks-macros%2Fsrc%2Fvalue_trait_macro.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/c6775aef908f4a85ffdf3f8d25cc038b937bbc15/turbopack%2Fcrates%2Fturbo-tasks-macros%2Fsrc%2Fvalue_trait_macro.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks-macros%2Fsrc%2Fvalue_trait_macro.rs?ref=c6775aef908f4a85ffdf3f8d25cc038b937bbc15",
+            "patch": "@@ -194,6 +194,7 @@ pub fn value_trait(args: TokenStream, input: TokenStream) -> TokenStream {\n                 // - This only makes sense when a default implementation is present.\n                 local: false,\n                 invalidator: func_args.invalidator.is_some(),\n+                immutable: sig.asyncness.is_none() && func_args.invalidator.is_none(),\n             };\n \n             let native_function_ident = get_trait_default_impl_function_ident(trait_ident, ident);"
+        },
+        {
+            "sha": "b19185b087fb9fe43b8b28197d20b690c174110f",
+            "filename": "turbopack/crates/turbo-tasks/src/backend.rs",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/c6775aef908f4a85ffdf3f8d25cc038b937bbc15/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fbackend.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/c6775aef908f4a85ffdf3f8d25cc038b937bbc15/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fbackend.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fbackend.rs?ref=c6775aef908f4a85ffdf3f8d25cc038b937bbc15",
+            "patch": "@@ -667,13 +667,15 @@ pub trait Backend: Sync + Send {\n         &self,\n         task_type: CachedTaskType,\n         parent_task: TaskId,\n+        is_immutable: bool,\n         turbo_tasks: &dyn TurboTasksBackendApi<Self>,\n     ) -> TaskId;\n \n     fn get_or_create_transient_task(\n         &self,\n         task_type: CachedTaskType,\n         parent_task: TaskId,\n+        is_immutable: bool,\n         turbo_tasks: &dyn TurboTasksBackendApi<Self>,\n     ) -> TaskId;\n "
+        },
+        {
+            "sha": "c2762436f13f3611426d4e5fca8bb94c98e0feee",
+            "filename": "turbopack/crates/turbo-tasks/src/manager.rs",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/vercel/next.js/blob/c6775aef908f4a85ffdf3f8d25cc038b937bbc15/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fmanager.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/c6775aef908f4a85ffdf3f8d25cc038b937bbc15/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fmanager.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fmanager.rs?ref=c6775aef908f4a85ffdf3f8d25cc038b937bbc15",
+            "patch": "@@ -603,18 +603,24 @@ impl<B: Backend + 'static> TurboTasks<B> {\n                 self.schedule_local_task(task_type, persistence)\n             }\n             TaskPersistence::Transient => {\n+                let immutable = registry::get_function(fn_type).function_meta.immutable;\n                 let task_type = CachedTaskType { fn_type, this, arg };\n+\n                 RawVc::TaskOutput(self.backend.get_or_create_transient_task(\n                     task_type,\n                     current_task(\"turbo_function calls\"),\n+                    immutable,\n                     self,\n                 ))\n             }\n             TaskPersistence::Persistent => {\n+                let immutable = registry::get_function(fn_type).function_meta.immutable;\n                 let task_type = CachedTaskType { fn_type, this, arg };\n+\n                 RawVc::TaskOutput(self.backend.get_or_create_persistent_task(\n                     task_type,\n                     current_task(\"turbo_function calls\"),\n+                    immutable,\n                     self,\n                 ))\n             }"
+        },
+        {
+            "sha": "d0714b372e1498f82929fe94d72215759aad226f",
+            "filename": "turbopack/crates/turbo-tasks/src/native_function.rs",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 1,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/c6775aef908f4a85ffdf3f8d25cc038b937bbc15/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fnative_function.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/c6775aef908f4a85ffdf3f8d25cc038b937bbc15/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fnative_function.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fnative_function.rs?ref=c6775aef908f4a85ffdf3f8d25cc038b937bbc15",
+            "patch": "@@ -145,9 +145,12 @@ pub struct FunctionMeta {\n     /// the parent task.\n     pub local: bool,\n \n-    /// If true, the function will be allowed to call `get_invalidator` . If this is false, the\n+    /// If true, the function will be allowed to call `get_invalidator`. If this is false, the\n     /// `get_invalidator` function will panic on calls.\n     pub invalidator: bool,\n+\n+    /// If true, the function is statically analyzable immutable.\n+    pub immutable: bool,\n }\n \n /// A native (rust) turbo-tasks function. It's used internally by"
+        }
+    ],
+    "stats": {
+        "total": 59,
+        "additions": 47,
+        "deletions": 12
+    }
+}

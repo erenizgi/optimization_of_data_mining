@@ -1,0 +1,96 @@
+{
+    "author": "ijjk",
+    "message": "Add initial modifyConfig hook (#79162)",
+    "sha": "3b3a27bf35b4e913a2bd03c70bfbdae2c2401ea2",
+    "files": [
+        {
+            "sha": "12a17eb5990ae56222dcdcbd6db9063e574dff83",
+            "filename": "packages/next/src/server/config-schema.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/3b3a27bf35b4e913a2bd03c70bfbdae2c2401ea2/packages%2Fnext%2Fsrc%2Fserver%2Fconfig-schema.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/3b3a27bf35b4e913a2bd03c70bfbdae2c2401ea2/packages%2Fnext%2Fsrc%2Fserver%2Fconfig-schema.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fconfig-schema.ts?ref=3b3a27bf35b4e913a2bd03c70bfbdae2c2401ea2",
+            "patch": "@@ -317,6 +317,7 @@ export const configSchema: zod.ZodType<NextConfig> = z.lazy(() =>\n     excludeDefaultMomentLocales: z.boolean().optional(),\n     experimental: z\n       .strictObject({\n+        adapterPath: z.string().optional(),\n         useSkewCookie: z.boolean().optional(),\n         nodeMiddleware: z.boolean().optional(),\n         after: z.boolean().optional(),"
+        },
+        {
+            "sha": "3ecbab3cfc0dc4f662ae808ac2230e5fd747a947",
+            "filename": "packages/next/src/server/config-shared.ts",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/vercel/next.js/blob/3b3a27bf35b4e913a2bd03c70bfbdae2c2401ea2/packages%2Fnext%2Fsrc%2Fserver%2Fconfig-shared.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/3b3a27bf35b4e913a2bd03c70bfbdae2c2401ea2/packages%2Fnext%2Fsrc%2Fserver%2Fconfig-shared.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fconfig-shared.ts?ref=3b3a27bf35b4e913a2bd03c70bfbdae2c2401ea2",
+            "patch": "@@ -26,6 +26,13 @@ export type NextConfigComplete = Required<NextConfig> & {\n   experimental: Omit<ExperimentalConfig, 'turbo'>\n }\n \n+export interface NextAdapter {\n+  name: string\n+  modifyConfig(\n+    config: NextConfigComplete\n+  ): Promise<NextConfigComplete> | NextConfigComplete\n+}\n+\n export type I18NDomains = readonly DomainLocale[]\n \n export interface I18NConfig {\n@@ -273,6 +280,7 @@ export interface LoggingConfig {\n }\n \n export interface ExperimentalConfig {\n+  adapterPath?: string\n   useSkewCookie?: boolean\n   nodeMiddleware?: boolean\n   cacheHandlers?: {\n@@ -1244,6 +1252,7 @@ export const defaultConfig: NextConfig = {\n   outputFileTracingRoot: process.env.NEXT_PRIVATE_OUTPUT_TRACE_ROOT || '',\n   allowedDevOrigins: undefined,\n   experimental: {\n+    adapterPath: process.env.NEXT_ADAPTER_PATH || undefined,\n     useSkewCookie: false,\n     nodeMiddleware: false,\n     cacheLife: {"
+        },
+        {
+            "sha": "fd9ae3c18bb3bb4fe4ebabdc2b22e63045d7660d",
+            "filename": "packages/next/src/server/config.ts",
+            "status": "modified",
+            "additions": 51,
+            "deletions": 11,
+            "changes": 62,
+            "blob_url": "https://github.com/vercel/next.js/blob/3b3a27bf35b4e913a2bd03c70bfbdae2c2401ea2/packages%2Fnext%2Fsrc%2Fserver%2Fconfig.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/3b3a27bf35b4e913a2bd03c70bfbdae2c2401ea2/packages%2Fnext%2Fsrc%2Fserver%2Fconfig.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fconfig.ts?ref=3b3a27bf35b4e913a2bd03c70bfbdae2c2401ea2",
+            "patch": "@@ -4,13 +4,19 @@ import { pathToFileURL } from 'url'\n import findUp from 'next/dist/compiled/find-up'\n import * as Log from '../build/output/log'\n import * as ciEnvironment from '../server/ci-info'\n-import { CONFIG_FILES, PHASE_DEVELOPMENT_SERVER } from '../shared/lib/constants'\n+import {\n+  CONFIG_FILES,\n+  PHASE_DEVELOPMENT_SERVER,\n+  PHASE_PRODUCTION_BUILD,\n+  PHASE_PRODUCTION_SERVER,\n+} from '../shared/lib/constants'\n import { defaultConfig, normalizeConfig } from './config-shared'\n import type {\n   ExperimentalConfig,\n   NextConfigComplete,\n   NextConfig,\n   TurbopackLoaderItem,\n+  NextAdapter,\n } from './config-shared'\n \n import { loadWebpackHook } from './config-utils'\n@@ -31,6 +37,7 @@ import { normalizeZodErrors } from '../shared/lib/zod'\n import { HTML_LIMITED_BOT_UA_RE_STRING } from '../shared/lib/router/utils/is-bot'\n import { findDir } from '../lib/find-pages-dir'\n import { CanaryOnlyError, isStableBuild } from '../shared/lib/canary-only'\n+import { interopDefault } from '../lib/interop-default'\n \n export { normalizeConfig } from './config-shared'\n export type { DomainLocale, NextConfig } from './config-shared'\n@@ -1091,6 +1098,33 @@ function assignDefaults(\n   return result\n }\n \n+async function applyModifyConfig(\n+  config: NextConfigComplete,\n+  phase: string,\n+  silent: boolean\n+): Promise<NextConfigComplete> {\n+  if (\n+    // TODO: should this be called for server start as\n+    // adapters shouldn't be relying on \"next start\"\n+    [PHASE_PRODUCTION_BUILD, PHASE_PRODUCTION_SERVER].includes(phase) &&\n+    config.experimental?.adapterPath\n+  ) {\n+    const adapterMod = interopDefault(\n+      await import(\n+        pathToFileURL(require.resolve(config.experimental.adapterPath)).href\n+      )\n+    ) as NextAdapter\n+\n+    if (typeof adapterMod.modifyConfig === 'function') {\n+      if (!silent) {\n+        Log.info(`Applying modifyConfig from ${adapterMod.name}`)\n+      }\n+      config = await adapterMod.modifyConfig(config)\n+    }\n+  }\n+  return config\n+}\n+\n export default async function loadConfig(\n   phase: string,\n   dir: string,\n@@ -1121,6 +1155,8 @@ export default async function loadConfig(\n   }\n \n   if (process.env.__NEXT_PRIVATE_STANDALONE_CONFIG) {\n+    // we don't apply assignDefaults or modifyConfig here as it\n+    // has already been applied\n     return JSON.parse(process.env.__NEXT_PRIVATE_STANDALONE_CONFIG)\n   }\n \n@@ -1137,15 +1173,19 @@ export default async function loadConfig(\n   let configFileName = 'next.config.js'\n \n   if (customConfig) {\n-    return assignDefaults(\n-      dir,\n-      {\n-        configOrigin: 'server',\n-        configFileName,\n-        ...customConfig,\n-      },\n+    return await applyModifyConfig(\n+      assignDefaults(\n+        dir,\n+        {\n+          configOrigin: 'server',\n+          configFileName,\n+          ...customConfig,\n+        },\n+        silent\n+      ) as NextConfigComplete,\n+      phase,\n       silent\n-    ) as NextConfigComplete\n+    )\n   }\n \n   const path = await findUp(CONFIG_FILES, { cwd: dir })\n@@ -1334,7 +1374,7 @@ export default async function loadConfig(\n       },\n       silent\n     ) as NextConfigComplete\n-    return completeConfig\n+    return await applyModifyConfig(completeConfig, phase, silent)\n   } else {\n     const configBaseName = basename(CONFIG_FILES[0], extname(CONFIG_FILES[0]))\n     const unsupportedConfig = findUp.sync(\n@@ -1366,7 +1406,7 @@ export default async function loadConfig(\n   ) as NextConfigComplete\n   completeConfig.configFileName = configFileName\n   setHttpClientAndAgentOptions(completeConfig)\n-  return completeConfig\n+  return await applyModifyConfig(completeConfig, phase, silent)\n }\n \n export type ConfiguredExperimentalFeature ="
+        },
+        {
+            "sha": "d77e4ec98656376bdbc2492e628f0d90fea99336",
+            "filename": "test/production/adapter-config/adapter-config.test.ts",
+            "status": "added",
+            "additions": 19,
+            "deletions": 0,
+            "changes": 19,
+            "blob_url": "https://github.com/vercel/next.js/blob/3b3a27bf35b4e913a2bd03c70bfbdae2c2401ea2/test%2Fproduction%2Fadapter-config%2Fadapter-config.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/3b3a27bf35b4e913a2bd03c70bfbdae2c2401ea2/test%2Fproduction%2Fadapter-config%2Fadapter-config.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fproduction%2Fadapter-config%2Fadapter-config.test.ts?ref=3b3a27bf35b4e913a2bd03c70bfbdae2c2401ea2",
+            "patch": "@@ -0,0 +1,19 @@\n+import { nextTestSetup } from 'e2e-utils'\n+\n+describe('adapter-config', () => {\n+  const { next } = nextTestSetup({\n+    files: __dirname,\n+  })\n+\n+  it('should apply modifyConfig from adapter', async () => {\n+    // we apply basePath /docs so ensure that applied\n+    const res = await next.fetch('/')\n+    expect(res.status).toBe(404)\n+\n+    const res2 = await next.fetch('/docs')\n+    expect(res2.status).toBe(200)\n+    expect(await res2.text()).toContain('hello world')\n+\n+    expect(next.cliOutput).toContain('called modify config in adapter')\n+  })\n+})"
+        },
+        {
+            "sha": "cef42c82bb8c1e7fc06174e09a56dfc9031b4b8b",
+            "filename": "test/production/adapter-config/my-adapter.mjs",
+            "status": "added",
+            "additions": 11,
+            "deletions": 0,
+            "changes": 11,
+            "blob_url": "https://github.com/vercel/next.js/blob/3b3a27bf35b4e913a2bd03c70bfbdae2c2401ea2/test%2Fproduction%2Fadapter-config%2Fmy-adapter.mjs",
+            "raw_url": "https://github.com/vercel/next.js/raw/3b3a27bf35b4e913a2bd03c70bfbdae2c2401ea2/test%2Fproduction%2Fadapter-config%2Fmy-adapter.mjs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fproduction%2Fadapter-config%2Fmy-adapter.mjs?ref=3b3a27bf35b4e913a2bd03c70bfbdae2c2401ea2",
+            "patch": "@@ -0,0 +1,11 @@\n+/** @type {import('next').NextAdapter } */\n+const myAdapter = {\n+  name: 'my-custom-adapter',\n+  modifyConfig: (config) => {\n+    console.log('called modify config in adapter')\n+    config.basePath = '/docs'\n+    return config\n+  },\n+}\n+\n+export default myAdapter"
+        },
+        {
+            "sha": "29c7dcb570841ea4d3198e9cf46c59d00d7f7fca",
+            "filename": "test/production/adapter-config/next.config.mjs",
+            "status": "added",
+            "additions": 11,
+            "deletions": 0,
+            "changes": 11,
+            "blob_url": "https://github.com/vercel/next.js/blob/3b3a27bf35b4e913a2bd03c70bfbdae2c2401ea2/test%2Fproduction%2Fadapter-config%2Fnext.config.mjs",
+            "raw_url": "https://github.com/vercel/next.js/raw/3b3a27bf35b4e913a2bd03c70bfbdae2c2401ea2/test%2Fproduction%2Fadapter-config%2Fnext.config.mjs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fproduction%2Fadapter-config%2Fnext.config.mjs?ref=3b3a27bf35b4e913a2bd03c70bfbdae2c2401ea2",
+            "patch": "@@ -0,0 +1,11 @@\n+import Module from 'module'\n+const require = Module.createRequire(import.meta.url)\n+\n+/** @type {import('next').NextConfig} */\n+const nextConfig = {\n+  experimental: {\n+    adapterPath: require.resolve('./my-adapter.mjs'),\n+  },\n+}\n+\n+export default nextConfig"
+        },
+        {
+            "sha": "ff7159d9149feeb1eb8f4b7bbeadb2e26c20b053",
+            "filename": "test/production/adapter-config/pages/index.tsx",
+            "status": "added",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/3b3a27bf35b4e913a2bd03c70bfbdae2c2401ea2/test%2Fproduction%2Fadapter-config%2Fpages%2Findex.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/3b3a27bf35b4e913a2bd03c70bfbdae2c2401ea2/test%2Fproduction%2Fadapter-config%2Fpages%2Findex.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fproduction%2Fadapter-config%2Fpages%2Findex.tsx?ref=3b3a27bf35b4e913a2bd03c70bfbdae2c2401ea2",
+            "patch": "@@ -0,0 +1,3 @@\n+export default function Page() {\n+  return <p>hello world</p>\n+}"
+        }
+    ],
+    "stats": {
+        "total": 116,
+        "additions": 105,
+        "deletions": 11
+    }
+}

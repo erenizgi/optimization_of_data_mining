@@ -1,0 +1,48 @@
+{
+    "author": "gnoff",
+    "message": "[use-cache] track cache read earlier when encrypting bound args (#81427)\n\nbound args need to be encrypted for use cache functions and currently we\ntrack the read slightly later than will be necessary when we sync the\nlatest React. This change moves the tracking to be as early as possible\n(as soon as the input signal is aborted or when the bound args are\nfinished being serialized, whichever is first).",
+    "sha": "656271b21033cdb7f835a8ffe48813a298a9d898",
+    "files": [
+        {
+            "sha": "8eaaa4de358479817bf0360421f4154ae3a176db",
+            "filename": "packages/next/src/server/app-render/encryption.ts",
+            "status": "modified",
+            "additions": 45,
+            "deletions": 8,
+            "changes": 53,
+            "blob_url": "https://github.com/vercel/next.js/blob/656271b21033cdb7f835a8ffe48813a298a9d898/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fencryption.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/656271b21033cdb7f835a8ffe48813a298a9d898/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fencryption.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fencryption.ts?ref=656271b21033cdb7f835a8ffe48813a298a9d898",
+            "patch": "@@ -82,12 +82,24 @@ async function encodeActionBoundArg(actionId: string, arg: string) {\n   return btoa(ivValue + arrayBufferToString(encrypted))\n }\n \n+enum ReadStatus {\n+  Ready,\n+  Pending,\n+  Complete,\n+}\n+\n // Encrypts the action's bound args into a string. For the same combination of\n // actionId and args the same cached promise is returned. This ensures reference\n // equality for returned objects from \"use cache\" functions when they're invoked\n // multiple times within one render pass using the same bound args.\n export const encryptActionBoundArgs = React.cache(\n   async function encryptActionBoundArgs(actionId: string, ...args: any[]) {\n+    const workUnitStore = workUnitAsyncStorage.getStore()\n+    const cacheSignal =\n+      workUnitStore?.type === 'prerender'\n+        ? workUnitStore.cacheSignal\n+        : undefined\n+\n     const { clientModules } = getClientReferenceManifestForRsc()\n \n     // Create an error before any asynchronous calls, to capture the original\n@@ -97,13 +109,38 @@ export const encryptActionBoundArgs = React.cache(\n \n     let didCatchError = false\n \n-    const workUnitStore = workUnitAsyncStorage.getStore()\n-\n     const hangingInputAbortSignal =\n       workUnitStore?.type === 'prerender'\n         ? createHangingInputAbortSignal(workUnitStore)\n         : undefined\n \n+    let readStatus = ReadStatus.Ready\n+    function startReadOnce() {\n+      if (readStatus === ReadStatus.Ready) {\n+        readStatus = ReadStatus.Pending\n+        cacheSignal?.beginRead()\n+      }\n+    }\n+\n+    function endReadIfStarted() {\n+      if (readStatus === ReadStatus.Pending) {\n+        cacheSignal?.endRead()\n+      }\n+      readStatus = ReadStatus.Complete\n+    }\n+\n+    // streamToString might take longer than a microtask to resolve and then other things\n+    // waiting on the cache signal might not realize there is another cache to fill so if\n+    // we are no longer waiting on the bound args serialization via the hangingInputAbortSignal\n+    // we should eagerly start the cache read to prevent other readers of the cache signal from\n+    // missing this cache fill. We use a idempotent function to only start reading once because\n+    // it's also possible that streamToString finishes before the hangingInputAbortSignal aborts.\n+    if (hangingInputAbortSignal && cacheSignal) {\n+      hangingInputAbortSignal.addEventListener('abort', startReadOnce, {\n+        once: true,\n+      })\n+    }\n+\n     // Using Flight to serialize the args into a string.\n     const serialized = await streamToString(\n       renderToReadableStream(args, clientModules, {\n@@ -139,13 +176,18 @@ export const encryptActionBoundArgs = React.cache(\n         console.error(error)\n       }\n \n+      endReadIfStarted()\n       throw error\n     }\n \n     if (!workUnitStore) {\n+      // We don't need to call cacheSignal.endRead here because we can't have a cacheSignal\n+      // if we do not have a workUnitStore.\n       return encodeActionBoundArg(actionId, serialized)\n     }\n \n+    startReadOnce()\n+\n     const prerenderResumeDataCache = getPrerenderResumeDataCache(workUnitStore)\n     const renderResumeDataCache = getRenderResumeDataCache(workUnitStore)\n     const cacheKey = actionId + serialized\n@@ -158,14 +200,9 @@ export const encryptActionBoundArgs = React.cache(\n       return cachedEncrypted\n     }\n \n-    const cacheSignal =\n-      workUnitStore.type === 'prerender' ? workUnitStore.cacheSignal : undefined\n-\n-    cacheSignal?.beginRead()\n-\n     const encrypted = await encodeActionBoundArg(actionId, serialized)\n \n-    cacheSignal?.endRead()\n+    endReadIfStarted()\n     prerenderResumeDataCache?.encryptedBoundArgs.set(cacheKey, encrypted)\n \n     return encrypted"
+        },
+        {
+            "sha": "5746ea3d55f0241729ab406ab37add6041003108",
+            "filename": "test/e2e/app-dir/use-cache-hanging-inputs/app/uncached-promise-nested/page.tsx",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/656271b21033cdb7f835a8ffe48813a298a9d898/test%2Fe2e%2Fapp-dir%2Fuse-cache-hanging-inputs%2Fapp%2Funcached-promise-nested%2Fpage.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/656271b21033cdb7f835a8ffe48813a298a9d898/test%2Fe2e%2Fapp-dir%2Fuse-cache-hanging-inputs%2Fapp%2Funcached-promise-nested%2Fpage.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fuse-cache-hanging-inputs%2Fapp%2Funcached-promise-nested%2Fpage.tsx?ref=656271b21033cdb7f835a8ffe48813a298a9d898",
+            "patch": "@@ -2,7 +2,7 @@ import React from 'react'\n import { setTimeout } from 'timers/promises'\n \n async function getUncachedData() {\n-  await setTimeout(100)\n+  await setTimeout(0)\n \n   return Math.random()\n }"
+        },
+        {
+            "sha": "7a18769bd24aa18415d0646b90ab2f56a0cb1b9b",
+            "filename": "test/e2e/app-dir/use-cache-hanging-inputs/app/uncached-promise/page.tsx",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/656271b21033cdb7f835a8ffe48813a298a9d898/test%2Fe2e%2Fapp-dir%2Fuse-cache-hanging-inputs%2Fapp%2Funcached-promise%2Fpage.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/656271b21033cdb7f835a8ffe48813a298a9d898/test%2Fe2e%2Fapp-dir%2Fuse-cache-hanging-inputs%2Fapp%2Funcached-promise%2Fpage.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fuse-cache-hanging-inputs%2Fapp%2Funcached-promise%2Fpage.tsx?ref=656271b21033cdb7f835a8ffe48813a298a9d898",
+            "patch": "@@ -2,7 +2,7 @@ import React from 'react'\n import { setTimeout } from 'timers/promises'\n \n async function fetchUncachedData() {\n-  await setTimeout(100)\n+  await setTimeout(0)\n \n   return Math.random()\n }"
+        }
+    ],
+    "stats": {
+        "total": 57,
+        "additions": 47,
+        "deletions": 10
+    }
+}

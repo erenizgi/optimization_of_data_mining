@@ -1,0 +1,84 @@
+{
+    "author": "sokra",
+    "message": "Turbopack: include obsolete entries in computation (#80362)\n\n### What?\n\nWe didn't include already removed entries in the usage computation. So a meta file was incorrectly marked as unused and was removed.",
+    "sha": "9499a50f064925b48dc98895d001dde5ac0d3305",
+    "files": [
+        {
+            "sha": "8a026c99aae5288a33b55e8958e860661ac1c380",
+            "filename": "turbopack/crates/turbo-persistence-tools/src/main.rs",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/9499a50f064925b48dc98895d001dde5ac0d3305/turbopack%2Fcrates%2Fturbo-persistence-tools%2Fsrc%2Fmain.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/9499a50f064925b48dc98895d001dde5ac0d3305/turbopack%2Fcrates%2Fturbo-persistence-tools%2Fsrc%2Fmain.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-persistence-tools%2Fsrc%2Fmain.rs?ref=9499a50f064925b48dc98895d001dde5ac0d3305",
+            "patch": "@@ -39,7 +39,7 @@ fn main() -> Result<()> {\n         {\n             println!(\n                 \"  SST {sequence_number:08}.sst: {min_hash:016x} - {max_hash:016x} (p = 1/{})\",\n-                u64::MAX / (max_hash - min_hash)\n+                u64::MAX / (max_hash - min_hash + 1)\n             );\n             println!(\"    AQMF {aqmf_entries} entries = {} KiB\", aqmf_size / 1024);\n             println!("
+        },
+        {
+            "sha": "e1db68ae0959b7d8aaea3ad65580f852bae69674",
+            "filename": "turbopack/crates/turbo-persistence/src/db.rs",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 2,
+            "changes": 12,
+            "blob_url": "https://github.com/vercel/next.js/blob/9499a50f064925b48dc98895d001dde5ac0d3305/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fdb.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/9499a50f064925b48dc98895d001dde5ac0d3305/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fdb.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fdb.rs?ref=9499a50f064925b48dc98895d001dde5ac0d3305",
+            "patch": "@@ -525,7 +525,12 @@ impl TurboPersistence {\n                         (seq, range.min_hash, range.max_hash, size)\n                     })\n                     .collect::<Vec<_>>();\n-                (meta.sequence_number(), meta.family(), ssts)\n+                (\n+                    meta.sequence_number(),\n+                    meta.family(),\n+                    ssts,\n+                    meta.obsolete_sst_files().to_vec(),\n+                )\n             })\n             .collect::<Vec<_>>();\n \n@@ -606,7 +611,7 @@ impl TurboPersistence {\n             writeln!(log, \"Time {time}\")?;\n             let span = time.until(Timestamp::now())?;\n             writeln!(log, \"Commit {seq:08} {keys_written} keys in {span:#}\")?;\n-            for (seq, family, ssts) in new_meta_info {\n+            for (seq, family, ssts, obsolete) in new_meta_info {\n                 writeln!(log, \"{seq:08} META family:{family}\",)?;\n                 for (seq, min, max, size) in ssts {\n                     writeln!(\n@@ -615,6 +620,9 @@ impl TurboPersistence {\n                         size / 1024 / 1024\n                     )?;\n                 }\n+                for seq in obsolete {\n+                    writeln!(log, \"  {seq:08} OBSOLETE SST\")?;\n+                }\n             }\n             new_sst_files.sort_unstable_by_key(|(seq, _)| *seq);\n             for (seq, _) in new_sst_files.iter() {"
+        },
+        {
+            "sha": "9a2d8f7b874b50beebba704d1a5dfecf429ec083",
+            "filename": "turbopack/crates/turbo-persistence/src/meta_file.rs",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 2,
+            "changes": 17,
+            "blob_url": "https://github.com/vercel/next.js/blob/9499a50f064925b48dc98895d001dde5ac0d3305/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fmeta_file.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/9499a50f064925b48dc98895d001dde5ac0d3305/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fmeta_file.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fmeta_file.rs?ref=9499a50f064925b48dc98895d001dde5ac0d3305",
+            "patch": "@@ -183,6 +183,8 @@ pub struct MetaFile {\n     family: u32,\n     /// The entries of the file.\n     entries: Vec<MetaEntry>,\n+    /// The entries that have been marked as obsolete.\n+    obsolete_entries: Vec<u32>,\n     /// The obsolete SST files.\n     obsolete_sst_files: Vec<u32>,\n     /// The memory mapped file.\n@@ -247,6 +249,7 @@ impl MetaFile {\n             sequence_number,\n             family,\n             entries,\n+            obsolete_entries: Vec::new(),\n             obsolete_sst_files,\n             mmap,\n         };\n@@ -276,11 +279,21 @@ impl MetaFile {\n \n     pub fn retain_entries(&mut self, mut predicate: impl FnMut(u32) -> bool) -> bool {\n         let old_len = self.entries.len();\n-        self.entries\n-            .retain(|entry| predicate(entry.sst_data.sequence_number));\n+        self.entries.retain(|entry| {\n+            if predicate(entry.sst_data.sequence_number) {\n+                true\n+            } else {\n+                self.obsolete_entries.push(entry.sst_data.sequence_number);\n+                false\n+            }\n+        });\n         old_len != self.entries.len()\n     }\n \n+    pub fn obsolete_entries(&self) -> &[u32] {\n+        &self.obsolete_entries\n+    }\n+\n     pub fn has_active_entries(&self) -> bool {\n         !self.entries.is_empty()\n     }"
+        },
+        {
+            "sha": "eb78f03ff90be49dac64f1c61b5d98c9168816c5",
+            "filename": "turbopack/crates/turbo-persistence/src/meta_file_builder.rs",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 2,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/9499a50f064925b48dc98895d001dde5ac0d3305/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fmeta_file_builder.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/9499a50f064925b48dc98895d001dde5ac0d3305/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fmeta_file_builder.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fmeta_file_builder.rs?ref=9499a50f064925b48dc98895d001dde5ac0d3305",
+            "patch": "@@ -35,17 +35,18 @@ impl MetaFileBuilder {\n     }\n \n     #[tracing::instrument(level = \"trace\", skip_all)]\n-    pub fn write(&self, db_path: &Path, seq: u32) -> Result<File> {\n+    pub fn write(self, db_path: &Path, seq: u32) -> Result<File> {\n         let file = db_path.join(format!(\"{seq:08}.meta\"));\n         self.write_internal(&file)\n             .with_context(|| format!(\"Unable to write meta file {seq:08}.meta\"))\n     }\n \n-    fn write_internal(&self, file: &Path) -> io::Result<File> {\n+    fn write_internal(mut self, file: &Path) -> io::Result<File> {\n         let mut file = BufWriter::new(File::create(file)?);\n         file.write_u32::<BE>(0xFE4ADA4A)?; // Magic number\n         file.write_u32::<BE>(self.family)?;\n \n+        self.obsolete_sst_files.sort();\n         file.write_u32::<BE>(self.obsolete_sst_files.len() as u32)?;\n         for obsolete_sst in &self.obsolete_sst_files {\n             file.write_u32::<BE>(*obsolete_sst)?;"
+        },
+        {
+            "sha": "ca562880666d43002060cee4edec3d3645aaaf98",
+            "filename": "turbopack/crates/turbo-persistence/src/sst_filter.rs",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/vercel/next.js/blob/9499a50f064925b48dc98895d001dde5ac0d3305/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fsst_filter.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/9499a50f064925b48dc98895d001dde5ac0d3305/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fsst_filter.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fsst_filter.rs?ref=9499a50f064925b48dc98895d001dde5ac0d3305",
+            "patch": "@@ -19,6 +19,15 @@ impl SstFilter {\n \n     /// Phase 1: Apply the filter to the meta file and update the state in the filter.\n     pub fn apply_filter(&mut self, meta: &mut MetaFile) {\n+        // Already obsolete entries need to be considered for usage computation\n+        for seq in meta.obsolete_entries() {\n+            if let Some(state) = self.0.get_mut(seq)\n+                && matches!(state, SstState::UnusedObsolete)\n+            {\n+                // the obsolete state is used now\n+                *state = SstState::Obsolete;\n+            }\n+        }\n         meta.retain_entries(|seq| match self.0.entry(seq) {\n             Entry::Occupied(mut e) => {\n                 let state = e.get_mut();"
+        },
+        {
+            "sha": "8e68e8a30310b51f4a2b77831ffa188129ee0525",
+            "filename": "turbopack/crates/turbo-persistence/src/tests.rs",
+            "status": "modified",
+            "additions": 97,
+            "deletions": 1,
+            "changes": 98,
+            "blob_url": "https://github.com/vercel/next.js/blob/9499a50f064925b48dc98895d001dde5ac0d3305/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Ftests.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/9499a50f064925b48dc98895d001dde5ac0d3305/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Ftests.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Ftests.rs?ref=9499a50f064925b48dc98895d001dde5ac0d3305",
+            "patch": "@@ -1,4 +1,4 @@\n-use std::time::Instant;\n+use std::{fs, time::Instant};\n \n use anyhow::Result;\n use rayon::iter::{IntoParallelIterator, ParallelIterator};\n@@ -557,3 +557,99 @@ fn partial_compaction() -> Result<()> {\n \n     Ok(())\n }\n+\n+#[test]\n+fn merge_file_removal() -> Result<()> {\n+    let tempdir = tempfile::tempdir()?;\n+    let path = tempdir.path();\n+\n+    let _ = fs::remove_dir_all(path);\n+\n+    const READ_COUNT: u32 = 2_000; // we'll read every 10th value, so writes are 10x this value\n+    fn put(b: &WriteBatch<(u8, [u8; 4]), 1>, key: u8, value: u32) -> Result<()> {\n+        for i in 0..(READ_COUNT * 10) {\n+            b.put(\n+                0,\n+                (key, i.to_be_bytes()),\n+                value.to_be_bytes().to_vec().into(),\n+            )?;\n+        }\n+        Ok(())\n+    }\n+    fn check(db: &TurboPersistence, key: u8, value: u32) -> Result<()> {\n+        for i in 0..READ_COUNT {\n+            // read every 10th item\n+            let i = i * 10;\n+            assert_eq!(\n+                db.get(0, &(key, i.to_be_bytes()))?.as_deref(),\n+                Some(&value.to_be_bytes()[..]),\n+                \"Key {key} {i} expected {value}\"\n+            );\n+        }\n+        Ok(())\n+    }\n+    fn iter_bits(v: u32) -> impl Iterator<Item = u8> {\n+        (0..32u8).filter(move |i| v & (1 << i) != 0)\n+    }\n+\n+    {\n+        println!(\"--- Init ---\");\n+        let db = TurboPersistence::open(path.to_path_buf())?;\n+        let b = db.write_batch::<_, 1>()?;\n+        for j in 0..=255 {\n+            put(&b, j, 0)?;\n+        }\n+        db.commit_write_batch(b)?;\n+        db.shutdown()?;\n+    }\n+\n+    let mut expected_values = [0; 256];\n+\n+    for i in 1..50 {\n+        println!(\"--- Iteration {i} ---\");\n+        let i = i * 37;\n+        println!(\"Add more entries\");\n+        {\n+            let db = TurboPersistence::open(path.to_path_buf())?;\n+            let b = db.write_batch::<_, 1>()?;\n+            for j in iter_bits(i) {\n+                println!(\"Put {j} = {i}\");\n+                expected_values[j as usize] = i;\n+                put(&b, j, i)?;\n+            }\n+            db.commit_write_batch(b)?;\n+\n+            for j in 0..32 {\n+                check(&db, j, expected_values[j as usize])?;\n+            }\n+\n+            db.shutdown()?;\n+        }\n+\n+        println!(\"Compaction\");\n+        {\n+            let db = TurboPersistence::open(path.to_path_buf())?;\n+\n+            db.compact(3.0, 3, u64::MAX)?;\n+\n+            for j in 0..32 {\n+                check(&db, j, expected_values[j as usize])?;\n+            }\n+\n+            db.shutdown()?;\n+        }\n+\n+        println!(\"Restore check\");\n+        {\n+            let db = TurboPersistence::open(path.to_path_buf())?;\n+\n+            for j in 0..32 {\n+                check(&db, j, expected_values[j as usize])?;\n+            }\n+\n+            db.shutdown()?;\n+        }\n+    }\n+\n+    Ok(())\n+}"
+        }
+    ],
+    "stats": {
+        "total": 143,
+        "additions": 135,
+        "deletions": 8
+    }
+}

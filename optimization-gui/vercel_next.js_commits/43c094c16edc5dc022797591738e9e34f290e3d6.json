@@ -1,0 +1,72 @@
+{
+    "author": "mischnic",
+    "message": "Turbopack: fix `this` when accessing named properties of namespace (#80896)\n\nPreviously, this namespace-import-to-named-import optimization always caused `this` to be unbound for function calls.\r\nNow, it is preserved (if possible. There's nothing we can do when this is scope hoisted together).\r\n```js\r\nimport * as R from \"ramda\";\r\nimport { pipe } from 'ramda'\r\n\r\nexpect((0, R.pipe)()).toBe(false);\r\nexpect(R.pipe()).toBe(true);\r\nexpect(pipe()).toBe(false);\r\n```\r\n\r\n```js\r\nvar __TURBOPACK__imported__module__ramda = __turbopack_context__.i(\r\n  \"[project]/turbopack/crates/turbopack-tests/tests/execution/turbopack/side-effects-optimization/import-star/input/node_modules/ramda/pipe.js [test] (ecmascript)\"\r\n);\r\nit(\"should have the correct `this` context\", () => {\r\n  expect((0, __TURBOPACK__imported__module__ramda[\"pipe\"])()).toBe(false);\r\n  // this was previously also `(0, ns.pipe)()`\r\n  expect(__TURBOPACK__imported__module__ramda[\"pipe\"]()).toBe(true);\r\n  expect((0, __TURBOPACK__imported__module__ramda[\"pipe\"])()).toBe(false);\r\n});\r\n```\r\n\r\nAlso has  a small bundle size benefit",
+    "sha": "43c094c16edc5dc022797591738e9e34f290e3d6",
+    "files": [
+        {
+            "sha": "6e8b5f03617ae68e5e53a1cb4e385ee1afc7509a",
+            "filename": "turbopack/crates/turbopack-ecmascript/src/references/esm/binding.rs",
+            "status": "modified",
+            "additions": 26,
+            "deletions": 9,
+            "changes": 35,
+            "blob_url": "https://github.com/vercel/next.js/blob/43c094c16edc5dc022797591738e9e34f290e3d6/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Freferences%2Fesm%2Fbinding.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/43c094c16edc5dc022797591738e9e34f290e3d6/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Freferences%2Fesm%2Fbinding.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Freferences%2Fesm%2Fbinding.rs?ref=43c094c16edc5dc022797591738e9e34f290e3d6",
+            "patch": "@@ -21,9 +21,10 @@ use crate::{\n \n #[derive(Hash, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, TraceRawVcs, NonLocalValue)]\n pub struct EsmBinding {\n-    pub reference: ResolvedVc<EsmAssetReference>,\n-    pub export: Option<RcStr>,\n-    pub ast_path: AstPath,\n+    reference: ResolvedVc<EsmAssetReference>,\n+    export: Option<RcStr>,\n+    ast_path: AstPath,\n+    keep_this: bool,\n }\n \n impl EsmBinding {\n@@ -36,6 +37,21 @@ impl EsmBinding {\n             reference,\n             export,\n             ast_path,\n+            keep_this: false,\n+        }\n+    }\n+\n+    /// Where possible, bind the namespace to `this` when the named import is called.\n+    pub fn new_keep_this(\n+        reference: ResolvedVc<EsmAssetReference>,\n+        export: Option<RcStr>,\n+        ast_path: AstPath,\n+    ) -> Self {\n+        EsmBinding {\n+            reference,\n+            export,\n+            ast_path,\n+            keep_this: true,\n         }\n     }\n \n@@ -101,12 +117,13 @@ impl EsmBinding {\n                 // Any other expression can be replaced with the import accessor.\n                 Some(swc_core::ecma::visit::AstParentKind::Expr(_)) => {\n                     ast_path.pop();\n-                    let in_call = matches!(\n-                        ast_path.last(),\n-                        Some(swc_core::ecma::visit::AstParentKind::Callee(\n-                            CalleeField::Expr\n-                        ))\n-                    );\n+                    let in_call = !self.keep_this\n+                        && matches!(\n+                            ast_path.last(),\n+                            Some(swc_core::ecma::visit::AstParentKind::Callee(\n+                                CalleeField::Expr\n+                            ))\n+                        );\n \n                     visitors.push(\n                         create_visitor!(exact ast_path, visit_mut_expr(expr: &mut Expr) {"
+        },
+        {
+            "sha": "2b055f7ef783952626998ddecb656bc25d46a7c4",
+            "filename": "turbopack/crates/turbopack-ecmascript/src/references/mod.rs",
+            "status": "modified",
+            "additions": 22,
+            "deletions": 19,
+            "changes": 41,
+            "blob_url": "https://github.com/vercel/next.js/blob/43c094c16edc5dc022797591738e9e34f290e3d6/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Freferences%2Fmod.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/43c094c16edc5dc022797591738e9e34f290e3d6/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Freferences%2Fmod.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Freferences%2Fmod.rs?ref=43c094c16edc5dc022797591738e9e34f290e3d6",
+            "patch": "@@ -1366,28 +1366,31 @@ pub(crate) async fn analyse_ecmascript_module_internal(\n                             options.tree_shaking_mode,\n                             Some(TreeShakingMode::ReexportsOnly)\n                         ) {\n-                            let r_ref = r.await?;\n-                            if r_ref.export_name.is_none()\n+                            let original_reference = r.await?;\n+                            if original_reference.export_name.is_none()\n                                 && export.is_some()\n                                 && let Some(export) = export\n                             {\n-                                let r = analysis.add_esm_reference_namespace_resolved(\n-                                    esm_reference_index,\n-                                    export.clone(),\n-                                    || {\n-                                        EsmAssetReference::new(\n-                                            r_ref.origin,\n-                                            r_ref.request,\n-                                            r_ref.issue_source.clone(),\n-                                            r_ref.annotations.clone(),\n-                                            Some(ModulePart::export(export.clone())),\n-                                            r_ref.import_externals,\n-                                        )\n-                                        .resolved_cell()\n-                                    },\n-                                );\n-                                analysis.add_code_gen(EsmBinding::new(\n-                                    r,\n+                                // Rewrite `import * as ns from 'foo'; foo.bar()` to behave like\n+                                // `import {bar} from 'foo'; bar()` for tree shaking purposes.\n+                                let named_reference = analysis\n+                                    .add_esm_reference_namespace_resolved(\n+                                        esm_reference_index,\n+                                        export.clone(),\n+                                        || {\n+                                            EsmAssetReference::new(\n+                                                original_reference.origin,\n+                                                original_reference.request,\n+                                                original_reference.issue_source.clone(),\n+                                                original_reference.annotations.clone(),\n+                                                Some(ModulePart::export(export.clone())),\n+                                                original_reference.import_externals,\n+                                            )\n+                                            .resolved_cell()\n+                                        },\n+                                    );\n+                                analysis.add_code_gen(EsmBinding::new_keep_this(\n+                                    named_reference,\n                                     Some(export),\n                                     ast_path.into(),\n                                 ));"
+        },
+        {
+            "sha": "d5e2288a01de90062927cb7725231ea21a27be14",
+            "filename": "turbopack/crates/turbopack-tests/tests/execution/turbopack/side-effects-optimization/import-star/input/index.js",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 2,
+            "changes": 8,
+            "blob_url": "https://github.com/vercel/next.js/blob/43c094c16edc5dc022797591738e9e34f290e3d6/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fimport-star%2Finput%2Findex.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/43c094c16edc5dc022797591738e9e34f290e3d6/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fimport-star%2Finput%2Findex.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fimport-star%2Finput%2Findex.js?ref=43c094c16edc5dc022797591738e9e34f290e3d6",
+            "patch": "@@ -1,7 +1,11 @@\n import * as R from 'ramda'\n+import { pipe } from 'ramda'\n \n-console.log((0, R.pipe)('a', 'b', 'c'))\n-console.log(R.pipe('a', 'b', 'c'))\n+it('should have the correct `this` context', () => {\n+  expect((0, R.pipe)()).toBe(false)\n+  expect(R.pipe()).toBe(true)\n+  expect(pipe()).toBe(false)\n+})\n \n it('should import only pipe.js', () => {\n   const modules = Object.keys(__turbopack_modules__)"
+        },
+        {
+            "sha": "2982d7f4d10c69e71aa46625dbb7a4caa6b6279a",
+            "filename": "turbopack/crates/turbopack-tests/tests/execution/turbopack/side-effects-optimization/import-star/input/node_modules/ramda/index.js",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/43c094c16edc5dc022797591738e9e34f290e3d6/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fimport-star%2Finput%2Fnode_modules%2Framda%2Findex.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/43c094c16edc5dc022797591738e9e34f290e3d6/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fimport-star%2Finput%2Fnode_modules%2Framda%2Findex.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fimport-star%2Finput%2Fnode_modules%2Framda%2Findex.js?ref=43c094c16edc5dc022797591738e9e34f290e3d6",
+            "patch": "@@ -1 +1 @@\n-export * from './pipe';\n+export * from './pipe'"
+        },
+        {
+            "sha": "da8b640581726b849af69fe41622ea708ee40161",
+            "filename": "turbopack/crates/turbopack-tests/tests/execution/turbopack/side-effects-optimization/import-star/input/node_modules/ramda/pipe.js",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 4,
+            "changes": 6,
+            "blob_url": "https://github.com/vercel/next.js/blob/43c094c16edc5dc022797591738e9e34f290e3d6/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fimport-star%2Finput%2Fnode_modules%2Framda%2Fpipe.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/43c094c16edc5dc022797591738e9e34f290e3d6/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fimport-star%2Finput%2Fnode_modules%2Framda%2Fpipe.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fimport-star%2Finput%2Fnode_modules%2Framda%2Fpipe.js?ref=43c094c16edc5dc022797591738e9e34f290e3d6",
+            "patch": "@@ -1,5 +1,3 @@\n-\n-\n-export const pipe= (a,b,c)=> {\n-  console.log(a,b,c)\n+export function pipe() {\n+  return this != null\n }"
+        }
+    ],
+    "stats": {
+        "total": 92,
+        "additions": 57,
+        "deletions": 35
+    }
+}

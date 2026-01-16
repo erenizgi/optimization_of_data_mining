@@ -1,0 +1,144 @@
+{
+    "author": "devjiwonchoi",
+    "message": "[next-config-ts] fix: read tsconfig file using TypeScript API (#79055)\n\n### Why?\n\nSince we \"lazily\" read the tsconfig file, it didn't properly handle\n`extends`. Instead of applying further to lazily read, properly read the\nconfig using the TypeScript API.\n\nSee failed CI from adding the test with expected behavior:\n\n\nhttps://github.com/vercel/next.js/actions/runs/14956950541/job/42013900207?pr=79055#step:34:125\n\nSupersedes https://github.com/vercel/next.js/issues/74914\nFixes https://github.com/vercel/next.js/issues/74888\n\n---------\n\nCo-authored-by: JJ Kasper <jj@jjsweb.site>",
+    "sha": "2be311e61f890945879002a908d91ea7893cd958",
+    "files": [
+        {
+            "sha": "f5fec658d6fbae3118a0c9937a58455e7dfc3d35",
+            "filename": "packages/next/src/build/next-config-ts/transpile-config.ts",
+            "status": "modified",
+            "additions": 70,
+            "deletions": 13,
+            "changes": 83,
+            "blob_url": "https://github.com/vercel/next.js/blob/2be311e61f890945879002a908d91ea7893cd958/packages%2Fnext%2Fsrc%2Fbuild%2Fnext-config-ts%2Ftranspile-config.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/2be311e61f890945879002a908d91ea7893cd958/packages%2Fnext%2Fsrc%2Fbuild%2Fnext-config-ts%2Ftranspile-config.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Fnext-config-ts%2Ftranspile-config.ts?ref=2be311e61f890945879002a908d91ea7893cd958",
+            "patch": "@@ -1,15 +1,17 @@\n import type { Options as SWCOptions } from '@swc/core'\n import type { CompilerOptions } from 'typescript'\n-import { join } from 'node:path'\n+\n+import { resolve } from 'node:path'\n import { readFile } from 'node:fs/promises'\n import { deregisterHook, registerHook, requireFromString } from './require-hook'\n-import { parseJsonFile } from '../load-jsconfig'\n+import { warn } from '../output/log'\n+import { installDependencies } from '../../lib/install-dependencies'\n \n function resolveSWCOptions(\n   cwd: string,\n   compilerOptions: CompilerOptions\n ): SWCOptions {\n-  const resolvedBaseUrl = join(cwd, compilerOptions.baseUrl ?? '.')\n+  const resolvedBaseUrl = resolve(cwd, compilerOptions.baseUrl ?? '.')\n   return {\n     jsc: {\n       target: 'es5',\n@@ -26,31 +28,86 @@ function resolveSWCOptions(\n   } satisfies SWCOptions\n }\n \n-async function lazilyGetTSConfig(cwd: string) {\n-  let tsConfig: { compilerOptions: CompilerOptions }\n+// Ported from next/src/lib/verify-typescript-setup.ts\n+// Although this overlaps with the later `verifyTypeScriptSetup`,\n+// it is acceptable since the time difference in the worst case is trivial,\n+// as we are only preparing to install the dependencies once more.\n+async function verifyTypeScriptSetup(cwd: string, configFileName: string) {\n   try {\n-    tsConfig = parseJsonFile(join(cwd, 'tsconfig.json'))\n+    // Quick module check.\n+    require.resolve('typescript', { paths: [cwd] })\n   } catch (error) {\n-    // ignore if tsconfig.json does not exist\n-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {\n-      throw error\n+    if (\n+      error &&\n+      typeof error === 'object' &&\n+      'code' in error &&\n+      error.code === 'MODULE_NOT_FOUND'\n+    ) {\n+      warn(\n+        `Installing TypeScript as it was not found while loading \"${configFileName}\".`\n+      )\n+\n+      await installDependencies(cwd, [{ pkg: 'typescript' }], true).catch(\n+        (err) => {\n+          if (err && typeof err === 'object' && 'command' in err) {\n+            console.error(\n+              `Failed to install TypeScript, please install it manually to continue:\\n` +\n+                (err as any).command +\n+                '\\n'\n+            )\n+          }\n+          throw err\n+        }\n+      )\n     }\n-    tsConfig = { compilerOptions: {} }\n   }\n+}\n+\n+async function getTsConfig(cwd: string): Promise<CompilerOptions> {\n+  const ts: typeof import('typescript') = require(\n+    require.resolve('typescript', { paths: [cwd] })\n+  )\n+\n+  // NOTE: This doesn't fully cover the edge case for setting\n+  // \"typescript.tsconfigPath\" in next config which is currently\n+  // a restriction.\n+  const tsConfigPath = ts.findConfigFile(\n+    cwd,\n+    ts.sys.fileExists,\n+    'tsconfig.json'\n+  )\n \n-  return tsConfig\n+  if (!tsConfigPath) {\n+    // It is ok to not return ts.getDefaultCompilerOptions() because\n+    // we are only lookfing for paths and baseUrl from tsConfig.\n+    return {}\n+  }\n+\n+  const configFile = ts.readConfigFile(tsConfigPath, ts.sys.readFile)\n+  const parsedCommandLine = ts.parseJsonConfigFileContent(\n+    configFile.config,\n+    ts.sys,\n+    cwd\n+  )\n+\n+  return parsedCommandLine.options\n }\n \n export async function transpileConfig({\n   nextConfigPath,\n+  configFileName,\n   cwd,\n }: {\n   nextConfigPath: string\n+  configFileName: string\n   cwd: string\n }) {\n   let hasRequire = false\n   try {\n-    const { compilerOptions } = await lazilyGetTSConfig(cwd)\n+    // Ensure TypeScript is installed to use the API.\n+    await verifyTypeScriptSetup(cwd, configFileName)\n+\n+    const compilerOptions = await getTsConfig(cwd)\n     const swcOptions = resolveSWCOptions(cwd, compilerOptions)\n \n     const nextConfigString = await readFile(nextConfigPath, 'utf8')\n@@ -66,7 +123,7 @@ export async function transpileConfig({\n     }\n \n     // filename & extension don't matter here\n-    return requireFromString(code, join(cwd, 'next.config.compiled.js'))\n+    return requireFromString(code, resolve(cwd, 'next.config.compiled.js'))\n   } catch (error) {\n     throw error\n   } finally {"
+        },
+        {
+            "sha": "2bd12478128bc648bfcfc0d6f6434b0f27d1396c",
+            "filename": "packages/next/src/server/config.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/2be311e61f890945879002a908d91ea7893cd958/packages%2Fnext%2Fsrc%2Fserver%2Fconfig.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/2be311e61f890945879002a908d91ea7893cd958/packages%2Fnext%2Fsrc%2Fserver%2Fconfig.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fconfig.ts?ref=2be311e61f890945879002a908d91ea7893cd958",
+            "patch": "@@ -1177,6 +1177,7 @@ export default async function loadConfig(\n       } else if (configFileName === 'next.config.ts') {\n         userConfigModule = await transpileConfig({\n           nextConfigPath: path,\n+          configFileName,\n           cwd: dir,\n         })\n       } else {"
+        },
+        {
+            "sha": "ca3f2dbd5e047e55cc406d013cd54407d7a8c3ea",
+            "filename": "test/e2e/app-dir/next-config-ts/tsconfig-extends/.gitignore",
+            "status": "added",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/2be311e61f890945879002a908d91ea7893cd958/test%2Fe2e%2Fapp-dir%2Fnext-config-ts%2Ftsconfig-extends%2F.gitignore",
+            "raw_url": "https://github.com/vercel/next.js/raw/2be311e61f890945879002a908d91ea7893cd958/test%2Fe2e%2Fapp-dir%2Fnext-config-ts%2Ftsconfig-extends%2F.gitignore",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fnext-config-ts%2Ftsconfig-extends%2F.gitignore?ref=2be311e61f890945879002a908d91ea7893cd958",
+            "patch": "@@ -0,0 +1 @@\n+!tsconfig.json"
+        },
+        {
+            "sha": "1fc11814f22e8055ad96dae288f9faf32b67c1d5",
+            "filename": "test/e2e/app-dir/next-config-ts/tsconfig-extends/bar.ts",
+            "status": "added",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/2be311e61f890945879002a908d91ea7893cd958/test%2Fe2e%2Fapp-dir%2Fnext-config-ts%2Ftsconfig-extends%2Fbar.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/2be311e61f890945879002a908d91ea7893cd958/test%2Fe2e%2Fapp-dir%2Fnext-config-ts%2Ftsconfig-extends%2Fbar.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fnext-config-ts%2Ftsconfig-extends%2Fbar.ts?ref=2be311e61f890945879002a908d91ea7893cd958",
+            "patch": "@@ -0,0 +1 @@\n+export const bar = 'bar'"
+        },
+        {
+            "sha": "c42471ea3502c1f0efd3ee4c39b9a1dfb9e123c5",
+            "filename": "test/e2e/app-dir/next-config-ts/tsconfig-extends/index.test.ts",
+            "status": "added",
+            "additions": 12,
+            "deletions": 0,
+            "changes": 12,
+            "blob_url": "https://github.com/vercel/next.js/blob/2be311e61f890945879002a908d91ea7893cd958/test%2Fe2e%2Fapp-dir%2Fnext-config-ts%2Ftsconfig-extends%2Findex.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/2be311e61f890945879002a908d91ea7893cd958/test%2Fe2e%2Fapp-dir%2Fnext-config-ts%2Ftsconfig-extends%2Findex.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fnext-config-ts%2Ftsconfig-extends%2Findex.test.ts?ref=2be311e61f890945879002a908d91ea7893cd958",
+            "patch": "@@ -0,0 +1,12 @@\n+import { nextTestSetup } from 'e2e-utils'\n+\n+describe('next-config-ts-tsconfig-extends', () => {\n+  const { next } = nextTestSetup({\n+    files: __dirname,\n+  })\n+\n+  it('should support tsconfig extends', async () => {\n+    const $ = await next.render$('/')\n+    expect($('p').text()).toBe('foobar')\n+  })\n+})"
+        },
+        {
+            "sha": "32b00acc74b2f28d4e9a4b219cadbf2b7ad34666",
+            "filename": "test/e2e/app-dir/next-config-ts/tsconfig-extends/next.config.ts",
+            "status": "added",
+            "additions": 12,
+            "deletions": 0,
+            "changes": 12,
+            "blob_url": "https://github.com/vercel/next.js/blob/2be311e61f890945879002a908d91ea7893cd958/test%2Fe2e%2Fapp-dir%2Fnext-config-ts%2Ftsconfig-extends%2Fnext.config.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/2be311e61f890945879002a908d91ea7893cd958/test%2Fe2e%2Fapp-dir%2Fnext-config-ts%2Ftsconfig-extends%2Fnext.config.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fnext-config-ts%2Ftsconfig-extends%2Fnext.config.ts?ref=2be311e61f890945879002a908d91ea7893cd958",
+            "patch": "@@ -0,0 +1,12 @@\n+import type { NextConfig } from 'next'\n+import { foo } from '@/foo'\n+import { bar } from 'bar'\n+\n+const nextConfig: NextConfig = {\n+  env: {\n+    foo,\n+    bar,\n+  },\n+}\n+\n+export default nextConfig"
+        },
+        {
+            "sha": "e7077399c03ce1479a655dc647c0545b64531628",
+            "filename": "test/e2e/app-dir/next-config-ts/tsconfig-extends/src/app/layout.tsx",
+            "status": "added",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/vercel/next.js/blob/2be311e61f890945879002a908d91ea7893cd958/test%2Fe2e%2Fapp-dir%2Fnext-config-ts%2Ftsconfig-extends%2Fsrc%2Fapp%2Flayout.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/2be311e61f890945879002a908d91ea7893cd958/test%2Fe2e%2Fapp-dir%2Fnext-config-ts%2Ftsconfig-extends%2Fsrc%2Fapp%2Flayout.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fnext-config-ts%2Ftsconfig-extends%2Fsrc%2Fapp%2Flayout.tsx?ref=2be311e61f890945879002a908d91ea7893cd958",
+            "patch": "@@ -0,0 +1,7 @@\n+export default function Root({ children }: { children: React.ReactNode }) {\n+  return (\n+    <html>\n+      <body>{children}</body>\n+    </html>\n+  )\n+}"
+        },
+        {
+            "sha": "a5bd27cb99b4d0adb94cd6f9d7953cbe247593ab",
+            "filename": "test/e2e/app-dir/next-config-ts/tsconfig-extends/src/app/page.tsx",
+            "status": "added",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/2be311e61f890945879002a908d91ea7893cd958/test%2Fe2e%2Fapp-dir%2Fnext-config-ts%2Ftsconfig-extends%2Fsrc%2Fapp%2Fpage.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/2be311e61f890945879002a908d91ea7893cd958/test%2Fe2e%2Fapp-dir%2Fnext-config-ts%2Ftsconfig-extends%2Fsrc%2Fapp%2Fpage.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fnext-config-ts%2Ftsconfig-extends%2Fsrc%2Fapp%2Fpage.tsx?ref=2be311e61f890945879002a908d91ea7893cd958",
+            "patch": "@@ -0,0 +1,3 @@\n+export default function Page() {\n+  return <p>{`${process.env.foo + process.env.bar}`}</p>\n+}"
+        },
+        {
+            "sha": "cb356468240d506ec494bbe2cdd8c46c20a50558",
+            "filename": "test/e2e/app-dir/next-config-ts/tsconfig-extends/src/foo.ts",
+            "status": "added",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/2be311e61f890945879002a908d91ea7893cd958/test%2Fe2e%2Fapp-dir%2Fnext-config-ts%2Ftsconfig-extends%2Fsrc%2Ffoo.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/2be311e61f890945879002a908d91ea7893cd958/test%2Fe2e%2Fapp-dir%2Fnext-config-ts%2Ftsconfig-extends%2Fsrc%2Ffoo.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fnext-config-ts%2Ftsconfig-extends%2Fsrc%2Ffoo.ts?ref=2be311e61f890945879002a908d91ea7893cd958",
+            "patch": "@@ -0,0 +1 @@\n+export const foo = 'foo'"
+        },
+        {
+            "sha": "2340e77c656dc5f68fe3a83af1eb20a4a84b814c",
+            "filename": "test/e2e/app-dir/next-config-ts/tsconfig-extends/tsconfig.base.json",
+            "status": "added",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/vercel/next.js/blob/2be311e61f890945879002a908d91ea7893cd958/test%2Fe2e%2Fapp-dir%2Fnext-config-ts%2Ftsconfig-extends%2Ftsconfig.base.json",
+            "raw_url": "https://github.com/vercel/next.js/raw/2be311e61f890945879002a908d91ea7893cd958/test%2Fe2e%2Fapp-dir%2Fnext-config-ts%2Ftsconfig-extends%2Ftsconfig.base.json",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fnext-config-ts%2Ftsconfig-extends%2Ftsconfig.base.json?ref=2be311e61f890945879002a908d91ea7893cd958",
+            "patch": "@@ -0,0 +1,9 @@\n+{\n+  \"compilerOptions\": {\n+    \"jsx\": \"preserve\",\n+    \"baseUrl\": \".\",\n+    \"paths\": {\n+      \"@/*\": [\"./src/*\"]\n+    }\n+  }\n+}"
+        },
+        {
+            "sha": "ffcbb9477ec54d030206d6583dfd9f70f7fbc3b4",
+            "filename": "test/e2e/app-dir/next-config-ts/tsconfig-extends/tsconfig.json",
+            "status": "added",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/2be311e61f890945879002a908d91ea7893cd958/test%2Fe2e%2Fapp-dir%2Fnext-config-ts%2Ftsconfig-extends%2Ftsconfig.json",
+            "raw_url": "https://github.com/vercel/next.js/raw/2be311e61f890945879002a908d91ea7893cd958/test%2Fe2e%2Fapp-dir%2Fnext-config-ts%2Ftsconfig-extends%2Ftsconfig.json",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fnext-config-ts%2Ftsconfig-extends%2Ftsconfig.json?ref=2be311e61f890945879002a908d91ea7893cd958",
+            "patch": "@@ -0,0 +1,3 @@\n+{\n+  \"extends\": \"./tsconfig.base.json\"\n+}"
+        }
+    ],
+    "stats": {
+        "total": 133,
+        "additions": 120,
+        "deletions": 13
+    }
+}

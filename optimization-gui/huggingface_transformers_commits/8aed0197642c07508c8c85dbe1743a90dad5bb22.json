@@ -1,0 +1,36 @@
+{
+    "author": "gante",
+    "message": "[generate] `torch.distributed`-compatible `DynamicCache` (#36373)\n\n* test\n\n* docstring\n\n* prepare distributed cache data\n\n* fix cat dim\n\n* test mvp\n\n* add test checks\n\n* like this?\n\n* working test and solution\n\n* nit\n\n* nit\n\n* add shape info",
+    "sha": "8aed0197642c07508c8c85dbe1743a90dad5bb22",
+    "files": [
+        {
+            "sha": "87a6a8fb1ac083eafffb916744d1e8b06bb64232",
+            "filename": "src/transformers/cache_utils.py",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 2,
+            "changes": 15,
+            "blob_url": "https://github.com/huggingface/transformers/blob/8aed0197642c07508c8c85dbe1743a90dad5bb22/src%2Ftransformers%2Fcache_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/8aed0197642c07508c8c85dbe1743a90dad5bb22/src%2Ftransformers%2Fcache_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fcache_utils.py?ref=8aed0197642c07508c8c85dbe1743a90dad5bb22",
+            "patch": "@@ -3,7 +3,7 @@\n import json\n import os\n from dataclasses import dataclass\n-from typing import Any, Dict, List, Optional, Tuple, Union\n+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union\n \n import torch\n from packaging import version\n@@ -358,12 +358,23 @@ class DynamicCache(Cache):\n         ```\n     \"\"\"\n \n-    def __init__(self) -> None:\n+    def __init__(self, _distributed_cache_data: Iterable = None) -> None:\n         super().__init__()\n         self._seen_tokens = 0  # Used in `generate` to keep tally of how many tokens the cache has seen\n         self.key_cache: List[torch.Tensor] = []\n         self.value_cache: List[torch.Tensor] = []\n \n+        # `_distributed_cache_data` was originally added for compatibility with `torch.distributed` (DDP). See #36121\n+        # and #36373 for more information. In a nutshell, it is `map(gather_map, zip(*caches))`, i.e. each item in the\n+        # iterable contains the key and value states for a layer gathered across replicas by torch.distributed\n+        # (shape=[global batch size, num_heads, seq_len, head_dim]).\n+        # WARNING: `_distributed_cache_data` must be the first argument in `__init__`, otherwise we'll break\n+        # compatibility. The name of the argument doesn't matter.\n+        if _distributed_cache_data is not None:\n+            for key_states, value_states in _distributed_cache_data:\n+                self.key_cache.append(key_states)\n+                self.value_cache.append(value_states)\n+\n     def __getitem__(self, layer_idx: int) -> List[Tuple[torch.Tensor]]:\n         \"\"\"\n         Support for backwards-compatible `past_key_value` indexing, e.g. `past_key_value[0][0].shape[2]` to get the"
+        },
+        {
+            "sha": "e16d30e549810eb16ec2cc4bd32ef28d2dcdba70",
+            "filename": "tests/utils/test_cache_utils.py",
+            "status": "modified",
+            "additions": 34,
+            "deletions": 0,
+            "changes": 34,
+            "blob_url": "https://github.com/huggingface/transformers/blob/8aed0197642c07508c8c85dbe1743a90dad5bb22/tests%2Futils%2Ftest_cache_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/8aed0197642c07508c8c85dbe1743a90dad5bb22/tests%2Futils%2Ftest_cache_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Futils%2Ftest_cache_utils.py?ref=8aed0197642c07508c8c85dbe1743a90dad5bb22",
+            "patch": "@@ -20,12 +20,14 @@\n \n from transformers import set_seed\n from transformers.testing_utils import (\n+    get_gpu_count,\n     is_torch_available,\n     require_gptq,\n     require_non_xpu,\n     require_read_token,\n     require_torch,\n     require_torch_gpu,\n+    require_torch_multi_gpu,\n     slow,\n     torch_device,\n )\n@@ -620,3 +622,35 @@ def test_cache_copy(self):\n             'You are a helpful assistant. What is the capital of France?\\n\\n\\n## Response:Paris is the capital of France.\\n\\n\\n\\n\\n\\n## Query:\\n\\nIn a detailed analysis, compare the economic impacts of the introduction of the'\n         ]  # fmt: skip\n         self.assertEqual(responses, EXPECTED_DECODED_TEXT)\n+\n+    @require_torch_multi_gpu\n+    def test_data_parallel_dynamic_cache(self):\n+        \"\"\"\n+        Tests that the dynamic cache works with nn.DataParallel. Under the hood, `DynamicCache` is rebuilt from\n+        multiple `DynamicCache` in the gather step.\n+        \"\"\"\n+\n+        model_repo = \"hf-internal-testing/tiny-random-MistralForCausalLM\"\n+        model = AutoModelForCausalLM.from_pretrained(model_repo).to(torch_device)\n+        tokenizer = AutoTokenizer.from_pretrained(model_repo)\n+\n+        # w/o DP: batch_size = num_gpu\n+        # w DP: batch_size = 1 (with num_gpus replicas)\n+        num_gpus = get_gpu_count()\n+        model_inputs = tokenizer([\"foo bar\"] * num_gpus, return_tensors=\"pt\").to(model.device)\n+\n+        # w/o DP\n+        no_parallelism_cache = model(**model_inputs).past_key_values\n+        self.assertIsInstance(no_parallelism_cache, DynamicCache)\n+\n+        # w DP\n+        model = torch.nn.DataParallel(model)\n+        parallelism_cache = model(**model_inputs).past_key_values\n+        self.assertIsInstance(parallelism_cache, DynamicCache)\n+\n+        # Check that the caches are the same\n+        for layer_idx in range(len(no_parallelism_cache)):\n+            for kv_idx in range(2):  # 0 = key, 1 = value\n+                torch.testing.assert_close(\n+                    actual=parallelism_cache[layer_idx][kv_idx], expected=no_parallelism_cache[layer_idx][kv_idx]\n+                )"
+        }
+    ],
+    "stats": {
+        "total": 49,
+        "additions": 47,
+        "deletions": 2
+    }
+}

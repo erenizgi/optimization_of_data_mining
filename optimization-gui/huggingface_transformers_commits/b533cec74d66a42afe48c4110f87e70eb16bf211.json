@@ -1,0 +1,48 @@
+{
+    "author": "HaroldBenoit",
+    "message": "Support loading LFM2 GGUF (#41111)\n\n* add gguf config mapping for lfm2\n\n* add lfm2 tensor process to unsqueeze conv weights\n\n* adjust values from gguf config to HF config\n\n* add test for lfm2 gguf\n\n* ruff\n\n---------\n\nCo-authored-by: Marc Sun <57196510+SunMarc@users.noreply.github.com>",
+    "sha": "b533cec74d66a42afe48c4110f87e70eb16bf211",
+    "files": [
+        {
+            "sha": "fd2c9c4e889a3b644291c2353fe5292fdc6771e4",
+            "filename": "src/transformers/integrations/ggml.py",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 0,
+            "changes": 13,
+            "blob_url": "https://github.com/huggingface/transformers/blob/b533cec74d66a42afe48c4110f87e70eb16bf211/src%2Ftransformers%2Fintegrations%2Fggml.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/b533cec74d66a42afe48c4110f87e70eb16bf211/src%2Ftransformers%2Fintegrations%2Fggml.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fintegrations%2Fggml.py?ref=b533cec74d66a42afe48c4110f87e70eb16bf211",
+            "patch": "@@ -90,6 +90,19 @@\n         \"expert_count\": \"num_experts\",\n         \"expert_used_count\": \"num_experts_per_tok\",\n     },\n+    \"lfm2\": {\n+        \"context_length\": \"max_position_embeddings\",\n+        \"block_count\": \"num_hidden_layers\",\n+        \"feed_forward_length\": \"intermediate_size\",\n+        \"embedding_length\": \"hidden_size\",\n+        \"rope.dimension_count\": None,\n+        \"rope.freq_base\": \"rope_theta\",\n+        \"attention.head_count\": \"num_attention_heads\",\n+        \"attention.head_count_kv\": \"num_key_value_heads\",\n+        \"attention.layer_norm_rms_epsilon\": \"rms_norm_eps\",\n+        \"vocab_size\": \"vocab_size\",\n+        \"shortconv.l_cache\": \"conv_L_cache\",\n+    },\n     \"qwen3\": {\n         \"context_length\": \"max_position_embeddings\",\n         \"block_count\": \"num_hidden_layers\","
+        },
+        {
+            "sha": "08aaac3617ff65b5f9e8306bb04ea454e20be5ee",
+            "filename": "src/transformers/modeling_gguf_pytorch_utils.py",
+            "status": "modified",
+            "additions": 25,
+            "deletions": 0,
+            "changes": 25,
+            "blob_url": "https://github.com/huggingface/transformers/blob/b533cec74d66a42afe48c4110f87e70eb16bf211/src%2Ftransformers%2Fmodeling_gguf_pytorch_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/b533cec74d66a42afe48c4110f87e70eb16bf211/src%2Ftransformers%2Fmodeling_gguf_pytorch_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodeling_gguf_pytorch_utils.py?ref=b533cec74d66a42afe48c4110f87e70eb16bf211",
+            "patch": "@@ -243,6 +243,17 @@ def process(self, weights, name, **kwargs):\n         return GGUFTensor(weights, name, {})\n \n \n+class Lfm2TensorProcessor(TensorProcessor):\n+    def __init__(self, config=None):\n+        super().__init__(config=config)\n+\n+    def process(self, weights, name, **kwargs):\n+        if \"shortconv.conv.weight\" in name:\n+            ## GGUF shape is [hidden_dim, L_cache], HF expects [hidden_dim, 1, L_cache]\n+            weights = np.expand_dims(weights, axis=1)  ## equivalent to unsqueeze(1)\n+        return GGUFTensor(weights, name, {})\n+\n+\n TENSOR_PROCESSORS = {\n     \"llama\": LlamaTensorProcessor,\n     \"qwen2moe\": Qwen2MoeTensorProcessor,\n@@ -255,6 +266,7 @@ def process(self, weights, name, **kwargs):\n     \"nemotron\": NemotronTensorProcessor,\n     \"gemma2\": Gemma2TensorProcessor,\n     \"gemma3\": Gemma2TensorProcessor,\n+    \"lfm2\": Lfm2TensorProcessor,\n }\n \n \n@@ -459,6 +471,19 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False, model_to_lo\n     if parsed_parameters[\"config\"][\"model_type\"] == \"gemma3\":\n         parsed_parameters[\"config\"][\"model_type\"] = \"gemma3_text\"\n \n+    if parsed_parameters[\"config\"][\"model_type\"] == \"lfm2\":\n+        gguf_num_key_value_heads = parsed_parameters[\"config\"][\"num_key_value_heads\"]\n+        # LFM2 GGUF checkpoint defines num_key_value_heads as a list of integers .e.g [0, 0, 8, 0, 0, 8, 0, 0, 8, 0, 8, 0, 8, 0, 8, 0] but we need to set it to the max value for HF\n+        parsed_parameters[\"config\"][\"num_key_value_heads\"] = max(gguf_num_key_value_heads)\n+        ## we already read the correct intermediate_size from the GGUF checkpoint so we need to set block_auto_adjust_ff_dim to False\n+        parsed_parameters[\"config\"][\"block_auto_adjust_ff_dim\"] = False\n+\n+        ## llama.cpp defines the layers that are full-attention by looking at num_key_value_heads\n+        ## we need to set the full_attn_idxs to the layers that are full-attention\n+        parsed_parameters[\"config\"][\"full_attn_idxs\"] = [\n+            i for i, num_kv_heads in enumerate(gguf_num_key_value_heads) if num_kv_heads > 0\n+        ]\n+\n     # retrieve config vocab_size from tokenizer\n     # Please refer to https://github.com/huggingface/transformers/issues/32526 for more details\n     if \"vocab_size\" not in parsed_parameters[\"config\"]:"
+        },
+        {
+            "sha": "8b7e71a0508ca52da747de71ea529771bedce7ea",
+            "filename": "tests/quantization/ggml/test_ggml.py",
+            "status": "modified",
+            "additions": 19,
+            "deletions": 0,
+            "changes": 19,
+            "blob_url": "https://github.com/huggingface/transformers/blob/b533cec74d66a42afe48c4110f87e70eb16bf211/tests%2Fquantization%2Fggml%2Ftest_ggml.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/b533cec74d66a42afe48c4110f87e70eb16bf211/tests%2Fquantization%2Fggml%2Ftest_ggml.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fquantization%2Fggml%2Ftest_ggml.py?ref=b533cec74d66a42afe48c4110f87e70eb16bf211",
+            "patch": "@@ -311,6 +311,7 @@ class GgufModelTests(unittest.TestCase):\n     qwen3_model_id = \"Qwen/Qwen3-0.6B-GGUF\"\n     qwen3moe_model_id = \"Qwen/Qwen3-30B-A3B-GGUF\"\n     umt5_encoder_model_id = \"city96/umt5-xxl-encoder-gguf\"\n+    lfm2_model_id = \"LiquidAI/LFM2-1.2B-GGUF\"\n \n     q4_0_phi3_model_id = \"Phi-3-mini-4k-instruct-q4.gguf\"\n     q4_0_mistral_model_id = \"mistral-7b-instruct-v0.2.Q4_0.gguf\"\n@@ -350,6 +351,7 @@ class GgufModelTests(unittest.TestCase):\n     q8_0_qwen3_model_id = \"Qwen3-0.6B-Q8_0.gguf\"\n     q4_k_m_qwen3moe_model_id = \"Qwen3-30B-A3B-Q4_K_M.gguf\"\n     q8_0_umt5_encoder_model_id = \"umt5-xxl-encoder-Q8_0.gguf\"\n+    q4_k_m_lfm2_model_id = \"LFM2-1.2B-Q4_K_M.gguf\"\n \n     example_text = \"Hello\"\n \n@@ -1116,3 +1118,20 @@ def test_umt5_encoder_q8_0(self):\n         ).to(torch_device)\n \n         torch.testing.assert_close(outputs.last_hidden_state[0, :3, :3], EXPECTED_OUTPUT, rtol=6e-3, atol=4e-4)\n+\n+    @require_read_token\n+    ## to be precise, it currently require upstream gguf-py to be installed as lfm2 is not yet present in gguf 0.17.1\n+    @unittest.skipUnless(is_gguf_available(\"0.17.0\"), \"test requires gguf version >= 0.17.0\")\n+    def test_lfm2_q4_k_m(self):\n+        tokenizer = AutoTokenizer.from_pretrained(\"LiquidAI/LFM2-1.2B\")\n+        model = AutoModelForCausalLM.from_pretrained(\n+            self.lfm2_model_id,\n+            gguf_file=self.q4_k_m_lfm2_model_id,\n+            dtype=torch.float16,\n+        )\n+\n+        text = tokenizer(self.example_text, return_tensors=\"pt\")[\"input_ids\"]\n+        out = model.generate(text, max_new_tokens=10)\n+\n+        EXPECTED_TEXT = \"Hello Atari 2600! es un videoj\"\n+        self.assertEqual(tokenizer.decode(out[0], skip_special_tokens=True), EXPECTED_TEXT)"
+        }
+    ],
+    "stats": {
+        "total": 57,
+        "additions": 57,
+        "deletions": 0
+    }
+}

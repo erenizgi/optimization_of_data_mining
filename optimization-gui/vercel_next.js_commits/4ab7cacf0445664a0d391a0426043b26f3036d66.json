@@ -1,0 +1,60 @@
+{
+    "author": "sokra",
+    "message": "Turbopack: Improve errors when opening SST files (#80106)\n\n### What?\n\nadd more context to error messages for database failures",
+    "sha": "4ab7cacf0445664a0d391a0426043b26f3036d66",
+    "files": [
+        {
+            "sha": "74f62deb12c2ada5a733b4f9072b7854592a0000",
+            "filename": "turbopack/crates/turbo-persistence/src/db.rs",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 6,
+            "changes": 16,
+            "blob_url": "https://github.com/vercel/next.js/blob/4ab7cacf0445664a0d391a0426043b26f3036d66/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fdb.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/4ab7cacf0445664a0d391a0426043b26f3036d66/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fdb.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fdb.rs?ref=4ab7cacf0445664a0d391a0426043b26f3036d66",
+            "patch": "@@ -652,7 +652,8 @@ impl TurboPersistence {\n                 max_coverage,\n                 max_merge_sequence,\n                 max_merge_size,\n-            )?;\n+            )\n+            .context(\"Failed to compact database\")?;\n         }\n \n         if !new_meta_files.is_empty() {\n@@ -664,7 +665,8 @@ impl TurboPersistence {\n                 blob_seq_numbers_to_delete,\n                 sequence_number: *sequence_number.get_mut(),\n                 keys_written,\n-            })?;\n+            })\n+            .context(\"Failed to commit the database compaction\")?;\n         }\n \n         self.active_write_operation.store(false, Ordering::Release);\n@@ -853,7 +855,7 @@ impl TurboPersistence {\n                                 let index_in_meta = ssts_with_ranges[index].index_in_meta;\n                                 let meta = &meta_files[meta_index];\n                                 meta.entry(index_in_meta)\n-                                    .sst(&self.path)?\n+                                    .sst(meta)?\n                                     .iter(key_block_cache, value_block_cache)\n                             })\n                             .collect::<Result<Vec<_>>>()?;\n@@ -983,7 +985,10 @@ impl TurboPersistence {\n                             keys_written,\n                         })\n                     })\n-                    .collect::<Result<Vec<_>>>()?;\n+                    .collect::<Result<Vec<_>>>()\n+                    .with_context(|| {\n+                        format!(\"Failed to merge database files for family {family}\")\n+                    })?;\n \n                 let mut meta_file_builder = meta_file_builder.into_inner();\n \n@@ -1017,8 +1022,7 @@ impl TurboPersistence {\n \n                 let span = tracing::trace_span!(\"write meta file\").entered();\n                 let seq = sequence_number.fetch_add(1, Ordering::SeqCst) + 1;\n-                let meta_file =\n-                    meta_file_builder.write(&self.path.join(format!(\"{seq:08}.meta\")))?;\n+                let meta_file = meta_file_builder.write(&self.path, seq)?;\n                 drop(span);\n \n                 let mut new_sst_files = Vec::with_capacity("
+        },
+        {
+            "sha": "0bb81f6d71ce7ff3ef45601f2615af87f7aa4fb6",
+            "filename": "turbopack/crates/turbo-persistence/src/meta_file.rs",
+            "status": "modified",
+            "additions": 28,
+            "deletions": 11,
+            "changes": 39,
+            "blob_url": "https://github.com/vercel/next.js/blob/4ab7cacf0445664a0d391a0426043b26f3036d66/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fmeta_file.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/4ab7cacf0445664a0d391a0426043b26f3036d66/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fmeta_file.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fmeta_file.rs?ref=4ab7cacf0445664a0d391a0426043b26f3036d66",
+            "patch": "@@ -68,9 +68,15 @@ impl MetaEntry {\n             .expect(\"AQMF data out of bounds\")\n     }\n \n-    pub fn sst(&self, db_path: &Path) -> Result<&StaticSortedFile> {\n-        self.sst\n-            .get_or_try_init(|| StaticSortedFile::open(db_path, self.sst_data.clone()))\n+    pub fn sst(&self, meta: &MetaFile) -> Result<&StaticSortedFile> {\n+        self.sst.get_or_try_init(|| {\n+            StaticSortedFile::open(&meta.db_path, self.sst_data.clone()).with_context(|| {\n+                format!(\n+                    \"Unable to open static sorted file referenced from {:08}.meta\",\n+                    meta.sequence_number()\n+                )\n+            })\n+        })\n     }\n \n     /// Returns the key family and hash range of this file.\n@@ -262,7 +268,14 @@ impl MetaFile {\n                     GuardResult::Value(aqmf) => aqmf,\n                     GuardResult::Guard(guard) => {\n                         let aqmf = entry.aqmf(self.aqmf_data());\n-                        let aqmf: Arc<qfilter::Filter> = Arc::new(pot::from_slice(aqmf)?);\n+                        let aqmf: Arc<qfilter::Filter> =\n+                            Arc::new(pot::from_slice(aqmf).with_context(|| {\n+                                format!(\n+                                    \"Failed to deserialize AQMF from {:08}.meta for {:08}.sst\",\n+                                    self.sequence_number,\n+                                    entry.sequence_number()\n+                                )\n+                            })?);\n                         let _ = guard.insert(aqmf.clone());\n                         aqmf\n                     }\n@@ -275,19 +288,23 @@ impl MetaFile {\n             } else {\n                 let aqmf = entry.aqmf.get_or_try_init(|| {\n                     let aqmf = entry.aqmf(self.aqmf_data());\n-                    anyhow::Ok(pot::from_slice(aqmf)?)\n+                    anyhow::Ok(pot::from_slice(aqmf).with_context(|| {\n+                        format!(\n+                            \"Failed to deserialize AQMF from {:08}.meta for {:08}.sst\",\n+                            self.sequence_number,\n+                            entry.sequence_number()\n+                        )\n+                    })?)\n                 })?;\n                 if !aqmf.contains_fingerprint(key_hash) {\n                     miss_result = MetaLookupResult::QuickFilterMiss;\n                     continue;\n                 }\n             };\n-            let result = entry.sst(&self.db_path)?.lookup(\n-                key_hash,\n-                key,\n-                key_block_cache,\n-                value_block_cache,\n-            )?;\n+            let result =\n+                entry\n+                    .sst(self)?\n+                    .lookup(key_hash, key, key_block_cache, value_block_cache)?;\n             if !matches!(result, SstLookupResult::NotFound) {\n                 return Ok(MetaLookupResult::SstLookup(result));\n             }"
+        },
+        {
+            "sha": "f0471976f69795280a2d613260ee068267a826e6",
+            "filename": "turbopack/crates/turbo-persistence/src/meta_file_builder.rs",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 1,
+            "changes": 9,
+            "blob_url": "https://github.com/vercel/next.js/blob/4ab7cacf0445664a0d391a0426043b26f3036d66/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fmeta_file_builder.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/4ab7cacf0445664a0d391a0426043b26f3036d66/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fmeta_file_builder.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fmeta_file_builder.rs?ref=4ab7cacf0445664a0d391a0426043b26f3036d66",
+            "patch": "@@ -4,6 +4,7 @@ use std::{\n     path::Path,\n };\n \n+use anyhow::{Context, Result};\n use byteorder::{BE, WriteBytesExt};\n \n use crate::static_sorted_file_builder::StaticSortedFileBuilderMeta;\n@@ -34,7 +35,13 @@ impl MetaFileBuilder {\n     }\n \n     #[tracing::instrument(level = \"trace\", skip_all)]\n-    pub fn write(&self, file: &Path) -> io::Result<File> {\n+    pub fn write(&self, db_path: &Path, seq: u32) -> Result<File> {\n+        let file = db_path.join(format!(\"{seq:08}.meta\"));\n+        self.write_internal(&file)\n+            .with_context(|| format!(\"Unable to write meta file {seq:08}.meta\"))\n+    }\n+\n+    fn write_internal(&self, file: &Path) -> io::Result<File> {\n         let mut file = BufWriter::new(File::create(file)?);\n         file.write_u32::<BE>(0xFE4ADA4A)?; // Magic number\n         file.write_u32::<BE>(self.family)?;"
+        },
+        {
+            "sha": "60997d385242af804437aea87808154ad14daf7c",
+            "filename": "turbopack/crates/turbo-persistence/src/write_batch.rs",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 4,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/4ab7cacf0445664a0d391a0426043b26f3036d66/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fwrite_batch.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/4ab7cacf0445664a0d391a0426043b26f3036d66/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fwrite_batch.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fwrite_batch.rs?ref=4ab7cacf0445664a0d391a0426043b26f3036d66",
+            "patch": "@@ -397,10 +397,7 @@ impl<K: StoreKey + Send + Sync, const FAMILIES: usize> WriteBatch<K, FAMILIES> {\n                 }\n                 keys_written.fetch_add(entries, Ordering::Relaxed);\n                 let seq = self.current_sequence_number.fetch_add(1, Ordering::SeqCst) + 1;\n-                let file = self.db_path.join(format!(\"{seq:08}.meta\"));\n-                let file = builder\n-                    .write(&file)\n-                    .with_context(|| format!(\"Unable to write meta file {seq:08}.meta\"))?;\n+                let file = builder.write(&self.db_path, seq)?;\n                 Ok((seq, file))\n             })\n             .collect::<Result<Vec<_>>>()?;"
+        }
+    ],
+    "stats": {
+        "total": 69,
+        "additions": 47,
+        "deletions": 22
+    }
+}

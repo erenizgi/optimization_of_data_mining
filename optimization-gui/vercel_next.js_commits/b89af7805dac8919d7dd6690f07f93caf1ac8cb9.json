@@ -1,0 +1,84 @@
+{
+    "author": "bgw",
+    "message": "Turbopack: bincode: Add bincode encode/decode wrappers for `serde_json::Value` when stored in a cell (#86749)\n\nThis is used by https://github.com/vercel/next.js/pull/86338.\n\nWe store `serde_json::Value` directly in a cell. This worked because it was defined as a \"primitive\" (similar to how you can store a `Vc<bool>`). However, this doesn't implement `bincode::Encode`/`bincode::Decode`, so it causes problems when trying to store the cells using bincode.\n\nThis introduces a wrapper trait that we can implement for primitives to allow us to intercept their encoding/decoding. #86338 modifies `turbopack/crates/turbo-tasks-macros/src/primitive_macro.rs` to call this wrapper if it is provided.",
+    "sha": "b89af7805dac8919d7dd6690f07f93caf1ac8cb9",
+    "files": [
+        {
+            "sha": "21d9bacf7da072d05cc6893170595f80ce11cd59",
+            "filename": "Cargo.lock",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/b89af7805dac8919d7dd6690f07f93caf1ac8cb9/Cargo.lock",
+            "raw_url": "https://github.com/vercel/next.js/raw/b89af7805dac8919d7dd6690f07f93caf1ac8cb9/Cargo.lock",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/Cargo.lock?ref=b89af7805dac8919d7dd6690f07f93caf1ac8cb9",
+            "patch": "@@ -9230,6 +9230,7 @@ dependencies = [\n  \"tokio-util\",\n  \"tracing\",\n  \"triomphe 0.1.12\",\n+ \"turbo-bincode\",\n  \"turbo-dyn-eq-hash\",\n  \"turbo-rcstr\",\n  \"turbo-tasks-hash\","
+        },
+        {
+            "sha": "92edd5b8cba0885cf4a52f5357101f312bbd7e45",
+            "filename": "turbopack/crates/turbo-tasks-macros/src/primitive_input.rs",
+            "status": "modified",
+            "additions": 43,
+            "deletions": 10,
+            "changes": 53,
+            "blob_url": "https://github.com/vercel/next.js/blob/b89af7805dac8919d7dd6690f07f93caf1ac8cb9/turbopack%2Fcrates%2Fturbo-tasks-macros%2Fsrc%2Fprimitive_input.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/b89af7805dac8919d7dd6690f07f93caf1ac8cb9/turbopack%2Fcrates%2Fturbo-tasks-macros%2Fsrc%2Fprimitive_input.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks-macros%2Fsrc%2Fprimitive_input.rs?ref=b89af7805dac8919d7dd6690f07f93caf1ac8cb9",
+            "patch": "@@ -1,22 +1,19 @@\n-use proc_macro2::Span;\n use syn::{\n-    Meta, Result, Token, Type,\n+    MacroDelimiter, Meta, MetaList, Result, Token, Type,\n     parse::{Parse, ParseStream},\n-    spanned::Spanned,\n };\n \n-#[derive(Debug)]\n pub struct PrimitiveInput {\n     pub ty: Type,\n-    pub manual_shrink_to_fit: Option<Span>,\n+    pub bincode_wrappers: Option<BincodeWrappers>,\n }\n \n impl Parse for PrimitiveInput {\n     fn parse(input: ParseStream) -> Result<Self> {\n         let ty: Type = input.parse()?;\n         let mut parsed_input = PrimitiveInput {\n             ty,\n-            manual_shrink_to_fit: None,\n+            bincode_wrappers: None,\n         };\n         if input.parse::<Option<Token![,]>>()?.is_some() {\n             let punctuated = input.parse_terminated(Meta::parse, Token![,])?;\n@@ -27,15 +24,26 @@ impl Parse for PrimitiveInput {\n                         .map(ToString::to_string)\n                         .as_deref()\n                         .unwrap_or_default(),\n-                    &meta,\n+                    meta,\n                 ) {\n-                    (\"manual_shrink_to_fit\", Meta::Path(_)) => {\n-                        parsed_input.manual_shrink_to_fit = Some(meta.span())\n+                    (\"bincode_wrappers\", meta) => {\n+                        let Meta::List(MetaList {\n+                            tokens: wrapper_tokens,\n+                            delimiter: MacroDelimiter::Paren(..),\n+                            ..\n+                        }) = meta\n+                        else {\n+                            return Err(syn::Error::new_spanned(\n+                                meta,\n+                                \"expected parenthesized (EncodeTy, DecodeTy) list\",\n+                            ));\n+                        };\n+                        parsed_input.bincode_wrappers = Some(syn::parse2(wrapper_tokens)?);\n                     }\n                     (_, meta) => {\n                         return Err(syn::Error::new_spanned(\n                             meta,\n-                            \"unexpected token, expected: \\\"manual_shrink_to_fit\\\"\",\n+                            \"unexpected token, expected: \\\"bincode_wrappers\\\"\",\n                         ));\n                     }\n                 }\n@@ -44,3 +52,28 @@ impl Parse for PrimitiveInput {\n         Ok(parsed_input)\n     }\n }\n+\n+// TODO: wire this up in https://github.com/vercel/next.js/pull/86338\n+#[allow(dead_code)]\n+pub struct BincodeWrappers {\n+    pub encode_ty: Type,\n+    pub decode_ty: Type,\n+}\n+\n+impl Parse for BincodeWrappers {\n+    fn parse(input: ParseStream) -> Result<Self> {\n+        let punctuated = input.parse_terminated(Type::parse, Token![,])?;\n+        let items: [Type; 2] = punctuated\n+            .into_iter()\n+            .collect::<Vec<_>>()\n+            .try_into()\n+            .map_err(|_| {\n+                syn::Error::new(input.span(), \"expected exactly two comma-separated types\")\n+            })?;\n+        let (encode_ty, decode_ty) = items.into();\n+        Ok(BincodeWrappers {\n+            encode_ty,\n+            decode_ty,\n+        })\n+    }\n+}"
+        },
+        {
+            "sha": "130babc8eb610c03ea6f114b00574b8f4f0c8c72",
+            "filename": "turbopack/crates/turbo-tasks-macros/src/primitive_macro.rs",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 7,
+            "changes": 20,
+            "blob_url": "https://github.com/vercel/next.js/blob/b89af7805dac8919d7dd6690f07f93caf1ac8cb9/turbopack%2Fcrates%2Fturbo-tasks-macros%2Fsrc%2Fprimitive_macro.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/b89af7805dac8919d7dd6690f07f93caf1ac8cb9/turbopack%2Fcrates%2Fturbo-tasks-macros%2Fsrc%2Fprimitive_macro.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks-macros%2Fsrc%2Fprimitive_macro.rs?ref=b89af7805dac8919d7dd6690f07f93caf1ac8cb9",
+            "patch": "@@ -8,9 +8,11 @@ use crate::{\n };\n \n pub fn primitive(input: TokenStream) -> TokenStream {\n-    let input = parse_macro_input!(input as PrimitiveInput);\n+    let PrimitiveInput {\n+        ty,\n+        bincode_wrappers: _,\n+    } = parse_macro_input!(input as PrimitiveInput);\n \n-    let ty = input.ty;\n     let Some(ident) = get_type_ident(&ty) else {\n         return quote! {\n             // An error occurred while parsing the ident.\n@@ -34,7 +36,13 @@ pub fn primitive(input: TokenStream) -> TokenStream {\n             }\n         }\n     };\n-    let name = global_name(quote! {stringify!(#ty) });\n+\n+    let name = global_name(quote!(stringify!(#ty)));\n+    // TODO: https://github.com/vercel/next.js/pull/86338 -- switch to bincode, use bincode wrapper\n+    let new_value_type = quote! {\n+        turbo_tasks::ValueType::new_with_any_serialization::<#ty>(#name);\n+    };\n+\n     let value_type_and_register = value_type_and_register(\n         &ident,\n         quote! { #ty },\n@@ -45,10 +53,8 @@ pub fn primitive(input: TokenStream) -> TokenStream {\n         quote! {\n             turbo_tasks::VcCellCompareMode<#ty>\n         },\n-        quote! {\n-            turbo_tasks::ValueType::new_with_any_serialization::<#ty>(#name)\n-        },\n-        quote! { true },\n+        new_value_type,\n+        /* has_serialization */ quote! { true },\n     );\n \n     let value_default_impl = quote! {"
+        },
+        {
+            "sha": "4c5ff7e480ac60eb766371c46c215ca1e6e7eecd",
+            "filename": "turbopack/crates/turbo-tasks/Cargo.toml",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/b89af7805dac8919d7dd6690f07f93caf1ac8cb9/turbopack%2Fcrates%2Fturbo-tasks%2FCargo.toml",
+            "raw_url": "https://github.com/vercel/next.js/raw/b89af7805dac8919d7dd6690f07f93caf1ac8cb9/turbopack%2Fcrates%2Fturbo-tasks%2FCargo.toml",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks%2FCargo.toml?ref=b89af7805dac8919d7dd6690f07f93caf1ac8cb9",
+            "patch": "@@ -48,6 +48,7 @@ tokio = { workspace = true, features = [\"full\"] }\n tokio-util = { workspace = true }\n tracing = { workspace = true }\n triomphe = { workspace = true, features = [\"unsize\", \"unstable\"] }\n+turbo-bincode = { workspace = true }\n turbo-dyn-eq-hash = { workspace = true }\n turbo-rcstr = { workspace = true }\n turbo-tasks-hash = { workspace = true }"
+        },
+        {
+            "sha": "51bf5f8afc0dc967b0c39a519c7a26e0108674a2",
+            "filename": "turbopack/crates/turbo-tasks/src/primitives.rs",
+            "status": "modified",
+            "additions": 52,
+            "deletions": 6,
+            "changes": 58,
+            "blob_url": "https://github.com/vercel/next.js/blob/b89af7805dac8919d7dd6690f07f93caf1ac8cb9/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fprimitives.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/b89af7805dac8919d7dd6690f07f93caf1ac8cb9/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fprimitives.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fprimitives.rs?ref=b89af7805dac8919d7dd6690f07f93caf1ac8cb9",
+            "patch": "@@ -1,18 +1,25 @@\n use std::time::Duration;\n \n+use bincode::{\n+    Decode, Encode,\n+    de::Decoder,\n+    enc::Encoder,\n+    error::{DecodeError, EncodeError},\n+};\n use turbo_rcstr::RcStr;\n use turbo_tasks_macros::primitive as __turbo_tasks_internal_primitive;\n \n use crate::{\n-    Vc, {self as turbo_tasks},\n+    self as turbo_tasks, Vc,\n+    value_type::{ManualDecodeWrapper, ManualEncodeWrapper},\n };\n \n __turbo_tasks_internal_primitive!(());\n-__turbo_tasks_internal_primitive!(String, manual_shrink_to_fit);\n+__turbo_tasks_internal_primitive!(String);\n __turbo_tasks_internal_primitive!(RcStr);\n __turbo_tasks_internal_primitive!(Option<String>);\n __turbo_tasks_internal_primitive!(Option<RcStr>);\n-__turbo_tasks_internal_primitive!(Vec<RcStr>, manual_shrink_to_fit);\n+__turbo_tasks_internal_primitive!(Vec<RcStr>);\n __turbo_tasks_internal_primitive!(Option<u16>);\n __turbo_tasks_internal_primitive!(Option<u64>);\n __turbo_tasks_internal_primitive!(bool);\n@@ -29,7 +36,46 @@ __turbo_tasks_internal_primitive!(i64);\n __turbo_tasks_internal_primitive!(i128);\n __turbo_tasks_internal_primitive!(usize);\n __turbo_tasks_internal_primitive!(isize);\n-__turbo_tasks_internal_primitive!(serde_json::Value);\n+__turbo_tasks_internal_primitive!(\n+    serde_json::Value,\n+    bincode_wrappers(JsonValueEncodeWrapper, JsonValueDecodeWrapper),\n+);\n __turbo_tasks_internal_primitive!(Duration);\n-__turbo_tasks_internal_primitive!(Vec<u8>, manual_shrink_to_fit);\n-__turbo_tasks_internal_primitive!(Vec<bool>, manual_shrink_to_fit);\n+__turbo_tasks_internal_primitive!(Vec<u8>);\n+__turbo_tasks_internal_primitive!(Vec<bool>);\n+\n+// TODO: use this in https://github.com/vercel/next.js/pull/86338\n+#[allow(dead_code)]\n+struct JsonValueEncodeWrapper<'a>(&'a serde_json::Value);\n+\n+impl ManualEncodeWrapper for JsonValueEncodeWrapper<'_> {\n+    type Value = serde_json::Value;\n+\n+    fn new<'a>(value: &'a Self::Value) -> impl Encode + 'a {\n+        JsonValueEncodeWrapper(value)\n+    }\n+}\n+\n+impl Encode for JsonValueEncodeWrapper<'_> {\n+    fn encode<E: Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {\n+        turbo_bincode::serde_json::encode(self.0, encoder)\n+    }\n+}\n+\n+// TODO: use this in https://github.com/vercel/next.js/pull/86338\n+#[allow(dead_code)]\n+struct JsonValueDecodeWrapper(serde_json::Value);\n+\n+impl ManualDecodeWrapper for JsonValueDecodeWrapper {\n+    type Value = serde_json::Value;\n+\n+    fn inner(self) -> Self::Value {\n+        self.0\n+    }\n+}\n+\n+impl<Context> Decode<Context> for JsonValueDecodeWrapper {\n+    fn decode<D: Decoder<Context = Context>>(decoder: &mut D) -> Result<Self, DecodeError> {\n+        Ok(Self(turbo_bincode::serde_json::decode(decoder)?))\n+    }\n+}"
+        },
+        {
+            "sha": "217ac346b954b6a00d6d8abd1768b948bfe11f9b",
+            "filename": "turbopack/crates/turbo-tasks/src/value_type.rs",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 0,
+            "changes": 16,
+            "blob_url": "https://github.com/vercel/next.js/blob/b89af7805dac8919d7dd6690f07f93caf1ac8cb9/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fvalue_type.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/b89af7805dac8919d7dd6690f07f93caf1ac8cb9/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fvalue_type.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fvalue_type.rs?ref=b89af7805dac8919d7dd6690f07f93caf1ac8cb9",
+            "patch": "@@ -5,6 +5,7 @@ use std::{\n };\n \n use auto_hash_map::{AutoMap, AutoSet};\n+use bincode::{Decode, Encode};\n use serde::{Deserialize, Serialize};\n use tracing::Span;\n \n@@ -98,6 +99,21 @@ pub fn any_as_serialize<T: Any + Serialize + Send + Sync + 'static>(\n     );\n }\n \n+// TODO: use this in https://github.com/vercel/next.js/pull/86338\n+#[allow(dead_code)]\n+pub trait ManualEncodeWrapper: Encode {\n+    type Value;\n+    // this uses RPIT to avoid some lifetime problems\n+    fn new<'a>(value: &'a Self::Value) -> impl Encode + 'a;\n+}\n+\n+// TODO: use this in https://github.com/vercel/next.js/pull/86338\n+#[allow(dead_code)]\n+pub trait ManualDecodeWrapper: Decode<()> {\n+    type Value;\n+    fn inner(self) -> Self::Value;\n+}\n+\n impl ValueType {\n     /// This is internally used by `#[turbo_tasks::value]`\n     pub fn new<T: VcValueType>(global_name: &'static str) -> Self {"
+        }
+    ],
+    "stats": {
+        "total": 149,
+        "additions": 126,
+        "deletions": 23
+    }
+}

@@ -1,0 +1,48 @@
+{
+    "author": "wbinnssmith",
+    "message": "Turbopack: derive de/serialize for loader config (#79581)",
+    "sha": "185b4b76d02fdd2cf8c338f728d65d0bb79bc637",
+    "files": [
+        {
+            "sha": "9bcda49dff60e3f2b76d52b2f72e5c615f2fc6ea",
+            "filename": "crates/next-core/src/next_config.rs",
+            "status": "modified",
+            "additions": 46,
+            "deletions": 48,
+            "changes": 94,
+            "blob_url": "https://github.com/vercel/next.js/blob/185b4b76d02fdd2cf8c338f728d65d0bb79bc637/crates%2Fnext-core%2Fsrc%2Fnext_config.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/185b4b76d02fdd2cf8c338f728d65d0bb79bc637/crates%2Fnext-core%2Fsrc%2Fnext_config.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/crates%2Fnext-core%2Fsrc%2Fnext_config.rs?ref=185b4b76d02fdd2cf8c338f728d65d0bb79bc637",
+            "patch": "@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};\n use rustc_hash::FxHashSet;\n use serde::{Deserialize, Deserializer, Serialize};\n use serde_json::Value as JsonValue;\n+use turbo_esregex::EsRegex;\n use turbo_rcstr::RcStr;\n use turbo_tasks::{\n     FxIndexMap, NonLocalValue, OperationValue, ResolvedVc, TaskInput, Vc, debug::ValueDebugFormat,\n@@ -10,10 +11,8 @@ use turbo_tasks::{\n use turbo_tasks_env::EnvMap;\n use turbo_tasks_fs::FileSystemPath;\n use turbopack::module_options::{\n-    LoaderRuleItem, OptionWebpackRules,\n-    module_options_context::{\n-        ConditionItem, ConditionPath, MdxTransformOptions, OptionWebpackConditions,\n-    },\n+    ConditionItem, ConditionPath, LoaderRuleItem, OptionWebpackRules,\n+    module_options_context::{MdxTransformOptions, OptionWebpackConditions},\n };\n use turbopack_core::{\n     issue::{Issue, IssueSeverity, IssueStage, OptionStyledString, StyledString},\n@@ -551,48 +550,45 @@ pub struct TurbopackConfig {\n     pub module_ids: Option<ModuleIds>,\n }\n \n-#[derive(Clone, Debug, PartialEq, Serialize, TraceRawVcs, NonLocalValue)]\n-pub struct ConfigConditionItem(ConditionItem);\n+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]\n+pub struct RegexComponents {\n+    source: RcStr,\n+    flags: RcStr,\n+}\n \n-impl<'de> Deserialize<'de> for ConfigConditionItem {\n-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>\n-    where\n-        D: Deserializer<'de>,\n-    {\n-        #[derive(Deserialize)]\n-        struct RegexComponents {\n-            source: RcStr,\n-            flags: RcStr,\n-        }\n+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]\n+#[serde(tag = \"type\", content = \"value\", rename_all = \"camelCase\")]\n+pub enum ConfigConditionPath {\n+    Glob(RcStr),\n+    Regex(RegexComponents),\n+}\n \n-        #[derive(Deserialize)]\n-        struct ConfigPath {\n-            path: RegexOrGlob,\n-        }\n+impl TryInto<ConditionPath> for ConfigConditionPath {\n+    fn try_into(self) -> Result<ConditionPath> {\n+        Ok(match self {\n+            ConfigConditionPath::Glob(path) => ConditionPath::Glob(path),\n+            ConfigConditionPath::Regex(path) => {\n+                ConditionPath::Regex(EsRegex::new(&path.source, &path.flags)?.resolved_cell())\n+            }\n+        })\n+    }\n \n-        #[derive(Deserialize)]\n-        #[serde(tag = \"type\", rename_all = \"lowercase\")]\n-        enum RegexOrGlob {\n-            Regexp { value: RegexComponents },\n-            Glob { value: String },\n-        }\n+    type Error = anyhow::Error;\n+}\n \n-        let config_path = ConfigPath::deserialize(deserializer)?;\n-        let condition_item = match config_path.path {\n-            RegexOrGlob::Regexp { value } => {\n-                let regex = turbo_esregex::EsRegex::new(&value.source, &value.flags)\n-                    .map_err(serde::de::Error::custom)?;\n-                ConditionItem {\n-                    path: ConditionPath::Regex(regex.resolved_cell()),\n-                }\n-            }\n-            RegexOrGlob::Glob { value } => ConditionItem {\n-                path: ConditionPath::Glob(value.into()),\n-            },\n-        };\n+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]\n+pub struct ConfigConditionItem {\n+    pub path: ConfigConditionPath,\n+}\n \n-        Ok(ConfigConditionItem(condition_item))\n+impl TryInto<ConditionItem> for ConfigConditionItem {\n+    fn try_into(self) -> Result<ConditionItem> {\n+        Ok(ConditionItem {\n+            path: self.path.try_into()?,\n+        })\n     }\n+\n+    type Error = anyhow::Error;\n }\n \n #[derive(\n@@ -1285,19 +1281,21 @@ impl NextConfig {\n     }\n \n     #[turbo_tasks::function]\n-    pub fn webpack_conditions(&self) -> Vc<OptionWebpackConditions> {\n+    pub fn webpack_conditions(&self) -> Result<Vc<OptionWebpackConditions>> {\n         let Some(config_conditions) = self.turbopack.as_ref().and_then(|t| t.conditions.as_ref())\n         else {\n-            return Vc::cell(None);\n+            return Ok(Vc::cell(None));\n         };\n \n-        let conditions = FxIndexMap::from_iter(\n-            config_conditions\n-                .iter()\n-                .map(|(k, v)| (k.clone(), v.0.clone())),\n-        );\n+        let conditions = config_conditions\n+            .iter()\n+            .map(|(k, v)| {\n+                let item: Result<ConditionItem> = TryInto::<ConditionItem>::try_into((*v).clone());\n+                item.map(|item| (k.clone(), item))\n+            })\n+            .collect::<Result<FxIndexMap<RcStr, ConditionItem>>>()?;\n \n-        Vc::cell(Some(ResolvedVc::cell(conditions)))\n+        Ok(Vc::cell(Some(ResolvedVc::cell(conditions))))\n     }\n \n     #[turbo_tasks::function]"
+        },
+        {
+            "sha": "93b1a7d83ade1c5e48f52d95b8d1dc68d72de86f",
+            "filename": "packages/next/src/build/swc/index.ts",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/vercel/next.js/blob/185b4b76d02fdd2cf8c338f728d65d0bb79bc637/packages%2Fnext%2Fsrc%2Fbuild%2Fswc%2Findex.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/185b4b76d02fdd2cf8c338f728d65d0bb79bc637/packages%2Fnext%2Fsrc%2Fbuild%2Fswc%2Findex.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Fswc%2Findex.ts?ref=185b4b76d02fdd2cf8c338f728d65d0bb79bc637",
+            "patch": "@@ -891,7 +891,7 @@ function bindingToApi(\n       type SerializedConditions = {\n         [key: string]: {\n           path:\n-            | { type: 'regexp'; value: { source: string; flags: string } }\n+            | { type: 'regex'; value: { source: string; flags: string } }\n             | { type: 'glob'; value: string }\n         }\n       }\n@@ -903,7 +903,7 @@ function bindingToApi(\n           path:\n             value.path instanceof RegExp\n               ? {\n-                  type: 'regexp',\n+                  type: 'regex',\n                   value: { source: value.path.source, flags: value.path.flags },\n                 }\n               : { type: 'glob', value: value.path },"
+        },
+        {
+            "sha": "f4399ac845492f57817a76a791d62c7ce5ffa876",
+            "filename": "turbopack/crates/turbo-esregex/src/lib.rs",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/vercel/next.js/blob/185b4b76d02fdd2cf8c338f728d65d0bb79bc637/turbopack%2Fcrates%2Fturbo-esregex%2Fsrc%2Flib.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/185b4b76d02fdd2cf8c338f728d65d0bb79bc637/turbopack%2Fcrates%2Fturbo-esregex%2Fsrc%2Flib.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-esregex%2Fsrc%2Flib.rs?ref=185b4b76d02fdd2cf8c338f728d65d0bb79bc637",
+            "patch": "@@ -18,8 +18,8 @@ pub struct EsRegex {\n     delegate: EsRegexImpl,\n     // Store the original arguments used to construct\n     // this regex to support equality and serialization.\n-    pattern: String,\n-    flags: String,\n+    pub pattern: String,\n+    pub flags: String,\n }\n \n #[derive(Debug, Clone)]"
+        }
+    ],
+    "stats": {
+        "total": 102,
+        "additions": 50,
+        "deletions": 52
+    }
+}

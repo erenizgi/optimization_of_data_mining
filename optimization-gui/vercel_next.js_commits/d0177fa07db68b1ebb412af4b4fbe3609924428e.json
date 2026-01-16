@@ -1,0 +1,36 @@
+{
+    "author": "timneutkens",
+    "message": "Tracing: Fix memory leak in span map (#85529)\n\n## What?\n\nFixes a small retainer object that is inserted on each request and not\ncleaned up.\n\nWhile at it also swapped array -> Set for the type checks to leverage\n`has`​ instead of `includes`​.",
+    "sha": "d0177fa07db68b1ebb412af4b4fbe3609924428e",
+    "files": [
+        {
+            "sha": "4bfb7394e156d869310f38a7be56f623c88ef5b0",
+            "filename": "packages/next/src/server/lib/trace/constants.ts",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 4,
+            "changes": 8,
+            "blob_url": "https://github.com/vercel/next.js/blob/d0177fa07db68b1ebb412af4b4fbe3609924428e/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Ftrace%2Fconstants.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/d0177fa07db68b1ebb412af4b4fbe3609924428e/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Ftrace%2Fconstants.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Ftrace%2Fconstants.ts?ref=d0177fa07db68b1ebb412af4b4fbe3609924428e",
+            "patch": "@@ -125,7 +125,7 @@ type SpanTypes =\n   | `${MiddlewareSpan}`\n \n // This list is used to filter out spans that are not relevant to the user\n-export const NextVanillaSpanAllowlist = [\n+export const NextVanillaSpanAllowlist = new Set([\n   MiddlewareSpan.execute,\n   BaseServerSpan.handleRequest,\n   RenderSpan.getServerSideProps,\n@@ -142,15 +142,15 @@ export const NextVanillaSpanAllowlist = [\n   NextNodeServerSpan.getLayoutOrPageModule,\n   NextNodeServerSpan.startResponse,\n   NextNodeServerSpan.clientComponentLoading,\n-]\n+])\n \n // These Spans are allowed to be always logged\n // when the otel log prefix env is set\n-export const LogSpanAllowList = [\n+export const LogSpanAllowList = new Set([\n   NextNodeServerSpan.findPageComponents,\n   NextNodeServerSpan.createComponentTree,\n   NextNodeServerSpan.clientComponentLoading,\n-]\n+])\n \n export {\n   BaseServerSpan,"
+        },
+        {
+            "sha": "a17b5d638638ea367cf954aa1c8f98e6cc210ee6",
+            "filename": "packages/next/src/server/lib/trace/tracer.ts",
+            "status": "modified",
+            "additions": 29,
+            "deletions": 14,
+            "changes": 43,
+            "blob_url": "https://github.com/vercel/next.js/blob/d0177fa07db68b1ebb412af4b4fbe3609924428e/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Ftrace%2Ftracer.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/d0177fa07db68b1ebb412af4b4fbe3609924428e/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Ftrace%2Ftracer.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Ftrace%2Ftracer.ts?ref=d0177fa07db68b1ebb412af4b4fbe3609924428e",
+            "patch": "@@ -13,6 +13,8 @@ import type {\n } from 'next/dist/compiled/@opentelemetry/api'\n import { isThenable } from '../../../shared/lib/is-thenable'\n \n+const NEXT_OTEL_PERFORMANCE_PREFIX = process.env.NEXT_OTEL_PERFORMANCE_PREFIX\n+\n let api: typeof import('next/dist/compiled/@opentelemetry/api')\n \n // we want to allow users to use their own version of @opentelemetry/api if they\n@@ -274,7 +276,7 @@ class NextTracerImpl implements NextTracer {\n     const spanName = options.spanName ?? type\n \n     if (\n-      (!NextVanillaSpanAllowlist.includes(type) &&\n+      (!NextVanillaSpanAllowlist.has(type) &&\n         process.env.NEXT_OTEL_VERBOSE !== '1') ||\n       options.hideSpan\n     ) {\n@@ -307,20 +309,26 @@ class NextTracerImpl implements NextTracer {\n         spanName,\n         options,\n         (span: Span) => {\n-          const startTime =\n-            'performance' in globalThis && 'measure' in performance\n-              ? globalThis.performance.now()\n-              : undefined\n+          let startTime: number | undefined\n+          if (\n+            NEXT_OTEL_PERFORMANCE_PREFIX &&\n+            type &&\n+            LogSpanAllowList.has(type)\n+          ) {\n+            startTime =\n+              'performance' in globalThis && 'measure' in performance\n+                ? globalThis.performance.now()\n+                : undefined\n+          }\n \n+          let cleanedUp = false\n           const onCleanup = () => {\n+            if (cleanedUp) return\n+            cleanedUp = true\n             rootSpanAttributesStore.delete(spanId)\n-            if (\n-              startTime &&\n-              process.env.NEXT_OTEL_PERFORMANCE_PREFIX &&\n-              LogSpanAllowList.includes(type || ('' as any))\n-            ) {\n+            if (startTime) {\n               performance.measure(\n-                `${process.env.NEXT_OTEL_PERFORMANCE_PREFIX}:next-${(\n+                `${NEXT_OTEL_PERFORMANCE_PREFIX}:next-${(\n                   type.split('.').pop() || ''\n                 ).replace(\n                   /[A-Z]/g,\n@@ -345,11 +353,18 @@ class NextTracerImpl implements NextTracer {\n               )\n             )\n           }\n-          try {\n-            if (fn.length > 1) {\n+          if (fn.length > 1) {\n+            try {\n               return fn(span, (err) => closeSpanWithError(span, err))\n+            } catch (err: any) {\n+              closeSpanWithError(span, err)\n+              throw err\n+            } finally {\n+              onCleanup()\n             }\n+          }\n \n+          try {\n             const result = fn(span)\n             if (isThenable(result)) {\n               // If there's error make sure it throws\n@@ -398,7 +413,7 @@ class NextTracerImpl implements NextTracer {\n       args.length === 3 ? args : [args[0], {}, args[1]]\n \n     if (\n-      !NextVanillaSpanAllowlist.includes(name) &&\n+      !NextVanillaSpanAllowlist.has(name) &&\n       process.env.NEXT_OTEL_VERBOSE !== '1'\n     ) {\n       return fn"
+        }
+    ],
+    "stats": {
+        "total": 51,
+        "additions": 33,
+        "deletions": 18
+    }
+}

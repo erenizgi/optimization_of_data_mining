@@ -1,0 +1,36 @@
+{
+    "author": "tugsbayasgalan",
+    "message": "Fix bugs in DynamicCache (#37880)\n\n* Fix bugs in DynamicCache\n\n* Updarte\n\n* Update\n\n* Lint\n\n* lint\n\n* Rename test\n\n* update\n\n* update",
+    "sha": "67d36dc1d727d887b0ec91cc8e296ef1d216a792",
+    "files": [
+        {
+            "sha": "04ccc6f7efcf29f44c1da0839d6e814785570c48",
+            "filename": "src/transformers/cache_utils.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/huggingface/transformers/blob/67d36dc1d727d887b0ec91cc8e296ef1d216a792/src%2Ftransformers%2Fcache_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/67d36dc1d727d887b0ec91cc8e296ef1d216a792/src%2Ftransformers%2Fcache_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fcache_utils.py?ref=67d36dc1d727d887b0ec91cc8e296ef1d216a792",
+            "patch": "@@ -695,7 +695,7 @@ def _flatten_dynamic_cache_for_fx(cache, spec):\n         \"key_cache\": getattr(cache, \"key_cache\"),\n         \"value_cache\": getattr(cache, \"value_cache\"),\n     }\n-    return torch.utils._pytree.tree_flatten(dictionary)[0]\n+    return torch.fx._pytree._dict_flatten_spec(dictionary, spec)\n \n \n if is_torch_greater_or_equal(\"2.3\"):"
+        },
+        {
+            "sha": "8c864f9b64f13e54cbdd0bd92ab259610eac2170",
+            "filename": "tests/utils/test_cache_utils.py",
+            "status": "modified",
+            "additions": 96,
+            "deletions": 0,
+            "changes": 96,
+            "blob_url": "https://github.com/huggingface/transformers/blob/67d36dc1d727d887b0ec91cc8e296ef1d216a792/tests%2Futils%2Ftest_cache_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/67d36dc1d727d887b0ec91cc8e296ef1d216a792/tests%2Futils%2Ftest_cache_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Futils%2Ftest_cache_utils.py?ref=67d36dc1d727d887b0ec91cc8e296ef1d216a792",
+            "patch": "@@ -626,6 +626,102 @@ def test_dynamic_cache_exportability(self):\n         for v1, v2 in zip(res.past_key_values.value_cache, res_eager.past_key_values.value_cache):\n             self.assertTrue(torch.allclose(v1, v2))\n \n+    def test_dynamic_cache_exportability_multiple_run(self):\n+        # When exporting with DynamicCache, you should export two graphs:\n+        #   1. A graph without cache\n+        #   2. A graph with cache\n+        # In the future, we will make improvements to export API to export two graphs\n+        # more seamlessly.\n+\n+        model = AutoModelForCausalLM.from_pretrained(\"hf-internal-testing/tiny-random-MistralForCausalLM\")\n+        model = model.eval()\n+        tokenizer = AutoTokenizer.from_pretrained(\"hf-internal-testing/tiny-random-MistralForCausalLM\")\n+        prompt = \"What is the best way to debug python script?\"\n+        inputs = tokenizer(prompt, return_tensors=\"pt\")\n+        attention_mask = inputs.attention_mask\n+        input_ids = inputs.input_ids\n+\n+        ep = export_with_dynamic_cache(model, input_ids, attention_mask)\n+        res = ep.module()(\n+            input_ids=input_ids,\n+            attention_mask=attention_mask,\n+            past_key_values=DynamicCache(),\n+            use_cache=True,\n+        )\n+        self.assertTrue(len(res.past_key_values.key_cache) == model.config.num_hidden_layers)\n+        self.assertEqual(2 * model.config.num_hidden_layers + 1, len(ep.graph_signature.output_specs))\n+        self.assertEqual(\n+            3,\n+            len(\n+                [\n+                    x\n+                    for x in ep.graph_signature.input_specs\n+                    if x.kind == torch.export.graph_signature.InputKind.USER_INPUT\n+                ]\n+            ),\n+        )\n+\n+        res_eager = model(\n+            input_ids=input_ids,\n+            attention_mask=attention_mask,\n+            past_key_values=DynamicCache(),\n+            use_cache=True,\n+        )\n+        past_key_values_eager = res_eager.past_key_values\n+        past_key_values = res.past_key_values\n+\n+        shapes = torch.export.ShapesCollection()\n+        dyn = torch.export.Dim(\"seq\", max=512)\n+\n+        for ix in range(len(past_key_values.key_cache)):\n+            shapes[past_key_values.key_cache[ix]] = (None, None, dyn, None)\n+            shapes[past_key_values.value_cache[ix]] = (None, None, dyn, None)\n+\n+        ep_second = torch.export.export(\n+            model,\n+            (),\n+            {\n+                \"input_ids\": input_ids,\n+                \"attention_mask\": attention_mask,\n+                \"past_key_values\": past_key_values,\n+                \"use_cache\": True,\n+            },\n+            strict=False,\n+            dynamic_shapes=shapes,\n+        )\n+        res_export = ep_second.module()(\n+            input_ids=input_ids,\n+            attention_mask=attention_mask,\n+            past_key_values=past_key_values,\n+            use_cache=True,\n+        )\n+        # It should work with variable len\n+        res_export_2 = ep_second.module()(\n+            input_ids=input_ids,\n+            attention_mask=attention_mask,\n+            past_key_values=res_export.past_key_values,\n+            use_cache=True,\n+        )\n+\n+        res_eager = model(\n+            input_ids=input_ids,\n+            attention_mask=attention_mask,\n+            past_key_values=past_key_values_eager,\n+            use_cache=True,\n+        )\n+        res_eager_2 = model(\n+            input_ids=input_ids,\n+            attention_mask=attention_mask,\n+            past_key_values=res_eager.past_key_values,\n+            use_cache=True,\n+        )\n+\n+        for k1, k2 in zip(res_export_2.past_key_values.key_cache, res_eager_2.past_key_values.key_cache):\n+            self.assertTrue(torch.allclose(k1, k2))\n+\n+        for v1, v2 in zip(res_export_2.past_key_values.value_cache, res_eager_2.past_key_values.value_cache):\n+            self.assertTrue(torch.allclose(v1, v2))\n+\n     def test_static_cache_exportability(self):\n         \"\"\"\n         Tests that static cache works with `torch.export()`"
+        }
+    ],
+    "stats": {
+        "total": 98,
+        "additions": 97,
+        "deletions": 1
+    }
+}

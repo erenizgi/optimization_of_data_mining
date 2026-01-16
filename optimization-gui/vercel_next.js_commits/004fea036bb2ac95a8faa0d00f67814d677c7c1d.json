@@ -1,0 +1,132 @@
+{
+    "author": "ztanner",
+    "message": "optimize server action refresh logic (#82674)\n\nWhen a server action is in-flight and the user kicks off a navigation,\nthe router has handling to prioritize that navigation and \"discard\" the\naction that was pending. This only discards it from the router state\nperspective: the action is still run to completion and not aborted.\n\nTo account for the case where your action might have performed a data\nmutation + revalidation, we'd eagerly refresh the router state after the\ndiscarded action completes. However this isn't zero-cost:\n`router.refresh` wipes the full router cache, which is wasteful if the\naction you ran wasn't a mutation (ie, maybe it was just a GET).\n\nSince actions already pass information to the reducer about when/if they\nperformed some sort of revalidation, we can use this to pass information\nto the action queue, and it can use this to determine that a refresh is\nneeded, rather than always eagerly executing it.\n\nWhile making this change, I noticed the original test case for it wasn't\nactually working as expected. The random number in the root layout was a\n`Math.random()` without any caching, so a navigation would have resulted\nin a new random number, regardless of calling `router.refresh()`.",
+    "sha": "004fea036bb2ac95a8faa0d00f67814d677c7c1d",
+    "files": [
+        {
+            "sha": "d6c3d2c44993e8a4b8bd82b897040ed2be80c0af",
+            "filename": "packages/next/src/client/components/app-router-instance.ts",
+            "status": "modified",
+            "additions": 26,
+            "deletions": 18,
+            "changes": 44,
+            "blob_url": "https://github.com/vercel/next.js/blob/004fea036bb2ac95a8faa0d00f67814d677c7c1d/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Fapp-router-instance.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/004fea036bb2ac95a8faa0d00f67814d677c7c1d/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Fapp-router-instance.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Fapp-router-instance.ts?ref=004fea036bb2ac95a8faa0d00f67814d677c7c1d",
+            "patch": "@@ -69,24 +69,25 @@ function runRemainingActions(\n   if (actionQueue.pending !== null) {\n     actionQueue.pending = actionQueue.pending.next\n     if (actionQueue.pending !== null) {\n-      // eslint-disable-next-line @typescript-eslint/no-use-before-define\n       runAction({\n         actionQueue,\n         action: actionQueue.pending,\n         setState,\n       })\n-    } else {\n-      // No more actions are pending, check if a refresh is needed\n-      if (actionQueue.needsRefresh) {\n-        actionQueue.needsRefresh = false\n-        actionQueue.dispatch(\n-          {\n-            type: ACTION_REFRESH,\n-            origin: window.location.origin,\n-          },\n-          setState\n-        )\n-      }\n+    }\n+  } else {\n+    // Check for refresh when pending is already null\n+    // This handles the case where a discarded server action completes\n+    // after the navigation has already finished and the queue is empty\n+    if (actionQueue.needsRefresh) {\n+      actionQueue.needsRefresh = false\n+      actionQueue.dispatch(\n+        {\n+          type: ACTION_REFRESH,\n+          origin: window.location.origin,\n+        },\n+        setState\n+      )\n     }\n   }\n }\n@@ -110,6 +111,18 @@ async function runAction({\n   function handleResult(nextState: AppRouterState) {\n     // if we discarded this action, the state should also be discarded\n     if (action.discarded) {\n+      // Check if the discarded server action revalidated data\n+      if (\n+        action.payload.type === ACTION_SERVER_ACTION &&\n+        action.payload.didRevalidate\n+      ) {\n+        // The server action was discarded but it revalidated data,\n+        // mark that we need to refresh after all actions complete\n+        actionQueue.needsRefresh = true\n+      }\n+      // Still need to run remaining actions even for discarded actions\n+      // to potentially trigger the refresh\n+      runRemainingActions(actionQueue, setState)\n       return\n     }\n \n@@ -187,11 +200,6 @@ function dispatchAction(\n     // (Note that it can't contain any earlier navigations, because we always put those into `actionQueue.pending` by calling `runAction`)\n     newAction.next = actionQueue.pending.next\n \n-    // if the pending action was a server action, mark the queue as needing a refresh once events are processed\n-    if (actionQueue.pending.payload.type === ACTION_SERVER_ACTION) {\n-      actionQueue.needsRefresh = true\n-    }\n-\n     runAction({\n       actionQueue,\n       action: newAction,"
+        },
+        {
+            "sha": "397ecf36470b3532acb46958646b06227305eac3",
+            "filename": "packages/next/src/client/components/router-reducer/reducers/server-action-reducer.ts",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 0,
+            "changes": 8,
+            "blob_url": "https://github.com/vercel/next.js/blob/004fea036bb2ac95a8faa0d00f67814d677c7c1d/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Frouter-reducer%2Freducers%2Fserver-action-reducer.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/004fea036bb2ac95a8faa0d00f67814d677c7c1d/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Frouter-reducer%2Freducers%2Fserver-action-reducer.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Frouter-reducer%2Freducers%2Fserver-action-reducer.ts?ref=004fea036bb2ac95a8faa0d00f67814d677c7c1d",
+            "patch": "@@ -290,6 +290,14 @@ export function serverActionReducer(\n         revalidatedParts.tag ||\n         revalidatedParts.cookie\n \n+      // Store whether this action triggered any revalidation\n+      // The action queue will use this information to potentially\n+      // trigger a refresh action if the action was discarded\n+      // (ie, due to a navigation, before the action completed)\n+      if (actionRevalidated) {\n+        action.didRevalidate = true\n+      }\n+\n       for (const normalizedFlightData of flightData) {\n         const {\n           tree: treePatch,"
+        },
+        {
+            "sha": "7c1eb87daa31c842c68184a03275b1a8b1aa8b4c",
+            "filename": "packages/next/src/client/components/router-reducer/router-reducer-types.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/004fea036bb2ac95a8faa0d00f67814d677c7c1d/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Frouter-reducer%2Frouter-reducer-types.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/004fea036bb2ac95a8faa0d00f67814d677c7c1d/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Frouter-reducer%2Frouter-reducer-types.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Frouter-reducer%2Frouter-reducer-types.ts?ref=004fea036bb2ac95a8faa0d00f67814d677c7c1d",
+            "patch": "@@ -69,6 +69,7 @@ export interface ServerActionAction {\n   actionArgs: any[]\n   resolve: (value: any) => void\n   reject: (reason?: any) => void\n+  didRevalidate?: boolean\n }\n \n /**"
+        },
+        {
+            "sha": "ad1a80d6178a2079a9a273e9dc9431971f1eb3e4",
+            "filename": "packages/next/src/server/app-render/action-handler.ts",
+            "status": "modified",
+            "additions": 25,
+            "deletions": 6,
+            "changes": 31,
+            "blob_url": "https://github.com/vercel/next.js/blob/004fea036bb2ac95a8faa0d00f67814d677c7c1d/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Faction-handler.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/004fea036bb2ac95a8faa0d00f67814d677c7c1d/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Faction-handler.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Faction-handler.ts?ref=004fea036bb2ac95a8faa0d00f67814d677c7c1d",
+            "patch": "@@ -261,11 +261,27 @@ async function createForwardedActionResponse(\n function getAppRelativeRedirectUrl(\n   basePath: string,\n   host: Host,\n-  redirectUrl: string\n+  redirectUrl: string,\n+  currentPathname?: string\n ): URL | null {\n-  if (redirectUrl.startsWith('/') || redirectUrl.startsWith('.')) {\n-    // Make sure we are appending the basePath to relative URLS\n+  if (redirectUrl.startsWith('/')) {\n+    // Absolute path - just add basePath\n     return new URL(`${basePath}${redirectUrl}`, 'http://n')\n+  } else if (redirectUrl.startsWith('.')) {\n+    // Relative path - resolve relative to current pathname\n+    let base = currentPathname || '/'\n+    // Ensure the base path ends with a slash so relative resolution works correctly\n+    // e.g., \"./subpage\" from \"/subdir\" should resolve to \"/subdir/subpage\"\n+    // not \"/subpage\"\n+    if (!base.endsWith('/')) {\n+      base = base + '/'\n+    }\n+    const resolved = new URL(redirectUrl, `http://n${base}`)\n+    // Include basePath in the final URL\n+    return new URL(\n+      `${basePath}${resolved.pathname}${resolved.search}${resolved.hash}`,\n+      'http://n'\n+    )\n   }\n \n   const parsedRedirectUrl = new URL(redirectUrl)\n@@ -288,7 +304,8 @@ async function createRedirectRenderResult(\n   redirectUrl: string,\n   redirectType: RedirectType,\n   basePath: string,\n-  workStore: WorkStore\n+  workStore: WorkStore,\n+  currentPathname?: string\n ) {\n   res.setHeader('x-action-redirect', `${redirectUrl};${redirectType}`)\n \n@@ -300,7 +317,8 @@ async function createRedirectRenderResult(\n   const appRelativeRedirectUrl = getAppRelativeRedirectUrl(\n     basePath,\n     originalHost,\n-    redirectUrl\n+    redirectUrl,\n+    currentPathname\n   )\n \n   if (appRelativeRedirectUrl) {\n@@ -1052,7 +1070,8 @@ export async function handleAction({\n             redirectUrl,\n             redirectType,\n             ctx.renderOpts.basePath,\n-            workStore\n+            workStore,\n+            requestStore.url.pathname\n           ),\n         }\n       }"
+        },
+        {
+            "sha": "58205c6acfd9aa30046c2c7b67c245ef8b10b77c",
+            "filename": "test/e2e/app-dir/actions/app-action.test.ts",
+            "status": "modified",
+            "additions": 50,
+            "deletions": 21,
+            "changes": 71,
+            "blob_url": "https://github.com/vercel/next.js/blob/004fea036bb2ac95a8faa0d00f67814d677c7c1d/test%2Fe2e%2Fapp-dir%2Factions%2Fapp-action.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/004fea036bb2ac95a8faa0d00f67814d677c7c1d/test%2Fe2e%2Fapp-dir%2Factions%2Fapp-action.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Factions%2Fapp-action.test.ts?ref=004fea036bb2ac95a8faa0d00f67814d677c7c1d",
+            "patch": "@@ -553,27 +553,6 @@ describe('app-dir action handling', () => {\n     await check(() => browser.url(), `${next.url}/`, true, 2)\n   })\n \n-  it('should trigger a refresh for a server action that gets discarded due to a navigation', async () => {\n-    let browser = await next.browser('/client')\n-    const initialRandomNumber = await browser\n-      .elementByCss('#random-number')\n-      .text()\n-\n-    await browser.elementByCss('#slow-inc').click()\n-\n-    // navigate to server\n-    await browser.elementByCss('#navigate-server').click()\n-\n-    // wait for the action to be completed\n-    await retry(async () => {\n-      const newRandomNumber = await browser\n-        .elementByCss('#random-number')\n-        .text()\n-\n-      expect(newRandomNumber).not.toBe(initialRandomNumber)\n-    })\n-  })\n-\n   it('should trigger a refresh for a server action that also dispatches a navigation event', async () => {\n     let browser = await next.browser('/revalidate')\n     let initialJustPutit = await browser.elementById('justputit').text()\n@@ -1926,4 +1905,54 @@ describe('app-dir action handling', () => {\n       }\n     )\n   })\n+\n+  describe('action discarding', () => {\n+    it('should not trigger a refresh for a server action that gets discarded due to a navigation (without revalidation)', async () => {\n+      let browser = await next.browser('/action-discarding')\n+      await browser.waitForIdleNetwork()\n+      const initialRandomNumber = await browser\n+        .elementByCss('#cached-random')\n+        .text()\n+\n+      await browser.elementByCss('#slow-action').click()\n+\n+      // navigate to destination\n+      await browser.elementByCss('#navigate-destination').click()\n+\n+      // wait for the 2s action to finish\n+      await waitFor(2000)\n+\n+      await retry(async () => {\n+        const newRandomNumber = await browser\n+          .elementByCss('#cached-random')\n+          .text()\n+\n+        expect(newRandomNumber).toBe(initialRandomNumber)\n+      })\n+    })\n+\n+    it('should trigger a refresh for a server action that gets discarded due to a navigation (with revalidation)', async () => {\n+      let browser = await next.browser('/action-discarding')\n+      await browser.waitForIdleNetwork()\n+      const initialRandomNumber = await browser\n+        .elementByCss('#cached-random')\n+        .text()\n+\n+      await browser.elementByCss('#slow-action-revalidate').click()\n+\n+      // navigate to destination\n+      await browser.elementByCss('#navigate-destination').click()\n+\n+      // wait for the 2s action to finish\n+      await waitFor(2000)\n+\n+      await retry(async () => {\n+        const newRandomNumber = await browser\n+          .elementByCss('#cached-random')\n+          .text()\n+\n+        expect(newRandomNumber).not.toBe(initialRandomNumber)\n+      })\n+    })\n+  })\n })"
+        },
+        {
+            "sha": "e1f906a5f564d157419708f74f32eeb09050d389",
+            "filename": "test/e2e/app-dir/actions/app/action-discarding/actions.js",
+            "status": "added",
+            "additions": 14,
+            "deletions": 0,
+            "changes": 14,
+            "blob_url": "https://github.com/vercel/next.js/blob/004fea036bb2ac95a8faa0d00f67814d677c7c1d/test%2Fe2e%2Fapp-dir%2Factions%2Fapp%2Faction-discarding%2Factions.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/004fea036bb2ac95a8faa0d00f67814d677c7c1d/test%2Fe2e%2Fapp-dir%2Factions%2Fapp%2Faction-discarding%2Factions.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Factions%2Fapp%2Faction-discarding%2Factions.js?ref=004fea036bb2ac95a8faa0d00f67814d677c7c1d",
+            "patch": "@@ -0,0 +1,14 @@\n+'use server'\n+\n+import { revalidateTag } from 'next/cache'\n+\n+export async function slowAction() {\n+  await new Promise((resolve) => setTimeout(resolve, 2000))\n+  return 'slow action completed'\n+}\n+\n+export async function slowActionWithRevalidation() {\n+  await new Promise((resolve) => setTimeout(resolve, 2000))\n+  revalidateTag('cached-random')\n+  return 'slow action with revalidation completed'\n+}"
+        },
+        {
+            "sha": "1e451c621485d2b8769ea852dbf550dc4a27ef65",
+            "filename": "test/e2e/app-dir/actions/app/action-discarding/destination/page.js",
+            "status": "added",
+            "additions": 8,
+            "deletions": 0,
+            "changes": 8,
+            "blob_url": "https://github.com/vercel/next.js/blob/004fea036bb2ac95a8faa0d00f67814d677c7c1d/test%2Fe2e%2Fapp-dir%2Factions%2Fapp%2Faction-discarding%2Fdestination%2Fpage.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/004fea036bb2ac95a8faa0d00f67814d677c7c1d/test%2Fe2e%2Fapp-dir%2Factions%2Fapp%2Faction-discarding%2Fdestination%2Fpage.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Factions%2Fapp%2Faction-discarding%2Fdestination%2Fpage.js?ref=004fea036bb2ac95a8faa0d00f67814d677c7c1d",
+            "patch": "@@ -0,0 +1,8 @@\n+export default function DestinationPage() {\n+  return (\n+    <div>\n+      <h1 id=\"destination-page\">Destination Page</h1>\n+      <p>You have navigated to the destination.</p>\n+    </div>\n+  )\n+}"
+        },
+        {
+            "sha": "158d0113f88e72bf09ce62a554a30724243ff84f",
+            "filename": "test/e2e/app-dir/actions/app/action-discarding/layout.js",
+            "status": "added",
+            "additions": 24,
+            "deletions": 0,
+            "changes": 24,
+            "blob_url": "https://github.com/vercel/next.js/blob/004fea036bb2ac95a8faa0d00f67814d677c7c1d/test%2Fe2e%2Fapp-dir%2Factions%2Fapp%2Faction-discarding%2Flayout.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/004fea036bb2ac95a8faa0d00f67814d677c7c1d/test%2Fe2e%2Fapp-dir%2Factions%2Fapp%2Faction-discarding%2Flayout.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Factions%2Fapp%2Faction-discarding%2Flayout.js?ref=004fea036bb2ac95a8faa0d00f67814d677c7c1d",
+            "patch": "@@ -0,0 +1,24 @@\n+import Link from 'next/link'\n+import { connection } from 'next/server'\n+\n+export default async function Layout({ children }) {\n+  await connection()\n+\n+  const cachedRandom = await fetch(\n+    'https://next-data-api-endpoint.vercel.app/api/random?key=cached-random',\n+    { next: { tags: ['cached-random'] } }\n+  ).then((res) => res.text())\n+  return (\n+    <div>\n+      <div>\n+        Cached Random: <span id=\"cached-random\">{cachedRandom}</span>\n+      </div>\n+      <div>\n+        <Link id=\"navigate-destination\" href=\"/action-discarding/destination\">\n+          Navigate to Destination\n+        </Link>\n+      </div>\n+      {children}\n+    </div>\n+  )\n+}"
+        },
+        {
+            "sha": "1b8faec42f92463979fb69d35b811d07acede053",
+            "filename": "test/e2e/app-dir/actions/app/action-discarding/page.js",
+            "status": "added",
+            "additions": 27,
+            "deletions": 0,
+            "changes": 27,
+            "blob_url": "https://github.com/vercel/next.js/blob/004fea036bb2ac95a8faa0d00f67814d677c7c1d/test%2Fe2e%2Fapp-dir%2Factions%2Fapp%2Faction-discarding%2Fpage.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/004fea036bb2ac95a8faa0d00f67814d677c7c1d/test%2Fe2e%2Fapp-dir%2Factions%2Fapp%2Faction-discarding%2Fpage.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Factions%2Fapp%2Faction-discarding%2Fpage.js?ref=004fea036bb2ac95a8faa0d00f67814d677c7c1d",
+            "patch": "@@ -0,0 +1,27 @@\n+'use client'\n+\n+import { slowAction, slowActionWithRevalidation } from './actions'\n+\n+export default function Page() {\n+  return (\n+    <div>\n+      <h1>Action Discarding Test</h1>\n+      <button\n+        id=\"slow-action\"\n+        onClick={async () => {\n+          await slowAction()\n+        }}\n+      >\n+        Slow Action (No Revalidation)\n+      </button>\n+      <button\n+        id=\"slow-action-revalidate\"\n+        onClick={async () => {\n+          await slowActionWithRevalidation()\n+        }}\n+      >\n+        Slow Action (With Revalidation)\n+      </button>\n+    </div>\n+  )\n+}"
+        },
+        {
+            "sha": "913b1a6f53d54fd1181736f41a17bb9bef2c9fdc",
+            "filename": "test/e2e/app-dir/actions/app/client/actions.js",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/004fea036bb2ac95a8faa0d00f67814d677c7c1d/test%2Fe2e%2Fapp-dir%2Factions%2Fapp%2Fclient%2Factions.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/004fea036bb2ac95a8faa0d00f67814d677c7c1d/test%2Fe2e%2Fapp-dir%2Factions%2Fapp%2Fclient%2Factions.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Factions%2Fapp%2Fclient%2Factions.js?ref=004fea036bb2ac95a8faa0d00f67814d677c7c1d",
+            "patch": "@@ -15,7 +15,7 @@ export async function inc(value) {\n }\n \n export async function slowInc(value) {\n-  await new Promise((resolve) => setTimeout(resolve, 10000))\n+  await new Promise((resolve) => setTimeout(resolve, 2000))\n   return value + 1\n }\n "
+        }
+    ],
+    "stats": {
+        "total": 230,
+        "additions": 184,
+        "deletions": 46
+    }
+}

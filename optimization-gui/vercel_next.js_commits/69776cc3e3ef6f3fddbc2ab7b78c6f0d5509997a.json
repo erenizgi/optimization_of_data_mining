@@ -1,0 +1,192 @@
+{
+    "author": "huozhi",
+    "message": "[dev-overlay] remove special handling for missing tag error  (#77147)\n\n### What\n\nWe had a few existing hacks for the missing html tag errors, we used a\nlot of tricks and components to deal with it specifically. It was quite\na pain to handle on specific error across the entire codebase. This PR\nleverage the existing SSR error template we sent through the rendering.\nWe now inject a open `<html>` tag to intercept the HTML. And then it\nwill be consumed as a SSR error. We added one more thing that we'll open\nthe error overlay automatically by default. It doesn't have to be build\nerror since the display was not ideal.\n\nNow it's just one of the normal error, such like it can show the version\nindicator as well. Except we had a little bit logic to make it pop up by\ndefault.\n\nThe idea is to insert a piece of errored html like what we expect for\nerroring rendered html. So it inserts a new start point of the html, and\nthen React will hydrate it with the error template.\n\n```html\n<!-- layout / page content -->\n<meta .. />\n<script .. />\n\n<!-- we insert a html for missing tag error -->\n<html id=\"__next_error__\">\n  <template data-next-error-message=\"..\" ..></template>\n\n<!-- next.js always render close tag -->\n</body>\n</html>\n```\n\n\n| After | Before |\n|:-- |:--|\n| <img width=\"1048\" alt=\"image\"\nsrc=\"https://github.com/user-attachments/assets/713812cf-50cd-4b14-8906-44ed3795ef12\"\n/> | <img width=\"1020\" alt=\"image\"\nsrc=\"https://github.com/user-attachments/assets/ac7614d9-da3b-48d1-bab1-c97355c27963\"\n/> |",
+    "sha": "69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a",
+    "files": [
+        {
+            "sha": "89182cd7b6d092e5307b92726c6666f899f18ffd",
+            "filename": "packages/next/src/client/app-index.tsx",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 9,
+            "changes": 11,
+            "blob_url": "https://github.com/vercel/next.js/blob/69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a/packages%2Fnext%2Fsrc%2Fclient%2Fapp-index.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a/packages%2Fnext%2Fsrc%2Fclient%2Fapp-index.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fclient%2Fapp-index.tsx?ref=69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a",
+            "patch": "@@ -25,7 +25,6 @@ import type { InitialRSCPayload } from '../server/app-render/types'\n import { createInitialRouterState } from './components/router-reducer/create-initial-router-state'\n import { MissingSlotContext } from '../shared/lib/app-router-context.shared-runtime'\n import { setAppBuildId } from './app-build-id'\n-import { shouldRenderRootLevelErrorOverlay } from './lib/is-error-thrown-while-rendering-rsc'\n \n /// <reference types=\"react-dom/experimental\" />\n \n@@ -250,16 +249,10 @@ export function hydrate() {\n     </StrictModeIfEnabled>\n   )\n \n-  if (\n-    document.documentElement.id === '__next_error__' ||\n-    !!window.__next_root_layout_missing_tags?.length\n-  ) {\n+  if (document.documentElement.id === '__next_error__') {\n     let element = reactEl\n     // Server rendering failed, fall back to client-side rendering\n-    if (\n-      process.env.NODE_ENV !== 'production' &&\n-      shouldRenderRootLevelErrorOverlay()\n-    ) {\n+    if (process.env.NODE_ENV !== 'production') {\n       const { createRootLevelDevOverlayElement } =\n         require('./components/react-dev-overlay/app/client-entry') as typeof import('./components/react-dev-overlay/app/client-entry')\n "
+        },
+        {
+            "sha": "999e00b233e5c387353676089952bc15e1c7c804",
+            "filename": "packages/next/src/client/components/react-dev-overlay/app/app-dev-overlay.tsx",
+            "status": "modified",
+            "additions": 27,
+            "deletions": 13,
+            "changes": 40,
+            "blob_url": "https://github.com/vercel/next.js/blob/69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Freact-dev-overlay%2Fapp%2Fapp-dev-overlay.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Freact-dev-overlay%2Fapp%2Fapp-dev-overlay.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Freact-dev-overlay%2Fapp%2Fapp-dev-overlay.tsx?ref=69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a",
+            "patch": "@@ -1,14 +1,15 @@\n import type { OverlayState } from '../shared'\n import type { GlobalErrorComponent } from '../../error-boundary'\n \n-import { useEffect, useState } from 'react'\n+import { useCallback, useEffect, useState } from 'react'\n import { AppDevOverlayErrorBoundary } from './app-dev-overlay-error-boundary'\n import { FontStyles } from '../font/font-styles'\n import { DevOverlay } from '../ui/dev-overlay'\n import { handleClientError } from '../../errors/use-error-handler'\n import { isNextRouterError } from '../../is-next-router-error'\n+import { MISSING_ROOT_TAGS_ERROR } from '../../../../shared/lib/errors/constants'\n \n-function readSsrError(): Error | null {\n+function readSsrError(): (Error & { digest?: string }) | null {\n   if (typeof document === 'undefined') {\n     return null\n   }\n@@ -40,7 +41,11 @@ function readSsrError(): Error | null {\n // Needs to be in the same error boundary as the shell.\n // If it commits, we know we recovered from an SSR error.\n // If it doesn't commit, we errored again and React will take care of error reporting.\n-function ReplaySsrOnlyErrors() {\n+function ReplaySsrOnlyErrors({\n+  onBlockingError,\n+}: {\n+  onBlockingError: () => void\n+}) {\n   if (process.env.NODE_ENV !== 'production') {\n     // Need to read during render. The attributes will be gone after commit.\n     const ssrError = readSsrError()\n@@ -51,8 +56,13 @@ function ReplaySsrOnlyErrors() {\n         // TODO(veil): Mark as recoverable error\n         // TODO(veil): console.error\n         handleClientError(ssrError, [])\n+\n+        // If it's missing root tags, we can't recover, make it blocking.\n+        if (ssrError.digest === MISSING_ROOT_TAGS_ERROR) {\n+          onBlockingError()\n+        }\n       }\n-    }, [ssrError])\n+    }, [ssrError, onBlockingError])\n   }\n \n   return null\n@@ -68,24 +78,28 @@ export function AppDevOverlay({\n   children: React.ReactNode\n }) {\n   const [isErrorOverlayOpen, setIsErrorOverlayOpen] = useState(false)\n+  const openOverlay = useCallback(() => {\n+    setIsErrorOverlayOpen(true)\n+  }, [])\n \n   return (\n     <>\n       <AppDevOverlayErrorBoundary\n         globalError={globalError}\n         onError={setIsErrorOverlayOpen}\n       >\n-        <ReplaySsrOnlyErrors />\n+        <ReplaySsrOnlyErrors onBlockingError={openOverlay} />\n         {children}\n       </AppDevOverlayErrorBoundary>\n-\n-      {/* Fonts can only be loaded outside the Shadow DOM. */}\n-      <FontStyles />\n-      <DevOverlay\n-        state={state}\n-        isErrorOverlayOpen={isErrorOverlayOpen}\n-        setIsErrorOverlayOpen={setIsErrorOverlayOpen}\n-      />\n+      <>\n+        {/* Fonts can only be loaded outside the Shadow DOM. */}\n+        <FontStyles />\n+        <DevOverlay\n+          state={state}\n+          isErrorOverlayOpen={isErrorOverlayOpen}\n+          setIsErrorOverlayOpen={setIsErrorOverlayOpen}\n+        />\n+      </>\n     </>\n   )\n }"
+        },
+        {
+            "sha": "5c9eb1e6de31c1a02d7ce14623601cdceb9dfe0b",
+            "filename": "packages/next/src/client/components/react-dev-overlay/app/client-entry.tsx",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 24,
+            "changes": 33,
+            "blob_url": "https://github.com/vercel/next.js/blob/69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Freact-dev-overlay%2Fapp%2Fclient-entry.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Freact-dev-overlay%2Fapp%2Fclient-entry.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Freact-dev-overlay%2Fapp%2Fclient-entry.tsx?ref=69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a",
+            "patch": "@@ -1,15 +1,14 @@\n import React from 'react'\n-import { AppDevOverlay } from './app-dev-overlay'\n import { getSocketUrl } from '../utils/get-socket-url'\n-import { INITIAL_OVERLAY_STATE } from '../shared'\n import { HMR_ACTIONS_SENT_TO_BROWSER } from '../../../../server/dev/hot-reloader-types'\n import GlobalError from '../../error-boundary'\n+import { AppDevOverlayErrorBoundary } from './app-dev-overlay-error-boundary'\n+\n+const noop = () => {}\n \n // if an error is thrown while rendering an RSC stream, this will catch it in dev\n // and show the error overlay\n export function createRootLevelDevOverlayElement(reactEl: React.ReactElement) {\n-  const rootLayoutMissingTags = window.__next_root_layout_missing_tags\n-  const hasMissingTags = !!rootLayoutMissingTags?.length\n   const socketUrl = getSocketUrl(process.env.__NEXT_ASSET_PREFIX || '')\n   const socket = new window.WebSocket(`${socketUrl}/_next/webpack-hmr`)\n \n@@ -31,26 +30,12 @@ export function createRootLevelDevOverlayElement(reactEl: React.ReactElement) {\n \n   socket.addEventListener('message', handler)\n \n-  const FallbackLayout = hasMissingTags\n-    ? ({ children }: { children: React.ReactNode }) => (\n-        <html id=\"__next_error__\">\n-          <body>{children}</body>\n-        </html>\n-      )\n-    : React.Fragment\n-\n   return (\n-    <FallbackLayout>\n-      <AppDevOverlay\n-        state={{\n-          ...INITIAL_OVERLAY_STATE,\n-          rootLayoutMissingTags,\n-          routerType: 'app',\n-        }}\n-        globalError={[GlobalError, null]}\n-      >\n-        {reactEl}\n-      </AppDevOverlay>\n-    </FallbackLayout>\n+    <AppDevOverlayErrorBoundary\n+      globalError={[GlobalError, null]}\n+      onError={noop}\n+    >\n+      {reactEl}\n+    </AppDevOverlayErrorBoundary>\n   )\n }"
+        },
+        {
+            "sha": "24008c460ad6e60e69e640b6de35e3eb6adf017e",
+            "filename": "packages/next/src/client/components/react-dev-overlay/app/hot-reloader-client.tsx",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 27,
+            "changes": 33,
+            "blob_url": "https://github.com/vercel/next.js/blob/69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Freact-dev-overlay%2Fapp%2Fhot-reloader-client.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Freact-dev-overlay%2Fapp%2Fhot-reloader-client.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Freact-dev-overlay%2Fapp%2Fhot-reloader-client.tsx?ref=69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a",
+            "patch": "@@ -1,12 +1,5 @@\n import type { ReactNode } from 'react'\n-import {\n-  useCallback,\n-  useEffect,\n-  startTransition,\n-  useMemo,\n-  useRef,\n-  useSyncExternalStore,\n-} from 'react'\n+import { useCallback, useEffect, startTransition, useMemo, useRef } from 'react'\n import stripAnsi from 'next/dist/compiled/strip-ansi'\n import formatWebpackMessages from '../utils/format-webpack-messages'\n import { useRouter } from '../../navigation'\n@@ -47,7 +40,6 @@ import type { HydrationErrorState } from '../../errors/hydration-error-info'\n import type { DebugInfo } from '../types'\n import { useUntrackedPathname } from '../../navigation-untracked'\n import { getReactStitchedError } from '../../errors/stitched-error'\n-import { shouldRenderRootLevelErrorOverlay } from '../../../lib/is-error-thrown-while-rendering-rsc'\n import { handleDevBuildIndicatorHmrEvents } from '../../../dev/dev-build-indicator/internal/handle-dev-build-indicator-hmr-events'\n import type { GlobalErrorComponent } from '../../error-boundary'\n import type { DevIndicatorServerState } from '../../../../server/dev/dev-indicator-server-state'\n@@ -553,15 +545,6 @@ export default function HotReload({\n     }\n   }, [dispatch])\n \n-  //  We render a separate error overlay at the root when an error is thrown from rendering RSC, so\n-  //  we should not render an additional error overlay in the descendent. However, we need to\n-  //  keep rendering these hooks to ensure HMR works when the error is addressed.\n-  const shouldRenderErrorOverlay = useSyncExternalStore(\n-    () => () => {},\n-    () => !shouldRenderRootLevelErrorOverlay(),\n-    () => true\n-  )\n-\n   const handleOnUnhandledError = useCallback(\n     (error: Error): void => {\n       const errorDetails = (error as any).details as\n@@ -681,13 +664,9 @@ export default function HotReload({\n     appIsrManifestRef,\n   ])\n \n-  if (shouldRenderErrorOverlay) {\n-    return (\n-      <AppDevOverlay state={state} globalError={globalError}>\n-        {children}\n-      </AppDevOverlay>\n-    )\n-  }\n-\n-  return children\n+  return (\n+    <AppDevOverlay state={state} globalError={globalError}>\n+      {children}\n+    </AppDevOverlay>\n+  )\n }"
+        },
+        {
+            "sha": "a995edcc57915d2b4f779d369ce9213e8c8882f2",
+            "filename": "packages/next/src/client/components/react-dev-overlay/shared.ts",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 2,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Freact-dev-overlay%2Fshared.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Freact-dev-overlay%2Fshared.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Freact-dev-overlay%2Fshared.ts?ref=69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a",
+            "patch": "@@ -19,7 +19,6 @@ export interface OverlayState {\n   buildError: string | null\n   errors: SupportedErrorEvent[]\n   refreshState: FastRefreshState\n-  rootLayoutMissingTags: typeof window.__next_root_layout_missing_tags\n   versionInfo: VersionInfo\n   notFound: boolean\n   staticIndicator: boolean\n@@ -127,7 +126,6 @@ export const INITIAL_OVERLAY_STATE: Omit<OverlayState, 'routerType'> = {\n   // To prevent flickering, set the initial state to disabled.\n   disableDevIndicator: true,\n   refreshState: { type: 'idle' },\n-  rootLayoutMissingTags: [],\n   versionInfo: { installed: '0.0.0', staleness: 'unknown' },\n   debugInfo: { devtoolsFrontendUrl: undefined },\n }"
+        },
+        {
+            "sha": "5dee3e28a96d17ec1f76d5ae14e6ebb7a32c314a",
+            "filename": "packages/next/src/client/components/react-dev-overlay/ui/components/errors/dev-tools-indicator/dev-tools-indicator.stories.tsx",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 1,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Freact-dev-overlay%2Fui%2Fcomponents%2Ferrors%2Fdev-tools-indicator%2Fdev-tools-indicator.stories.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Freact-dev-overlay%2Fui%2Fcomponents%2Ferrors%2Fdev-tools-indicator%2Fdev-tools-indicator.stories.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Freact-dev-overlay%2Fui%2Fcomponents%2Ferrors%2Fdev-tools-indicator%2Fdev-tools-indicator.stories.tsx?ref=69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a",
+            "patch": "@@ -51,7 +51,6 @@ const state: OverlayState = {\n   errors: [],\n   refreshState: { type: 'idle' },\n   disableDevIndicator: false,\n-  rootLayoutMissingTags: [],\n   versionInfo: mockVersionInfo,\n   notFound: false,\n   staticIndicator: true,"
+        },
+        {
+            "sha": "bc0bd5e4dd109512edd7ae807dab8006799f6626",
+            "filename": "packages/next/src/client/components/react-dev-overlay/ui/components/errors/error-overlay/error-overlay.tsx",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 12,
+            "changes": 12,
+            "blob_url": "https://github.com/vercel/next.js/blob/69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Freact-dev-overlay%2Fui%2Fcomponents%2Ferrors%2Ferror-overlay%2Ferror-overlay.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Freact-dev-overlay%2Fui%2Fcomponents%2Ferrors%2Ferror-overlay%2Ferror-overlay.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Freact-dev-overlay%2Fui%2Fcomponents%2Ferrors%2Ferror-overlay%2Ferror-overlay.tsx?ref=69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a",
+            "patch": "@@ -3,7 +3,6 @@ import type { OverlayState } from '../../../../shared'\n import { Suspense } from 'react'\n import { BuildError } from '../../../container/build-error'\n import { Errors } from '../../../container/errors'\n-import { RootLayoutMissingTagsError } from '../../../container/root-layout-missing-tags-error'\n import { useDelayedRender } from '../../../hooks/use-delayed-render'\n import type { ReadyRuntimeError } from '../../../../utils/get-error-by-type'\n \n@@ -41,17 +40,6 @@ export function ErrorOverlay({\n     versionInfo: state.versionInfo,\n   }\n \n-  if (!!state.rootLayoutMissingTags?.length) {\n-    return (\n-      <RootLayoutMissingTagsError\n-        {...commonProps}\n-        // This is not a runtime error, forcedly display error overlay\n-        rendered\n-        missingTags={state.rootLayoutMissingTags}\n-      />\n-    )\n-  }\n-\n   if (state.buildError !== null) {\n     return (\n       <BuildError"
+        },
+        {
+            "sha": "c9df956e931892305886459074c32a198c421c26",
+            "filename": "packages/next/src/client/components/react-dev-overlay/ui/container/root-layout-missing-tags-error.stories.tsx",
+            "status": "removed",
+            "additions": 0,
+            "deletions": 41,
+            "changes": 41,
+            "blob_url": "https://github.com/vercel/next.js/blob/9549032915ef6b3c758cb106dd153133a62543b9/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Freact-dev-overlay%2Fui%2Fcontainer%2Froot-layout-missing-tags-error.stories.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/9549032915ef6b3c758cb106dd153133a62543b9/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Freact-dev-overlay%2Fui%2Fcontainer%2Froot-layout-missing-tags-error.stories.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Freact-dev-overlay%2Fui%2Fcontainer%2Froot-layout-missing-tags-error.stories.tsx?ref=9549032915ef6b3c758cb106dd153133a62543b9",
+            "patch": "@@ -1,41 +0,0 @@\n-import type { Meta, StoryObj } from '@storybook/react'\n-import { RootLayoutMissingTagsError } from './root-layout-missing-tags-error'\n-import { withShadowPortal } from '../storybook/with-shadow-portal'\n-\n-const meta: Meta<typeof RootLayoutMissingTagsError> = {\n-  component: RootLayoutMissingTagsError,\n-  parameters: {\n-    layout: 'fullscreen',\n-  },\n-  decorators: [withShadowPortal],\n-}\n-\n-export default meta\n-type Story = StoryObj<typeof RootLayoutMissingTagsError>\n-\n-export const Default: Story = {\n-  args: {\n-    missingTags: ['html', 'body'],\n-    versionInfo: {\n-      installed: '15.0.0',\n-      staleness: 'fresh',\n-    },\n-  },\n-}\n-\n-export const SingleTag: Story = {\n-  args: {\n-    missingTags: ['html'],\n-    versionInfo: {\n-      installed: '15.0.0',\n-      staleness: 'fresh',\n-    },\n-  },\n-}\n-\n-export const Turbopack: Story = {\n-  args: {\n-    ...Default.args,\n-    isTurbopack: true,\n-  },\n-}"
+        },
+        {
+            "sha": "debdacdd64d6d1422cb0244129dcbfbbdfc83208",
+            "filename": "packages/next/src/client/components/react-dev-overlay/ui/container/root-layout-missing-tags-error.tsx",
+            "status": "removed",
+            "additions": 0,
+            "deletions": 31,
+            "changes": 31,
+            "blob_url": "https://github.com/vercel/next.js/blob/9549032915ef6b3c758cb106dd153133a62543b9/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Freact-dev-overlay%2Fui%2Fcontainer%2Froot-layout-missing-tags-error.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/9549032915ef6b3c758cb106dd153133a62543b9/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Freact-dev-overlay%2Fui%2Fcontainer%2Froot-layout-missing-tags-error.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Freact-dev-overlay%2Fui%2Fcontainer%2Froot-layout-missing-tags-error.tsx?ref=9549032915ef6b3c758cb106dd153133a62543b9",
+            "patch": "@@ -1,31 +0,0 @@\n-import { useCallback } from 'react'\n-import { HotlinkedText } from '../components/hot-linked-text'\n-import { ErrorOverlayLayout } from '../components/errors/error-overlay-layout/error-overlay-layout'\n-import type { ErrorBaseProps } from '../components/errors/error-overlay/error-overlay'\n-\n-interface RootLayoutMissingTagsErrorProps extends ErrorBaseProps {\n-  missingTags: string[]\n-}\n-\n-export function RootLayoutMissingTagsError({\n-  missingTags,\n-  ...props\n-}: RootLayoutMissingTagsErrorProps) {\n-  const noop = useCallback(() => {}, [])\n-  const error = new Error(\n-    `The following tags are missing in the Root Layout: ${missingTags\n-      .map((tagName) => `<${tagName}>`)\n-      .join(\n-        ', '\n-      )}.\\nRead more at https://nextjs.org/docs/messages/missing-root-layout-tags`\n-  )\n-  return (\n-    <ErrorOverlayLayout\n-      errorType=\"Missing Required HTML Tag\"\n-      error={error}\n-      errorMessage={<HotlinkedText text={error.message} />}\n-      onClose={noop}\n-      {...props}\n-    />\n-  )\n-}"
+        },
+        {
+            "sha": "dcdf38d4072f5fa05c91da300cf6736f98b9eb12",
+            "filename": "packages/next/src/client/components/react-dev-overlay/ui/container/runtime-error/render-error.tsx",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Freact-dev-overlay%2Fui%2Fcontainer%2Fruntime-error%2Frender-error.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Freact-dev-overlay%2Fui%2Fcontainer%2Fruntime-error%2Frender-error.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Freact-dev-overlay%2Fui%2Fcontainer%2Fruntime-error%2Frender-error.tsx?ref=69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a",
+            "patch": "@@ -41,8 +41,7 @@ type Props = {\n \n export const RenderError = (props: Props) => {\n   const { state } = props\n-  const isBuildError =\n-    !!state.rootLayoutMissingTags?.length || !!state.buildError\n+  const isBuildError = !!state.buildError\n \n   if (isBuildError) {\n     return <RenderBuildError {...props} />"
+        },
+        {
+            "sha": "7b460e3d035eb0e7ace225d0730d5f217c95d98f",
+            "filename": "packages/next/src/client/components/react-dev-overlay/ui/dev-overlay.stories.tsx",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 1,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Freact-dev-overlay%2Fui%2Fdev-overlay.stories.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Freact-dev-overlay%2Fui%2Fdev-overlay.stories.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Freact-dev-overlay%2Fui%2Fdev-overlay.stories.tsx?ref=69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a",
+            "patch": "@@ -73,7 +73,6 @@ const state: OverlayState = {\n     },\n   ],\n   refreshState: { type: 'idle' },\n-  rootLayoutMissingTags: [],\n   notFound: false,\n   staticIndicator: false,\n   debugInfo: { devtoolsFrontendUrl: undefined },"
+        },
+        {
+            "sha": "e99912d002d35794c82a402a2f23f9a9006bcca7",
+            "filename": "packages/next/src/client/lib/is-error-thrown-while-rendering-rsc.ts",
+            "status": "removed",
+            "additions": 0,
+            "deletions": 3,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/9549032915ef6b3c758cb106dd153133a62543b9/packages%2Fnext%2Fsrc%2Fclient%2Flib%2Fis-error-thrown-while-rendering-rsc.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/9549032915ef6b3c758cb106dd153133a62543b9/packages%2Fnext%2Fsrc%2Fclient%2Flib%2Fis-error-thrown-while-rendering-rsc.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fclient%2Flib%2Fis-error-thrown-while-rendering-rsc.ts?ref=9549032915ef6b3c758cb106dd153133a62543b9",
+            "patch": "@@ -1,3 +0,0 @@\n-export const shouldRenderRootLevelErrorOverlay = () => {\n-  return !!window.__next_root_layout_missing_tags?.length\n-}"
+        },
+        {
+            "sha": "ad7202f7ca9276f1b29ddd762179c093f1738896",
+            "filename": "packages/next/src/server/stream-utils/node-web-streams-helper.ts",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 4,
+            "changes": 17,
+            "blob_url": "https://github.com/vercel/next.js/blob/69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a/packages%2Fnext%2Fsrc%2Fserver%2Fstream-utils%2Fnode-web-streams-helper.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a/packages%2Fnext%2Fsrc%2Fserver%2Fstream-utils%2Fnode-web-streams-helper.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fstream-utils%2Fnode-web-streams-helper.ts?ref=69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a",
+            "patch": "@@ -8,6 +8,7 @@ import {\n   isEquivalentUint8Arrays,\n   removeFromUint8Array,\n } from './uint8array-helpers'\n+import { MISSING_ROOT_TAGS_ERROR } from '../../shared/lib/errors/constants'\n \n function voidCatch() {\n   // this catcher is designed to be used with pipeTo where we expect the underlying\n@@ -489,17 +490,25 @@ export function createRootLayoutValidatorStream(): TransformStream<\n       controller.enqueue(chunk)\n     },\n     flush(controller) {\n-      const missingTags: typeof window.__next_root_layout_missing_tags = []\n+      const missingTags: ('html' | 'body')[] = []\n       if (!foundHtml) missingTags.push('html')\n       if (!foundBody) missingTags.push('body')\n \n       if (!missingTags.length) return\n \n       controller.enqueue(\n         encoder.encode(\n-          `<script>self.__next_root_layout_missing_tags=${JSON.stringify(\n-            missingTags\n-          )}</script>`\n+          `<html id=\"__next_error__\">\n+            <template\n+              data-next-error-message=\"Missing ${missingTags\n+                .map((c) => `<${c}>`)\n+                .join(\n+                  missingTags.length > 1 ? ' and ' : ''\n+                )} tags in the root layout.\\nRead more at https://nextjs.org/docs/messages/missing-root-layout-tags\"\"\n+              data-next-error-digest=\"${MISSING_ROOT_TAGS_ERROR}\"\n+              data-next-error-stack=\"\"\n+            ></template>\n+          `\n         )\n       )\n     },"
+        },
+        {
+            "sha": "401466a0450cd3dc6b974b8025f8377dfe44a5ec",
+            "filename": "packages/next/src/shared/lib/errors/constants.ts",
+            "status": "added",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a/packages%2Fnext%2Fsrc%2Fshared%2Flib%2Ferrors%2Fconstants.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a/packages%2Fnext%2Fsrc%2Fshared%2Flib%2Ferrors%2Fconstants.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fshared%2Flib%2Ferrors%2Fconstants.ts?ref=69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a",
+            "patch": "@@ -0,0 +1 @@\n+export const MISSING_ROOT_TAGS_ERROR = 'NEXT_MISSING_ROOT_TAGS'"
+        },
+        {
+            "sha": "878b1f0f14dd2644f31d3b2bfc9cfff944bbfb85",
+            "filename": "test/development/app-dir/missing-required-html-tags/index.test.ts",
+            "status": "modified",
+            "additions": 35,
+            "deletions": 29,
+            "changes": 64,
+            "blob_url": "https://github.com/vercel/next.js/blob/69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a/test%2Fdevelopment%2Fapp-dir%2Fmissing-required-html-tags%2Findex.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a/test%2Fdevelopment%2Fapp-dir%2Fmissing-required-html-tags%2Findex.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fdevelopment%2Fapp-dir%2Fmissing-required-html-tags%2Findex.test.ts?ref=69776cc3e3ef6f3fddbc2ab7b78c6f0d5509997a",
+            "patch": "@@ -2,40 +2,37 @@ import { nextTestSetup } from 'e2e-utils'\n import {\n   assertHasRedbox,\n   assertNoRedbox,\n-  getRedboxDescription,\n   getToastErrorCount,\n   hasErrorToast,\n   retry,\n } from 'next-test-utils'\n-import { outdent } from 'outdent'\n \n describe('app-dir - missing required html tags', () => {\n-  const { next } = nextTestSetup({ files: __dirname })\n+  const { next, isTurbopack } = nextTestSetup({ files: __dirname })\n \n   it('should display correct error count in dev indicator', async () => {\n     const browser = await next.browser('/')\n \n     retry(async () => {\n       expect(await hasErrorToast(browser)).toBe(true)\n     })\n-    // Dev indicator should show 1 error\n     expect(await getToastErrorCount(browser)).toBe(1)\n   })\n \n   it('should show error overlay', async () => {\n     const browser = await next.browser('/')\n \n-    // There was a bug where multiple dialogs were being rendered when required\n-    // html tags were missing. This test ensures there is no regression.\n-    await retry(async () => {\n-      const dialogs = await browser.elementsByCss('nextjs-portal')\n-      expect(dialogs).toHaveLength(1)\n-    })\n-\n     await assertHasRedbox(browser)\n-    expect(await getRedboxDescription(browser)).toMatchInlineSnapshot(`\n-      \"The following tags are missing in the Root Layout: <html>, <body>.\n-      Read more at https://nextjs.org/docs/messages/missing-root-layout-tags\"\n+    await expect(browser).toDisplayRedbox(`\n+     {\n+       \"count\": 1,\n+       \"description\": \"Error: Missing <html> and <body> tags in the root layout.\n+     Read more at https://nextjs.org/docs/messages/missing-root-layout-tags\",\n+       \"environmentLabel\": null,\n+       \"label\": \"Unhandled Runtime Error\",\n+       \"source\": null,\n+       \"stack\": [],\n+     }\n     `)\n   })\n \n@@ -47,13 +44,18 @@ describe('app-dir - missing required html tags', () => {\n     )\n \n     await assertHasRedbox(browser)\n-    // Wait for the HMR to apply and the updated error to show.\n-    await retry(async () => {\n-      expect(await getRedboxDescription(browser)).toEqual(outdent`\n-        The following tags are missing in the Root Layout: <html>.\n-        Read more at https://nextjs.org/docs/messages/missing-root-layout-tags\n-      `)\n-    })\n+\n+    await expect(browser).toDisplayRedbox(`\n+     {\n+       \"count\": 1,\n+       \"description\": \"Error: Missing <html> tags in the root layout.\n+     Read more at https://nextjs.org/docs/messages/missing-root-layout-tags\",\n+       \"environmentLabel\": null,\n+       \"label\": \"Unhandled Runtime Error\",\n+       \"source\": null,\n+       \"stack\": [],\n+     }\n+    `)\n \n     await next.patchFile('app/layout.js', (code) =>\n       code.replace(\n@@ -73,15 +75,19 @@ describe('app-dir - missing required html tags', () => {\n       )\n     )\n \n-    if (process.env.TURBOPACK) {\n+    if (isTurbopack) {\n       await assertHasRedbox(browser)\n-      // Wait for the HMR to apply and the updated error to show.\n-      await retry(async () => {\n-        expect(await getRedboxDescription(browser)).toEqual(outdent`\n-          The following tags are missing in the Root Layout: <html>, <body>.\n-          Read more at https://nextjs.org/docs/messages/missing-root-layout-tags\n-        `)\n-      })\n+      await expect(browser).toDisplayRedbox(`\n+       {\n+         \"count\": 1,\n+         \"description\": \"Error: Missing <html> and <body> tags in the root layout.\n+       Read more at https://nextjs.org/docs/messages/missing-root-layout-tags\",\n+         \"environmentLabel\": null,\n+         \"label\": \"Unhandled Runtime Error\",\n+         \"source\": null,\n+         \"stack\": [],\n+       }\n+      `)\n     } else {\n       // TODO(NDX-768): Should show \"missing tags\" error\n       await assertNoRedbox(browser)"
+        }
+    ],
+    "stats": {
+        "total": 293,
+        "additions": 94,
+        "deletions": 199
+    }
+}

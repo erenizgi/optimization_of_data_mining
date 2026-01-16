@@ -1,0 +1,72 @@
+{
+    "author": "FightingZhen",
+    "message": "[bugfix] [WIP] fix apply_rotary_emb error on Ascend NPU (#38491)\n\n[bugfix] fix apply_rotary_emb error on Ascend NPU",
+    "sha": "fdf86fb4407a42eeec2733f6566c1ede914bb1cc",
+    "files": [
+        {
+            "sha": "b6a6001729c1a9f64e6c274f049f045adf11499e",
+            "filename": "src/transformers/integrations/npu_flash_attention.py",
+            "status": "modified",
+            "additions": 17,
+            "deletions": 0,
+            "changes": 17,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fdf86fb4407a42eeec2733f6566c1ede914bb1cc/src%2Ftransformers%2Fintegrations%2Fnpu_flash_attention.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fdf86fb4407a42eeec2733f6566c1ede914bb1cc/src%2Ftransformers%2Fintegrations%2Fnpu_flash_attention.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fintegrations%2Fnpu_flash_attention.py?ref=fdf86fb4407a42eeec2733f6566c1ede914bb1cc",
+            "patch": "@@ -23,6 +23,7 @@\n \n     import torch_npu\n     from einops import rearrange, repeat\n+    from torch_npu import npu_rotary_mul\n \n \n # FlashAttention2 is supported on Ascend NPU with down-right aligned causal mask by default.\n@@ -247,3 +248,19 @@ def npu_flash_attn_varlen_func(\n         )[0]\n \n     return output\n+\n+\n+def npu_apply_rotary_emb(x, cos, sin, **kwargs):\n+    # cos tensor after chunk should be repeated through chunked dimension to original shape on Ascend NPU\n+    if len(cos.shape) == 2 and cos.shape[-1] == x.shape[-1] // 2:\n+        cos = cos.repeat(1, 2)\n+        # cos tensor with [S,D] shape should be unsqueezed to 4-d tensor with shape [1,S,1,D]\n+        cos = cos.unsqueeze(0).unsqueeze(2)\n+\n+    # sin tensor after chunk should be repeated through chunked dimension to original shape on Ascend NPU\n+    if len(sin.shape) == 2 and sin.shape[-1] == x.shape[-1] // 2:\n+        sin = sin.repeat(1, 2)\n+        # sin tensor with [S,D] shape should be unsqueezed to 4-d tensor with shape [1,S,1,D]\n+        sin = sin.unsqueeze(0).unsqueeze(2)\n+\n+    return npu_rotary_mul(x, cos, sin)"
+        },
+        {
+            "sha": "f01db89f5b1b706965abb8d7b6f312f540a1273f",
+            "filename": "src/transformers/modeling_flash_attention_utils.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fdf86fb4407a42eeec2733f6566c1ede914bb1cc/src%2Ftransformers%2Fmodeling_flash_attention_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fdf86fb4407a42eeec2733f6566c1ede914bb1cc/src%2Ftransformers%2Fmodeling_flash_attention_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodeling_flash_attention_utils.py?ref=fdf86fb4407a42eeec2733f6566c1ede914bb1cc",
+            "patch": "@@ -40,9 +40,8 @@\n \n # patch functions in package `flash-attn` when using flash-attention on Ascend NPU.\n if is_torch_npu_available():\n-    from torch_npu import npu_rotary_mul as apply_rotary_emb  # noqa\n-\n     from .integrations.npu_flash_attention import index_first_axis, pad_input, unpad_input\n+    from .integrations.npu_flash_attention import npu_apply_rotary_emb as apply_rotary_emb  # noqa\n     from .integrations.npu_flash_attention import npu_flash_attn_func as flash_attn_func\n     from .integrations.npu_flash_attention import npu_flash_attn_varlen_func as flash_attn_varlen_func\n "
+        },
+        {
+            "sha": "640b8429f00868c0a07379379b4555890e023e77",
+            "filename": "src/transformers/models/esm/modeling_esm.py",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 3,
+            "changes": 7,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fdf86fb4407a42eeec2733f6566c1ede914bb1cc/src%2Ftransformers%2Fmodels%2Fesm%2Fmodeling_esm.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fdf86fb4407a42eeec2733f6566c1ede914bb1cc/src%2Ftransformers%2Fmodels%2Fesm%2Fmodeling_esm.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fesm%2Fmodeling_esm.py?ref=fdf86fb4407a42eeec2733f6566c1ede914bb1cc",
+            "patch": "@@ -23,6 +23,7 @@\n from torch import nn\n from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss\n \n+from ...modeling_flash_attention_utils import flash_attn_supports_top_left_mask, is_flash_attn_available\n from ...modeling_outputs import (\n     BaseModelOutputWithPastAndCrossAttentions,\n     BaseModelOutputWithPoolingAndCrossAttentions,\n@@ -31,11 +32,11 @@\n     TokenClassifierOutput,\n )\n from ...modeling_utils import PreTrainedModel, find_pruneable_heads_and_indices, prune_linear_layer\n-from ...utils import auto_docstring, is_flash_attn_2_available, is_flash_attn_greater_or_equal_2_10, logging\n+from ...utils import auto_docstring, logging\n from .configuration_esm import EsmConfig\n \n \n-if is_flash_attn_2_available():\n+if is_flash_attn_available():\n     from ...modeling_flash_attention_utils import _flash_attention_forward\n \n \n@@ -413,7 +414,7 @@ def __init__(self, config, position_embedding_type=None):\n         # TODO: Should be removed once Flash Attention for RoCm is bumped to 2.1.\n         # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignement, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.\n         # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1) produces a wrong mask (top-left).\n-        self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()\n+        self._flash_attn_uses_top_left_mask = flash_attn_supports_top_left_mask()\n         self.dropout_prob = config.attention_probs_dropout_prob\n \n     def forward("
+        },
+        {
+            "sha": "8164ad0f4bac816080af1533f0ecfecf71019b7e",
+            "filename": "src/transformers/models/qwen2_5_omni/modeling_qwen2_5_omni.py",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 12,
+            "changes": 21,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fdf86fb4407a42eeec2733f6566c1ede914bb1cc/src%2Ftransformers%2Fmodels%2Fqwen2_5_omni%2Fmodeling_qwen2_5_omni.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fdf86fb4407a42eeec2733f6566c1ede914bb1cc/src%2Ftransformers%2Fmodels%2Fqwen2_5_omni%2Fmodeling_qwen2_5_omni.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fqwen2_5_omni%2Fmodeling_qwen2_5_omni.py?ref=fdf86fb4407a42eeec2733f6566c1ede914bb1cc",
+            "patch": "@@ -34,19 +34,17 @@\n from ...cache_utils import Cache, DynamicCache\n from ...generation import GenerationMixin\n from ...masking_utils import create_causal_mask, create_sliding_window_causal_mask\n-from ...modeling_flash_attention_utils import FlashAttentionKwargs\n+from ...modeling_flash_attention_utils import (\n+    FlashAttentionKwargs,\n+    flash_attn_supports_top_left_mask,\n+    is_flash_attn_available,\n+)\n from ...modeling_layers import GradientCheckpointingLayer\n from ...modeling_outputs import BaseModelOutput, BaseModelOutputWithPast, ModelOutput\n from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update\n from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel\n from ...processing_utils import Unpack\n-from ...utils import (\n-    auto_docstring,\n-    check_torch_load_is_safe,\n-    is_flash_attn_2_available,\n-    is_flash_attn_greater_or_equal_2_10,\n-    logging,\n-)\n+from ...utils import auto_docstring, check_torch_load_is_safe, logging\n from ...utils.hub import cached_file\n from .configuration_qwen2_5_omni import (\n     Qwen2_5OmniAudioEncoderConfig,\n@@ -61,9 +59,8 @@\n )\n \n \n-if is_flash_attn_2_available():\n-    from flash_attn.flash_attn_interface import flash_attn_varlen_func as flash_attn_varlen_func\n-    from flash_attn.layers.rotary import apply_rotary_emb\n+if is_flash_attn_available():\n+    from ...modeling_flash_attention_utils import apply_rotary_emb, flash_attn_varlen_func\n else:\n     flash_attn_varlen_func = None\n     apply_rotary_emb = None\n@@ -653,7 +650,7 @@ def __init__(self, *args, **kwargs):\n         # TODO: Should be removed once Flash Attention for RoCm is bumped to 2.1.\n         # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignment, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.\n         # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1) produces a wrong mask (top-left).\n-        self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()\n+        self._flash_attn_uses_top_left_mask = flash_attn_supports_top_left_mask()\n \n     def forward(\n         self,"
+        },
+        {
+            "sha": "6f40803f803220d2652f4d3307f25c2ee6275ab0",
+            "filename": "src/transformers/models/qwen2_5_omni/modular_qwen2_5_omni.py",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 6,
+            "changes": 10,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fdf86fb4407a42eeec2733f6566c1ede914bb1cc/src%2Ftransformers%2Fmodels%2Fqwen2_5_omni%2Fmodular_qwen2_5_omni.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fdf86fb4407a42eeec2733f6566c1ede914bb1cc/src%2Ftransformers%2Fmodels%2Fqwen2_5_omni%2Fmodular_qwen2_5_omni.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fqwen2_5_omni%2Fmodular_qwen2_5_omni.py?ref=fdf86fb4407a42eeec2733f6566c1ede914bb1cc",
+            "patch": "@@ -43,22 +43,20 @@\n \n from ...configuration_utils import PretrainedConfig, layer_type_validation\n from ...generation import GenerationMixin\n+from ...modeling_flash_attention_utils import flash_attn_supports_top_left_mask, is_flash_attn_available\n from ...modeling_outputs import BaseModelOutput, ModelOutput\n from ...modeling_rope_utils import rope_config_validation\n from ...modeling_utils import ALL_ATTENTION_FUNCTIONS\n from ...utils import (\n     auto_docstring,\n     check_torch_load_is_safe,\n-    is_flash_attn_2_available,\n-    is_flash_attn_greater_or_equal_2_10,\n     logging,\n )\n from ...utils.hub import cached_file\n \n \n-if is_flash_attn_2_available():\n-    from flash_attn.flash_attn_interface import flash_attn_varlen_func as flash_attn_varlen_func\n-    from flash_attn.layers.rotary import apply_rotary_emb\n+if is_flash_attn_available():\n+    from ...modeling_flash_attention_utils import apply_rotary_emb, flash_attn_varlen_func\n else:\n     flash_attn_varlen_func = None\n     apply_rotary_emb = None\n@@ -1667,7 +1665,7 @@ def __init__(self, *args, **kwargs):\n         # TODO: Should be removed once Flash Attention for RoCm is bumped to 2.1.\n         # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignment, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.\n         # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1) produces a wrong mask (top-left).\n-        self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()\n+        self._flash_attn_uses_top_left_mask = flash_attn_supports_top_left_mask()\n \n     def forward(\n         self,"
+        }
+    ],
+    "stats": {
+        "total": 58,
+        "additions": 35,
+        "deletions": 23
+    }
+}

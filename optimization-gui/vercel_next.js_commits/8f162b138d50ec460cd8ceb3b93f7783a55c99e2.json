@@ -1,0 +1,132 @@
+{
+    "author": "gaojude",
+    "message": "Fix: Client should auto reload after server restarts (#83971)\n\nPort the implementation from pages router to app router.\n\nhttps://github.com/vercel/next.js/blob/27515900b31bfad83c3ecc65ed2e5d020ec289a6/packages/next/src/client/dev/hot-reloader/pages/websocket.ts\n\n---------\n\nCo-authored-by: devjiwonchoi <devjiwonchoi@gmail.com>\nCo-authored-by: JJ Kasper <jj@jjsweb.site>",
+    "sha": "8f162b138d50ec460cd8ceb3b93f7783a55c99e2",
+    "files": [
+        {
+            "sha": "be0e323ec80b25835fea6c9eb52faa7612c0a38e",
+            "filename": "packages/next/src/client/dev/hot-reloader/app/web-socket.ts",
+            "status": "modified",
+            "additions": 110,
+            "deletions": 29,
+            "changes": 139,
+            "blob_url": "https://github.com/vercel/next.js/blob/8f162b138d50ec460cd8ceb3b93f7783a55c99e2/packages%2Fnext%2Fsrc%2Fclient%2Fdev%2Fhot-reloader%2Fapp%2Fweb-socket.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/8f162b138d50ec460cd8ceb3b93f7783a55c99e2/packages%2Fnext%2Fsrc%2Fclient%2Fdev%2Fhot-reloader%2Fapp%2Fweb-socket.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fclient%2Fdev%2Fhot-reloader%2Fapp%2Fweb-socket.ts?ref=8f162b138d50ec460cd8ceb3b93f7783a55c99e2",
+            "patch": "@@ -17,6 +17,12 @@ import {\n   logQueue,\n } from '../../../../next-devtools/userspace/app/forward-logs'\n import { InvariantError } from '../../../../shared/lib/invariant-error'\n+import { WEB_SOCKET_MAX_RECONNECTIONS } from '../../../../lib/constants'\n+\n+let reconnections = 0\n+let reloading = false\n+let serverSessionId: number | null = null\n+let mostRecentCompilationHash: string | null = null\n \n export function createWebSocket(\n   assetPrefix: string,\n@@ -28,45 +34,120 @@ export function createWebSocket(\n     )\n   }\n \n-  const webSocket = new window.WebSocket(\n-    `${getSocketUrl(assetPrefix)}/_next/webpack-hmr?id=${self.__next_r}`\n-  )\n-\n-  webSocket.binaryType = 'arraybuffer'\n-\n-  if (isTerminalLoggingEnabled) {\n-    webSocket.addEventListener('open', () => {\n-      logQueue.onSocketReady(webSocket)\n-    })\n-  }\n+  let webSocket: WebSocket\n+  let timer: ReturnType<typeof setTimeout>\n \n   const sendMessage = (data: string) => {\n-    if (webSocket.readyState === webSocket.OPEN) {\n+    if (webSocket && webSocket.readyState === webSocket.OPEN) {\n       webSocket.send(data)\n     }\n   }\n \n   const processTurbopackMessage = createProcessTurbopackMessage(sendMessage)\n \n-  webSocket.addEventListener('message', (event) => {\n-    try {\n-      const message: HmrMessageSentToBrowser =\n-        event.data instanceof ArrayBuffer\n-          ? parseBinaryMessage(event.data)\n-          : JSON.parse(event.data)\n-\n-      processMessage(\n-        message,\n-        sendMessage,\n-        processTurbopackMessage,\n-        staticIndicatorState\n-      )\n-    } catch (err: unknown) {\n-      reportInvalidHmrMessage(event, err)\n+  function init() {\n+    if (webSocket) {\n+      webSocket.close()\n     }\n-  })\n \n-  return webSocket\n+    const newWebSocket = new window.WebSocket(\n+      `${getSocketUrl(assetPrefix)}/_next/webpack-hmr?id=${self.__next_r}`\n+    )\n+\n+    newWebSocket.binaryType = 'arraybuffer'\n+\n+    function handleOnline() {\n+      if (isTerminalLoggingEnabled) {\n+        logQueue.onSocketReady(newWebSocket)\n+      }\n+\n+      reconnections = 0\n+      window.console.log('[HMR] connected')\n+    }\n+\n+    function handleMessage(event: MessageEvent) {\n+      // While the page is reloading, don't respond to any more messages.\n+      if (reloading) {\n+        return\n+      }\n+\n+      try {\n+        const message: HmrMessageSentToBrowser =\n+          event.data instanceof ArrayBuffer\n+            ? parseBinaryMessage(event.data)\n+            : JSON.parse(event.data)\n+\n+        // Check for server restart in Turbopack mode\n+        if (message.type === HMR_MESSAGE_SENT_TO_BROWSER.TURBOPACK_CONNECTED) {\n+          if (\n+            serverSessionId !== null &&\n+            serverSessionId !== message.data.sessionId\n+          ) {\n+            // Either the server's session id has changed and it's a new server, or\n+            // it's been too long since we disconnected and we should reload the page.\n+            window.location.reload()\n+            reloading = true\n+            return\n+          }\n+          serverSessionId = message.data.sessionId\n+        }\n+\n+        // Track webpack compilation hash for server restart detection\n+        if (\n+          message.type === HMR_MESSAGE_SENT_TO_BROWSER.SYNC &&\n+          'hash' in message\n+        ) {\n+          // If we had previously reconnected and the hash changed, the server may have restarted\n+          if (\n+            mostRecentCompilationHash !== null &&\n+            mostRecentCompilationHash !== message.hash\n+          ) {\n+            window.location.reload()\n+            reloading = true\n+            return\n+          }\n+          mostRecentCompilationHash = message.hash\n+        }\n+\n+        processMessage(\n+          message,\n+          sendMessage,\n+          processTurbopackMessage,\n+          staticIndicatorState\n+        )\n+      } catch (err: unknown) {\n+        reportInvalidHmrMessage(event, err)\n+      }\n+    }\n+\n+    function handleDisconnect() {\n+      newWebSocket.onerror = null\n+      newWebSocket.onclose = null\n+      newWebSocket.close()\n+      reconnections++\n+\n+      // After 25 reconnects we'll want to reload the page as it indicates the dev server is no longer running.\n+      if (reconnections > WEB_SOCKET_MAX_RECONNECTIONS) {\n+        reloading = true\n+        window.location.reload()\n+        return\n+      }\n+\n+      clearTimeout(timer)\n+      // Try again after 5 seconds\n+      timer = setTimeout(init, reconnections > 5 ? 5000 : 1000)\n+    }\n+\n+    newWebSocket.onopen = handleOnline\n+    newWebSocket.onerror = handleDisconnect\n+    newWebSocket.onclose = handleDisconnect\n+    newWebSocket.onmessage = handleMessage\n+\n+    webSocket = newWebSocket\n+    return newWebSocket\n+  }\n+\n+  return init()\n }\n \n export function createProcessTurbopackMessage("
+        },
+        {
+            "sha": "d702360c73c8a06c8a8fff80b90870d27788fb89",
+            "filename": "packages/next/src/client/dev/hot-reloader/pages/websocket.ts",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 2,
+            "changes": 6,
+            "blob_url": "https://github.com/vercel/next.js/blob/8f162b138d50ec460cd8ceb3b93f7783a55c99e2/packages%2Fnext%2Fsrc%2Fclient%2Fdev%2Fhot-reloader%2Fpages%2Fwebsocket.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/8f162b138d50ec460cd8ceb3b93f7783a55c99e2/packages%2Fnext%2Fsrc%2Fclient%2Fdev%2Fhot-reloader%2Fpages%2Fwebsocket.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fclient%2Fdev%2Fhot-reloader%2Fpages%2Fwebsocket.ts?ref=8f162b138d50ec460cd8ceb3b93f7783a55c99e2",
+            "patch": "@@ -7,6 +7,7 @@ import {\n   type HmrMessageSentToBrowser,\n } from '../../../../server/dev/hot-reloader-types'\n import { getSocketUrl } from '../get-socket-url'\n+import { WEB_SOCKET_MAX_RECONNECTIONS } from '../../../../lib/constants'\n \n let source: WebSocket\n \n@@ -28,6 +29,8 @@ let reloading = false\n let serverSessionId: number | null = null\n \n export function connectHMR(options: { path: string; assetPrefix: string }) {\n+  let timer: ReturnType<typeof setTimeout>\n+\n   function init() {\n     if (source) source.close()\n \n@@ -71,14 +74,13 @@ export function connectHMR(options: { path: string; assetPrefix: string }) {\n       }\n     }\n \n-    let timer: ReturnType<typeof setTimeout>\n     function handleDisconnect() {\n       source.onerror = null\n       source.onclose = null\n       source.close()\n       reconnections++\n       // After 25 reconnects we'll want to reload the page as it indicates the dev server is no longer running.\n-      if (reconnections > 25) {\n+      if (reconnections > WEB_SOCKET_MAX_RECONNECTIONS) {\n         reloading = true\n         window.location.reload()\n         return"
+        },
+        {
+            "sha": "627e2cf70afbce00c69474fc5542e242121107b8",
+            "filename": "packages/next/src/lib/constants.ts",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/8f162b138d50ec460cd8ceb3b93f7783a55c99e2/packages%2Fnext%2Fsrc%2Flib%2Fconstants.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/8f162b138d50ec460cd8ceb3b93f7783a55c99e2/packages%2Fnext%2Fsrc%2Flib%2Fconstants.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Flib%2Fconstants.ts?ref=8f162b138d50ec460cd8ceb3b93f7783a55c99e2",
+            "patch": "@@ -100,6 +100,8 @@ export const SERVER_RUNTIME: Record<string, ServerRuntime> = {\n   nodejs: 'nodejs',\n }\n \n+export const WEB_SOCKET_MAX_RECONNECTIONS = 12\n+\n /**\n  * The names of the webpack layers. These layers are the primitives for the\n  * webpack chunks."
+        },
+        {
+            "sha": "803f17d863c8ad887c14588aab3487e473367b41",
+            "filename": "test/development/app-dir/watch-config-file/fixture/app/layout.js",
+            "status": "added",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/vercel/next.js/blob/8f162b138d50ec460cd8ceb3b93f7783a55c99e2/test%2Fdevelopment%2Fapp-dir%2Fwatch-config-file%2Ffixture%2Fapp%2Flayout.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/8f162b138d50ec460cd8ceb3b93f7783a55c99e2/test%2Fdevelopment%2Fapp-dir%2Fwatch-config-file%2Ffixture%2Fapp%2Flayout.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fdevelopment%2Fapp-dir%2Fwatch-config-file%2Ffixture%2Fapp%2Flayout.js?ref=8f162b138d50ec460cd8ceb3b93f7783a55c99e2",
+            "patch": "@@ -0,0 +1,7 @@\n+export default function RootLayout({ children }) {\n+  return (\n+    <html>\n+      <body>{children}</body>\n+    </html>\n+  )\n+}"
+        },
+        {
+            "sha": "ff7159d9149feeb1eb8f4b7bbeadb2e26c20b053",
+            "filename": "test/development/app-dir/watch-config-file/fixture/app/page.js",
+            "status": "added",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/8f162b138d50ec460cd8ceb3b93f7783a55c99e2/test%2Fdevelopment%2Fapp-dir%2Fwatch-config-file%2Ffixture%2Fapp%2Fpage.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/8f162b138d50ec460cd8ceb3b93f7783a55c99e2/test%2Fdevelopment%2Fapp-dir%2Fwatch-config-file%2Ffixture%2Fapp%2Fpage.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fdevelopment%2Fapp-dir%2Fwatch-config-file%2Ffixture%2Fapp%2Fpage.js?ref=8f162b138d50ec460cd8ceb3b93f7783a55c99e2",
+            "patch": "@@ -0,0 +1,3 @@\n+export default function Page() {\n+  return <p>hello world</p>\n+}"
+        },
+        {
+            "sha": "dc5fc2c6bcc331e2d5880f193f9342412b1145f0",
+            "filename": "test/development/app-dir/watch-config-file/fixture/next.config.js",
+            "status": "added",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/8f162b138d50ec460cd8ceb3b93f7783a55c99e2/test%2Fdevelopment%2Fapp-dir%2Fwatch-config-file%2Ffixture%2Fnext.config.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/8f162b138d50ec460cd8ceb3b93f7783a55c99e2/test%2Fdevelopment%2Fapp-dir%2Fwatch-config-file%2Ffixture%2Fnext.config.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fdevelopment%2Fapp-dir%2Fwatch-config-file%2Ffixture%2Fnext.config.js?ref=8f162b138d50ec460cd8ceb3b93f7783a55c99e2",
+            "patch": "@@ -0,0 +1,5 @@\n+const nextConfig = {\n+  reactStrictMode: true,\n+}\n+\n+module.exports = nextConfig"
+        },
+        {
+            "sha": "c6ced0ab558e5e22365b6be31d6cefb5b941657b",
+            "filename": "test/development/app-dir/watch-config-file/index.test.ts",
+            "status": "added",
+            "additions": 37,
+            "deletions": 0,
+            "changes": 37,
+            "blob_url": "https://github.com/vercel/next.js/blob/8f162b138d50ec460cd8ceb3b93f7783a55c99e2/test%2Fdevelopment%2Fapp-dir%2Fwatch-config-file%2Findex.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/8f162b138d50ec460cd8ceb3b93f7783a55c99e2/test%2Fdevelopment%2Fapp-dir%2Fwatch-config-file%2Findex.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fdevelopment%2Fapp-dir%2Fwatch-config-file%2Findex.test.ts?ref=8f162b138d50ec460cd8ceb3b93f7783a55c99e2",
+            "patch": "@@ -0,0 +1,37 @@\n+import { nextTestSetup } from 'e2e-utils'\n+import { check } from 'next-test-utils'\n+import { join } from 'path'\n+\n+describe('app-dir watch-config-file', () => {\n+  const { next } = nextTestSetup({\n+    files: join(__dirname, 'fixture'),\n+  })\n+\n+  it('should output config file change and restart server for app router', async () => {\n+    await check(async () => next.cliOutput, /ready/i)\n+\n+    await check(async () => {\n+      await next.patchFile(\n+        'next.config.js',\n+        `\n+            console.log(${Date.now()})\n+            const nextConfig = {\n+              reactStrictMode: true,\n+              async redirects() {\n+                  return [\n+                    {\n+                      source: '/about',\n+                      destination: '/',\n+                      permanent: false,\n+                    },\n+                  ]\n+                },\n+            }\n+            module.exports = nextConfig`\n+      )\n+      return next.cliOutput\n+    }, /Found a change in next\\.config\\.js\\. Restarting the server to apply the changes\\.\\.\\./)\n+\n+    await check(() => next.fetch('/about').then((res) => res.status), 200)\n+  })\n+})"
+        },
+        {
+            "sha": "95060b139d36ea45d015074276a6f5d023a4e904",
+            "filename": "test/development/app-hmr/fixtures/default-template/app/counter.js",
+            "status": "added",
+            "additions": 16,
+            "deletions": 0,
+            "changes": 16,
+            "blob_url": "https://github.com/vercel/next.js/blob/8f162b138d50ec460cd8ceb3b93f7783a55c99e2/test%2Fdevelopment%2Fapp-hmr%2Ffixtures%2Fdefault-template%2Fapp%2Fcounter.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/8f162b138d50ec460cd8ceb3b93f7783a55c99e2/test%2Fdevelopment%2Fapp-hmr%2Ffixtures%2Fdefault-template%2Fapp%2Fcounter.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fdevelopment%2Fapp-hmr%2Ffixtures%2Fdefault-template%2Fapp%2Fcounter.js?ref=8f162b138d50ec460cd8ceb3b93f7783a55c99e2",
+            "patch": "@@ -0,0 +1,16 @@\n+'use client'\n+\n+import { useState } from 'react'\n+\n+export function Counter() {\n+  const [count, setCount] = useState(0)\n+\n+  return (\n+    <div>\n+      <p id=\"counter-value\">Count: {count}</p>\n+      <button id=\"increment-button\" onClick={() => setCount(count + 1)}>\n+        Increment\n+      </button>\n+    </div>\n+  )\n+}"
+        },
+        {
+            "sha": "f1c084fb9dee98e0bf488ebe99e8255fed2189e8",
+            "filename": "test/development/app-hmr/fixtures/default-template/app/page.js",
+            "status": "added",
+            "additions": 10,
+            "deletions": 0,
+            "changes": 10,
+            "blob_url": "https://github.com/vercel/next.js/blob/8f162b138d50ec460cd8ceb3b93f7783a55c99e2/test%2Fdevelopment%2Fapp-hmr%2Ffixtures%2Fdefault-template%2Fapp%2Fpage.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/8f162b138d50ec460cd8ceb3b93f7783a55c99e2/test%2Fdevelopment%2Fapp-hmr%2Ffixtures%2Fdefault-template%2Fapp%2Fpage.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fdevelopment%2Fapp-hmr%2Ffixtures%2Fdefault-template%2Fapp%2Fpage.js?ref=8f162b138d50ec460cd8ceb3b93f7783a55c99e2",
+            "patch": "@@ -0,0 +1,10 @@\n+import { Counter } from './counter'\n+\n+export default function Page() {\n+  return (\n+    <div>\n+      <p>hello world</p>\n+      <Counter />\n+    </div>\n+  )\n+}"
+        },
+        {
+            "sha": "be2e3b6ba7996dd903f94c339359ec680bbb1c25",
+            "filename": "test/development/app-hmr/server-restart.test.ts",
+            "status": "added",
+            "additions": 66,
+            "deletions": 0,
+            "changes": 66,
+            "blob_url": "https://github.com/vercel/next.js/blob/8f162b138d50ec460cd8ceb3b93f7783a55c99e2/test%2Fdevelopment%2Fapp-hmr%2Fserver-restart.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/8f162b138d50ec460cd8ceb3b93f7783a55c99e2/test%2Fdevelopment%2Fapp-hmr%2Fserver-restart.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fdevelopment%2Fapp-hmr%2Fserver-restart.test.ts?ref=8f162b138d50ec460cd8ceb3b93f7783a55c99e2",
+            "patch": "@@ -0,0 +1,66 @@\n+import { FileRef, nextTestSetup, createNext } from 'e2e-utils'\n+import { retry, waitFor } from 'next-test-utils'\n+import path from 'path'\n+\n+describe('app-dir server restart', () => {\n+  const { next } = nextTestSetup({\n+    files: new FileRef(path.join(__dirname, 'fixtures', 'default-template')),\n+    patchFileDelay: 1000,\n+  })\n+\n+  it('should reload the page when the server restarts', async () => {\n+    const browser = await next.browser('/')\n+    await retry(async () => {\n+      expect(await browser.elementByCss('body').text()).toMatch(/hello world/)\n+    })\n+\n+    // Verify the counter is at 0 initially\n+    expect(await browser.elementById('counter-value').text()).toBe('Count: 0')\n+\n+    // Click increment button to change state\n+    await browser.elementById('increment-button').click()\n+    expect(await browser.elementById('counter-value').text()).toBe('Count: 1')\n+\n+    // Click again to make it 2\n+    await browser.elementById('increment-button').click()\n+    expect(await browser.elementById('counter-value').text()).toBe('Count: 2')\n+\n+    // Set up reload detection before stopping the server\n+    let reloadPromise = new Promise((resolve) => {\n+      browser.on('request', (req) => {\n+        if (req.url().endsWith('/')) {\n+          resolve(req.url())\n+        }\n+      })\n+    })\n+\n+    const appPort = next.appPort\n+    await next.destroy()\n+\n+    // Start a new server instance on the same port\n+    const secondNext = await createNext({\n+      files: new FileRef(path.join(__dirname, 'fixtures', 'default-template')),\n+      env: next.env,\n+      forcedPort: appPort,\n+    })\n+\n+    // Wait for the new server to be ready\n+    await waitFor(1000)\n+\n+    // Wait for the browser to reload\n+    await reloadPromise\n+\n+    // Verify the page content is still available after reload\n+    await retry(async () => {\n+      expect(await browser.elementByCss('body').text()).toMatch(/hello world/)\n+    })\n+\n+    // IMPORTANT: Verify the counter state is reset to 0 after reload\n+    // This proves the page actually reloaded and didn't just reconnect\n+    await retry(async () => {\n+      expect(await browser.elementById('counter-value').text()).toBe('Count: 0')\n+    })\n+\n+    await secondNext.destroy()\n+  })\n+})"
+        }
+    ],
+    "stats": {
+        "total": 291,
+        "additions": 260,
+        "deletions": 31
+    }
+}

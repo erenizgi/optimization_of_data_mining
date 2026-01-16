@@ -1,0 +1,84 @@
+{
+    "author": "remi-or",
+    "message": "Fix fp32_ln for various models (#41605)\n\n* Add is_causal to KosmosTextAttention\n\n* Move get target_dtype to be imported elsewhere\n\n* Fix fp32 flash attention bug in bark\n\n* Fix is_causal in mllama\n\n* Fix fp32 issue on StableLM\n\n* Fix repo-consistency",
+    "sha": "2935a1be19f12176c455cb65d67dc5a3bb84cd77",
+    "files": [
+        {
+            "sha": "1046f9e0ebe7997d6516d4ce4f71f5f4d02f1a35",
+            "filename": "src/transformers/integrations/flash_attention.py",
+            "status": "modified",
+            "additions": 14,
+            "deletions": 9,
+            "changes": 23,
+            "blob_url": "https://github.com/huggingface/transformers/blob/2935a1be19f12176c455cb65d67dc5a3bb84cd77/src%2Ftransformers%2Fintegrations%2Fflash_attention.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/2935a1be19f12176c455cb65d67dc5a3bb84cd77/src%2Ftransformers%2Fintegrations%2Fflash_attention.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fintegrations%2Fflash_attention.py?ref=2935a1be19f12176c455cb65d67dc5a3bb84cd77",
+            "patch": "@@ -11,6 +11,19 @@\n _use_top_left_mask = flash_attn_supports_top_left_mask()\n \n \n+def get_target_dtype(query: torch.Tensor, module: torch.nn.Module) -> torch.dtype:\n+    \"\"\"If the query is in float32, return a target dtype compatible with flash attention. Return None otherwise.\"\"\"\n+    if query.dtype == torch.float32:\n+        if torch.is_autocast_enabled():\n+            return torch.get_autocast_gpu_dtype()\n+        # Handle the case where the model is quantized\n+        elif hasattr(module.config, \"_pre_quantization_dtype\"):\n+            return module.config._pre_quantization_dtype\n+        else:\n+            return next(layer for layer in module.modules() if isinstance(layer, torch.nn.Linear)).weight.dtype\n+    return None\n+\n+\n def flash_attention_forward(\n     module: torch.nn.Module,\n     query: torch.Tensor,\n@@ -48,15 +61,7 @@ def flash_attention_forward(\n     # cast them back in the correct dtype just to be sure everything works as expected.\n     # This might slowdown training & inference so it is recommended to not cast the LayerNorms\n     # in fp32. (usually our RMSNorm modules handle it correctly)\n-    target_dtype = None\n-    if query.dtype == torch.float32:\n-        if torch.is_autocast_enabled():\n-            target_dtype = torch.get_autocast_gpu_dtype()\n-        # Handle the case where the model is quantized\n-        elif hasattr(module.config, \"_pre_quantization_dtype\"):\n-            target_dtype = module.config._pre_quantization_dtype\n-        else:\n-            target_dtype = next(layer for layer in module.modules() if isinstance(layer, torch.nn.Linear)).weight.dtype\n+    target_dtype = get_target_dtype(query, module)\n \n     # Instead of relying on the value set in the module directly, we use the is_causal passed in kwargs if it is presented\n     is_causal = kwargs.pop(\"is_causal\", None)"
+        },
+        {
+            "sha": "dfe91a4f2a524735b1b7d422d44c93569cb61b1b",
+            "filename": "src/transformers/models/bark/modeling_bark.py",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/huggingface/transformers/blob/2935a1be19f12176c455cb65d67dc5a3bb84cd77/src%2Ftransformers%2Fmodels%2Fbark%2Fmodeling_bark.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/2935a1be19f12176c455cb65d67dc5a3bb84cd77/src%2Ftransformers%2Fmodels%2Fbark%2Fmodeling_bark.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fbark%2Fmodeling_bark.py?ref=2935a1be19f12176c455cb65d67dc5a3bb84cd77",
+            "patch": "@@ -57,6 +57,7 @@\n \n \n if is_flash_attn_available():\n+    from ...integrations.flash_attention import get_target_dtype\n     from ...modeling_flash_attention_utils import _flash_attention_forward\n \n \n@@ -78,6 +79,7 @@ def __init__(self, config, is_causal=False, layer_idx=None):\n         self.embed_dim = config.hidden_size\n         self.num_heads = config.num_heads\n         self.head_dim = self.embed_dim // self.num_heads\n+        self.config = config\n \n         if config.hidden_size % config.num_heads != 0:\n             raise ValueError(\n@@ -228,6 +230,8 @@ def forward(\n         if past_key_values is not None:\n             key, value = past_key_values.update(key, value, self.layer_idx, {\"cache_position\": cache_position})\n \n+        target_dtype = get_target_dtype(query, self)  # if the query is in float32, this is the dtype to cast to for FA\n+\n         attn_output = _flash_attention_forward(\n             query,\n             key,\n@@ -237,6 +241,7 @@ def forward(\n             dropout=self.dropout if self.training else 0.0,\n             use_top_left_mask=self._flash_attn_uses_top_left_mask,\n             is_causal=self.is_causal,\n+            target_dtype=target_dtype,\n         )\n \n         attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)"
+        },
+        {
+            "sha": "054f3ff26f1981e1bdd95c1b0cc442427257194d",
+            "filename": "src/transformers/models/blt/modeling_blt.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/huggingface/transformers/blob/2935a1be19f12176c455cb65d67dc5a3bb84cd77/src%2Ftransformers%2Fmodels%2Fblt%2Fmodeling_blt.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/2935a1be19f12176c455cb65d67dc5a3bb84cd77/src%2Ftransformers%2Fmodels%2Fblt%2Fmodeling_blt.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fblt%2Fmodeling_blt.py?ref=2935a1be19f12176c455cb65d67dc5a3bb84cd77",
+            "patch": "@@ -280,12 +280,12 @@ def __init__(self, config: BltConfig, layer_idx: int):\n         self.scaling = self.head_dim**-0.5\n         self.rope_theta = config.rope_theta\n         self.layer_idx = layer_idx\n+        self.is_causal = True\n \n         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)\n         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)\n         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)\n         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)\n-        self.is_causal = True\n \n     def forward(\n         self,"
+        },
+        {
+            "sha": "903cbfe049d194641569cac9b03f031bad46b3ab",
+            "filename": "src/transformers/models/kosmos2/modeling_kosmos2.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/huggingface/transformers/blob/2935a1be19f12176c455cb65d67dc5a3bb84cd77/src%2Ftransformers%2Fmodels%2Fkosmos2%2Fmodeling_kosmos2.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/2935a1be19f12176c455cb65d67dc5a3bb84cd77/src%2Ftransformers%2Fmodels%2Fkosmos2%2Fmodeling_kosmos2.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fkosmos2%2Fmodeling_kosmos2.py?ref=2935a1be19f12176c455cb65d67dc5a3bb84cd77",
+            "patch": "@@ -680,6 +680,7 @@ def __init__(\n         self.num_heads = num_heads\n         self.dropout = dropout\n         self.head_dim = embed_dim // num_heads\n+        self.is_causal = True\n \n         if (self.head_dim * num_heads) != self.embed_dim:\n             raise ValueError("
+        },
+        {
+            "sha": "7f3bf4aa592a24e13174a5a8c75d0fc08f6df912",
+            "filename": "src/transformers/models/mllama/modeling_mllama.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/huggingface/transformers/blob/2935a1be19f12176c455cb65d67dc5a3bb84cd77/src%2Ftransformers%2Fmodels%2Fmllama%2Fmodeling_mllama.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/2935a1be19f12176c455cb65d67dc5a3bb84cd77/src%2Ftransformers%2Fmodels%2Fmllama%2Fmodeling_mllama.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fmllama%2Fmodeling_mllama.py?ref=2935a1be19f12176c455cb65d67dc5a3bb84cd77",
+            "patch": "@@ -519,6 +519,7 @@ def __init__(self, config: MllamaTextConfig, layer_idx: int):\n         self.scaling = self.head_dim**-0.5\n         self.rope_theta = config.rope_theta\n         self.layer_idx = layer_idx\n+        self.is_causal = True\n \n         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)\n         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)"
+        },
+        {
+            "sha": "17ea7c59fd3623adc179f0ca00174b816ef086d4",
+            "filename": "src/transformers/models/stablelm/modeling_stablelm.py",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/huggingface/transformers/blob/2935a1be19f12176c455cb65d67dc5a3bb84cd77/src%2Ftransformers%2Fmodels%2Fstablelm%2Fmodeling_stablelm.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/2935a1be19f12176c455cb65d67dc5a3bb84cd77/src%2Ftransformers%2Fmodels%2Fstablelm%2Fmodeling_stablelm.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fstablelm%2Fmodeling_stablelm.py?ref=2935a1be19f12176c455cb65d67dc5a3bb84cd77",
+            "patch": "@@ -52,6 +52,7 @@\n \n \n if is_flash_attn_available():\n+    from ...integrations.flash_attention import get_target_dtype\n     from ...modeling_flash_attention_utils import _flash_attention_forward\n \n \n@@ -495,6 +496,8 @@ def forward(\n \n         dropout_rate = self.attention_dropout.p if self.training else 0.0\n \n+        target_dtype = get_target_dtype(query_states, self)\n+\n         attn_output = _flash_attention_forward(\n             query_states,\n             key_states,\n@@ -505,6 +508,7 @@ def forward(\n             dropout=dropout_rate,\n             use_top_left_mask=self._flash_attn_uses_top_left_mask,\n             is_causal=self.is_causal,\n+            target_dtype=target_dtype,\n         )\n \n         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()"
+        }
+    ],
+    "stats": {
+        "total": 36,
+        "additions": 26,
+        "deletions": 10
+    }
+}

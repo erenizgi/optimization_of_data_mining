@@ -1,0 +1,36 @@
+{
+    "author": "sokra",
+    "message": "Turbopack: fix a bug where marking a task a completed causes a panic when reading the output (#77922)\n\n### What?\n\nWhen using mark_finished() on a task, reading that task while it's still in progress will lead to a panic because it would try to schedule that task for recomputation, but it's already scheduled.",
+    "sha": "0c7610b73663e2cdd15d4b140d58e3af3e3a25ea",
+    "files": [
+        {
+            "sha": "b43c0c7e9405f1f6e8a352bba533eabc5c072670",
+            "filename": "turbopack/crates/turbo-tasks-backend/src/backend/mod.rs",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 9,
+            "changes": 18,
+            "blob_url": "https://github.com/vercel/next.js/blob/0c7610b73663e2cdd15d4b140d58e3af3e3a25ea/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fbackend%2Fmod.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/0c7610b73663e2cdd15d4b140d58e3af3e3a25ea/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fbackend%2Fmod.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fbackend%2Fmod.rs?ref=0c7610b73663e2cdd15d4b140d58e3af3e3a25ea",
+            "patch": "@@ -455,11 +455,11 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n                     Some(Ok(Err(listen_to_done_event(this, reader, done_event))))\n                 }\n                 Some(InProgressState::InProgress(box InProgressStateInner {\n-                    marked_as_completed,\n+                    done,\n                     done_event,\n                     ..\n                 })) => {\n-                    if !*marked_as_completed {\n+                    if !*done {\n                         Some(Ok(Err(listen_to_done_event(this, reader, done_event))))\n                     } else {\n                         None\n@@ -606,6 +606,8 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n         // Output doesn't exist. We need to schedule the task to compute it.\n         let (item, listener) =\n             CachedDataItem::new_scheduled_with_listener(self.get_task_desc_fn(task_id), note);\n+        // It's not possible that the task is InProgress at this point. If it is InProgress {\n+        // done: true } it must have Output and would early return.\n         task.add_new(item);\n         turbo_tasks.schedule(task_id);\n \n@@ -1135,6 +1137,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n                     done_event,\n                     session_dependent: false,\n                     marked_as_completed: false,\n+                    done: false,\n                     new_children: Default::default(),\n                 })),\n             });\n@@ -1277,7 +1280,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n         };\n         let &mut InProgressState::InProgress(box InProgressStateInner {\n             stale,\n-            ref mut marked_as_completed,\n+            ref mut done,\n             ref done_event,\n             ref mut new_children,\n             ..\n@@ -1318,10 +1321,8 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n         }\n \n         // mark the task as completed, so dependent tasks can continue working\n-        if !*marked_as_completed {\n-            *marked_as_completed = true;\n-            done_event.notify(usize::MAX);\n-        }\n+        *done = true;\n+        done_event.notify(usize::MAX);\n \n         // take the children from the task to process them\n         let mut new_children = take(new_children);\n@@ -1502,6 +1503,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n             once_task: _,\n             stale,\n             session_dependent,\n+            done: _,\n             marked_as_completed: _,\n             new_children,\n         }) = in_progress\n@@ -1886,12 +1888,10 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n         let mut task = ctx.task(task, TaskDataCategory::Data);\n         if let Some(InProgressState::InProgress(box InProgressStateInner {\n             marked_as_completed,\n-            done_event,\n             ..\n         })) = get_mut!(task, InProgress)\n         {\n             *marked_as_completed = true;\n-            done_event.notify(usize::MAX);\n             // TODO this should remove the dirty state (also check session_dependent)\n             // but this would break some assumptions for strongly consistent reads.\n             // Client tasks are not connected yet, so we wouldn't wait for them."
+        },
+        {
+            "sha": "da4dab0a775bacb48bf10436ea11e4b44386c5e3",
+            "filename": "turbopack/crates/turbo-tasks-backend/src/data.rs",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/vercel/next.js/blob/0c7610b73663e2cdd15d4b140d58e3af3e3a25ea/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fdata.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/0c7610b73663e2cdd15d4b140d58e3af3e3a25ea/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fdata.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fdata.rs?ref=0c7610b73663e2cdd15d4b140d58e3af3e3a25ea",
+            "patch": "@@ -309,7 +309,13 @@ pub struct InProgressStateInner {\n     #[allow(dead_code)]\n     pub once_task: bool,\n     pub session_dependent: bool,\n+    /// Early marking as completed. This is set before the output is available and will ignore full\n+    /// task completion of the task for strongly consistent reads.\n     pub marked_as_completed: bool,\n+    /// Task execution has completed and the output is available.\n+    pub done: bool,\n+    /// Event that is triggered when the task output is available (completed flag set).\n+    /// This is used to wait for completion when reading the task output before it's available.\n     pub done_event: Event,\n     /// Children that should be connected to the task and have their active_count decremented\n     /// once the task completes."
+        }
+    ],
+    "stats": {
+        "total": 24,
+        "additions": 15,
+        "deletions": 9
+    }
+}

@@ -1,0 +1,72 @@
+{
+    "author": "nhamanasu",
+    "message": "add RAdamScheduleFree optimizer (#35313)\n\n* add RAdamScheduleFree optimizer\n\n* revert schedulefree version to the minimum requirement\n\n* refine is_schedulefree_available so that it can take min_version\n\n* refine documents\n\n---------\n\nCo-authored-by: Arthur <48595927+ArthurZucker@users.noreply.github.com>",
+    "sha": "377d8e2b9c51117c42f313244e379aa8395a7d6b",
+    "files": [
+        {
+            "sha": "15858fd5800ec0a5aa828710521e0b42fd6df10c",
+            "filename": "docs/source/en/trainer.md",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 5,
+            "changes": 15,
+            "blob_url": "https://github.com/huggingface/transformers/blob/377d8e2b9c51117c42f313244e379aa8395a7d6b/docs%2Fsource%2Fen%2Ftrainer.md",
+            "raw_url": "https://github.com/huggingface/transformers/raw/377d8e2b9c51117c42f313244e379aa8395a7d6b/docs%2Fsource%2Fen%2Ftrainer.md",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/docs%2Fsource%2Fen%2Ftrainer.md?ref=377d8e2b9c51117c42f313244e379aa8395a7d6b",
+            "patch": "@@ -542,13 +542,17 @@ trainer = Trainer(\n trainer.train()\n ```\n \n-This script demonstrates how to fine-tune the `google/gemma-2b` model on the IMDB dataset using the GrokAdamW optimizer. The `TrainingArguments` are configured to use GrokAdamW, and the dataset is passed to the `Trainer` for training.\n+This script demonstrates how to fine-tune the [google/gemma-2b](https://huggingface.co/google/gemma-2b) model on the IMDB dataset using the GrokAdamW optimizer. The `TrainingArguments` are configured to use GrokAdamW, and the dataset is passed to the `Trainer` for training.\n \n-### Schedule Free Optimizer\n+### Schedule-Free Optimizer\n+\n+The Schedule-Free optimizers have been introduced in [The Road Less Scheduled](https://hf.co/papers/2405.15682).\n+Supported optimizers for Schedule-Free are `schedule_free_radam`, `schedule_free_adamw` and `schedule_free_sgd`. First install schedulefree from pypi `pip install schedulefree`.\n \n-The Schedule Free optimizers have been introduced in [The Road Less Scheduled](https://hf.co/papers/2405.15682).\n Schedule-Free learning replaces the momentum of the base optimizer with a combination of averaging and interpolation, to completely remove the need to anneal the learning rate with a traditional schedule.\n-Supported optimizers for SFO are `\"schedule_free_adamw\"` and `\"schedule_free_sgd\"`. First install schedulefree from pypi `pip install schedulefree`.\n+Additionally, neither `warmup_steps` nor `warmup_ratio` parameters are required when using `schedule_free_radam`.\n+\n+By default, we recommend setting `lr_scheduler_type=\"constant\"` in the `TrainingArguments`. Setting other `lr_scheduler_type` would also work, but combining Schedule-Free with other learning rate schedules is not well-studied both in research and in practice, as it may affect the optimizer's intended behavior and performance guarantees.\n \n Below is a simple script to demonstrate how to fine-tune [google/gemma-2b](https://huggingface.co/google/gemma-2b) on IMDB dataset in full precision:\n \n@@ -564,7 +568,8 @@ args = TrainingArguments(\n     output_dir=\"./test-schedulefree\",\n     max_steps=1000,\n     per_device_train_batch_size=4,\n-    optim=\"schedule_free_adamw\",\n+    optim=\"schedule_free_radam\",\n+    lr_scheduler_type=\"constant\",\n     gradient_checkpointing=True,\n     logging_strategy=\"steps\",\n     logging_steps=1,"
+        },
+        {
+            "sha": "31a4982881e134af08590e16588317172ab90164",
+            "filename": "src/transformers/trainer.py",
+            "status": "modified",
+            "additions": 20,
+            "deletions": 4,
+            "changes": 24,
+            "blob_url": "https://github.com/huggingface/transformers/blob/377d8e2b9c51117c42f313244e379aa8395a7d6b/src%2Ftransformers%2Ftrainer.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/377d8e2b9c51117c42f313244e379aa8395a7d6b/src%2Ftransformers%2Ftrainer.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Ftrainer.py?ref=377d8e2b9c51117c42f313244e379aa8395a7d6b",
+            "patch": "@@ -1644,28 +1644,44 @@ def optimizer_hook(param):\n                 raise ValueError(\"Invalid optimizer\")\n             optimizer_kwargs.update(adam_kwargs)\n         elif args.optim in [\n+            OptimizerNames.SCHEDULE_FREE_RADAM,\n             OptimizerNames.SCHEDULE_FREE_ADAMW,\n             OptimizerNames.SCHEDULE_FREE_SGD,\n         ]:\n             if not is_schedulefree_available():\n                 raise ImportError(\n-                    \"You need to install `schedulefree` in order to use schedulefree optimizers\"\n-                    \" install it with `pip install schedulefree`\"\n+                    \"You need to install `schedulefree` in order to use schedulefree optimizers. \"\n+                    \"Install it with `pip install schedulefree.`\"\n                 )\n             if not is_accelerate_available(\"0.30.0\"):\n                 raise ImportError(\"You need to have `accelerate>=0.30.0` to be able to use schedulefree optimizers\")\n             from schedulefree import AdamWScheduleFree, SGDScheduleFree\n \n             additional_optim_kwargs = {}\n-            if args.optim == OptimizerNames.SCHEDULE_FREE_ADAMW:\n+            require_warmup = True\n+\n+            if args.optim == OptimizerNames.SCHEDULE_FREE_RADAM:\n+                if not is_schedulefree_available(\"1.4.0\"):\n+                    raise ImportError(\n+                        \"You need to install `schedulefree>=1.4.0` in order to use RAdamScheduleFree optimizer. \"\n+                        \"Install it with `pip install schedulefree.`\"\n+                    )\n+                from schedulefree import RAdamScheduleFree\n+\n+                optimizer_cls = RAdamScheduleFree\n+                additional_optim_kwargs = adam_kwargs\n+                require_warmup = False\n+            elif args.optim == OptimizerNames.SCHEDULE_FREE_ADAMW:\n                 optimizer_cls = AdamWScheduleFree\n                 additional_optim_kwargs = adam_kwargs\n             elif args.optim == OptimizerNames.SCHEDULE_FREE_SGD:\n                 optimizer_cls = SGDScheduleFree\n             else:\n                 raise ValueError(\"Invalid schedulefree optimizer\")\n+\n             additional_optim_kwargs[\"weight_decay\"] = args.weight_decay\n-            additional_optim_kwargs[\"warmup_steps\"] = args.warmup_steps\n+            if require_warmup:\n+                additional_optim_kwargs[\"warmup_steps\"] = args.warmup_steps\n             additional_optim_kwargs.update(\n                 {\n                     \"weight_lr_power\": float(optim_args.get(\"weight_lr_power\", 2.0)),"
+        },
+        {
+            "sha": "23b1b6384f0e6666fb697c68c18ee41d30fd56c9",
+            "filename": "src/transformers/training_args.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/huggingface/transformers/blob/377d8e2b9c51117c42f313244e379aa8395a7d6b/src%2Ftransformers%2Ftraining_args.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/377d8e2b9c51117c42f313244e379aa8395a7d6b/src%2Ftransformers%2Ftraining_args.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Ftraining_args.py?ref=377d8e2b9c51117c42f313244e379aa8395a7d6b",
+            "patch": "@@ -182,6 +182,7 @@ class OptimizerNames(ExplicitEnum):\n     LOMO = \"lomo\"\n     ADALOMO = \"adalomo\"\n     GROKADAMW = \"grokadamw\"\n+    SCHEDULE_FREE_RADAM = \"schedule_free_radam\"\n     SCHEDULE_FREE_ADAMW = \"schedule_free_adamw\"\n     SCHEDULE_FREE_SGD = \"schedule_free_sgd\"\n "
+        },
+        {
+            "sha": "5a6dd937519383f7eba7a8e1a6e087ee39b3e49a",
+            "filename": "src/transformers/utils/import_utils.py",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 3,
+            "changes": 7,
+            "blob_url": "https://github.com/huggingface/transformers/blob/377d8e2b9c51117c42f313244e379aa8395a7d6b/src%2Ftransformers%2Futils%2Fimport_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/377d8e2b9c51117c42f313244e379aa8395a7d6b/src%2Ftransformers%2Futils%2Fimport_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Futils%2Fimport_utils.py?ref=377d8e2b9c51117c42f313244e379aa8395a7d6b",
+            "patch": "@@ -89,6 +89,7 @@ def _is_package_available(pkg_name: str, return_version: bool = False) -> Union[\n TORCH_FX_REQUIRED_VERSION = version.parse(\"1.10\")\n \n ACCELERATE_MIN_VERSION = \"0.26.0\"\n+SCHEDULEFREE_MIN_VERSION = \"1.2.6\"\n FSDP_MIN_VERSION = \"1.12.0\"\n GGUF_MIN_VERSION = \"0.10.0\"\n XLA_FSDPV2_MIN_VERSION = \"2.2.0\"\n@@ -108,7 +109,7 @@ def _is_package_available(pkg_name: str, return_version: bool = False) -> Union[\n _galore_torch_available = _is_package_available(\"galore_torch\")\n _lomo_available = _is_package_available(\"lomo_optim\")\n _grokadamw_available = _is_package_available(\"grokadamw\")\n-_schedulefree_available = _is_package_available(\"schedulefree\")\n+_schedulefree_available, _schedulefree_version = _is_package_available(\"schedulefree\", return_version=True)\n # `importlib.metadata.version` doesn't work with `bs4` but `beautifulsoup4`. For `importlib.util.find_spec`, reversed.\n _bs4_available = importlib.util.find_spec(\"bs4\") is not None\n _coloredlogs_available = _is_package_available(\"coloredlogs\")\n@@ -410,8 +411,8 @@ def is_grokadamw_available():\n     return _grokadamw_available\n \n \n-def is_schedulefree_available():\n-    return _schedulefree_available\n+def is_schedulefree_available(min_version: str = SCHEDULEFREE_MIN_VERSION):\n+    return _schedulefree_available and version.parse(_schedulefree_version) >= version.parse(min_version)\n \n \n def is_pyctcdecode_available():"
+        },
+        {
+            "sha": "4737b6ad5836b7fa2e30859b684dea1fd054fa35",
+            "filename": "tests/trainer/test_trainer.py",
+            "status": "modified",
+            "additions": 32,
+            "deletions": 8,
+            "changes": 40,
+            "blob_url": "https://github.com/huggingface/transformers/blob/377d8e2b9c51117c42f313244e379aa8395a7d6b/tests%2Ftrainer%2Ftest_trainer.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/377d8e2b9c51117c42f313244e379aa8395a7d6b/tests%2Ftrainer%2Ftest_trainer.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Ftrainer%2Ftest_trainer.py?ref=377d8e2b9c51117c42f313244e379aa8395a7d6b",
+            "patch": "@@ -1865,14 +1865,38 @@ def test_schedulefree_adam(self):\n         x = torch.randint(0, 100, (128,))\n         train_dataset = RepeatDataset(x)\n \n-        # Trainer without inf/nan filter\n-        args = TrainingArguments(\n-            self.get_auto_remove_tmp_dir(),\n-            learning_rate=1e-9,\n-            logging_steps=5,\n-            optim=\"schedule_free_adamw\",\n-        )\n-        trainer = Trainer(tiny_llama, args, train_dataset=train_dataset)\n+        with tempfile.TemporaryDirectory() as tmpdir:\n+            # Trainer without inf/nan filter\n+            args = TrainingArguments(\n+                tmpdir,\n+                learning_rate=1e-9,\n+                logging_steps=5,\n+                optim=\"schedule_free_adamw\",\n+                lr_scheduler_type=\"constant\",\n+            )\n+            trainer = Trainer(tiny_llama, args, train_dataset=train_dataset)\n+\n+            # Check this works\n+            _ = trainer.train()\n+\n+    @require_schedulefree\n+    @require_torch_gpu\n+    def test_schedulefree_radam(self):\n+        config = LlamaConfig(vocab_size=100, hidden_size=32, num_hidden_layers=3, num_attention_heads=4)\n+        tiny_llama = LlamaForCausalLM(config)\n+        x = torch.randint(0, 100, (128,))\n+        train_dataset = RepeatDataset(x)\n+\n+        with tempfile.TemporaryDirectory() as tmpdir:\n+            # Trainer without inf/nan filter\n+            args = TrainingArguments(\n+                tmpdir,\n+                learning_rate=1e-9,\n+                logging_steps=5,\n+                lr_scheduler_type=\"constant\",\n+                optim=\"schedule_free_radam\",\n+            )\n+            trainer = Trainer(tiny_llama, args, train_dataset=train_dataset)\n \n         # Check this works\n         _ = trainer.train()"
+        }
+    ],
+    "stats": {
+        "total": 87,
+        "additions": 67,
+        "deletions": 20
+    }
+}

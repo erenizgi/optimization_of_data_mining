@@ -1,0 +1,36 @@
+{
+    "author": "sywangyi",
+    "message": "fix test failure of speculative_generation on xpu (#42052)\n\n* fix test failure of speculative_generation on xpu\n\nSigned-off-by: Wang, Yi A <yi.a.wang@intel.com>\n\n* code refine\n\nSigned-off-by: Wang, Yi A <yi.a.wang@intel.com>\n\n* address review comment\n\nSigned-off-by: Wang, Yi A <yi.a.wang@intel.com>\n\n---------\n\nSigned-off-by: Wang, Yi A <yi.a.wang@intel.com>",
+    "sha": "58a3f8caacdb95c6a9393ea9499defab89b0ae73",
+    "files": [
+        {
+            "sha": "b7252168483cc92ea85461558258cd29667353af",
+            "filename": "src/transformers/masking_utils.py",
+            "status": "modified",
+            "additions": 44,
+            "deletions": 9,
+            "changes": 53,
+            "blob_url": "https://github.com/huggingface/transformers/blob/58a3f8caacdb95c6a9393ea9499defab89b0ae73/src%2Ftransformers%2Fmasking_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/58a3f8caacdb95c6a9393ea9499defab89b0ae73/src%2Ftransformers%2Fmasking_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmasking_utils.py?ref=58a3f8caacdb95c6a9393ea9499defab89b0ae73",
+            "patch": "@@ -177,6 +177,42 @@ def prepare_padding_mask(\n     return local_padding_mask\n \n \n+def _can_skip_causal_mask_xpu(\n+    padding_mask: Optional[torch.Tensor],\n+    query_length: int,\n+    kv_length: int,\n+    local_attention_size: Optional[int],\n+) -> bool:\n+    \"\"\"\n+    XPU-specific logic for determining if we can skip causal mask creation.\n+\n+    For XPU devices, we have special handling:\n+    - Single query tokens (query_length == 1) use the same logic as CUDA\n+    - Multi-query tokens can skip if padding_mask is provided and correctly structured\n+      The mask must have all True values in the query window and all False after\n+    \"\"\"\n+\n+    if is_tracing(padding_mask):\n+        return False\n+\n+    # Check local attention constraint (same as CUDA)\n+    if local_attention_size is not None and kv_length >= local_attention_size:\n+        return False\n+\n+    if padding_mask is None:\n+        # Without padding mask, can skip if single query token or full causal attention\n+        return query_length == 1 or kv_length == query_length\n+\n+    # XPU allows skipping under additional conditions when padding_mask is provided\n+    if query_length == 1:\n+        # Single query token: skip only if no padding tokens present\n+        return padding_mask.all()\n+\n+    # XPU-specific: check if query window is all True and rest is all False\n+    # This allows XPU to optimize the 1st token in static cache\n+    return padding_mask[:, :query_length].all() and not padding_mask[:, query_length:].any()\n+\n+\n def _ignore_causal_mask_sdpa(\n     padding_mask: Optional[torch.Tensor],\n     query_length: int,\n@@ -197,25 +233,24 @@ def _ignore_causal_mask_sdpa(\n         mask_indices += kv_offset\n         padding_mask = padding_mask[:, mask_indices]\n \n+    if _is_torch_xpu_available:\n+        # XPU devices have special handling for mask skipping:\n+        # - Single query tokens use the same logic as CUDA\n+        # - Multi-query tokens can skip if padding_mask is provided and correctly structured\n+        #   (all True in query window, all False after)\n+        return _can_skip_causal_mask_xpu(padding_mask, query_length, kv_length, local_attention_size)\n     # When using `torch.export` or `torch.onnx.dynamo_export`, we must pass an example input, and `is_causal` behavior is\n     # hard-coded to the forward. If a user exports a model with query_length > 1, the exported model will hard-code `is_causal=True`\n     # which is in general wrong (see https://github.com/pytorch/pytorch/issues/108108). Thus, we only set\n     # `ignore_causal_mask = True` if we are not tracing\n     if (\n         not is_tracing(padding_mask)\n         # only cases when lower and upper diags are the same, see https://github.com/pytorch/pytorch/issues/108108\n-        and (query_length == 1 or (kv_length == query_length or _is_torch_xpu_available))\n+        and (query_length == 1 or kv_length == query_length)\n         # in this case we need to add special patterns to the mask so cannot be skipped otherwise\n         and (local_attention_size is None or kv_length < local_attention_size)\n         # In this case, we need to add padding to the mask, so cannot be skipped otherwise\n-        and (\n-            padding_mask is None\n-            or (\n-                padding_mask.all()\n-                if not _is_torch_xpu_available or query_length == 1\n-                else padding_mask[:, :query_length].all()\n-            )\n-        )\n+        and (padding_mask is None or padding_mask.all())\n     ):\n         return True\n "
+        },
+        {
+            "sha": "c06089c1081323e979d70078d2e49b8f6bedc59f",
+            "filename": "tests/models/qwen3/test_modeling_qwen3.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/huggingface/transformers/blob/58a3f8caacdb95c6a9393ea9499defab89b0ae73/tests%2Fmodels%2Fqwen3%2Ftest_modeling_qwen3.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/58a3f8caacdb95c6a9393ea9499defab89b0ae73/tests%2Fmodels%2Fqwen3%2Ftest_modeling_qwen3.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fqwen3%2Ftest_modeling_qwen3.py?ref=58a3f8caacdb95c6a9393ea9499defab89b0ae73",
+            "patch": "@@ -165,7 +165,7 @@ def test_model_600m_long_prompt_sdpa(self):\n     def test_speculative_generation(self):\n         EXPECTED_TEXT_COMPLETIONS = Expectations(\n             {\n-                (\"xpu\", 3): \"My favourite condiment is 100% peanut butter. I love it so much that I can't help but use it\",\n+                (\"xpu\", 3): \"My favourite condiment is 100% beef and comes in a 12 oz. jar. It is sold in\",\n                 (\"cuda\", 7): \"My favourite condiment is 100% natural. It's a little spicy and a little sweet, but it's the\",\n                 (\"cuda\", 8): \"My favourite condiment is 100% beef, 100% beef, 100% beef.\",\n             }"
+        }
+    ],
+    "stats": {
+        "total": 55,
+        "additions": 45,
+        "deletions": 10
+    }
+}

@@ -1,0 +1,120 @@
+{
+    "author": "unstubbable",
+    "message": "Lazily call `refreshTags` and `getExpiration` (#77779)\n\nWhen `\"use cache\"` is not used on the current route, we don't need to call `refreshTags` for the configured cache handlers. So instead of calling it at the beginning of the request for every cache handler, we now call it lazily right before the first cache entry is retrieved for the respective cache handler (once per request).\r\n\r\nSimilarly, we now call `getExpiration` for the implicit tags of the current route lazily (also once per request) after an existing cache entry has been retrieved, and its timestamp needs to be compared with the expiration of the implicit tags.",
+    "sha": "6d537d3a61b212f310e6bb037348635491ead05a",
+    "files": [
+        {
+            "sha": "66e278e7832f1c8b041a155614bb5e47a9fe9860",
+            "filename": "packages/next/src/server/app-render/work-async-storage.external.ts",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 5,
+            "changes": 21,
+            "blob_url": "https://github.com/vercel/next.js/blob/6d537d3a61b212f310e6bb037348635491ead05a/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fwork-async-storage.external.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/6d537d3a61b212f310e6bb037348635491ead05a/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fwork-async-storage.external.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fwork-async-storage.external.ts?ref=6d537d3a61b212f310e6bb037348635491ead05a",
+            "patch": "@@ -54,15 +54,26 @@ export interface WorkStore {\n   nextFetchId?: number\n   pathWasRevalidated?: boolean\n \n-  // Tags that were revalidated during the current request. They need to be sent\n-  // to cache handlers to propagate their revalidation.\n+  /**\n+   * Tags that were revalidated during the current request. They need to be sent\n+   * to cache handlers to propagate their revalidation.\n+   */\n   pendingRevalidatedTags?: string[]\n \n-  // Tags that were previously revalidated (e.g. by a redirecting server action)\n-  // and have already been sent to cache handlers. Retrieved cache entries that\n-  // include any of these tags must be discarded.\n+  /**\n+   * Tags that were previously revalidated (e.g. by a redirecting server action)\n+   * and have already been sent to cache handlers. Retrieved cache entries that\n+   * include any of these tags must be discarded.\n+   */\n   readonly previouslyRevalidatedTags: readonly string[]\n \n+  /**\n+   * This map contains promise-like values so that we can evaluate them lazily\n+   * when a cache entry is read. It allows us to skip refreshing tags if no\n+   * caches are read at all.\n+   */\n+  readonly refreshTagsByCacheKind: Map<string, PromiseLike<void>>\n+\n   fetchMetrics?: FetchMetrics\n \n   isDraftMode?: boolean"
+        },
+        {
+            "sha": "f820f11f20ab8b604cf09907d60bc5bab9593796",
+            "filename": "packages/next/src/server/async-storage/work-store.ts",
+            "status": "modified",
+            "additions": 25,
+            "deletions": 0,
+            "changes": 25,
+            "blob_url": "https://github.com/vercel/next.js/blob/6d537d3a61b212f310e6bb037348635491ead05a/packages%2Fnext%2Fsrc%2Fserver%2Fasync-storage%2Fwork-store.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/6d537d3a61b212f310e6bb037348635491ead05a/packages%2Fnext%2Fsrc%2Fserver%2Fasync-storage%2Fwork-store.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fasync-storage%2Fwork-store.ts?ref=6d537d3a61b212f310e6bb037348635491ead05a",
+            "patch": "@@ -10,6 +10,8 @@ import type { CacheLife } from '../use-cache/cache-life'\n import { AfterContext } from '../after/after-context'\n \n import { normalizeAppPath } from '../../shared/lib/router/utils/app-paths'\n+import { createLazyResult } from '../lib/lazy-result'\n+import { getCacheHandlerEntries } from '../use-cache/handlers'\n \n export type WorkStoreContext = {\n   /**\n@@ -135,6 +137,7 @@ export function createWorkStore({\n     dynamicIOEnabled: renderOpts.experimental.dynamicIO,\n     dev: renderOpts.dev ?? false,\n     previouslyRevalidatedTags,\n+    refreshTagsByCacheKind: createRefreshTagsByCacheKind(),\n   }\n \n   // TODO: remove this when we resolve accessing the store outside the execution context\n@@ -151,3 +154,25 @@ function createAfterContext(renderOpts: RequestLifecycleOpts): AfterContext {\n     onTaskError: onAfterTaskError,\n   })\n }\n+\n+/**\n+ * Creates a map with promise-like objects, that refresh tags for the given\n+ * cache kind when they're awaited for the first time.\n+ */\n+function createRefreshTagsByCacheKind(): Map<string, PromiseLike<void>> {\n+  const refreshTagsByCacheKind = new Map<string, PromiseLike<void>>()\n+  const cacheHandlers = getCacheHandlerEntries()\n+\n+  if (cacheHandlers) {\n+    for (const [kind, cacheHandler] of cacheHandlers) {\n+      if ('refreshTags' in cacheHandler) {\n+        refreshTagsByCacheKind.set(\n+          kind,\n+          createLazyResult(async () => cacheHandler.refreshTags())\n+        )\n+      }\n+    }\n+  }\n+\n+  return refreshTagsByCacheKind\n+}"
+        },
+        {
+            "sha": "d9d2e6df031d7af890dbe0cbbeca573493ef07a0",
+            "filename": "packages/next/src/server/base-server.ts",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 1,
+            "changes": 4,
+            "blob_url": "https://github.com/vercel/next.js/blob/6d537d3a61b212f310e6bb037348635491ead05a/packages%2Fnext%2Fsrc%2Fserver%2Fbase-server.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/6d537d3a61b212f310e6bb037348635491ead05a/packages%2Fnext%2Fsrc%2Fserver%2Fbase-server.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fbase-server.ts?ref=6d537d3a61b212f310e6bb037348635491ead05a",
+            "patch": "@@ -1440,7 +1440,9 @@ export default abstract class Server<\n         await Promise.all(\n           [...cacheHandlers].map(async (cacheHandler) => {\n             if ('refreshTags' in cacheHandler) {\n-              await cacheHandler.refreshTags()\n+              // Note: cacheHandler.refreshTags() is called lazily before the\n+              // first cache entry is retrieved. It allows us to skip the\n+              // refresh request if no caches are read at all.\n             } else {\n               const previouslyRevalidatedTags = getPreviouslyRevalidatedTags(\n                 req.headers,"
+        },
+        {
+            "sha": "9c7fae0fda05fd2fb5dd7e270d93a6a8b1f603ca",
+            "filename": "packages/next/src/server/lib/implicit-tags.ts",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 5,
+            "changes": 15,
+            "blob_url": "https://github.com/vercel/next.js/blob/6d537d3a61b212f310e6bb037348635491ead05a/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Fimplicit-tags.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/6d537d3a61b212f310e6bb037348635491ead05a/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Fimplicit-tags.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Fimplicit-tags.ts?ref=6d537d3a61b212f310e6bb037348635491ead05a",
+            "patch": "@@ -1,6 +1,7 @@\n import { NEXT_CACHE_IMPLICIT_TAG_ID } from '../../lib/constants'\n import type { FallbackRouteParams } from '../request/fallback-params'\n import { getCacheHandlers } from '../use-cache/handlers'\n+import { createLazyResult } from './lazy-result'\n \n export interface ImplicitTags {\n   /**\n@@ -9,11 +10,13 @@ export interface ImplicitTags {\n    */\n   readonly tags: string[]\n   /**\n-   * Modern cache handlers don't receive implicit tags. Instead, the\n-   * implicit tags' expiration is stored in the work unit store, and used to\n-   * compare with a cache entry's timestamp.\n+   * Modern cache handlers don't receive implicit tags. Instead, the implicit\n+   * tags' expiration is stored in the work unit store, and used to compare with\n+   * a cache entry's timestamp. Note: This is a promise-like value so that we\n+   * can evaluate it lazily when a cache entry is read. It allows us to skip\n+   * fetching the expiration value if no caches are read at all.\n    */\n-  readonly expiration: number\n+  readonly expiration: PromiseLike<number>\n }\n \n const getDerivedTags = (pathname: string): string[] => {\n@@ -98,7 +101,9 @@ export async function getImplicitTags(\n     tags.push(tag)\n   }\n \n-  const expiration = await getImplicitTagsExpiration(tags)\n+  const expiration = createLazyResult(async () =>\n+    getImplicitTagsExpiration(tags)\n+  )\n \n   return { tags, expiration }\n }"
+        },
+        {
+            "sha": "b111f0b1c419d1d3722ec7f9d7f9164a05965bdf",
+            "filename": "packages/next/src/server/lib/lazy-result.ts",
+            "status": "added",
+            "additions": 19,
+            "deletions": 0,
+            "changes": 19,
+            "blob_url": "https://github.com/vercel/next.js/blob/6d537d3a61b212f310e6bb037348635491ead05a/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Flazy-result.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/6d537d3a61b212f310e6bb037348635491ead05a/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Flazy-result.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Flazy-result.ts?ref=6d537d3a61b212f310e6bb037348635491ead05a",
+            "patch": "@@ -0,0 +1,19 @@\n+/**\n+ * Calls the given async function only when the returned promise-like object is\n+ * awaited.\n+ */\n+export function createLazyResult<TResult>(\n+  fn: () => Promise<TResult>\n+): PromiseLike<TResult> {\n+  let pendingResult: Promise<TResult> | undefined\n+\n+  return {\n+    then(onfulfilled, onrejected) {\n+      if (!pendingResult) {\n+        pendingResult = fn()\n+      }\n+\n+      return pendingResult.then(onfulfilled, onrejected)\n+    },\n+  }\n+}"
+        },
+        {
+            "sha": "e8bff7561b6f49c4698b9bfd2ca7e49eba8250b6",
+            "filename": "packages/next/src/server/use-cache/handlers.ts",
+            "status": "modified",
+            "additions": 21,
+            "deletions": 3,
+            "changes": 24,
+            "blob_url": "https://github.com/vercel/next.js/blob/6d537d3a61b212f310e6bb037348635491ead05a/packages%2Fnext%2Fsrc%2Fserver%2Fuse-cache%2Fhandlers.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/6d537d3a61b212f310e6bb037348635491ead05a/packages%2Fnext%2Fsrc%2Fserver%2Fuse-cache%2Fhandlers.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fuse-cache%2Fhandlers.ts?ref=6d537d3a61b212f310e6bb037348635491ead05a",
+            "patch": "@@ -78,7 +78,8 @@ export function initializeCacheHandlers(): boolean {\n /**\n  * Get a cache handler by kind.\n  * @param kind - The kind of cache handler to get.\n- * @returns The cache handler, or `undefined` if it is not initialized or does not exist.\n+ * @returns The cache handler, or `undefined` if it does not exist.\n+ * @throws If the cache handlers are not initialized.\n  */\n export function getCacheHandler(kind: string): CacheHandlerCompat | undefined {\n   // This should never be called before initializeCacheHandlers.\n@@ -90,8 +91,9 @@ export function getCacheHandler(kind: string): CacheHandlerCompat | undefined {\n }\n \n /**\n- * Get an iterator over the cache handlers.\n- * @returns An iterator over the cache handlers, or `undefined` if they are not initialized.\n+ * Get a set iterator over the cache handlers.\n+ * @returns An iterator over the cache handlers, or `undefined` if they are not\n+ * initialized.\n  */\n export function getCacheHandlers():\n   | SetIterator<CacheHandlerCompat>\n@@ -103,6 +105,22 @@ export function getCacheHandlers():\n   return reference[handlersSetSymbol].values()\n }\n \n+/**\n+ * Get a map iterator over the cache handlers (keyed by kind).\n+ * @returns An iterator over the cache handler entries, or `undefined` if they\n+ * are not initialized.\n+ * @throws If the cache handlers are not initialized.\n+ */\n+export function getCacheHandlerEntries():\n+  | MapIterator<[string, CacheHandlerCompat]>\n+  | undefined {\n+  if (!reference[handlersMapSymbol]) {\n+    return undefined\n+  }\n+\n+  return reference[handlersMapSymbol].entries()\n+}\n+\n /**\n  * Set a cache handler by kind.\n  * @param kind - The kind of cache handler to set."
+        },
+        {
+            "sha": "265c5166b2833887285d074cfb3ba71e6ae50186",
+            "filename": "packages/next/src/server/use-cache/use-cache-wrapper.ts",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 23,
+            "changes": 36,
+            "blob_url": "https://github.com/vercel/next.js/blob/6d537d3a61b212f310e6bb037348635491ead05a/packages%2Fnext%2Fsrc%2Fserver%2Fuse-cache%2Fuse-cache-wrapper.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/6d537d3a61b212f310e6bb037348635491ead05a/packages%2Fnext%2Fsrc%2Fserver%2Fuse-cache%2Fuse-cache-wrapper.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fuse-cache%2Fuse-cache-wrapper.ts?ref=6d537d3a61b212f310e6bb037348635491ead05a",
+            "patch": "@@ -52,6 +52,7 @@ import {\n import type { Params } from '../request/params'\n import React from 'react'\n import type { ImplicitTags } from '../lib/implicit-tags'\n+import { createLazyResult } from '../lib/lazy-result'\n \n type CacheKeyParts =\n   | [buildId: string, id: string, args: unknown[]]\n@@ -694,6 +695,11 @@ export function cache(\n         const implicitTags = workUnitStore?.implicitTags\n         const forceRevalidate = shouldForceRevalidate(workStore, workUnitStore)\n \n+        // Lazily refresh the tags for the cache handler that's associated with\n+        // this cache function. This is only done once per request and cache\n+        // handler, when it's awaited for the first time.\n+        await workStore.refreshTagsByCacheKind.get(kind)\n+\n         let entry = forceRevalidate\n           ? undefined\n           : 'getExpiration' in cacheHandler\n@@ -706,7 +712,10 @@ export function cache(\n                 implicitTags?.tags ?? []\n               )\n \n-        if (entry && shouldDiscardCacheEntry(entry, workStore, implicitTags)) {\n+        if (\n+          entry &&\n+          (await shouldDiscardCacheEntry(entry, workStore, implicitTags))\n+        ) {\n           entry = undefined\n         }\n \n@@ -880,25 +889,6 @@ export function cache(\n   return React.cache(cachedFn)\n }\n \n-/**\n- * Calls the given function only when the returned promise is awaited.\n- */\n-function createLazyResult<TResult>(\n-  fn: () => Promise<TResult>\n-): PromiseLike<TResult> {\n-  let pendingResult: Promise<TResult> | undefined\n-\n-  return {\n-    then(onfulfilled, onrejected) {\n-      if (!pendingResult) {\n-        pendingResult = fn()\n-      }\n-\n-      return pendingResult.then(onfulfilled, onrejected)\n-    },\n-  }\n-}\n-\n function isPageComponent(\n   args: any[]\n ): args is [UseCachePageComponentProps, undefined] {\n@@ -937,11 +927,11 @@ function shouldForceRevalidate(\n   return false\n }\n \n-function shouldDiscardCacheEntry(\n+async function shouldDiscardCacheEntry(\n   entry: CacheEntry,\n   workStore: WorkStore,\n   implicitTags: ImplicitTags | undefined\n-): boolean {\n+): Promise<boolean> {\n   // If the cache entry contains revalidated tags that the cache handler might\n   // not know about yet, we need to discard it.\n   if (entry.tags.some((tag) => isRecentlyRevalidatedTag(tag, workStore))) {\n@@ -951,7 +941,7 @@ function shouldDiscardCacheEntry(\n   if (implicitTags) {\n     // If the cache entry was created before any of the implicit tags were\n     // revalidated last, we also need to discard it.\n-    if (entry.timestamp <= implicitTags.expiration) {\n+    if (entry.timestamp <= (await implicitTags.expiration)) {\n       return true\n     }\n "
+        },
+        {
+            "sha": "d2302e8644c0f415bed36914971bb8a4ddd776a7",
+            "filename": "test/e2e/app-dir/use-cache-custom-handler/app/no-cache/page.tsx",
+            "status": "added",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/6d537d3a61b212f310e6bb037348635491ead05a/test%2Fe2e%2Fapp-dir%2Fuse-cache-custom-handler%2Fapp%2Fno-cache%2Fpage.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/6d537d3a61b212f310e6bb037348635491ead05a/test%2Fe2e%2Fapp-dir%2Fuse-cache-custom-handler%2Fapp%2Fno-cache%2Fpage.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fuse-cache-custom-handler%2Fapp%2Fno-cache%2Fpage.tsx?ref=6d537d3a61b212f310e6bb037348635491ead05a",
+            "patch": "@@ -0,0 +1,3 @@\n+export default function Page() {\n+  return <p>This page does not use \"use cache\".</p>\n+}"
+        },
+        {
+            "sha": "a00608c50390695d2801f513f00d518b79d60fed",
+            "filename": "test/e2e/app-dir/use-cache-custom-handler/use-cache-custom-handler.test.ts",
+            "status": "modified",
+            "additions": 30,
+            "deletions": 17,
+            "changes": 47,
+            "blob_url": "https://github.com/vercel/next.js/blob/6d537d3a61b212f310e6bb037348635491ead05a/test%2Fe2e%2Fapp-dir%2Fuse-cache-custom-handler%2Fuse-cache-custom-handler.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/6d537d3a61b212f310e6bb037348635491ead05a/test%2Fe2e%2Fapp-dir%2Fuse-cache-custom-handler%2Fuse-cache-custom-handler.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fuse-cache-custom-handler%2Fuse-cache-custom-handler.test.ts?ref=6d537d3a61b212f310e6bb037348635491ead05a",
+            "patch": "@@ -23,13 +23,9 @@ describe('use-cache-custom-handler', () => {\n     const initialData = await browser.elementById('data').text()\n     expect(initialData).toMatch(isoDateRegExp)\n \n-    expect(next.cliOutput.slice(outputIndex)).toContain(\n-      'ModernCustomCacheHandler::refreshTags'\n-    )\n+    const cliOutput = next.cliOutput.slice(outputIndex)\n \n-    expect(next.cliOutput.slice(outputIndex)).toContain(\n-      `ModernCustomCacheHandler::getExpiration [\"_N_T_/layout\",\"_N_T_/page\",\"_N_T_/\"]`\n-    )\n+    expect(cliOutput).toContain('ModernCustomCacheHandler::refreshTags')\n \n     expect(next.cliOutput.slice(outputIndex)).toMatch(\n       /ModernCustomCacheHandler::get \\[\"(development|[A-Za-z0-9_-]{21})\",\"([0-9a-f]{2})+\",\\[\\]\\]/\n@@ -39,13 +35,26 @@ describe('use-cache-custom-handler', () => {\n       /ModernCustomCacheHandler::set \\[\"(development|[A-Za-z0-9_-]{21})\",\"([0-9a-f]{2})+\",\\[\\]\\]/\n     )\n \n+    // Since no existing cache entry was retrieved, we don't need to call\n+    // getExpiration() to compare the cache entries timestamp with the\n+    // expiration of the implicit tags.\n+    expect(cliOutput).not.toContain(`ModernCustomCacheHandler::getExpiration`)\n+\n     // The data should be cached initially.\n \n+    outputIndex = next.cliOutput.length\n     await browser.refresh()\n     let data = await browser.elementById('data').text()\n     expect(data).toMatch(isoDateRegExp)\n     expect(data).toEqual(initialData)\n \n+    // Now that a cache entry exists, we expect that getExpiration() is called\n+    // to compare the cache entries timestamp with the expiration of the\n+    // implicit tags.\n+    expect(next.cliOutput.slice(outputIndex)).toContain(\n+      `ModernCustomCacheHandler::getExpiration [\"_N_T_/layout\",\"_N_T_/page\",\"_N_T_/\"]`\n+    )\n+\n     // Because we use a low `revalidate` value for the \"use cache\" function, new\n     // data should be returned eventually.\n \n@@ -57,6 +66,19 @@ describe('use-cache-custom-handler', () => {\n     }, 5000)\n   })\n \n+  it('calls neither refreshTags nor getExpiration if \"use cache\" is not used', async () => {\n+    await next.fetch(`/no-cache`)\n+    const cliOutput = next.cliOutput.slice(outputIndex)\n+\n+    expect(cliOutput).not.toContain('ModernCustomCacheHandler::refreshTags')\n+    expect(cliOutput).not.toContain(`ModernCustomCacheHandler::getExpiration`)\n+\n+    // We don't optimize for legacy cache handlers though:\n+    expect(cliOutput).toContain(\n+      `LegacyCustomCacheHandler::receiveExpiredTags []`\n+    )\n+  })\n+\n   it('should use a legacy custom cache handler if provided', async () => {\n     const browser = await next.browser(`/legacy`)\n     const initialData = await browser.elementById('data').text()\n@@ -142,29 +164,20 @@ describe('use-cache-custom-handler', () => {\n     await retry(async () => {\n       const cliOutput = next.cliOutput.slice(outputIndex)\n       expect(cliOutput).toInclude('ModernCustomCacheHandler::refreshTags')\n-      expect(cliOutput).toInclude('ModernCustomCacheHandler::getExpiration')\n       expect(cliOutput).not.toInclude('ModernCustomCacheHandler::expireTags')\n     })\n   })\n \n-  it('should not call getExpiration again after an action', async () => {\n+  it('should not call getExpiration after an action', async () => {\n     const browser = await next.browser(`/`)\n \n-    await retry(async () => {\n-      const cliOutput = next.cliOutput.slice(outputIndex)\n-      expect(cliOutput).toInclude('ModernCustomCacheHandler::getExpiration')\n-    })\n-\n     outputIndex = next.cliOutput.length\n \n     await browser.elementById('revalidate-tag').click()\n \n     await retry(async () => {\n       const cliOutput = next.cliOutput.slice(outputIndex)\n-      expect(cliOutput).toIncludeRepeated(\n-        'ModernCustomCacheHandler::getExpiration',\n-        1\n-      )\n+      expect(cliOutput).not.toInclude('ModernCustomCacheHandler::getExpiration')\n       expect(cliOutput).toIncludeRepeated(\n         `ModernCustomCacheHandler::expireTags`,\n         1"
+        }
+    ],
+    "stats": {
+        "total": 194,
+        "additions": 140,
+        "deletions": 54
+    }
+}

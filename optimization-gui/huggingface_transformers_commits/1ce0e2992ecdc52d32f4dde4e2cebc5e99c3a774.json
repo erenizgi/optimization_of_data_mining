@@ -1,0 +1,36 @@
+{
+    "author": "muellerzr",
+    "message": "Nail in edge case of torch dtype being overriden permantly in the case of an error (#35845)\n\n* Nail in edge case of torch dtype\r\n\r\n* Rm unused func\r\n\r\n* Apply suggestions from code review\r\n\r\nCo-authored-by: Benjamin Bossan <BenjaminBossan@users.noreply.github.com>\r\n\r\n* Refactor tests to only mock what we need, don't introduce injection functions\r\n\r\n* SetUp/TearDown\r\n\r\n* Do super\r\n\r\n---------\r\n\r\nCo-authored-by: Benjamin Bossan <BenjaminBossan@users.noreply.github.com>",
+    "sha": "1ce0e2992ecdc52d32f4dde4e2cebc5e99c3a774",
+    "files": [
+        {
+            "sha": "114c90524d8e565cb3d90a48702a581715fc2cfa",
+            "filename": "src/transformers/modeling_utils.py",
+            "status": "modified",
+            "additions": 21,
+            "deletions": 0,
+            "changes": 21,
+            "blob_url": "https://github.com/huggingface/transformers/blob/1ce0e2992ecdc52d32f4dde4e2cebc5e99c3a774/src%2Ftransformers%2Fmodeling_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/1ce0e2992ecdc52d32f4dde4e2cebc5e99c3a774/src%2Ftransformers%2Fmodeling_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodeling_utils.py?ref=1ce0e2992ecdc52d32f4dde4e2cebc5e99c3a774",
+            "patch": "@@ -246,6 +246,25 @@ def set_zero3_state():\n         _is_ds_init_called = False\n \n \n+def restore_default_torch_dtype(func):\n+    \"\"\"\n+    Decorator to restore the default torch dtype\n+    at the end of the function. Serves\n+    as a backup in case calling the function raises\n+    an error after the function has changed the default dtype but before it could restore it.\n+    \"\"\"\n+\n+    @wraps(func)\n+    def _wrapper(*args, **kwargs):\n+        old_dtype = torch.get_default_dtype()\n+        try:\n+            return func(*args, **kwargs)\n+        finally:\n+            torch.set_default_dtype(old_dtype)\n+\n+    return _wrapper\n+\n+\n def get_parameter_device(parameter: Union[nn.Module, \"ModuleUtilsMixin\"]):\n     try:\n         return next(parameter.parameters()).device\n@@ -1407,6 +1426,7 @@ def add_model_tags(self, tags: Union[List[str], str]) -> None:\n                 self.model_tags.append(tag)\n \n     @classmethod\n+    @restore_default_torch_dtype\n     def _from_config(cls, config, **kwargs):\n         \"\"\"\n         All context managers that the model should be initialized under go here.\n@@ -3142,6 +3162,7 @@ def float(self, *args):\n             return super().float(*args)\n \n     @classmethod\n+    @restore_default_torch_dtype\n     def from_pretrained(\n         cls: Type[SpecificPreTrainedModelType],\n         pretrained_model_name_or_path: Optional[Union[str, os.PathLike]],"
+        },
+        {
+            "sha": "cae38422f5329db7ec7f410f28781bb65374b097",
+            "filename": "tests/utils/test_modeling_utils.py",
+            "status": "modified",
+            "additions": 70,
+            "deletions": 0,
+            "changes": 70,
+            "blob_url": "https://github.com/huggingface/transformers/blob/1ce0e2992ecdc52d32f4dde4e2cebc5e99c3a774/tests%2Futils%2Ftest_modeling_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/1ce0e2992ecdc52d32f4dde4e2cebc5e99c3a774/tests%2Futils%2Ftest_modeling_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Futils%2Ftest_modeling_utils.py?ref=1ce0e2992ecdc52d32f4dde4e2cebc5e99c3a774",
+            "patch": "@@ -39,6 +39,7 @@\n     AutoModelForSequenceClassification,\n     DynamicCache,\n     LlavaForConditionalGeneration,\n+    MistralForCausalLM,\n     OwlViTForObjectDetection,\n     PretrainedConfig,\n     is_torch_available,\n@@ -318,6 +319,14 @@ def check_models_equal(model1, model2):\n \n @require_torch\n class ModelUtilsTest(TestCasePlus):\n+    def setUp(self):\n+        self.old_dtype = torch.get_default_dtype()\n+        super().setUp()\n+\n+    def tearDown(self):\n+        torch.set_default_dtype(self.old_dtype)\n+        super().tearDown()\n+\n     @slow\n     def test_model_from_pretrained(self):\n         model_name = \"google-bert/bert-base-uncased\"\n@@ -1819,6 +1828,67 @@ def test_cache_when_needed_at_train_time(self):\n         self.assertIsNone(model_outputs.past_key_values)\n         self.assertTrue(model.training)\n \n+    def test_restore_default_torch_dtype_from_pretrained(self):\n+        \"\"\"\n+        Tests that the default torch dtype is restored\n+        when an error happens during the loading of a model.\n+        \"\"\"\n+        old_dtype = torch.get_default_dtype()\n+        # set default type to float32\n+        torch.set_default_dtype(torch.float32)\n+\n+        # Mock injection point which is right after the call to `_set_default_torch_dtype`\n+        original_set_default_torch_dtype = MistralForCausalLM._set_default_torch_dtype\n+\n+        def debug(*args, **kwargs):\n+            # call the method as usual, than raise a RuntimeError\n+            original_set_default_torch_dtype(*args, **kwargs)\n+            raise RuntimeError\n+\n+        with mock.patch(\n+            \"transformers.models.mistral.modeling_mistral.MistralForCausalLM._set_default_torch_dtype\",\n+            side_effect=debug,\n+        ):\n+            with self.assertRaises(RuntimeError):\n+                _ = AutoModelForCausalLM.from_pretrained(TINY_MISTRAL, device_map=\"auto\", torch_dtype=torch.float16)\n+        # default should still be float32\n+        assert torch.get_default_dtype() == torch.float32\n+        torch.set_default_dtype(old_dtype)\n+\n+    def test_restore_default_torch_dtype_from_config(self):\n+        \"\"\"\n+        Tests that the default torch dtype is restored\n+        when an error happens during the loading of a model.\n+        \"\"\"\n+        old_dtype = torch.get_default_dtype()\n+        # set default type to float32\n+        torch.set_default_dtype(torch.float32)\n+\n+        config = AutoConfig.from_pretrained(\n+            TINY_MISTRAL,\n+        )\n+\n+        # Mock injection point which is right after the call to `_set_default_torch_dtype`\n+        original_set_default_torch_dtype = MistralForCausalLM._set_default_torch_dtype\n+\n+        def debug(*args, **kwargs):\n+            # call the method as usual, than raise a RuntimeError\n+            original_set_default_torch_dtype(*args, **kwargs)\n+            raise RuntimeError\n+\n+        with mock.patch(\n+            \"transformers.models.mistral.modeling_mistral.MistralForCausalLM._set_default_torch_dtype\",\n+            side_effect=debug,\n+        ):\n+            with self.assertRaises(RuntimeError):\n+                config.torch_dtype = torch.float16\n+                _ = AutoModelForCausalLM.from_config(\n+                    config,\n+                )\n+        # default should still be float32\n+        assert torch.get_default_dtype() == torch.float32\n+        torch.set_default_dtype(old_dtype)\n+\n     def test_unknown_quantization_config(self):\n         with tempfile.TemporaryDirectory() as tmpdir:\n             config = BertConfig("
+        }
+    ],
+    "stats": {
+        "total": 91,
+        "additions": 91,
+        "deletions": 0
+    }
+}

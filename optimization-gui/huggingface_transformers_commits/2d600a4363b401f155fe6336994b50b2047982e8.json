@@ -1,0 +1,36 @@
+{
+    "author": "avihu111",
+    "message": "Granite speech speedups (#39197)\n\n* ensure the query is updated during training\n\navoid unused parameters that DDP does not like\n\n* avoid a crash when `kwargs` contain `padding=True`\n\ntrainers often pass this argument automatically\n\n* minor\n\n* Remove mel_spec lazy init, and rename to mel_filters.\nthis ensures save_pretrained will not crash when saving the processor during training\nhttps://github.com/huggingface/transformers/blob/d5d007a1a0f0c11a726a54c8f00bd71825f84d02/src/transformers/feature_extraction_utils.py#L595\n\n* minor - most feature extractors has a `sampling_rate` property\n\n* speedup relative position embeddings\n\n* fix several issues in model saving/loading:\n- avoid modifying `self._hf_peft_config_loaded` when saving\n- adapter_config automatically points to the original base model - a finetuned version should point to the model save dir.\n- fixing model weights names, that are changed by adding an adapter.\n\n* minor\n\n* minor\n\n* minor\n\n* fixing a crash without peft active\n\n* add todo to replace einsum\n\n* granite speech speedups:\n1. register attention_dist to avoid cpu-to-gpu transfer every layer.\n2. pad_sequence is much faster than per-sample-padding + concat.\n3. avoid returning audio back to cpu when using a compute device.\n\n* support audio.shape=(1,L)",
+    "sha": "2d600a4363b401f155fe6336994b50b2047982e8",
+    "files": [
+        {
+            "sha": "7528fc7ea5bd9efa6ae322d7fd2e40b567855359",
+            "filename": "src/transformers/models/granite_speech/feature_extraction_granite_speech.py",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 7,
+            "changes": 9,
+            "blob_url": "https://github.com/huggingface/transformers/blob/2d600a4363b401f155fe6336994b50b2047982e8/src%2Ftransformers%2Fmodels%2Fgranite_speech%2Ffeature_extraction_granite_speech.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/2d600a4363b401f155fe6336994b50b2047982e8/src%2Ftransformers%2Fmodels%2Fgranite_speech%2Ffeature_extraction_granite_speech.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fgranite_speech%2Ffeature_extraction_granite_speech.py?ref=2d600a4363b401f155fe6336994b50b2047982e8",
+            "patch": "@@ -117,8 +117,6 @@ def _extract_mel_spectrograms(self, audio: \"torch.Tensor\", device=\"cpu\"):\n             # stacking and skipping by 2\n             audio = logmel.reshape(bsz, -1, 2 * logmel.shape[-1])\n \n-        if audio.device != \"cpu\":\n-            return audio.detach().cpu()\n         return audio\n \n     def _get_num_audio_features(self, audio_lengths: Sequence[int]) -> Sequence[int]:\n@@ -178,11 +176,8 @@ def _get_audios_and_audio_lengths(self, audios: AudioInput) -> Sequence[\"torch.T\n             if not torch.is_floating_point(audios[0]):\n                 raise ValueError(\"Invalid audio provided. Audio should be a floating point between 0 and 1\")\n             lengths = [audio.shape[-1] for audio in audios]\n-            padding = [max(lengths) - length for length in lengths]\n-            # ensure all audios have a batch dimension:\n-            audios = [audio.view(1, -1) for audio in audios]\n-            padded = [torch.nn.functional.pad(audio, (0, pad)) for audio, pad in zip(audios, padding)]\n-            audios = torch.cat(padded, dim=0)\n+            audios = [audio.squeeze(0) for audio in audios]\n+            audios = torch.nn.utils.rnn.pad_sequence(audios, batch_first=True, padding_value=0.0)\n             return audios, lengths\n \n         raise TypeError(\"Invalid audio provided. Audio should be a one or more torch tensors or numpy arrays\")"
+        },
+        {
+            "sha": "7a4ea8aa23d14f1b40259cbfff18ed854d34753b",
+            "filename": "src/transformers/models/granite_speech/modeling_granite_speech.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 4,
+            "changes": 7,
+            "blob_url": "https://github.com/huggingface/transformers/blob/2d600a4363b401f155fe6336994b50b2047982e8/src%2Ftransformers%2Fmodels%2Fgranite_speech%2Fmodeling_granite_speech.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/2d600a4363b401f155fe6336994b50b2047982e8/src%2Ftransformers%2Fmodels%2Fgranite_speech%2Fmodeling_granite_speech.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fgranite_speech%2Fmodeling_granite_speech.py?ref=2d600a4363b401f155fe6336994b50b2047982e8",
+            "patch": "@@ -157,8 +157,7 @@ def forward(self, hidden_states: torch.Tensor, attention_dists: torch.Tensor) ->\n         value_states = value_states.reshape(bsz, num_blocks, self.context_size, self.num_heads, -1).transpose(2, 3)\n \n         # shaw's relative positional embedding\n-        dist = attention_dists.to(hidden_states.device)\n-        rel_pos_emb = self.rel_pos_emb(dist)\n+        rel_pos_emb = self.rel_pos_emb(attention_dists)\n         # alternative computation of `pos_attn` - for readability\n         # rel_pos_emb_expanded = rel_pos_emb.view([1, 1, 1] + list(rel_pos_emb.shape))\n         # pos_attn = torch.sum(query_states.unsqueeze(-2) * rel_pos_emb_expanded, dim=-1) * self.scale\n@@ -258,8 +257,8 @@ def __init__(self, config: GraniteSpeechEncoderConfig):\n         # Precompute clamped relative positional encoding distances\n         seq = torch.arange(config.context_size)\n         relpos_dist = seq.view(-1, 1) - seq.view(1, -1)\n-        self.attention_dists = torch.clamp(relpos_dist, -config.context_size, config.context_size) + config.max_pos_emb\n-\n+        attention_dists = torch.clamp(relpos_dist, -config.context_size, config.context_size) + config.max_pos_emb\n+        self.register_buffer(\"attention_dists\", attention_dists, persistent=False)\n         self.input_linear = nn.Linear(config.input_dim, config.hidden_dim, bias=True)\n         self.layers = nn.ModuleList([GraniteSpeechConformerBlock(config) for _ in range(config.num_layers)])\n "
+        }
+    ],
+    "stats": {
+        "total": 16,
+        "additions": 5,
+        "deletions": 11
+    }
+}

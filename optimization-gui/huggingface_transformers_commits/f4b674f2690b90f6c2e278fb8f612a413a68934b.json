@@ -1,0 +1,36 @@
+{
+    "author": "BenjaminBossan",
+    "message": "[PEFT] Set eval mode when loading PEFT adapter (#34509)\n\n* [PEFT] Set eval mode when loading PEFT adapter\n\nResolves #34469\n\nWhen calling model.load_adapter to load a PEFT adapter, by default the\nadapter should be set to eval mode. This is now correctly done. Users\ncan still pass is_trainable=True to load the adapter in training mode.\n\n* Linter",
+    "sha": "f4b674f2690b90f6c2e278fb8f612a413a68934b",
+    "files": [
+        {
+            "sha": "ef09281431169f0fe9c2a9a269b7a998f8167604",
+            "filename": "src/transformers/integrations/peft.py",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 0,
+            "changes": 8,
+            "blob_url": "https://github.com/huggingface/transformers/blob/f4b674f2690b90f6c2e278fb8f612a413a68934b/src%2Ftransformers%2Fintegrations%2Fpeft.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/f4b674f2690b90f6c2e278fb8f612a413a68934b/src%2Ftransformers%2Fintegrations%2Fpeft.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fintegrations%2Fpeft.py?ref=f4b674f2690b90f6c2e278fb8f612a413a68934b",
+            "patch": "@@ -81,6 +81,7 @@ def load_adapter(\n         peft_config: Dict[str, Any] = None,\n         adapter_state_dict: Optional[Dict[str, \"torch.Tensor\"]] = None,\n         low_cpu_mem_usage: bool = False,\n+        is_trainable: bool = False,\n         adapter_kwargs: Optional[Dict[str, Any]] = None,\n     ) -> None:\n         \"\"\"\n@@ -136,6 +137,9 @@ def load_adapter(\n             low_cpu_mem_usage (`bool`, *optional*, defaults to `False`):\n                 Reduce memory usage while loading the PEFT adapter. This should also speed up the loading process.\n                 Requires PEFT version 0.13.0 or higher.\n+            is_trainable (`bool`, *optional*, defaults to `False`):\n+                Whether the adapter should be trainable or not. If `False`, the adapter will be frozen and can only be\n+                used for inference.\n             adapter_kwargs (`Dict[str, Any]`, *optional*):\n                 Additional keyword arguments passed along to the `from_pretrained` method of the adapter config and\n                 `find_adapter_config_file` method.\n@@ -209,6 +213,7 @@ def load_adapter(\n                 token=token,\n                 **adapter_kwargs,\n             )\n+            peft_config.inference_mode = not is_trainable\n \n         # Create and add fresh new adapters into the model.\n         inject_adapter_in_model(peft_config, self, adapter_name, **peft_load_kwargs)\n@@ -258,6 +263,9 @@ def load_adapter(\n             if err_msg:\n                 logger.warning(err_msg)\n \n+        if peft_config.inference_mode:\n+            self.eval()\n+\n         # Re-dispatch model and hooks in case the model is offloaded to CPU / Disk.\n         if (\n             (getattr(self, \"hf_device_map\", None) is not None)"
+        },
+        {
+            "sha": "48fd6da3d67e4c7649fe685b00a1e2d482849f5c",
+            "filename": "tests/peft_integration/test_peft_integration.py",
+            "status": "modified",
+            "additions": 43,
+            "deletions": 0,
+            "changes": 43,
+            "blob_url": "https://github.com/huggingface/transformers/blob/f4b674f2690b90f6c2e278fb8f612a413a68934b/tests%2Fpeft_integration%2Ftest_peft_integration.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/f4b674f2690b90f6c2e278fb8f612a413a68934b/tests%2Fpeft_integration%2Ftest_peft_integration.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fpeft_integration%2Ftest_peft_integration.py?ref=f4b674f2690b90f6c2e278fb8f612a413a68934b",
+            "patch": "@@ -622,3 +622,46 @@ def test_peft_from_pretrained_missing_keys_warning(self):\n \n                 msg = f\"Loading adapter weights from state_dict led to missing keys in the model: {key}\"\n                 self.assertIn(msg, cl.out)\n+\n+    def test_peft_load_adapter_training_inference_mode_true(self):\n+        \"\"\"\n+        By default, when loading an adapter, the whole model should be in eval mode and no parameter should have\n+        requires_grad=False.\n+        \"\"\"\n+        for model_id in self.peft_test_model_ids:\n+            for transformers_class in self.transformers_test_model_classes:\n+                peft_model = transformers_class.from_pretrained(model_id).to(torch_device)\n+\n+                with tempfile.TemporaryDirectory() as tmpdirname:\n+                    peft_model.save_pretrained(tmpdirname)\n+                    model = transformers_class.from_pretrained(peft_model.config._name_or_path)\n+                    model.load_adapter(tmpdirname)\n+                    assert not any(p.requires_grad for p in model.parameters())\n+                    assert not any(m.training for m in model.modules())\n+                    del model\n+\n+    def test_peft_load_adapter_training_inference_mode_false(self):\n+        \"\"\"\n+        When passing is_trainable=True, the LoRA modules should be in training mode and their parameters should have\n+        requires_grad=True.\n+        \"\"\"\n+        for model_id in self.peft_test_model_ids:\n+            for transformers_class in self.transformers_test_model_classes:\n+                peft_model = transformers_class.from_pretrained(model_id).to(torch_device)\n+\n+                with tempfile.TemporaryDirectory() as tmpdirname:\n+                    peft_model.save_pretrained(tmpdirname)\n+                    model = transformers_class.from_pretrained(peft_model.config._name_or_path)\n+                    model.load_adapter(tmpdirname, is_trainable=True)\n+\n+                    for name, module in model.named_modules():\n+                        if len(list(module.children())):\n+                            # only check leaf modules\n+                            continue\n+\n+                        if \"lora_\" in name:\n+                            assert module.training\n+                            assert all(p.requires_grad for p in module.parameters())\n+                        else:\n+                            assert not module.training\n+                            assert all(not p.requires_grad for p in module.parameters())"
+        }
+    ],
+    "stats": {
+        "total": 51,
+        "additions": 51,
+        "deletions": 0
+    }
+}

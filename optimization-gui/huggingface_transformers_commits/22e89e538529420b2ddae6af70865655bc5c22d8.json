@@ -1,0 +1,36 @@
+{
+    "author": "sbucaille",
+    "message": "[efficientloftr] fix bugs and follow original cross attn implementation strictly (#40141)\n\n* fix: changed is_causal to be False\n\n* fix: Added original cross attention bug\n\n* fix: fixed the way bordel removal is computed\n\n* fix: added missing normalization on coarse features\n\n* test: fixed integration tests\n\n---------\n\nCo-authored-by: Pavel Iakubovskii <qubvel@gmail.com>",
+    "sha": "22e89e538529420b2ddae6af70865655bc5c22d8",
+    "files": [
+        {
+            "sha": "ed806355c10d649d3f2d8e9743a83d0f1780e7bc",
+            "filename": "src/transformers/models/efficientloftr/modeling_efficientloftr.py",
+            "status": "modified",
+            "additions": 21,
+            "deletions": 10,
+            "changes": 31,
+            "blob_url": "https://github.com/huggingface/transformers/blob/22e89e538529420b2ddae6af70865655bc5c22d8/src%2Ftransformers%2Fmodels%2Fefficientloftr%2Fmodeling_efficientloftr.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/22e89e538529420b2ddae6af70865655bc5c22d8/src%2Ftransformers%2Fmodels%2Fefficientloftr%2Fmodeling_efficientloftr.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fefficientloftr%2Fmodeling_efficientloftr.py?ref=22e89e538529420b2ddae6af70865655bc5c22d8",
+            "patch": "@@ -322,7 +322,6 @@ def eager_attention_forward(\n class EfficientLoFTRAttention(nn.Module):\n     \"\"\"Multi-headed attention from 'Attention Is All You Need' paper\"\"\"\n \n-    # Copied from transformers.models.llama.modeling_llama.LlamaAttention.__init__ with Llama->EfficientLoFTR\n     def __init__(self, config: EfficientLoFTRConfig, layer_idx: int):\n         super().__init__()\n         self.config = config\n@@ -331,7 +330,7 @@ def __init__(self, config: EfficientLoFTRConfig, layer_idx: int):\n         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads\n         self.scaling = self.head_dim**-0.5\n         self.attention_dropout = config.attention_dropout\n-        self.is_causal = True\n+        self.is_causal = False\n \n         self.q_proj = nn.Linear(\n             config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias\n@@ -478,12 +477,16 @@ def forward(\n         hidden_states = hidden_states.reshape(-1, embed_dim, height, width)\n         hidden_states = self.self_attention(hidden_states, position_embeddings=position_embeddings, **kwargs)\n \n-        encoder_hidden_states = hidden_states.reshape(-1, 2, embed_dim, height, width)\n-        encoder_hidden_states = encoder_hidden_states.flip(1)\n-        encoder_hidden_states = encoder_hidden_states.reshape(-1, embed_dim, height, width)\n-\n-        hidden_states = self.cross_attention(hidden_states, encoder_hidden_states, **kwargs)\n-        hidden_states = hidden_states.reshape(batch_size, -1, embed_dim, height, width)\n+        ###\n+        # Implementation of a bug in the original implementation regarding the cross-attention\n+        # See : https://github.com/zju3dv/MatchAnything/issues/26\n+        hidden_states = hidden_states.reshape(-1, 2, embed_dim, height, width)\n+        features_0 = hidden_states[:, 0]\n+        features_1 = hidden_states[:, 1]\n+        features_0 = self.cross_attention(features_0, features_1, **kwargs)\n+        features_1 = self.cross_attention(features_1, features_0, **kwargs)\n+        hidden_states = torch.stack((features_0, features_1), dim=1)\n+        ###\n \n         return hidden_states\n \n@@ -750,8 +753,15 @@ def mask_border(tensor: torch.Tensor, border_margin: int, value: Union[bool, flo\n     if border_margin <= 0:\n         return tensor\n \n-    tensor[:, :border_margin, :border_margin, :border_margin, :border_margin] = value\n-    tensor[:, -border_margin:, -border_margin:, -border_margin:, -border_margin:] = value\n+    tensor[:, :border_margin] = value\n+    tensor[:, :, :border_margin] = value\n+    tensor[:, :, :, :border_margin] = value\n+    tensor[:, :, :, :, :border_margin] = value\n+    tensor[:, -border_margin:] = value\n+    tensor[:, :, -border_margin:] = value\n+    tensor[:, :, :, -border_margin:] = value\n+    tensor[:, :, :, :, -border_margin:] = value\n+\n     return tensor\n \n \n@@ -1276,6 +1286,7 @@ def forward(\n \n         # 3. Fine-level refinement\n         residual_features = features[1:]\n+        coarse_features = coarse_features / self.config.hidden_size**0.5\n         fine_features_0, fine_features_1 = self.refinement_layer(coarse_features, residual_features)\n \n         # Filter fine features with coarse matches indices"
+        },
+        {
+            "sha": "b295a452b351b1b360827719233f1d589b1af103",
+            "filename": "tests/models/efficientloftr/test_modeling_efficientloftr.py",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/huggingface/transformers/blob/22e89e538529420b2ddae6af70865655bc5c22d8/tests%2Fmodels%2Fefficientloftr%2Ftest_modeling_efficientloftr.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/22e89e538529420b2ddae6af70865655bc5c22d8/tests%2Fmodels%2Fefficientloftr%2Ftest_modeling_efficientloftr.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fefficientloftr%2Ftest_modeling_efficientloftr.py?ref=22e89e538529420b2ddae6af70865655bc5c22d8",
+            "patch": "@@ -436,10 +436,10 @@ def test_inference(self):\n         expected_matching_scores_shape = torch.Size((len(images), 2, expected_number_of_matches))\n \n         expected_top10_matches_indices = torch.tensor(\n-            [3145, 3065, 3143, 3066, 3144, 1397, 1705, 3151, 2342, 2422], dtype=torch.int64, device=torch_device\n+            [3145, 3065, 3143, 3144, 1397, 1705, 3151, 2422, 3066, 2342], dtype=torch.int64, device=torch_device\n         )\n         expected_top10_matching_scores = torch.tensor(\n-            [0.9997, 0.9996, 0.9996, 0.9995, 0.9995, 0.9995, 0.9994, 0.9994, 0.9994, 0.9994], device=torch_device\n+            [0.9998, 0.9997, 0.9997, 0.9996, 0.9996, 0.9996, 0.9996, 0.9995, 0.9995, 0.9995], device=torch_device\n         )\n \n         self.assertEqual(outputs.matches.shape, expected_matches_shape)"
+        }
+    ],
+    "stats": {
+        "total": 35,
+        "additions": 23,
+        "deletions": 12
+    }
+}

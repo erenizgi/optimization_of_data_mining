@@ -1,0 +1,36 @@
+{
+    "author": "sywangyi",
+    "message": "use the enable_gqa param in torch.nn.functional.scaled_dot_product_at… (#39412)\n\n* use the enable_gqa param in torch.nn.functional.scaled_dot_product_attention\n\nSigned-off-by: Wang, Yi A <yi.a.wang@intel.com>\n\n* ci failure fix\n\nSigned-off-by: Wang, Yi A <yi.a.wang@intel.com>\n\n* add check\n\nSigned-off-by: Wang, Yi A <yi.a.wang@intel.com>\n\n* fix ci failure\n\nSigned-off-by: Wang, Yi A <yi.a.wang@intel.com>\n\n* refine code, extend to cuda\n\nSigned-off-by: Wang, Yi A <yi.a.wang@intel.com>\n\n* refine code\n\nSigned-off-by: Wang, Yi A <yi.a.wang@intel.com>\n\n* fix review comments\n\nSigned-off-by: Wang, Yi A <yi.a.wang@intel.com>\n\n* refine the PR\n\nSigned-off-by: Wang, Yi A <yi.a.wang@intel.com>\n\n---------\n\nSigned-off-by: Wang, Yi A <yi.a.wang@intel.com>\nCo-authored-by: Cyril Vallez <cyril.vallez@huggingface.co>",
+    "sha": "9323d0873c01e7579c5d2a7907be430e7cf9edaf",
+    "files": [
+        {
+            "sha": "195cb447c44b5d3ae334c498410f4673b6becfb6",
+            "filename": "src/transformers/integrations/sdpa_attention.py",
+            "status": "modified",
+            "additions": 19,
+            "deletions": 3,
+            "changes": 22,
+            "blob_url": "https://github.com/huggingface/transformers/blob/9323d0873c01e7579c5d2a7907be430e7cf9edaf/src%2Ftransformers%2Fintegrations%2Fsdpa_attention.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/9323d0873c01e7579c5d2a7907be430e7cf9edaf/src%2Ftransformers%2Fintegrations%2Fsdpa_attention.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fintegrations%2Fsdpa_attention.py?ref=9323d0873c01e7579c5d2a7907be430e7cf9edaf",
+            "patch": "@@ -3,11 +3,15 @@\n import torch\n \n from ..utils import logging\n+from ..utils.import_utils import is_torch_greater_or_equal\n \n \n logger = logging.get_logger(__name__)\n \n \n+_is_torch_greater_or_equal_than_2_5 = is_torch_greater_or_equal(\"2.5\", accept_dev=True)\n+\n+\n def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:\n     \"\"\"\n     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,\n@@ -20,6 +24,14 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:\n     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)\n \n \n+def use_gqa_in_sdpa(attention_mask: Optional[torch.Tensor], key: torch.Tensor) -> bool:\n+    # GQA can only be used under the following conditions\n+    # 1. torch version >= 2.5\n+    # 2. attention_mask is None (otherwise it will fall back to the math kernel)\n+    # 3. key is not a torch.fx.Proxy (otherwise it will fail with a tracing error)\n+    return _is_torch_greater_or_equal_than_2_5 and attention_mask is None and not isinstance(key, torch.fx.Proxy)\n+\n+\n def sdpa_attention_forward(\n     module: torch.nn.Module,\n     query: torch.Tensor,\n@@ -36,10 +48,13 @@ def sdpa_attention_forward(\n             \"`sdpa` attention does not support `output_attentions=True` or `head_mask`.\"\n             \" Please set your attention to `eager` if you want any of these features.\"\n         )\n-\n+    sdpa_kwargs = {}\n     if hasattr(module, \"num_key_value_groups\"):\n-        key = repeat_kv(key, module.num_key_value_groups)\n-        value = repeat_kv(value, module.num_key_value_groups)\n+        if not use_gqa_in_sdpa(attention_mask, key):\n+            key = repeat_kv(key, module.num_key_value_groups)\n+            value = repeat_kv(value, module.num_key_value_groups)\n+        else:\n+            sdpa_kwargs = {\"enable_gqa\": True}\n \n     if attention_mask is not None and attention_mask.ndim == 4:\n         attention_mask = attention_mask[:, :, :, : key.shape[-2]]\n@@ -71,6 +86,7 @@ def sdpa_attention_forward(\n         dropout_p=dropout,\n         scale=scaling,\n         is_causal=is_causal,\n+        **sdpa_kwargs,\n     )\n     attn_output = attn_output.transpose(1, 2).contiguous()\n "
+        },
+        {
+            "sha": "bb73052b25197dbc7df3ac2b482c91f172890b08",
+            "filename": "tests/utils/test_cache_utils.py",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 5,
+            "changes": 10,
+            "blob_url": "https://github.com/huggingface/transformers/blob/9323d0873c01e7579c5d2a7907be430e7cf9edaf/tests%2Futils%2Ftest_cache_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/9323d0873c01e7579c5d2a7907be430e7cf9edaf/tests%2Futils%2Ftest_cache_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Futils%2Ftest_cache_utils.py?ref=9323d0873c01e7579c5d2a7907be430e7cf9edaf",
+            "patch": "@@ -588,12 +588,12 @@ def test_dynamic_cache_exportability(self):\n             past_key_values=past_key_values_eager,\n             use_cache=True,\n         )\n-        self.assertTrue(torch.allclose(res.logits, res_eager.logits))\n+        self.assertTrue(torch.allclose(res.logits, res_eager.logits, atol=1e-5))\n         for k1, k2 in zip(res.past_key_values.key_cache, res_eager.past_key_values.key_cache):\n-            self.assertTrue(torch.allclose(k1, k2))\n+            self.assertTrue(torch.allclose(k1, k2, atol=1e-5))\n \n         for v1, v2 in zip(res.past_key_values.value_cache, res_eager.past_key_values.value_cache):\n-            self.assertTrue(torch.allclose(v1, v2))\n+            self.assertTrue(torch.allclose(v1, v2, atol=1e-5))\n \n     def test_dynamic_cache_exportability_multiple_run(self):\n         # When exporting with DynamicCache, you should export two graphs:\n@@ -686,10 +686,10 @@ def test_dynamic_cache_exportability_multiple_run(self):\n         )\n \n         for k1, k2 in zip(res_export_2.past_key_values.key_cache, res_eager_2.past_key_values.key_cache):\n-            self.assertTrue(torch.allclose(k1, k2))\n+            self.assertTrue(torch.allclose(k1, k2, atol=1e-5))\n \n         for v1, v2 in zip(res_export_2.past_key_values.value_cache, res_eager_2.past_key_values.value_cache):\n-            self.assertTrue(torch.allclose(v1, v2))\n+            self.assertTrue(torch.allclose(v1, v2, atol=1e-5))\n \n     @unittest.skip(\"Runs on my machine locally, passed, no idea why it does not online\")\n     def test_static_cache_exportability(self):"
+        }
+    ],
+    "stats": {
+        "total": 32,
+        "additions": 24,
+        "deletions": 8
+    }
+}

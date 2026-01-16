@@ -1,0 +1,48 @@
+{
+    "author": "wyattjoh",
+    "message": "Improve Incremental Cache Locking Algorithm (#80497)\n\nThis improves the locking algorithm used by the incremental cache so\nthat it will retry to get a lock after the lock is released. This\ncorrects the behaviour that existed previously where multiple lockers\nall acquired a lock after the first lock was released.",
+    "sha": "c652fc3980a9d3fb7f9b92a846672a7af036bde4",
+    "files": [
+        {
+            "sha": "4bf18ed0d2213b21f717f153f7d6ff04efc91704",
+            "filename": "packages/next/src/server/lib/incremental-cache/index.ts",
+            "status": "modified",
+            "additions": 37,
+            "deletions": 16,
+            "changes": 53,
+            "blob_url": "https://github.com/vercel/next.js/blob/c652fc3980a9d3fb7f9b92a846672a7af036bde4/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Fincremental-cache%2Findex.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/c652fc3980a9d3fb7f9b92a846672a7af036bde4/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Fincremental-cache%2Findex.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Fincremental-cache%2Findex.ts?ref=c652fc3980a9d3fb7f9b92a846672a7af036bde4",
+            "patch": "@@ -34,6 +34,7 @@ import { InvariantError } from '../../../shared/lib/invariant-error'\n import type { Revalidate } from '../cache-control'\n import { getPreviouslyRevalidatedTags } from '../../server-utils'\n import { workAsyncStorage } from '../../app-render/work-async-storage.external'\n+import { DetachedPromise } from '../../../lib/detached-promise'\n \n export interface CacheHandlerContext {\n   fs?: CacheFs\n@@ -91,6 +92,8 @@ export class IncrementalCache implements IncrementalCacheType {\n   readonly revalidatedTags?: string[]\n   readonly isOnDemandRevalidate?: boolean\n \n+  private static readonly debug: boolean =\n+    !!process.env.NEXT_PRIVATE_DEBUG_CACHE\n   private readonly locks = new Map<string, Promise<void>>()\n \n   /**\n@@ -124,7 +127,6 @@ export class IncrementalCache implements IncrementalCacheType {\n     fetchCacheKeyPrefix?: string\n     CurCacheHandler?: typeof CacheHandler\n   }) {\n-    const debug = !!process.env.NEXT_PRIVATE_DEBUG_CACHE\n     this.hasCustomCacheHandler = Boolean(CurCacheHandler)\n \n     const cacheHandlersSymbol = Symbol.for('@next/cache-handlers')\n@@ -142,13 +144,13 @@ export class IncrementalCache implements IncrementalCacheType {\n         CurCacheHandler = globalCacheHandler.FetchCache\n       } else {\n         if (fs && serverDistDir) {\n-          if (debug) {\n+          if (IncrementalCache.debug) {\n             console.log('using filesystem cache handler')\n           }\n           CurCacheHandler = FileSystemCache\n         }\n       }\n-    } else if (debug) {\n+    } else if (IncrementalCache.debug) {\n       console.log('using custom cache handler', CurCacheHandler.name)\n     }\n \n@@ -234,23 +236,42 @@ export class IncrementalCache implements IncrementalCacheType {\n     this.cacheHandler?.resetRequestCache?.()\n   }\n \n-  async lock(cacheKey: string) {\n-    let unlockNext: () => Promise<void> = () => Promise.resolve()\n-    const existingLock = this.locks.get(cacheKey)\n+  async lock(cacheKey: string): Promise<() => Promise<void> | void> {\n+    // Wait for any existing lock on this cache key to be released\n+    // This implements a simple queue-based locking mechanism\n+    while (true) {\n+      const lock = this.locks.get(cacheKey)\n \n-    if (existingLock) {\n-      await existingLock\n+      if (IncrementalCache.debug) {\n+        console.log('lock get', cacheKey, !!lock)\n+      }\n+\n+      // If no lock exists, we can proceed to acquire it\n+      if (!lock) break\n+\n+      // Wait for the existing lock to be released before trying again\n+      await lock\n     }\n \n-    const newLock = new Promise<void>((resolve) => {\n-      unlockNext = async () => {\n-        resolve()\n-        this.locks.delete(cacheKey) // Remove the lock upon release\n-      }\n-    })\n+    // Create a new detached promise that will represent this lock\n+    // The resolve function (unlock) will be returned to the caller\n+    const { resolve, promise } = new DetachedPromise<void>()\n \n-    this.locks.set(cacheKey, newLock)\n-    return unlockNext\n+    if (IncrementalCache.debug) {\n+      console.log('successfully locked', cacheKey)\n+    }\n+\n+    // Store the lock promise in the locks map\n+    this.locks.set(cacheKey, promise)\n+\n+    return () => {\n+      // Resolve the promise to release the lock.\n+      resolve()\n+\n+      // Remove the lock from the map once it's released so that future gets\n+      // can acquire the lock.\n+      this.locks.delete(cacheKey)\n+    }\n   }\n \n   async revalidateTag(tags: string | string[]): Promise<void> {"
+        },
+        {
+            "sha": "1f7ad7f52ddf4dcca637edb560c43407f5abd342",
+            "filename": "packages/next/src/server/lib/patch-fetch.test.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/c652fc3980a9d3fb7f9b92a846672a7af036bde4/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Fpatch-fetch.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/c652fc3980a9d3fb7f9b92a846672a7af036bde4/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Fpatch-fetch.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Fpatch-fetch.test.ts?ref=c652fc3980a9d3fb7f9b92a846672a7af036bde4",
+            "patch": "@@ -41,7 +41,7 @@ describe('createPatchedFetcher', () => {\n       get: jest.fn(),\n       set: jest.fn(() => resolveIncrementalCacheSet()),\n       generateCacheKey: jest.fn(() => 'test-cache-key'),\n-      lock: jest.fn(() => resolveIncrementalCacheSet),\n+      lock: jest.fn(() => () => {}),\n     } as unknown as IncrementalCache\n \n     // We only need to provide a few of the WorkStore properties."
+        },
+        {
+            "sha": "9990da439a9d92a60ecf9e01fe2a3c87b3a18911",
+            "filename": "packages/next/src/server/lib/patch-fetch.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/c652fc3980a9d3fb7f9b92a846672a7af036bde4/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Fpatch-fetch.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/c652fc3980a9d3fb7f9b92a846672a7af036bde4/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Fpatch-fetch.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Fpatch-fetch.ts?ref=c652fc3980a9d3fb7f9b92a846672a7af036bde4",
+            "patch": "@@ -573,7 +573,7 @@ export function createPatchedFetcher(\n         const fetchIdx = workStore.nextFetchId ?? 1\n         workStore.nextFetchId = fetchIdx + 1\n \n-        let handleUnlock = () => Promise.resolve()\n+        let handleUnlock: () => Promise<void> | void = () => {}\n \n         const doOriginalFetch = async (\n           isStale?: boolean,"
+        }
+    ],
+    "stats": {
+        "total": 57,
+        "additions": 39,
+        "deletions": 18
+    }
+}

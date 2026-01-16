@@ -1,0 +1,36 @@
+{
+    "author": "sokra",
+    "message": "Turbopack: add print_cache_item_size feature flag to print cache size per task (#80043)\n\n### What?\n\nAllows to capture cache size stats per task type",
+    "sha": "fde4f7f2974d5870a74c196383af70df981de39e",
+    "files": [
+        {
+            "sha": "9cfdcc8d9fc30069ad8738819a07fea41e6ad553",
+            "filename": "turbopack/crates/turbo-tasks-backend/Cargo.toml",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/fde4f7f2974d5870a74c196383af70df981de39e/turbopack%2Fcrates%2Fturbo-tasks-backend%2FCargo.toml",
+            "raw_url": "https://github.com/vercel/next.js/raw/fde4f7f2974d5870a74c196383af70df981de39e/turbopack%2Fcrates%2Fturbo-tasks-backend%2FCargo.toml",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks-backend%2FCargo.toml?ref=fde4f7f2974d5870a74c196383af70df981de39e",
+            "patch": "@@ -14,6 +14,7 @@ workspace = true\n \n [features]\n default = []\n+print_cache_item_size = []\n verify_serialization = []\n verify_aggregation_graph = []\n trace_aggregation_update = []"
+        },
+        {
+            "sha": "a3f727c292ff56f4d8b4a5477fb58d1b58354397",
+            "filename": "turbopack/crates/turbo-tasks-backend/src/backend/mod.rs",
+            "status": "modified",
+            "additions": 72,
+            "deletions": 2,
+            "changes": 74,
+            "blob_url": "https://github.com/vercel/next.js/blob/fde4f7f2974d5870a74c196383af70df981de39e/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fbackend%2Fmod.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/fde4f7f2974d5870a74c196383af70df981de39e/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fbackend%2Fmod.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fbackend%2Fmod.rs?ref=fde4f7f2974d5870a74c196383af70df981de39e",
+            "patch": "@@ -913,6 +913,30 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n                 .take_snapshot(&preprocess, &process, &process_snapshot)\n         };\n \n+        #[cfg(feature = \"print_cache_item_size\")]\n+        #[derive(Default)]\n+        struct TaskCacheStats {\n+            data: usize,\n+            data_count: usize,\n+            meta: usize,\n+            meta_count: usize,\n+        }\n+        #[cfg(feature = \"print_cache_item_size\")]\n+        impl TaskCacheStats {\n+            fn add_data(&mut self, len: usize) {\n+                self.data += len;\n+                self.data_count += 1;\n+            }\n+\n+            fn add_meta(&mut self, len: usize) {\n+                self.meta += len;\n+                self.meta_count += 1;\n+            }\n+        }\n+        #[cfg(feature = \"print_cache_item_size\")]\n+        let task_cache_stats: Mutex<FxHashMap<_, TaskCacheStats>> =\n+            Mutex::new(FxHashMap::default());\n+\n         let task_snapshots = snapshot\n             .into_iter()\n             .filter_map(|iter| {\n@@ -924,7 +948,15 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n                             Option<Result<SmallVec<_>>>,\n                         )| {\n                             let meta = match meta {\n-                                Some(Ok(meta)) => Some(meta),\n+                                Some(Ok(meta)) => {\n+                                    #[cfg(feature = \"print_cache_item_size\")]\n+                                    task_cache_stats\n+                                        .lock()\n+                                        .entry(self.get_task_description(task_id))\n+                                        .or_default()\n+                                        .add_meta(meta.len());\n+                                    Some(meta)\n+                                }\n                                 None => None,\n                                 Some(Err(err)) => {\n                                     println!(\n@@ -936,7 +968,15 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n                                 }\n                             };\n                             let data = match data {\n-                                Some(Ok(data)) => Some(data),\n+                                Some(Ok(data)) => {\n+                                    #[cfg(feature = \"print_cache_item_size\")]\n+                                    task_cache_stats\n+                                        .lock()\n+                                        .entry(self.get_task_description(task_id))\n+                                        .or_default()\n+                                        .add_data(data.len());\n+                                    Some(data)\n+                                }\n                                 None => None,\n                                 Some(Err(err)) => {\n                                     println!(\n@@ -970,6 +1010,36 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n                 println!(\"Persisting failed: {err:?}\");\n                 return None;\n             }\n+            #[cfg(feature = \"print_cache_item_size\")]\n+            {\n+                let mut task_cache_stats = task_cache_stats\n+                    .into_inner()\n+                    .into_iter()\n+                    .collect::<Vec<_>>();\n+                if !task_cache_stats.is_empty() {\n+                    task_cache_stats.sort_unstable_by(|(key_a, stats_a), (key_b, stats_b)| {\n+                        (stats_b.data + stats_b.meta, key_b)\n+                            .cmp(&(stats_a.data + stats_a.meta, key_a))\n+                    });\n+                    println!(\"Task cache stats:\");\n+                    for (task_desc, stats) in task_cache_stats {\n+                        use std::ops::Div;\n+\n+                        use turbo_tasks::util::FormatBytes;\n+\n+                        println!(\n+                            \"  {} {task_desc} = {} meta ({} x {}), {} data ({} x {})\",\n+                            FormatBytes(stats.data + stats.meta),\n+                            FormatBytes(stats.meta),\n+                            stats.meta_count,\n+                            FormatBytes(stats.meta.checked_div(stats.meta_count).unwrap_or(0)),\n+                            FormatBytes(stats.data),\n+                            stats.data_count,\n+                            FormatBytes(stats.data.checked_div(stats.data_count).unwrap_or(0)),\n+                        );\n+                    }\n+                }\n+            }\n         }\n \n         Some((snapshot_time, new_items))"
+        }
+    ],
+    "stats": {
+        "total": 75,
+        "additions": 73,
+        "deletions": 2
+    }
+}

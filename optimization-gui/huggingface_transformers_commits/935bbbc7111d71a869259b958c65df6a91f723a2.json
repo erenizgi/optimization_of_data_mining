@@ -1,0 +1,48 @@
+{
+    "author": "Kirire",
+    "message": "Add config validation and style tweaks (#37589)\n\n* Add config validation and style tweaks\n\n* Fix style issues\n\n* Fix style issues\n\n* style\n\n* Small fixes for copy/paste errors\n\n---------\n\nCo-authored-by: Cyrile <cyrile.delestre@arkea.com>",
+    "sha": "935bbbc7111d71a869259b958c65df6a91f723a2",
+    "files": [
+        {
+            "sha": "3b1b1177c0a54ff9b5b20634a6f44a2e7928b08e",
+            "filename": "src/transformers/models/mamba2/configuration_mamba2.py",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/huggingface/transformers/blob/935bbbc7111d71a869259b958c65df6a91f723a2/src%2Ftransformers%2Fmodels%2Fmamba2%2Fconfiguration_mamba2.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/935bbbc7111d71a869259b958c65df6a91f723a2/src%2Ftransformers%2Fmodels%2Fmamba2%2Fconfiguration_mamba2.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fmamba2%2Fconfiguration_mamba2.py?ref=935bbbc7111d71a869259b958c65df6a91f723a2",
+            "patch": "@@ -140,6 +140,13 @@ def __init__(\n         tie_word_embeddings=False,\n         **kwargs,\n     ):\n+        if (hidden_size * expand) != (num_heads * head_dim):\n+            raise ValueError(\n+                \"Inconsistent configuration: hidden_size * expand \"\n+                f\"({hidden_size * expand}) must equal num_heads * head_dim \"\n+                f\"({num_heads * head_dim}).\"\n+            )\n+\n         self.vocab_size = vocab_size\n         self.hidden_size = hidden_size\n         self.state_size = state_size"
+        },
+        {
+            "sha": "28e785b860425d8b1693dd02851ce7293955a67a",
+            "filename": "src/transformers/models/mamba2/modeling_mamba2.py",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 20,
+            "changes": 33,
+            "blob_url": "https://github.com/huggingface/transformers/blob/935bbbc7111d71a869259b958c65df6a91f723a2/src%2Ftransformers%2Fmodels%2Fmamba2%2Fmodeling_mamba2.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/935bbbc7111d71a869259b958c65df6a91f723a2/src%2Ftransformers%2Fmodels%2Fmamba2%2Fmodeling_mamba2.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fmamba2%2Fmodeling_mamba2.py?ref=935bbbc7111d71a869259b958c65df6a91f723a2",
+            "patch": "@@ -21,7 +21,6 @@\n import torch\n import torch.utils.checkpoint\n from torch import nn\n-from torch.nn import CrossEntropyLoss\n \n from ...activations import ACT2FN\n from ...generation import GenerationMixin\n@@ -457,13 +456,19 @@ def cuda_kernels_forward(\n         return out\n \n     # fmt: off\n-    def torch_forward(self, input_states, cache_params: Optional[Mamba2Cache]=None, cache_position:Optional[torch.LongTensor]=None, attention_mask: Optional[torch.Tensor]=None):\n-        batch_size, seq_len, _ = input_states.shape\n-        dtype = input_states.dtype\n+    def torch_forward(\n+        self,\n+        hidden_states: torch.Tensor,\n+        cache_params: Optional[Mamba2Cache]=None,\n+        cache_position:Optional[torch.LongTensor]=None,\n+        attention_mask: Optional[torch.Tensor]=None\n+    ):\n+        batch_size, seq_len, _ = hidden_states.shape\n+        dtype = hidden_states.dtype\n \n         # 1. Gated MLP's linear projection\n-        input_states = apply_mask_to_padding_states(input_states, attention_mask)\n-        projected_states = self.in_proj(input_states)\n+        hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)\n+        projected_states = self.in_proj(hidden_states)\n         d_mlp = (projected_states.shape[-1] - 2 * self.intermediate_size - 2 * self.n_groups * self.ssm_state_size-self.num_heads) // 2\n         _, _, gate, hidden_states_B_C, dt = projected_states.split(\n                 [d_mlp, d_mlp, self.intermediate_size,  self.conv_dim, self.num_heads], dim=-1\n@@ -657,11 +662,6 @@ def forward(\n     ):\n         if is_fast_path_available and \"cuda\" in self.in_proj.weight.device.type:\n             return self.cuda_kernels_forward(hidden_states, cache_params, cache_position, attention_mask)\n-        dtype = hidden_states.dtype\n-        if attention_mask is not None and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1:\n-            # tune out hidden states for pad tokens, see https://github.com/state-spaces/mamba/issues/66\n-            hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)\n-\n         return self.torch_forward(hidden_states, cache_params, cache_position, attention_mask)\n \n \n@@ -1018,7 +1018,7 @@ def forward(\n         use_cache: Optional[bool] = None,\n         cache_position: Optional[torch.Tensor] = None,\n         attention_mask: Optional[torch.Tensor] = None,\n-        **kwargs,  # for now we need this for generation\n+        **kwargs,  # for now we need this for generation and loss_function\n     ) -> Union[Tuple, Mamba2CausalLMOutput]:\n         r\"\"\"\n         cache_params (`Mamba2Cache`, *optional*):\n@@ -1052,14 +1052,7 @@ def forward(\n \n         loss = None\n         if labels is not None:\n-            # move labels to correct device to enable model parallelism\n-            labels = labels.to(logits.device)\n-            # Shift so that tokens < n predict n\n-            shift_logits = logits[..., :-1, :].contiguous()\n-            shift_labels = labels[..., 1:].contiguous()\n-            # Flatten the tokens\n-            loss_fct = CrossEntropyLoss()\n-            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))\n+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)\n \n         if not return_dict:\n             output = (logits,) + mamba2_outputs[1:]"
+        },
+        {
+            "sha": "ee63e825e1f720b9c76bcf54bd3977d0e14d9acd",
+            "filename": "tests/models/mamba2/test_modeling_mamba2.py",
+            "status": "modified",
+            "additions": 24,
+            "deletions": 1,
+            "changes": 25,
+            "blob_url": "https://github.com/huggingface/transformers/blob/935bbbc7111d71a869259b958c65df6a91f723a2/tests%2Fmodels%2Fmamba2%2Ftest_modeling_mamba2.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/935bbbc7111d71a869259b958c65df6a91f723a2/tests%2Fmodels%2Fmamba2%2Ftest_modeling_mamba2.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fmamba2%2Ftest_modeling_mamba2.py?ref=935bbbc7111d71a869259b958c65df6a91f723a2",
+            "patch": "@@ -44,6 +44,29 @@\n     from transformers.models.mamba2.modeling_mamba2 import Mamba2Cache, Mamba2Mixer\n \n \n+class Mamba2ConfigTester(ConfigTester):\n+    def _create_config(self, hidden_size: int, num_heads: int, expand: int, head_dim: int):\n+        _input_dict = self.inputs_dict.copy()\n+        _input_dict[\"hidden_size\"] = hidden_size\n+        _input_dict[\"num_heads\"] = num_heads\n+        _input_dict[\"expand\"] = expand\n+        _input_dict[\"head_dim\"] = head_dim\n+        return self.config_class(**_input_dict)\n+\n+    def test_hidden_size_compatibility(self):\n+        self._create_config(hidden_size=2, num_heads=2, expand=2, head_dim=2)\n+        self._create_config(hidden_size=4, num_heads=4, expand=2, head_dim=2)\n+        self._create_config(hidden_size=2, num_heads=4, expand=4, head_dim=2)\n+        with self.parent.assertRaises(ValueError):\n+            self._create_config(hidden_size=2, num_heads=4, expand=2, head_dim=4)\n+        with self.parent.assertRaises(ValueError):\n+            self._create_config(hidden_size=4, num_heads=2, expand=4, head_dim=2)\n+\n+    def run_common_tests(self):\n+        self.test_hidden_size_compatibility()\n+        return super().run_common_tests()\n+\n+\n class Mamba2ModelTester:\n     def __init__(\n         self,\n@@ -233,7 +256,7 @@ class Mamba2ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMix\n \n     def setUp(self):\n         self.model_tester = Mamba2ModelTester(self)\n-        self.config_tester = ConfigTester(\n+        self.config_tester = Mamba2ConfigTester(\n             self, config_class=Mamba2Config, n_embd=37, common_properties=[\"hidden_size\", \"num_hidden_layers\"]\n         )\n "
+        }
+    ],
+    "stats": {
+        "total": 65,
+        "additions": 44,
+        "deletions": 21
+    }
+}

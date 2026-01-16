@@ -1,0 +1,48 @@
+{
+    "author": "zRzRzRzRzRzRzR",
+    "message": "Fix some bug for finetune and batch infer For GLM-4.1V (#39090)\n\n* update\n\n* 1",
+    "sha": "4a79bf947d0614d2a023b9137a32cf754ac241fe",
+    "files": [
+        {
+            "sha": "f8e66e8305aef9133a4feefb713bc565d49c9c06",
+            "filename": "src/transformers/models/glm4v/image_processing_glm4v_fast.py",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 4,
+            "changes": 11,
+            "blob_url": "https://github.com/huggingface/transformers/blob/4a79bf947d0614d2a023b9137a32cf754ac241fe/src%2Ftransformers%2Fmodels%2Fglm4v%2Fimage_processing_glm4v_fast.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/4a79bf947d0614d2a023b9137a32cf754ac241fe/src%2Ftransformers%2Fmodels%2Fglm4v%2Fimage_processing_glm4v_fast.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fglm4v%2Fimage_processing_glm4v_fast.py?ref=4a79bf947d0614d2a023b9137a32cf754ac241fe",
+            "patch": "@@ -121,6 +121,7 @@ def _preprocess(\n         do_convert_rgb: bool,\n         input_data_format: Optional[Union[str, ChannelDimension]],\n         device: Optional[Union[str, torch.device]],\n+        disable_grouping: Optional[bool],\n     ):\n         \"\"\"\n         Preprocess an image or batch of images. Copy of the `preprocess` method from `CLIPImageProcessor`.\n@@ -173,7 +174,7 @@ def _preprocess(\n         resized_height, resized_width = height, width\n \n         # Group images by size for batched resizing\n-        grouped_images, grouped_images_index = group_images_by_shape(images)\n+        grouped_images, grouped_images_index = group_images_by_shape(images, disable_grouping=disable_grouping)\n         resized_images_grouped = {}\n         for shape, stacked_images in grouped_images.items():\n             if do_resize:\n@@ -191,7 +192,7 @@ def _preprocess(\n         resized_images = reorder_images(resized_images_grouped, grouped_images_index)\n         # Group images by size for further processing\n         # Needed in case do_resize is False, or resize returns images with different sizes\n-        grouped_images, grouped_images_index = group_images_by_shape(resized_images)\n+        grouped_images, grouped_images_index = group_images_by_shape(resized_images, disable_grouping=disable_grouping)\n         processed_images_grouped = {}\n         for shape, stacked_images in grouped_images.items():\n             # Fused rescale and normalize\n@@ -249,6 +250,7 @@ def preprocess(\n         data_format: Optional[ChannelDimension] = ChannelDimension.FIRST,\n         input_data_format: Optional[Union[str, ChannelDimension]] = None,\n         device: Optional[\"torch.device\"] = None,\n+        disable_grouping: Optional[bool] = False,\n         **kwargs,\n     ):\n         r\"\"\"\n@@ -323,6 +325,7 @@ def preprocess(\n                     do_convert_rgb=do_convert_rgb,\n                     input_data_format=input_data_format,\n                     device=device,\n+                    disable_grouping=disable_grouping,\n                 )\n                 pixel_values.extend(patches)\n                 vision_grid_thws.append(image_grid_thw)\n@@ -351,11 +354,11 @@ def get_number_of_image_patches(self, height: int, width: int, images_kwargs=Non\n \n         factor = patch_size * merge_size\n         resized_height, resized_width = smart_resize(\n-            t=self.temporal_patch_size,\n+            num_frames=self.temporal_patch_size,\n             height=height,\n             width=width,\n+            temporal_factor=self.temporal_patch_size,\n             factor=factor,\n-            t_factor=self.temporal_patch_size,\n         )\n         grid_h, grid_w = resized_height // patch_size, resized_width // patch_size\n         return grid_h * grid_w"
+        },
+        {
+            "sha": "65ec7f0b79cc8c2d07d90b37f8fc5066a0227b84",
+            "filename": "src/transformers/models/glm4v/modeling_glm4v.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 5,
+            "changes": 8,
+            "blob_url": "https://github.com/huggingface/transformers/blob/4a79bf947d0614d2a023b9137a32cf754ac241fe/src%2Ftransformers%2Fmodels%2Fglm4v%2Fmodeling_glm4v.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/4a79bf947d0614d2a023b9137a32cf754ac241fe/src%2Ftransformers%2Fmodels%2Fglm4v%2Fmodeling_glm4v.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fglm4v%2Fmodeling_glm4v.py?ref=4a79bf947d0614d2a023b9137a32cf754ac241fe",
+            "patch": "@@ -287,6 +287,7 @@ def __init__(self, config: Glm4vVisionConfig) -> None:\n         self.attention_dropout = config.attention_dropout\n         self.qkv = nn.Linear(config.hidden_size, config.hidden_size * 3, bias=config.attention_bias)\n         self.proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)\n+        self.is_causal = False\n \n     def forward(\n         self,\n@@ -324,7 +325,7 @@ def forward(\n             attention_mask,\n             dropout=0.0 if not self.training else self.attention_dropout,\n             scaling=self.scale,\n-            is_causal=False,\n+            is_causal=self.is_causal,\n             **kwargs,\n         )\n         attn_output = attn_output.squeeze(0)\n@@ -1016,7 +1017,7 @@ def get_rope_index(\n                 dtype=input_ids.dtype,\n                 device=input_ids.device,\n             )\n-\n+            image_index, video_index = 0, 0\n             attention_mask = attention_mask.to(total_input_ids.device)\n             for i, input_ids in enumerate(total_input_ids):\n                 input_ids = input_ids[attention_mask[i] == 1]\n@@ -1046,7 +1047,6 @@ def get_rope_index(\n \n                 llm_pos_ids_list = []\n                 video_frame_num = 1\n-                image_index, video_index = 0, 0\n \n                 for modality_type, start_idx, end_idx in input_type_group:\n                     st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0\n@@ -1088,9 +1088,7 @@ def get_rope_index(\n                             t_index = torch.tensor(t_idx).view(-1, 1).expand(-1, llm_grid_h * llm_grid_w).flatten()\n \n                             h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(1, -1, llm_grid_w).flatten()\n-\n                             w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(1, llm_grid_h, -1).flatten()\n-\n                             llm_pos_ids_list.append(torch.stack([t_index, h_index, w_index]) + st_idx)\n \n                         video_index += 1"
+        },
+        {
+            "sha": "c6ca61b215385c81132dd5fbd6b82594028123d3",
+            "filename": "src/transformers/models/glm4v/modular_glm4v.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 5,
+            "changes": 8,
+            "blob_url": "https://github.com/huggingface/transformers/blob/4a79bf947d0614d2a023b9137a32cf754ac241fe/src%2Ftransformers%2Fmodels%2Fglm4v%2Fmodular_glm4v.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/4a79bf947d0614d2a023b9137a32cf754ac241fe/src%2Ftransformers%2Fmodels%2Fglm4v%2Fmodular_glm4v.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fglm4v%2Fmodular_glm4v.py?ref=4a79bf947d0614d2a023b9137a32cf754ac241fe",
+            "patch": "@@ -516,6 +516,7 @@ def __init__(self, config: Glm4vVisionConfig) -> None:\n         self.attention_dropout = config.attention_dropout\n         self.qkv = nn.Linear(config.hidden_size, config.hidden_size * 3, bias=config.attention_bias)\n         self.proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)\n+        self.is_causal = False\n \n     def forward(\n         self,\n@@ -553,7 +554,7 @@ def forward(\n             attention_mask,\n             dropout=0.0 if not self.training else self.attention_dropout,\n             scaling=self.scale,\n-            is_causal=False,\n+            is_causal=self.is_causal,\n             **kwargs,\n         )\n         attn_output = attn_output.squeeze(0)\n@@ -1115,7 +1116,7 @@ def get_rope_index(\n                 dtype=input_ids.dtype,\n                 device=input_ids.device,\n             )\n-\n+            image_index, video_index = 0, 0\n             attention_mask = attention_mask.to(total_input_ids.device)\n             for i, input_ids in enumerate(total_input_ids):\n                 input_ids = input_ids[attention_mask[i] == 1]\n@@ -1145,7 +1146,6 @@ def get_rope_index(\n \n                 llm_pos_ids_list = []\n                 video_frame_num = 1\n-                image_index, video_index = 0, 0\n \n                 for modality_type, start_idx, end_idx in input_type_group:\n                     st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0\n@@ -1187,9 +1187,7 @@ def get_rope_index(\n                             t_index = torch.tensor(t_idx).view(-1, 1).expand(-1, llm_grid_h * llm_grid_w).flatten()\n \n                             h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(1, -1, llm_grid_w).flatten()\n-\n                             w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(1, llm_grid_h, -1).flatten()\n-\n                             llm_pos_ids_list.append(torch.stack([t_index, h_index, w_index]) + st_idx)\n \n                         video_index += 1"
+        }
+    ],
+    "stats": {
+        "total": 27,
+        "additions": 13,
+        "deletions": 14
+    }
+}

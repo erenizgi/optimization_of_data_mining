@@ -1,0 +1,120 @@
+{
+    "author": "gante",
+    "message": "[generate] return Cache object even if passed in a legacy format (#35673)\n\n* generate returns a Cache object by default\r\n\r\n* fix tests\r\n\r\n* fix test for encoder-decoder models",
+    "sha": "94af1c0aa242d60faa8e69acf3391b1e4fd0d4bc",
+    "files": [
+        {
+            "sha": "655a388cb70dd8601ad53ae18efc06d15717952e",
+            "filename": "src/transformers/generation/utils.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 26,
+            "changes": 29,
+            "blob_url": "https://github.com/huggingface/transformers/blob/94af1c0aa242d60faa8e69acf3391b1e4fd0d4bc/src%2Ftransformers%2Fgeneration%2Futils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/94af1c0aa242d60faa8e69acf3391b1e4fd0d4bc/src%2Ftransformers%2Fgeneration%2Futils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fgeneration%2Futils.py?ref=94af1c0aa242d60faa8e69acf3391b1e4fd0d4bc",
+            "patch": "@@ -2111,9 +2111,6 @@ def generate(\n         # - `model_kwargs` may be updated in place with a cache as defined by the parameters in `generation_config`.\n         # - different models have a different cache name expected by the model (default = \"past_key_values\")\n         # - `max_length`, prepared above, is used to determine the maximum cache length\n-        # TODO (joao): remove `user_defined_cache` after v4.47 (remove default conversion to legacy format)\n-        cache_name = \"past_key_values\" if \"mamba\" not in self.__class__.__name__.lower() else \"cache_params\"\n-        user_defined_cache = model_kwargs.get(cache_name)\n         max_cache_length = generation_config.max_length\n         if (\n             inputs_tensor.shape[1] != input_ids_length\n@@ -2395,32 +2392,12 @@ def typeerror():\n \n         # Convert to legacy cache format if requested\n         if (\n-            generation_config.return_legacy_cache is not False  # Should check for `True` after v4.47\n+            generation_config.return_legacy_cache is True\n             and not is_torchdynamo_compiling()\n             and hasattr(result, \"past_key_values\")\n-            and hasattr(result.past_key_values, \"to_legacy_cache\")\n-            and result.past_key_values.to_legacy_cache is not None\n+            and getattr(result.past_key_values, \"to_legacy_cache\") is not None\n         ):\n-            # handle BC (convert by default if he user hasn't passed a cache AND the cache is of the default type)\n-            should_convert_cache = generation_config.return_legacy_cache\n-            is_user_defined_cache = user_defined_cache is not None\n-            is_default_cache_type = (\n-                type(result.past_key_values) == DynamicCache  # noqa E721\n-                or (\n-                    isinstance(result.past_key_values, EncoderDecoderCache)\n-                    and type(result.past_key_values.self_attention_cache) == DynamicCache  # noqa E721\n-                    and type(result.past_key_values.cross_attention_cache) == DynamicCache  # noqa E721\n-                )\n-            )\n-            if not is_user_defined_cache and is_default_cache_type:\n-                logger.warning_once(\n-                    \"From v4.47 onwards, when a model cache is to be returned, `generate` will return a `Cache` \"\n-                    \"instance instead by default (as opposed to the legacy tuple of tuples format). If you want to \"\n-                    \"keep returning the legacy format, please set `return_legacy_cache=True`.\"\n-                )\n-                should_convert_cache = True\n-            if should_convert_cache:\n-                result.past_key_values = result.past_key_values.to_legacy_cache()\n+            result.past_key_values = result.past_key_values.to_legacy_cache()\n         return result\n \n     def _has_unfinished_sequences("
+        },
+        {
+            "sha": "d59a18c59db472bf66b8786e4f8880ae8a7139a2",
+            "filename": "tests/generation/test_utils.py",
+            "status": "modified",
+            "additions": 33,
+            "deletions": 85,
+            "changes": 118,
+            "blob_url": "https://github.com/huggingface/transformers/blob/94af1c0aa242d60faa8e69acf3391b1e4fd0d4bc/tests%2Fgeneration%2Ftest_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/94af1c0aa242d60faa8e69acf3391b1e4fd0d4bc/tests%2Fgeneration%2Ftest_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fgeneration%2Ftest_utils.py?ref=94af1c0aa242d60faa8e69acf3391b1e4fd0d4bc",
+            "patch": "@@ -26,7 +26,7 @@\n import pytest\n from parameterized import parameterized\n \n-from transformers import AutoConfig, is_torch_available, pipeline, set_seed\n+from transformers import AutoConfig, is_torch_available, pipeline\n from transformers.testing_utils import (\n     is_flaky,\n     require_accelerate,\n@@ -69,7 +69,7 @@\n         SpeechEncoderDecoderModel,\n         T5ForConditionalGeneration,\n     )\n-    from transformers.cache_utils import DynamicCache, EncoderDecoderCache, QuantoQuantizedCache, StaticCache\n+    from transformers.cache_utils import Cache, DynamicCache, EncoderDecoderCache, QuantoQuantizedCache, StaticCache\n     from transformers.generation import (\n         BeamSampleDecoderOnlyOutput,\n         BeamSampleEncoderDecoderOutput,\n@@ -1851,75 +1851,6 @@ def test_generate_continue_from_past_key_values(self):\n                         )\n                     )\n \n-    @parameterized.expand([(1, False), (1, True), (4, False)])\n-    @pytest.mark.generate\n-    def test_new_cache_format(self, num_beams, do_sample):\n-        # Tests that generating with the new format is exactly the same as the legacy one (for models that support it).\n-        # 👉 tests with and without beam search so that we can test with and without cache reordering.\n-        # 👉 tests with and without sampling so we can cover the most common use cases.\n-        for model_class in self.all_generative_model_classes:\n-            if not model_class._supports_cache_class:\n-                self.skipTest(reason=\"This model does not support the new cache format\")\n-\n-            config, inputs_dict = self.prepare_config_and_inputs_for_generate()\n-\n-            model = model_class(config).to(torch_device).eval()\n-            generation_kwargs = {\n-                \"max_new_tokens\": 5,\n-                \"do_sample\": do_sample,\n-                \"num_beams\": num_beams,\n-                \"num_return_sequences\": num_beams,\n-                \"return_dict_in_generate\": True,  # Required to return `past_key_values`\n-                \"use_cache\": True,\n-            }\n-\n-            # Sets seed before calling `generate` for the case with do_sample=True\n-            seed = torch.randint(0, 1000000, (1,)).item()\n-            set_seed(seed)\n-            legacy_results = model.generate(**generation_kwargs, **inputs_dict)\n-            set_seed(seed)\n-            if config.is_encoder_decoder:\n-                cache_cls = EncoderDecoderCache\n-                past_key_values = cache_cls(DynamicCache(), DynamicCache())\n-            else:\n-                cache_cls = DynamicCache\n-                past_key_values = cache_cls()\n-\n-            new_results = model.generate(past_key_values=past_key_values, **generation_kwargs, **inputs_dict)\n-\n-            # The two sets of generated sequences must match, despite the cache format between forward passes being\n-            # different\n-            self.assertListEqual(legacy_results.sequences.tolist(), new_results.sequences.tolist())\n-            self.assertTrue(isinstance(legacy_results.past_key_values, tuple))\n-            self.assertTrue(isinstance(new_results.past_key_values, cache_cls))\n-\n-            # The contents of the two caches, when converted to the same format (in both directions!), must match\n-            legacy_cache = legacy_results.past_key_values\n-            new_cache_converted = new_results.past_key_values.to_legacy_cache()\n-            for layer_idx in range(len(legacy_cache)):\n-                for kv_idx in range(len(legacy_cache[layer_idx])):\n-                    # TODO: @raushan, please look into this for new cache format\n-                    if legacy_cache[layer_idx][kv_idx] != []:\n-                        self.assertTrue(\n-                            torch.allclose(\n-                                legacy_cache[layer_idx][kv_idx],\n-                                new_cache_converted[layer_idx][kv_idx],\n-                            )\n-                        )\n-\n-            new_cache = new_results.past_key_values\n-            legacy_cache_converted = cache_cls.from_legacy_cache(legacy_results.past_key_values)\n-            for layer_idx in range(len(new_cache)):\n-                for kv_idx in range(len(new_cache[layer_idx])):\n-                    # TODO: @raushan, please look into this for new cache format\n-                    if new_cache[layer_idx][kv_idx] != []:\n-                        self.assertTrue(\n-                            torch.allclose(\n-                                new_cache[layer_idx][kv_idx],\n-                                legacy_cache_converted[layer_idx][kv_idx],\n-                            )\n-                        )\n-\n     @parameterized.expand([(\"offloaded\",)])  # (\"offloaded_static\",) TODO: @raushan fixme in some models (eg T5)\n     @require_torch_gpu\n     @pytest.mark.generate\n@@ -2438,11 +2369,11 @@ def _check_encoder_hidden_states_for_generate(self, hidden_states, batch_size, c\n         )\n \n     def _check_past_key_values_for_generate(self, batch_size, past_key_values, seq_length, config, num_beam_groups=1):\n-        self.assertIsInstance(past_key_values, tuple)\n-        self.assertListEqual(\n-            [isinstance(iter_past_key_values, tuple) for iter_past_key_values in past_key_values],\n-            [True] * len(past_key_values),\n-        )\n+        self.assertIsInstance(past_key_values, (tuple, Cache))\n+\n+        # Encoder-decoder models: pull and verify the decoder cache\n+        if isinstance(past_key_values, EncoderDecoderCache):\n+            past_key_values = past_key_values.self_attention_cache\n \n         # (batch, head, seq_length, head_features)\n         expected_shape = (\n@@ -2451,15 +2382,32 @@ def _check_past_key_values_for_generate(self, batch_size, past_key_values, seq_l\n             seq_length,\n             config.hidden_size // config.num_attention_heads,\n         )\n-        # check shape key, value\n-        self.assertListEqual(\n-            [layer_past_key_values[0].shape for layer_past_key_values in past_key_values],\n-            [expected_shape] * len(past_key_values),\n-        )\n-        self.assertListEqual(\n-            [layer_past_key_values[1].shape for layer_past_key_values in past_key_values],\n-            [expected_shape] * len(past_key_values),\n-        )\n+\n+        if isinstance(past_key_values, Cache):\n+            self.assertListEqual(\n+                [key_tensor.shape for key_tensor in past_key_values.key_cache],\n+                [expected_shape] * len(past_key_values.key_cache),\n+            )\n+            self.assertListEqual(\n+                [value_tensor.shape for value_tensor in past_key_values.value_cache],\n+                [expected_shape] * len(past_key_values.value_cache),\n+            )\n+\n+        # Legacy cache format checks. This branch should be removed when all models use `Cache` by default\n+        else:\n+            self.assertListEqual(\n+                [isinstance(iter_past_key_values, tuple) for iter_past_key_values in past_key_values],\n+                [True] * len(past_key_values),\n+            )\n+            # check shape key, value\n+            self.assertListEqual(\n+                [layer_past_key_values[0].shape for layer_past_key_values in past_key_values],\n+                [expected_shape] * len(past_key_values),\n+            )\n+            self.assertListEqual(\n+                [layer_past_key_values[1].shape for layer_past_key_values in past_key_values],\n+                [expected_shape] * len(past_key_values),\n+            )\n \n     def _check_sequence_inside_sequence(self, tensor_1, tensor_2):\n         # check if tensor_1 inside tensor_2 or tensor_2 inside tensor_1."
+        },
+        {
+            "sha": "ead68f1f2b0d5a97d082399556b711e47cc0165c",
+            "filename": "tests/models/aria/test_modeling_aria.py",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 12,
+            "changes": 12,
+            "blob_url": "https://github.com/huggingface/transformers/blob/94af1c0aa242d60faa8e69acf3391b1e4fd0d4bc/tests%2Fmodels%2Faria%2Ftest_modeling_aria.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/94af1c0aa242d60faa8e69acf3391b1e4fd0d4bc/tests%2Fmodels%2Faria%2Ftest_modeling_aria.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Faria%2Ftest_modeling_aria.py?ref=94af1c0aa242d60faa8e69acf3391b1e4fd0d4bc",
+            "patch": "@@ -268,18 +268,6 @@ def test_sdpa_can_compile_dynamic(self):\n     def test_sdpa_can_dispatch_on_flash(self):\n         pass\n \n-    @unittest.skip(reason=\"\")\n-    def test_new_cache_format_0(self):\n-        pass\n-\n-    @unittest.skip(reason=\"\")\n-    def test_new_cache_format_1(self):\n-        pass\n-\n-    @unittest.skip(reason=\"\")\n-    def test_new_cache_format_2(self):\n-        pass\n-\n     @unittest.skip(reason=\"Feedforward chunking is not yet supported\")\n     def test_feed_forward_chunking(self):\n         pass"
+        },
+        {
+            "sha": "9356824dabda590132e3a974c6b61d297279d31e",
+            "filename": "tests/models/bamba/test_modeling_bamba.py",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 6,
+            "changes": 6,
+            "blob_url": "https://github.com/huggingface/transformers/blob/94af1c0aa242d60faa8e69acf3391b1e4fd0d4bc/tests%2Fmodels%2Fbamba%2Ftest_modeling_bamba.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/94af1c0aa242d60faa8e69acf3391b1e4fd0d4bc/tests%2Fmodels%2Fbamba%2Ftest_modeling_bamba.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fbamba%2Ftest_modeling_bamba.py?ref=94af1c0aa242d60faa8e69acf3391b1e4fd0d4bc",
+            "patch": "@@ -18,7 +18,6 @@\n import unittest\n \n import pytest\n-from parameterized import parameterized\n \n from transformers import AutoTokenizer, BambaConfig, is_torch_available\n from transformers.testing_utils import (\n@@ -395,11 +394,6 @@ def test_attention_outputs(self):\n                 [self.model_tester.num_attention_heads, encoder_seq_length, encoder_key_length],\n             )\n \n-    @unittest.skip(reason=\"Bamba has its own special cache type\")\n-    @parameterized.expand([(1, False), (1, True), (4, False)])\n-    def test_new_cache_format(self, num_beams, do_sample):\n-        pass\n-\n     def test_batching_equivalence(self):\n         # need to disable the tril input mask\n         orig = self.model_tester.use_input_mask"
+        },
+        {
+            "sha": "55da9e5eea18d616d9494436d8fc8447d1c50c26",
+            "filename": "tests/models/cohere2/test_modeling_cohere2.py",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 5,
+            "changes": 5,
+            "blob_url": "https://github.com/huggingface/transformers/blob/94af1c0aa242d60faa8e69acf3391b1e4fd0d4bc/tests%2Fmodels%2Fcohere2%2Ftest_modeling_cohere2.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/94af1c0aa242d60faa8e69acf3391b1e4fd0d4bc/tests%2Fmodels%2Fcohere2%2Ftest_modeling_cohere2.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fcohere2%2Ftest_modeling_cohere2.py?ref=94af1c0aa242d60faa8e69acf3391b1e4fd0d4bc",
+            "patch": "@@ -103,11 +103,6 @@ def test_assisted_decoding_sample(self):\n     def test_dola_decoding_sample(self):\n         pass\n \n-    @parameterized.expand([(1, False), (1, True), (4, False)])\n-    @unittest.skip(\"Cohere2 has HybridCache and doesn't support old tuple format at all\")\n-    def test_new_cache_format(self, num_beams, do_sample):\n-        pass\n-\n     @unittest.skip(\"Cohere2 has HybridCache and doesn't support continue from past kv\")\n     def test_generate_continue_from_past_key_values(self):\n         pass"
+        },
+        {
+            "sha": "57c6331c8beb13f61061b5c5ab68852676785daf",
+            "filename": "tests/models/gemma2/test_modeling_gemma2.py",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 5,
+            "changes": 5,
+            "blob_url": "https://github.com/huggingface/transformers/blob/94af1c0aa242d60faa8e69acf3391b1e4fd0d4bc/tests%2Fmodels%2Fgemma2%2Ftest_modeling_gemma2.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/94af1c0aa242d60faa8e69acf3391b1e4fd0d4bc/tests%2Fmodels%2Fgemma2%2Ftest_modeling_gemma2.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fgemma2%2Ftest_modeling_gemma2.py?ref=94af1c0aa242d60faa8e69acf3391b1e4fd0d4bc",
+            "patch": "@@ -117,11 +117,6 @@ def test_assisted_decoding_sample(self):\n     def test_dola_decoding_sample(self):\n         pass\n \n-    @parameterized.expand([(1, False), (1, True), (4, False)])\n-    @unittest.skip(\"Gemma2 has HybridCache and doesn't support old tuple format at all\")\n-    def test_new_cache_format(self, num_beams, do_sample):\n-        pass\n-\n     @unittest.skip(\"Gemma2 has HybridCache and doesn't support continue from past kv\")\n     def test_generate_continue_from_past_key_values(self):\n         pass"
+        },
+        {
+            "sha": "2f284763e08ae880afd98973c639f1bf84ac0f93",
+            "filename": "tests/models/jamba/test_modeling_jamba.py",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 6,
+            "changes": 6,
+            "blob_url": "https://github.com/huggingface/transformers/blob/94af1c0aa242d60faa8e69acf3391b1e4fd0d4bc/tests%2Fmodels%2Fjamba%2Ftest_modeling_jamba.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/94af1c0aa242d60faa8e69acf3391b1e4fd0d4bc/tests%2Fmodels%2Fjamba%2Ftest_modeling_jamba.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fjamba%2Ftest_modeling_jamba.py?ref=94af1c0aa242d60faa8e69acf3391b1e4fd0d4bc",
+            "patch": "@@ -19,7 +19,6 @@\n import unittest\n \n import pytest\n-from parameterized import parameterized\n \n from transformers import AutoTokenizer, JambaConfig, is_torch_available\n from transformers.testing_utils import (\n@@ -550,11 +549,6 @@ def test_flash_attn_2_inference_equivalence_right_padding(self):\n         \"\"\"\n         self.skipTest(reason=\"Jamba flash attention does not support right padding\")\n \n-    @unittest.skip(reason=\"Jamba has its own special cache type\")\n-    @parameterized.expand([(1, False), (1, True), (4, False)])\n-    def test_new_cache_format(self, num_beams, do_sample):\n-        pass\n-\n \n @require_torch\n class JambaModelIntegrationTest(unittest.TestCase):"
+        },
+        {
+            "sha": "ba7dc5377c861f92be9fd970c996e42e15379b13",
+            "filename": "tests/models/jetmoe/test_modeling_jetmoe.py",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 5,
+            "changes": 5,
+            "blob_url": "https://github.com/huggingface/transformers/blob/94af1c0aa242d60faa8e69acf3391b1e4fd0d4bc/tests%2Fmodels%2Fjetmoe%2Ftest_modeling_jetmoe.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/94af1c0aa242d60faa8e69acf3391b1e4fd0d4bc/tests%2Fmodels%2Fjetmoe%2Ftest_modeling_jetmoe.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fjetmoe%2Ftest_modeling_jetmoe.py?ref=94af1c0aa242d60faa8e69acf3391b1e4fd0d4bc",
+            "patch": "@@ -18,7 +18,6 @@\n import unittest\n \n import pytest\n-from parameterized import parameterized\n \n from transformers import AutoTokenizer, JetMoeConfig, is_torch_available\n from transformers.testing_utils import (\n@@ -299,10 +298,6 @@ class JetMoeModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMix\n     test_disk_offload_bin = False\n     test_disk_offload_safetensors = False\n \n-    @parameterized.expand([(1, False), (1, True), (4, False)])\n-    def test_new_cache_format(self, num_beams, do_sample):\n-        pass\n-\n     def setUp(self):\n         self.model_tester = JetMoeModelTester(self)\n         self.config_tester = ConfigTester("
+        },
+        {
+            "sha": "fc2d94c75078e7cbf5e1325f0b93822556eb4ad8",
+            "filename": "tests/models/zamba/test_modeling_zamba.py",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 6,
+            "changes": 6,
+            "blob_url": "https://github.com/huggingface/transformers/blob/94af1c0aa242d60faa8e69acf3391b1e4fd0d4bc/tests%2Fmodels%2Fzamba%2Ftest_modeling_zamba.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/94af1c0aa242d60faa8e69acf3391b1e4fd0d4bc/tests%2Fmodels%2Fzamba%2Ftest_modeling_zamba.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fzamba%2Ftest_modeling_zamba.py?ref=94af1c0aa242d60faa8e69acf3391b1e4fd0d4bc",
+            "patch": "@@ -19,7 +19,6 @@\n import unittest\n \n import pytest\n-from parameterized import parameterized\n \n from transformers import AutoTokenizer, ZambaConfig, is_torch_available\n from transformers.testing_utils import (\n@@ -551,11 +550,6 @@ def test_flash_attn_2_inference_equivalence_right_padding(self):\n         \"\"\"\n         self.skipTest(reason=\"Zamba flash attention does not support right padding\")\n \n-    @unittest.skip(reason=\"Zamba has its own special cache type\")\n-    @parameterized.expand([(1, False), (1, True), (4, False)])\n-    def test_new_cache_format(self, num_beams, do_sample):\n-        pass\n-\n \n @require_torch\n class ZambaModelIntegrationTest(unittest.TestCase):"
+        }
+    ],
+    "stats": {
+        "total": 192,
+        "additions": 36,
+        "deletions": 156
+    }
+}

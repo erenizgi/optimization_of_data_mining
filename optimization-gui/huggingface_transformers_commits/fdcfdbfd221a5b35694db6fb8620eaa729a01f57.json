@@ -1,0 +1,36 @@
+{
+    "author": "andrewor14",
+    "message": "Fix TorchAoConfig not JSON serializable (#36206)\n\n**Summary:** TorchAoConfig optionally contains a\r\n`torchao.dtypes.Layout` object which is a dataclass and not\r\nJSON serializable, and so the following fails:\r\n\r\n```\r\nimport json\r\nfrom torchao.dtypes import TensorCoreTiledLayout\r\nfrom transformers import TorchAoConfig\r\n\r\nconfig = TorchAoConfig(\"int4_weight_only\", layout=TensorCoreTiledLayout())\r\n\r\nconfig.to_json_string()\r\n\r\njson.dumps(config.to_dict())\r\n```\r\n\r\nThis also causes `quantized_model.save_pretrained(...)` to\r\nfail because the first step of this call is to JSON serialize\r\nthe config. Fixes https://github.com/pytorch/ao/issues/1704.\r\n\r\n**Test Plan:**\r\npython tests/quantization/torchao_integration/test_torchao.py -k test_json_serializable\r\n\r\nCo-authored-by: Mohamed Mekkouri <93391238+MekkCyber@users.noreply.github.com>\r\nCo-authored-by: Marc Sun <57196510+SunMarc@users.noreply.github.com>",
+    "sha": "fdcfdbfd221a5b35694db6fb8620eaa729a01f57",
+    "files": [
+        {
+            "sha": "3fafca29b9c38e6398edae7c4649e0d58c5cdacc",
+            "filename": "src/transformers/utils/quantization_config.py",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 0,
+            "changes": 16,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fdcfdbfd221a5b35694db6fb8620eaa729a01f57/src%2Ftransformers%2Futils%2Fquantization_config.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fdcfdbfd221a5b35694db6fb8620eaa729a01f57/src%2Ftransformers%2Futils%2Fquantization_config.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Futils%2Fquantization_config.py?ref=fdcfdbfd221a5b35694db6fb8620eaa729a01f57",
+            "patch": "@@ -15,6 +15,7 @@\n # See the License for the specific language governing permissions and\n # limitations under the License.\n import copy\n+import dataclasses\n import importlib.metadata\n import json\n import os\n@@ -1539,6 +1540,21 @@ def __repr__(self):\n         config_dict = self.to_dict()\n         return f\"{self.__class__.__name__} {json.dumps(config_dict, indent=2, sort_keys=True)}\\n\"\n \n+    def to_dict(self) -> Dict[str, Any]:\n+        \"\"\"\n+        Serializes this instance to a Python dictionary, converting any `torchao.dtypes.Layout`\n+        dataclasses to simple dicts.\n+\n+        Returns:\n+            `Dict[str, Any]`: Dictionary of all the attributes that make up this configuration instance.\n+        \"\"\"\n+        d = super().to_dict()\n+        if \"quant_type_kwargs\" in d and \"layout\" in d[\"quant_type_kwargs\"]:\n+            layout = d[\"quant_type_kwargs\"][\"layout\"]\n+            layout = dataclasses.asdict(layout)\n+            d[\"quant_type_kwargs\"][\"layout\"] = layout\n+        return d\n+\n \n @dataclass\n class BitNetConfig(QuantizationConfigMixin):"
+        },
+        {
+            "sha": "1708550cf02bb0d1453bdc4521c66d5f70560587",
+            "filename": "tests/quantization/torchao_integration/test_torchao.py",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 3,
+            "changes": 18,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fdcfdbfd221a5b35694db6fb8620eaa729a01f57/tests%2Fquantization%2Ftorchao_integration%2Ftest_torchao.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fdcfdbfd221a5b35694db6fb8620eaa729a01f57/tests%2Fquantization%2Ftorchao_integration%2Ftest_torchao.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fquantization%2Ftorchao_integration%2Ftest_torchao.py?ref=fdcfdbfd221a5b35694db6fb8620eaa729a01f57",
+            "patch": "@@ -31,16 +31,18 @@\n     import torch\n \n if is_torchao_available():\n-    from torchao.dtypes import AffineQuantizedTensor\n-    from torchao.dtypes.affine_quantized_tensor import TensorCoreTiledLayoutType\n+    from torchao.dtypes import (\n+        AffineQuantizedTensor,\n+        TensorCoreTiledLayout,\n+    )\n \n \n def check_torchao_quantized(test_module, qlayer, batch_size=1, context_size=1024):\n     weight = qlayer.weight\n     test_module.assertTrue(isinstance(weight, AffineQuantizedTensor))\n     test_module.assertEqual(weight.quant_min, 0)\n     test_module.assertEqual(weight.quant_max, 15)\n-    test_module.assertTrue(isinstance(weight.layout_type, TensorCoreTiledLayoutType))\n+    test_module.assertTrue(isinstance(weight.layout, TensorCoreTiledLayout))\n \n \n def check_forward(test_module, model, batch_size=1, context_size=1024):\n@@ -82,6 +84,16 @@ def test_repr(self):\n         quantization_config = TorchAoConfig(\"int4_weight_only\", modules_to_not_convert=[\"conv\"], group_size=8)\n         repr(quantization_config)\n \n+    def test_json_serializable(self):\n+        \"\"\"\n+        Check that the config dict can be JSON serialized.\n+        \"\"\"\n+        quantization_config = TorchAoConfig(\"int4_weight_only\", group_size=32, layout=TensorCoreTiledLayout())\n+        d = quantization_config.to_dict()\n+        self.assertIsInstance(d[\"quant_type_kwargs\"][\"layout\"], dict)\n+        self.assertTrue(\"inner_k_tiles\" in d[\"quant_type_kwargs\"][\"layout\"])\n+        quantization_config.to_json_string(use_diff=False)\n+\n \n @require_torch_gpu\n @require_torchao"
+        }
+    ],
+    "stats": {
+        "total": 34,
+        "additions": 31,
+        "deletions": 3
+    }
+}

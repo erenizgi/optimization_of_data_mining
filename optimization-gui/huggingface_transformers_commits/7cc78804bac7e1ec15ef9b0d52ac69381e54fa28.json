@@ -1,0 +1,36 @@
+{
+    "author": "psandovalsegura",
+    "message": "🚨🚨🚨 Fix forward of Dinov2ForImageClassification for models with registers (#37836)\n\n* add num_tokens_to_discard to the forward of Dinov2ForImageClassification\n\n* redefine forward in modular file, remove change to modeling_dinov2 file\n\n* run make fixup\n\n---------\n\nCo-authored-by: Pavel Iakubovskii <qubvel@gmail.com>",
+    "sha": "7cc78804bac7e1ec15ef9b0d52ac69381e54fa28",
+    "files": [
+        {
+            "sha": "4851d16ac899183c04677bc3c920c42d2b1383ce",
+            "filename": "src/transformers/models/dinov2_with_registers/modeling_dinov2_with_registers.py",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/huggingface/transformers/blob/7cc78804bac7e1ec15ef9b0d52ac69381e54fa28/src%2Ftransformers%2Fmodels%2Fdinov2_with_registers%2Fmodeling_dinov2_with_registers.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/7cc78804bac7e1ec15ef9b0d52ac69381e54fa28/src%2Ftransformers%2Fmodels%2Fdinov2_with_registers%2Fmodeling_dinov2_with_registers.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fdinov2_with_registers%2Fmodeling_dinov2_with_registers.py?ref=7cc78804bac7e1ec15ef9b0d52ac69381e54fa28",
+            "patch": "@@ -773,7 +773,8 @@ def forward(\n         sequence_output = outputs[0]  # batch_size, sequence_length, hidden_size\n \n         cls_token = sequence_output[:, 0]\n-        patch_tokens = sequence_output[:, 1:]\n+        # cls and register tokens should not be included in patch tokens variable\n+        patch_tokens = sequence_output[:, 1 + self.config.num_register_tokens :]\n \n         linear_input = torch.cat([cls_token, patch_tokens.mean(dim=1)], dim=1)\n "
+        },
+        {
+            "sha": "4ab7521f09fa6394fd1f4c03ede1f383b82e32e7",
+            "filename": "src/transformers/models/dinov2_with_registers/modular_dinov2_with_registers.py",
+            "status": "modified",
+            "additions": 72,
+            "deletions": 2,
+            "changes": 74,
+            "blob_url": "https://github.com/huggingface/transformers/blob/7cc78804bac7e1ec15ef9b0d52ac69381e54fa28/src%2Ftransformers%2Fmodels%2Fdinov2_with_registers%2Fmodular_dinov2_with_registers.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/7cc78804bac7e1ec15ef9b0d52ac69381e54fa28/src%2Ftransformers%2Fmodels%2Fdinov2_with_registers%2Fmodular_dinov2_with_registers.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fdinov2_with_registers%2Fmodular_dinov2_with_registers.py?ref=7cc78804bac7e1ec15ef9b0d52ac69381e54fa28",
+            "patch": "@@ -19,6 +19,7 @@\n import torch\n import torch.utils.checkpoint\n from torch import nn\n+from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss\n \n from ....transformers.models.dinov2.modeling_dinov2 import (\n     Dinov2Backbone,\n@@ -29,7 +30,7 @@\n     Dinov2PreTrainedModel,\n )\n from ...configuration_utils import PretrainedConfig\n-from ...modeling_outputs import BackboneOutput\n+from ...modeling_outputs import BackboneOutput, ImageClassifierOutput\n from ...utils import logging, torch_int\n from ...utils.backbone_utils import BackboneConfigMixin, get_aligned_output_features_output_indices\n \n@@ -314,7 +315,76 @@ class Dinov2WithRegistersModel(Dinov2Model):\n \n \n class Dinov2WithRegistersForImageClassification(Dinov2ForImageClassification):\n-    pass\n+    def forward(\n+        self,\n+        pixel_values: Optional[torch.Tensor] = None,\n+        head_mask: Optional[torch.Tensor] = None,\n+        labels: Optional[torch.Tensor] = None,\n+        output_attentions: Optional[bool] = None,\n+        output_hidden_states: Optional[bool] = None,\n+        return_dict: Optional[bool] = None,\n+    ) -> Union[tuple, ImageClassifierOutput]:\n+        r\"\"\"\n+        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):\n+            Labels for computing the image classification/regression loss. Indices should be in `[0, ...,\n+            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If\n+            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).\n+        \"\"\"\n+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict\n+\n+        outputs = self.dinov2_with_registers(\n+            pixel_values,\n+            head_mask=head_mask,\n+            output_attentions=output_attentions,\n+            output_hidden_states=output_hidden_states,\n+            return_dict=return_dict,\n+        )\n+\n+        sequence_output = outputs[0]  # batch_size, sequence_length, hidden_size\n+\n+        cls_token = sequence_output[:, 0]\n+        # cls and register tokens should not be included in patch tokens variable\n+        patch_tokens = sequence_output[:, 1 + self.config.num_register_tokens :]\n+\n+        linear_input = torch.cat([cls_token, patch_tokens.mean(dim=1)], dim=1)\n+\n+        logits = self.classifier(linear_input)\n+\n+        loss = None\n+        if labels is not None:\n+            # move labels to correct device to enable model parallelism\n+            labels = labels.to(logits.device)\n+            if self.config.problem_type is None:\n+                if self.num_labels == 1:\n+                    self.config.problem_type = \"regression\"\n+                elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):\n+                    self.config.problem_type = \"single_label_classification\"\n+                else:\n+                    self.config.problem_type = \"multi_label_classification\"\n+\n+            if self.config.problem_type == \"regression\":\n+                loss_fct = MSELoss()\n+                if self.num_labels == 1:\n+                    loss = loss_fct(logits.squeeze(), labels.squeeze())\n+                else:\n+                    loss = loss_fct(logits, labels)\n+            elif self.config.problem_type == \"single_label_classification\":\n+                loss_fct = CrossEntropyLoss()\n+                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))\n+            elif self.config.problem_type == \"multi_label_classification\":\n+                loss_fct = BCEWithLogitsLoss()\n+                loss = loss_fct(logits, labels)\n+\n+        if not return_dict:\n+            output = (logits,) + outputs[2:]\n+            return ((loss,) + output) if loss is not None else output\n+\n+        return ImageClassifierOutput(\n+            loss=loss,\n+            logits=logits,\n+            hidden_states=outputs.hidden_states,\n+            attentions=outputs.attentions,\n+        )\n \n \n class Dinov2WithRegistersBackbone(Dinov2Backbone):"
+        }
+    ],
+    "stats": {
+        "total": 77,
+        "additions": 74,
+        "deletions": 3
+    }
+}

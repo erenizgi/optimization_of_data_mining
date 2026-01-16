@@ -1,0 +1,72 @@
+{
+    "author": "ShaunSHamilton",
+    "message": "feat(api): add user id to user report (#59816)",
+    "sha": "6478bea038ca4875c25679d5135026488b82265a",
+    "files": [
+        {
+            "sha": "0ee036d8e1227903a89f937b98dde0495af6bd53",
+            "filename": "api/src/routes/protected/user.test.ts",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 12,
+            "changes": 22,
+            "blob_url": "https://github.com/freeCodeCamp/freeCodeCamp/blob/6478bea038ca4875c25679d5135026488b82265a/api%2Fsrc%2Froutes%2Fprotected%2Fuser.test.ts",
+            "raw_url": "https://github.com/freeCodeCamp/freeCodeCamp/raw/6478bea038ca4875c25679d5135026488b82265a/api%2Fsrc%2Froutes%2Fprotected%2Fuser.test.ts",
+            "contents_url": "https://api.github.com/repos/freeCodeCamp/freeCodeCamp/contents/api%2Fsrc%2Froutes%2Fprotected%2Fuser.test.ts?ref=6478bea038ca4875c25679d5135026488b82265a",
+            "patch": "@@ -13,7 +13,8 @@ import {\n   devLogin,\n   setupServer,\n   superRequest,\n-  createSuperRequest\n+  createSuperRequest,\n+  defaultUsername\n } from '../../../jest.utils';\n import { JWT_SECRET } from '../../utils/env';\n import {\n@@ -802,29 +803,25 @@ describe('userRoutes', () => {\n           reportDescription: 'Test Report'\n         });\n \n-        expect(response.statusCode).toBe(400);\n+        expect(response.statusCode).toBe(404);\n         expect(response.body).toStrictEqual({\n           type: 'danger',\n-          message: 'flash.provide-username'\n+          message: 'flash.report-error'\n         });\n       });\n \n       test('POST returns 400 for empty report', async () => {\n         const response = await superPost('/user/report-user').send({\n-          username: 'darth-vader',\n+          username: testUserData.username,\n           reportDescription: ''\n         });\n \n         expect(response.statusCode).toBe(400);\n-        expect(response.body).toStrictEqual({\n-          type: 'danger',\n-          message: 'flash.provide-username'\n-        });\n       });\n \n       test('POST sanitises report description', async () => {\n         await superPost('/user/report-user').send({\n-          username: 'darth-vader',\n+          username: defaultUsername,\n           reportDescription:\n             '<script>const breath = \"loud\"</script>Luke, I am your father'\n         });\n@@ -846,7 +843,7 @@ describe('userRoutes', () => {\n           }\n         );\n         const response = await superPost('/user/report-user').send({\n-          username: 'darth-vader',\n+          username: testUser.username,\n           reportDescription: 'Luke, I am your father'\n         });\n \n@@ -855,18 +852,19 @@ describe('userRoutes', () => {\n           from: 'team@freecodecamp.org',\n           to: 'support@freecodecamp.org',\n           cc: 'foo@bar.com',\n-          subject: \"Abuse Report : Reporting darth-vader's profile.\",\n+          subject: `Abuse Report : Reporting ${testUser.username}'s profile.`,\n           text: `\n Hello Team,\n \n-This is to report the profile of darth-vader.\n+This is to report the profile of ${testUser.username}. ID: ${defaultUserId}.\n \n Report Details:\n \n Luke, I am your father\n \n \n Reported by:\n+ID: ${testUser.id}\n Username: ${testUser.username}\n Name:\n Email: foo@bar.com"
+        },
+        {
+            "sha": "c783599e9b55d0199f715b87cc3bdbd122da023a",
+            "filename": "api/src/routes/protected/user.ts",
+            "status": "modified",
+            "additions": 31,
+            "deletions": 7,
+            "changes": 38,
+            "blob_url": "https://github.com/freeCodeCamp/freeCodeCamp/blob/6478bea038ca4875c25679d5135026488b82265a/api%2Fsrc%2Froutes%2Fprotected%2Fuser.ts",
+            "raw_url": "https://github.com/freeCodeCamp/freeCodeCamp/raw/6478bea038ca4875c25679d5135026488b82265a/api%2Fsrc%2Froutes%2Fprotected%2Fuser.ts",
+            "contents_url": "https://api.github.com/repos/freeCodeCamp/freeCodeCamp/contents/api%2Fsrc%2Froutes%2Fprotected%2Fuser.ts?ref=6478bea038ca4875c25679d5135026488b82265a",
+            "patch": "@@ -19,7 +19,7 @@ import {\n   normalizeTwitter,\n   removeNulls\n } from '../../utils/normalize';\n-import type { UpdateReqType } from '../../utils';\n+import { mapErr, type UpdateReqType } from '../../utils';\n import {\n   getCalendar,\n   getPoints,\n@@ -176,21 +176,45 @@ export const userRoutes: FastifyPluginCallbackTypebox = (\n       });\n       const { username, reportDescription: report } = req.body;\n \n-      if (!username || !report) {\n-        logger.warn('Missing username or reportDescription');\n-        void reply.code(400);\n+      // TODO: `findUnique` once db migration forces unique usernames\n+      const maybeReportedUsers = await mapErr(\n+        fastify.prisma.user.findMany({\n+          where: { username }\n+        })\n+      );\n+\n+      if (maybeReportedUsers.hasError) {\n+        logger.error(\n+          { error: maybeReportedUsers.error, username },\n+          'Error finding reported user.'\n+        );\n+        fastify.Sentry.captureException(maybeReportedUsers.error);\n+        void reply.code(500);\n+        return {\n+          type: 'danger',\n+          message: 'flash.generic-error'\n+        } as const;\n+      }\n+\n+      const reportedUsers = maybeReportedUsers.data;\n+\n+      if (reportedUsers.length !== 1) {\n+        logger.warn({ username }, 'Reported user not found');\n+        void reply.code(404);\n         return {\n           type: 'danger',\n-          message: 'flash.provide-username'\n+          message: 'flash.report-error'\n         } as const;\n       }\n \n+      const reportedUser = reportedUsers[0]!;\n+\n       await fastify.sendEmail({\n         from: 'team@freecodecamp.org',\n         to: 'support@freecodecamp.org',\n         cc: user.email,\n-        subject: `Abuse Report : Reporting ${username}'s profile.`,\n-        text: generateReportEmail(user, username, report)\n+        subject: `Abuse Report : Reporting ${reportedUser.username}'s profile.`,\n+        text: generateReportEmail(user, reportedUser, report)\n       });\n \n       return {"
+        },
+        {
+            "sha": "4c62198ebff480556670285adf73b2c656cf65d3",
+            "filename": "api/src/schemas/user/report-user.ts",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 4,
+            "changes": 8,
+            "blob_url": "https://github.com/freeCodeCamp/freeCodeCamp/blob/6478bea038ca4875c25679d5135026488b82265a/api%2Fsrc%2Fschemas%2Fuser%2Freport-user.ts",
+            "raw_url": "https://github.com/freeCodeCamp/freeCodeCamp/raw/6478bea038ca4875c25679d5135026488b82265a/api%2Fsrc%2Fschemas%2Fuser%2Freport-user.ts",
+            "contents_url": "https://api.github.com/repos/freeCodeCamp/freeCodeCamp/contents/api%2Fsrc%2Fschemas%2Fuser%2Freport-user.ts?ref=6478bea038ca4875c25679d5135026488b82265a",
+            "patch": "@@ -4,7 +4,7 @@ import { genericError } from '../types';\n export const reportUser = {\n   body: Type.Object({\n     username: Type.String(),\n-    reportDescription: Type.String()\n+    reportDescription: Type.String({ minLength: 1 })\n   }),\n   response: {\n     200: Type.Object({\n@@ -14,10 +14,10 @@ export const reportUser = {\n         email: Type.String()\n       })\n     }),\n-    400: Type.Object({\n+    404: Type.Object({\n       type: Type.Literal('danger'),\n-      message: Type.Literal('flash.provide-username')\n+      message: Type.Literal('flash.report-error')\n     }),\n-    default: genericError\n+    500: genericError\n   }\n };"
+        },
+        {
+            "sha": "20f502b75c1d596addaa3c6e68bd49d5a0235a62",
+            "filename": "api/src/utils/email-templates.ts",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 3,
+            "changes": 7,
+            "blob_url": "https://github.com/freeCodeCamp/freeCodeCamp/blob/6478bea038ca4875c25679d5135026488b82265a/api%2Fsrc%2Futils%2Femail-templates.ts",
+            "raw_url": "https://github.com/freeCodeCamp/freeCodeCamp/raw/6478bea038ca4875c25679d5135026488b82265a/api%2Fsrc%2Futils%2Femail-templates.ts",
+            "contents_url": "https://api.github.com/repos/freeCodeCamp/freeCodeCamp/contents/api%2Fsrc%2Futils%2Femail-templates.ts?ref=6478bea038ca4875c25679d5135026488b82265a",
+            "patch": "@@ -9,24 +9,25 @@ import { user } from '@prisma/client';\n  */\n export const generateReportEmail = (\n   reporter: user,\n-  abuser: string,\n+  abuser: user,\n   reportDesc: string\n ) => {\n   return `\n Hello Team,\n \n-This is to report the profile of ${abuser}.\n+This is to report the profile of ${abuser.username}. ID: ${abuser.id}.\n \n Report Details:\n \n ${reportDesc}\n \n \n Reported by:\n+ID: ${reporter.id}\n Username: ${reporter.username}\n Name:${reporter.name ? ' ' + reporter.name : ''}\n Email: ${reporter.email}\n \n Thanks and regards,\n-${reporter.name ?? ''}`;\n+${reporter.name ?? reporter.username}`;\n };"
+        },
+        {
+            "sha": "d9dd18c2df19540baf6b01c424362b2e9349a00b",
+            "filename": "client/i18n/locales/english/translations.json",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/freeCodeCamp/freeCodeCamp/blob/6478bea038ca4875c25679d5135026488b82265a/client%2Fi18n%2Flocales%2Fenglish%2Ftranslations.json",
+            "raw_url": "https://github.com/freeCodeCamp/freeCodeCamp/raw/6478bea038ca4875c25679d5135026488b82265a/client%2Fi18n%2Flocales%2Fenglish%2Ftranslations.json",
+            "contents_url": "https://api.github.com/repos/freeCodeCamp/freeCodeCamp/contents/client%2Fi18n%2Flocales%2Fenglish%2Ftranslations.json?ref=6478bea038ca4875c25679d5135026488b82265a",
+            "patch": "@@ -905,6 +905,7 @@\n     \"unlink-success\": \"You've successfully unlinked your {{website}}\",\n     \"provide-username\": \"Check if you have provided a username and a report\",\n     \"report-sent\": \"A report was sent to the team with {{email}} in copy\",\n+    \"report-error\": \"Unable to report this user at this time.\",\n     \"certificate-missing\": \"The certification you tried to view does not exist\",\n     \"create-token-err\": \"An error occurred while creating your user token\",\n     \"delete-token-err\": \"An error occurred while deleting your user token\","
+        }
+    ],
+    "stats": {
+        "total": 76,
+        "additions": 50,
+        "deletions": 26
+    }
+}

@@ -1,0 +1,60 @@
+{
+    "author": "lukesandberg",
+    "message": "[turbopack] Create a macro rcstr! for constructing RcStr from string literals. (#79759)\n\n## Add `rcstr!` macro for efficient string literal handling\n\n### What?\n\nThis PR introduces a new `rcstr!` macro that creates `RcStr` instances from string literals, optimizing for inline storage when possible and using `LazyLock` for longer strings.\n\n### Why?\n\nThe `rcstr!` macro provides several benefits:\n- Allows compile-time evaluation of inline strings\n- Caches longer strings using `LazyLock` to avoid repeated allocations",
+    "sha": "f1899f34876575addb3fee1c254c3f3cccf14b3e",
+    "files": [
+        {
+            "sha": "114febf1d94e15a4352205ba78bf203d71d26b18",
+            "filename": "turbopack/crates/turbo-rcstr/benches/mod.rs",
+            "status": "modified",
+            "additions": 19,
+            "deletions": 2,
+            "changes": 21,
+            "blob_url": "https://github.com/vercel/next.js/blob/f1899f34876575addb3fee1c254c3f3cccf14b3e/turbopack%2Fcrates%2Fturbo-rcstr%2Fbenches%2Fmod.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/f1899f34876575addb3fee1c254c3f3cccf14b3e/turbopack%2Fcrates%2Fturbo-rcstr%2Fbenches%2Fmod.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-rcstr%2Fbenches%2Fmod.rs?ref=f1899f34876575addb3fee1c254c3f3cccf14b3e",
+            "patch": "@@ -1,5 +1,5 @@\n use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};\n-use turbo_rcstr::RcStr;\n+use turbo_rcstr::{RcStr, rcstr};\n \n // map has a fast-path if the Arc is uniquely owned\n fn bench_map(c: &mut Criterion) {\n@@ -30,9 +30,26 @@ fn bench_map(c: &mut Criterion) {\n     }\n }\n \n+/// Compare the performance of `from` and `rcstr!`\n+fn bench_construct(c: &mut Criterion) {\n+    let mut g = c.benchmark_group(\"Rcstr::construct\");\n+    g.bench_with_input(\"rcstr!/small\", \"small\", |f, _| {\n+        f.iter(|| rcstr!(\"hello\"));\n+    });\n+    g.bench_with_input(\"rcstr!/large\", \"large\", |f, _| {\n+        f.iter(|| rcstr!(\"this is a long string that will take time to copy\"));\n+    });\n+\n+    g.bench_with_input(\"from/small\", \"small\", |f, _| {\n+        f.iter(|| RcStr::from(\"hello\"));\n+    });\n+    g.bench_with_input(\"from/large\", \"large\", |f, _| {\n+        f.iter(|| RcStr::from(\"this is a long string that will take time to copy\"));\n+    });\n+}\n criterion_group!(\n   name = benches;\n   config = Criterion::default();\n-  targets = bench_map,\n+  targets = bench_map,bench_construct,\n );\n criterion_main!(benches);"
+        },
+        {
+            "sha": "52a182a5d1aa306c10738a5b4f3ac1633d2101b8",
+            "filename": "turbopack/crates/turbo-rcstr/src/dynamic.rs",
+            "status": "modified",
+            "additions": 25,
+            "deletions": 2,
+            "changes": 27,
+            "blob_url": "https://github.com/vercel/next.js/blob/f1899f34876575addb3fee1c254c3f3cccf14b3e/turbopack%2Fcrates%2Fturbo-rcstr%2Fsrc%2Fdynamic.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/f1899f34876575addb3fee1c254c3f3cccf14b3e/turbopack%2Fcrates%2Fturbo-rcstr%2Fsrc%2Fdynamic.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-rcstr%2Fsrc%2Fdynamic.rs?ref=f1899f34876575addb3fee1c254c3f3cccf14b3e",
+            "patch": "@@ -1,9 +1,9 @@\n-use std::ptr::NonNull;\n+use std::{num::NonZeroU8, ptr::NonNull};\n \n use triomphe::Arc;\n \n use crate::{\n-    INLINE_TAG_INIT, LEN_OFFSET, RcStr, TAG_MASK,\n+    INLINE_TAG, INLINE_TAG_INIT, LEN_OFFSET, RcStr, TAG_MASK,\n     tagged_value::{MAX_INLINE_LEN, TaggedValue},\n };\n \n@@ -48,3 +48,26 @@ pub(crate) fn new_atom<T: AsRef<str> + Into<String>>(text: T) -> RcStr {\n         unsafe_data: TaggedValue::new_ptr(ptr),\n     }\n }\n+\n+/// Attempts to construct an RcStr but only if it can be constructed inline.\n+/// This is primarily useful in constant contexts.\n+#[doc(hidden)]\n+pub(crate) const fn inline_atom(text: &str) -> Option<RcStr> {\n+    let len = text.len();\n+    if len < MAX_INLINE_LEN {\n+        let tag = INLINE_TAG | ((len as u8) << LEN_OFFSET);\n+        let mut unsafe_data = TaggedValue::new_tag(NonZeroU8::new(tag).unwrap());\n+\n+        // This odd pattern is needed because we cannot create slices from ranges in constant\n+        // context.\n+        unsafe {\n+            unsafe_data\n+                .data_mut()\n+                .split_at_mut(len)\n+                .0\n+                .copy_from_slice(text.as_bytes());\n+        }\n+        return Some(RcStr { unsafe_data });\n+    }\n+    None\n+}"
+        },
+        {
+            "sha": "4f51b15f246d14dbea5c54907487f95be0b49c89",
+            "filename": "turbopack/crates/turbo-rcstr/src/lib.rs",
+            "status": "modified",
+            "additions": 57,
+            "deletions": 1,
+            "changes": 58,
+            "blob_url": "https://github.com/vercel/next.js/blob/f1899f34876575addb3fee1c254c3f3cccf14b3e/turbopack%2Fcrates%2Fturbo-rcstr%2Fsrc%2Flib.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/f1899f34876575addb3fee1c254c3f3cccf14b3e/turbopack%2Fcrates%2Fturbo-rcstr%2Fsrc%2Flib.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-rcstr%2Fsrc%2Flib.rs?ref=f1899f34876575addb3fee1c254c3f3cccf14b3e",
+            "patch": "@@ -250,7 +250,7 @@ impl Clone for RcStr {\n \n impl Default for RcStr {\n     fn default() -> Self {\n-        RcStr::from(\"\")\n+        rcstr!(\"\")\n     }\n }\n \n@@ -301,6 +301,33 @@ impl Drop for RcStr {\n     }\n }\n \n+#[doc(hidden)]\n+pub const fn inline_atom(s: &str) -> Option<RcStr> {\n+    dynamic::inline_atom(s)\n+}\n+\n+/// Create an rcstr from a string literal.\n+/// allocates the RcStr inline when possible otherwise uses a `LazyLock` to manage the allocation.\n+#[macro_export]\n+macro_rules! rcstr {\n+    ($s:tt) => {{\n+        const INLINE: core::option::Option<$crate::RcStr> = $crate::inline_atom($s);\n+        // this condition should be able to be compile time evaluated and inlined.\n+        if INLINE.is_some() {\n+            INLINE.unwrap()\n+        } else {\n+            #[inline(never)]\n+            fn get_rcstr() -> $crate::RcStr {\n+                static CACHE: std::sync::LazyLock<$crate::RcStr> =\n+                    std::sync::LazyLock::new(|| $crate::RcStr::from($s));\n+\n+                (*CACHE).clone()\n+            }\n+            get_rcstr()\n+        }\n+    }};\n+}\n+\n /// noop\n impl ShrinkToFit for RcStr {\n     #[inline(always)]\n@@ -375,4 +402,33 @@ mod tests {\n         let _ = str.clone().into_owned();\n         assert_eq!(refcount(&str), 1);\n     }\n+\n+    #[test]\n+    fn test_rcstr() {\n+        // Test enough to exceed the small string optimization\n+        assert_eq!(rcstr!(\"\"), RcStr::default());\n+        assert_eq!(rcstr!(\"\"), RcStr::from(\"\"));\n+        assert_eq!(rcstr!(\"a\"), RcStr::from(\"a\"));\n+        assert_eq!(rcstr!(\"ab\"), RcStr::from(\"ab\"));\n+        assert_eq!(rcstr!(\"abc\"), RcStr::from(\"abc\"));\n+        assert_eq!(rcstr!(\"abcd\"), RcStr::from(\"abcd\"));\n+        assert_eq!(rcstr!(\"abcde\"), RcStr::from(\"abcde\"));\n+        assert_eq!(rcstr!(\"abcdef\"), RcStr::from(\"abcdef\"));\n+        assert_eq!(rcstr!(\"abcdefg\"), RcStr::from(\"abcdefg\"));\n+        assert_eq!(rcstr!(\"abcdefgh\"), RcStr::from(\"abcdefgh\"));\n+        assert_eq!(rcstr!(\"abcdefghi\"), RcStr::from(\"abcdefghi\"));\n+    }\n+    #[test]\n+    fn test_inline_atom() {\n+        // This is a silly test, just asserts that we can evaluate this in a constant context.\n+        const STR: RcStr = {\n+            let inline = inline_atom(\"hello\");\n+            if inline.is_some() {\n+                inline.unwrap()\n+            } else {\n+                unreachable!();\n+            }\n+        };\n+        assert_eq!(STR, RcStr::from(\"hello\"));\n+    }\n }"
+        },
+        {
+            "sha": "8d9eb85aba71e521a294119af805c2f370772f43",
+            "filename": "turbopack/crates/turbo-rcstr/src/tagged_value.rs",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/vercel/next.js/blob/f1899f34876575addb3fee1c254c3f3cccf14b3e/turbopack%2Fcrates%2Fturbo-rcstr%2Fsrc%2Ftagged_value.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/f1899f34876575addb3fee1c254c3f3cccf14b3e/turbopack%2Fcrates%2Fturbo-rcstr%2Fsrc%2Ftagged_value.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-rcstr%2Fsrc%2Ftagged_value.rs?ref=f1899f34876575addb3fee1c254c3f3cccf14b3e",
+            "patch": "@@ -72,7 +72,7 @@ impl TaggedValue {\n     }\n \n     #[inline(always)]\n-    pub fn new_tag(value: NonZeroU8) -> Self {\n+    pub const fn new_tag(value: NonZeroU8) -> Self {\n         let value = value.get() as RawTaggedValue;\n         Self {\n             value: unsafe { std::mem::transmute(value) },\n@@ -129,7 +129,7 @@ impl TaggedValue {\n     /// used when setting the untagged slice part of this value. If tag is\n     /// zero and the slice is zeroed out, using this `TaggedValue` will be\n     /// UB!\n-    pub unsafe fn data_mut(&mut self) -> &mut [u8] {\n+    pub const unsafe fn data_mut(&mut self) -> &mut [u8] {\n         let x: *mut _ = &mut self.value;\n         let mut data = x as *mut u8;\n         // All except the lowest byte, which is first in little-endian, last in"
+        }
+    ],
+    "stats": {
+        "total": 110,
+        "additions": 103,
+        "deletions": 7
+    }
+}

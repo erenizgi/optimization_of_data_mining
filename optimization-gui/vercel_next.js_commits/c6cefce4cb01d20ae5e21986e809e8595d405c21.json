@@ -1,0 +1,192 @@
+{
+    "author": "Cy-Tek",
+    "message": "fix(Turbopack): Fix duplicated layout rendering in edge cases (#81948)\n\n## Fix module reference handling in app_structure.rs creating duplicated layouts\n\n### What?\nFixed a bug in the `check_and_update_module_references` function by\nmaking the code always overrides the `not-found`, `unauthorized`, etc\nfiles at the top level group route layer.\n\n### Why?\nThe previous implementation had a bug that when a directory was setup\nlike the added test case where the layouts from a lower directory would\nrender when only the layouts at the level of the not-found page should\nhave rendered.\n\n### How?\n- Added the ability to force overriding of the `module` when running\n`check_and_update_module_references`\n- Split the logic between global and layer-specific modules\n\nFixes #PACK-5081",
+    "sha": "c6cefce4cb01d20ae5e21986e809e8595d405c21",
+    "files": [
+        {
+            "sha": "1d86810ed55211945d52444cb46bcc2db01966f8",
+            "filename": "crates/next-core/src/app_structure.rs",
+            "status": "modified",
+            "additions": 47,
+            "deletions": 9,
+            "changes": 56,
+            "blob_url": "https://github.com/vercel/next.js/blob/c6cefce4cb01d20ae5e21986e809e8595d405c21/crates%2Fnext-core%2Fsrc%2Fapp_structure.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/c6cefce4cb01d20ae5e21986e809e8595d405c21/crates%2Fnext-core%2Fsrc%2Fapp_structure.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/crates%2Fnext-core%2Fsrc%2Fapp_structure.rs?ref=c6cefce4cb01d20ae5e21986e809e8595d405c21",
+            "patch": "@@ -923,18 +923,31 @@ async fn directory_tree_to_loader_tree(\n ///   set.\n /// * `file_path` - The file path to the default page if neither the current module nor the parent\n ///   module is set.\n+/// * `is_first_layer_group_route` - If true, the module will be overridden with the parent module\n+///   if it is not set.\n async fn check_and_update_module_references(\n     app_dir: FileSystemPath,\n     module: &mut Option<FileSystemPath>,\n     parent_module: &mut Option<FileSystemPath>,\n     file_path: &str,\n+    is_first_layer_group_route: bool,\n ) -> Result<()> {\n     match (module.as_mut(), parent_module.as_mut()) {\n+        // If the module is set, update the parent module to the same value\n         (Some(module), _) => *parent_module = Some(module.clone()),\n-        (None, Some(parent_module)) => *module = Some(parent_module.clone()),\n+        // If we are in a first layer group route and we have a parent module, we want to override\n+        // a nonexistent module with the parent module\n+        (None, Some(parent_module)) if is_first_layer_group_route => {\n+            *module = Some(parent_module.clone())\n+        }\n+        // If we are not in a first layer group route, and the module is not set, and the parent\n+        // module is set, we do nothing\n+        (None, Some(_)) => {}\n+        // If the module is not set, and the parent module is not set, we override with the default\n+        // page. This can only happen in the root directory because after this the parent module\n+        // will always be set.\n         (None, None) => {\n-            let default_page = get_next_package(app_dir.clone()).await?.join(file_path)?;\n-\n+            let default_page = get_next_package(app_dir).await?.join(file_path)?;\n             *module = Some(default_page.clone());\n             *parent_module = Some(default_page);\n         }\n@@ -943,6 +956,25 @@ async fn check_and_update_module_references(\n     Ok(())\n }\n \n+/// Checks if the current directory is the root directory and if the module is not set.\n+/// If the module is not set, it will be set to the default page.\n+///\n+/// # Arguments\n+/// * `app_dir` - The application directory.\n+/// * `module` - The module to check and update if it is not set.\n+/// * `file_path` - The file path to the default page if the module is not set.\n+async fn check_and_update_global_module_references(\n+    app_dir: FileSystemPath,\n+    module: &mut Option<FileSystemPath>,\n+    file_path: &str,\n+) -> Result<()> {\n+    if module.is_none() {\n+        *module = Some(get_next_package(app_dir).await?.join(file_path)?);\n+    }\n+\n+    Ok(())\n+}\n+\n async fn directory_tree_to_loader_tree_internal(\n     app_dir: FileSystemPath,\n     global_metadata: Vc<GlobalMetadata>,\n@@ -967,16 +999,19 @@ async fn directory_tree_to_loader_tree_internal(\n \n     // the root directory in the app dir.\n     let is_root_directory = app_page.is_root();\n-    // an alternative root layout (in a route group which affects the page, but not\n-    // the path).\n-    let is_root_layout = app_path.is_root() && modules.layout.is_some();\n \n-    if is_root_directory || is_root_layout {\n+    // If the first layer is a group route, we treat it as root layer\n+    let is_first_layer_group_route = app_page.is_first_layer_group_route();\n+\n+    // Handle the non-global modules that should always be overridden for top level groups or set to\n+    // the default page if they are not set.\n+    if is_root_directory || is_first_layer_group_route {\n         check_and_update_module_references(\n             app_dir.clone(),\n             &mut modules.not_found,\n             &mut parent_modules.not_found,\n             \"dist/client/components/builtin/not-found.js\",\n+            is_first_layer_group_route,\n         )\n         .await?;\n \n@@ -985,6 +1020,7 @@ async fn directory_tree_to_loader_tree_internal(\n             &mut modules.forbidden,\n             &mut parent_modules.forbidden,\n             \"dist/client/components/builtin/forbidden.js\",\n+            is_first_layer_group_route,\n         )\n         .await?;\n \n@@ -993,13 +1029,15 @@ async fn directory_tree_to_loader_tree_internal(\n             &mut modules.unauthorized,\n             &mut parent_modules.unauthorized,\n             \"dist/client/components/builtin/unauthorized.js\",\n+            is_first_layer_group_route,\n         )\n         .await?;\n+    }\n \n-        check_and_update_module_references(\n+    if is_root_directory {\n+        check_and_update_global_module_references(\n             app_dir.clone(),\n             &mut modules.global_error,\n-            &mut parent_modules.global_error,\n             \"dist/client/components/builtin/global-error.js\",\n         )\n         .await?;"
+        },
+        {
+            "sha": "e9b999d5d1028e6c8472decc74fc86baa0fda1c4",
+            "filename": "crates/next-core/src/next_app/mod.rs",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/c6cefce4cb01d20ae5e21986e809e8595d405c21/crates%2Fnext-core%2Fsrc%2Fnext_app%2Fmod.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/c6cefce4cb01d20ae5e21986e809e8595d405c21/crates%2Fnext-core%2Fsrc%2Fnext_app%2Fmod.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/crates%2Fnext-core%2Fsrc%2Fnext_app%2Fmod.rs?ref=c6cefce4cb01d20ae5e21986e809e8595d405c21",
+            "patch": "@@ -293,6 +293,11 @@ impl AppPage {\n         )\n     }\n \n+    /// Returns true if there is only one segment and it is a group.\n+    pub fn is_first_layer_group_route(&self) -> bool {\n+        self.0.len() == 1 && matches!(self.0.last(), Some(PageSegment::Group(_)))\n+    }\n+\n     pub fn complete(&self, page_type: PageType) -> Result<Self> {\n         self.clone_push(PageSegment::PageType(page_type))\n     }"
+        },
+        {
+            "sha": "d92e0a5ebe53c398391877da36e1d05a9a8d5590",
+            "filename": "test/e2e/app-dir/duplicate-layout-components/app/(site)/(default)/layout.jsx",
+            "status": "added",
+            "additions": 12,
+            "deletions": 0,
+            "changes": 12,
+            "blob_url": "https://github.com/vercel/next.js/blob/c6cefce4cb01d20ae5e21986e809e8595d405c21/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fapp%2F(site)%2F(default)%2Flayout.jsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/c6cefce4cb01d20ae5e21986e809e8595d405c21/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fapp%2F(site)%2F(default)%2Flayout.jsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fapp%2F(site)%2F(default)%2Flayout.jsx?ref=c6cefce4cb01d20ae5e21986e809e8595d405c21",
+            "patch": "@@ -0,0 +1,12 @@\n+import Header from '../../components/Header'\n+import Footer from '../../components/Footer'\n+\n+export default function DefaultLayout({ children }) {\n+  return (\n+    <>\n+      <Header />\n+      {children}\n+      <Footer />\n+    </>\n+  )\n+}"
+        },
+        {
+            "sha": "39744dbae9ff7bb432e1a3b7500d79db3422f63c",
+            "filename": "test/e2e/app-dir/duplicate-layout-components/app/(site)/(default)/solutions/[notfound.jsx]/page.jsx",
+            "status": "added",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/c6cefce4cb01d20ae5e21986e809e8595d405c21/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fapp%2F(site)%2F(default)%2Fsolutions%2F%5Bnotfound.jsx%5D%2Fpage.jsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/c6cefce4cb01d20ae5e21986e809e8595d405c21/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fapp%2F(site)%2F(default)%2Fsolutions%2F%5Bnotfound.jsx%5D%2Fpage.jsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fapp%2F(site)%2F(default)%2Fsolutions%2F%5Bnotfound.jsx%5D%2Fpage.jsx?ref=c6cefce4cb01d20ae5e21986e809e8595d405c21",
+            "patch": "@@ -0,0 +1,5 @@\n+import { notFound } from 'next/navigation'\n+\n+export default function NotFoundTemp() {\n+  notFound()\n+}"
+        },
+        {
+            "sha": "3c8de8fae49e336d89f2b805160a839f3a4a196d",
+            "filename": "test/e2e/app-dir/duplicate-layout-components/app/(site)/(default)/solutions/layout.jsx",
+            "status": "added",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/vercel/next.js/blob/c6cefce4cb01d20ae5e21986e809e8595d405c21/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fapp%2F(site)%2F(default)%2Fsolutions%2Flayout.jsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/c6cefce4cb01d20ae5e21986e809e8595d405c21/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fapp%2F(site)%2F(default)%2Fsolutions%2Flayout.jsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fapp%2F(site)%2F(default)%2Fsolutions%2Flayout.jsx?ref=c6cefce4cb01d20ae5e21986e809e8595d405c21",
+            "patch": "@@ -0,0 +1,9 @@\n+export default function SolutionsLayout({ children }) {\n+  return (\n+    <>\n+      <h1>Solutions Layout</h1>\n+      <main>{children}</main>\n+      <h1>Solutions Footer Test</h1>\n+    </>\n+  )\n+}"
+        },
+        {
+            "sha": "877dbf72dcd3d0d3f5ca7b85425ff1563c0c98b2",
+            "filename": "test/e2e/app-dir/duplicate-layout-components/app/(site)/layout.jsx",
+            "status": "added",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/vercel/next.js/blob/c6cefce4cb01d20ae5e21986e809e8595d405c21/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fapp%2F(site)%2Flayout.jsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/c6cefce4cb01d20ae5e21986e809e8595d405c21/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fapp%2F(site)%2Flayout.jsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fapp%2F(site)%2Flayout.jsx?ref=c6cefce4cb01d20ae5e21986e809e8595d405c21",
+            "patch": "@@ -0,0 +1,9 @@\n+export default function Layout({ children }) {\n+  return (\n+    <>\n+      <h1>Default Layout</h1>\n+      {children}\n+      <h1>Default Footer Test</h1>\n+    </>\n+  )\n+}"
+        },
+        {
+            "sha": "101e00ba416baf70cb58211bb1a7b82e806f7b71",
+            "filename": "test/e2e/app-dir/duplicate-layout-components/app/(site)/not-found.jsx",
+            "status": "added",
+            "additions": 12,
+            "deletions": 0,
+            "changes": 12,
+            "blob_url": "https://github.com/vercel/next.js/blob/c6cefce4cb01d20ae5e21986e809e8595d405c21/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fapp%2F(site)%2Fnot-found.jsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/c6cefce4cb01d20ae5e21986e809e8595d405c21/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fapp%2F(site)%2Fnot-found.jsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fapp%2F(site)%2Fnot-found.jsx?ref=c6cefce4cb01d20ae5e21986e809e8595d405c21",
+            "patch": "@@ -0,0 +1,12 @@\n+import { NotFoundTemp } from '../components/NotFoundTemp'\n+import DefaultLayout from './(default)/layout'\n+\n+export default function NotFound() {\n+  return (\n+    <>\n+      <DefaultLayout>\n+        <NotFoundTemp />\n+      </DefaultLayout>\n+    </>\n+  )\n+}"
+        },
+        {
+            "sha": "2e152164b286e51b31cfa5b65261f11dde1b1de0",
+            "filename": "test/e2e/app-dir/duplicate-layout-components/app/components/Footer.jsx",
+            "status": "added",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/vercel/next.js/blob/c6cefce4cb01d20ae5e21986e809e8595d405c21/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fapp%2Fcomponents%2FFooter.jsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/c6cefce4cb01d20ae5e21986e809e8595d405c21/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fapp%2Fcomponents%2FFooter.jsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fapp%2Fcomponents%2FFooter.jsx?ref=c6cefce4cb01d20ae5e21986e809e8595d405c21",
+            "patch": "@@ -0,0 +1,7 @@\n+export default function Footer() {\n+  return (\n+    <footer id=\"footer\">\n+      <h1>Footer</h1>\n+    </footer>\n+  )\n+}"
+        },
+        {
+            "sha": "2e7dda4543193420655b20b1272277fe6663e848",
+            "filename": "test/e2e/app-dir/duplicate-layout-components/app/components/Header.jsx",
+            "status": "added",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/vercel/next.js/blob/c6cefce4cb01d20ae5e21986e809e8595d405c21/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fapp%2Fcomponents%2FHeader.jsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/c6cefce4cb01d20ae5e21986e809e8595d405c21/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fapp%2Fcomponents%2FHeader.jsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fapp%2Fcomponents%2FHeader.jsx?ref=c6cefce4cb01d20ae5e21986e809e8595d405c21",
+            "patch": "@@ -0,0 +1,7 @@\n+export default function Header() {\n+  return (\n+    <header>\n+      <h1 id=\"header\">Header</h1>\n+    </header>\n+  )\n+}"
+        },
+        {
+            "sha": "7972d72ad5b70edcac6967f6c793227a8ad59e97",
+            "filename": "test/e2e/app-dir/duplicate-layout-components/app/components/NotFoundTemp.jsx",
+            "status": "added",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/c6cefce4cb01d20ae5e21986e809e8595d405c21/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fapp%2Fcomponents%2FNotFoundTemp.jsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/c6cefce4cb01d20ae5e21986e809e8595d405c21/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fapp%2Fcomponents%2FNotFoundTemp.jsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fapp%2Fcomponents%2FNotFoundTemp.jsx?ref=c6cefce4cb01d20ae5e21986e809e8595d405c21",
+            "patch": "@@ -0,0 +1,3 @@\n+export function NotFoundTemp() {\n+  return <div>Not Found</div>\n+}"
+        },
+        {
+            "sha": "4ee00a218505ac95ed8f4b2cb12779643277286d",
+            "filename": "test/e2e/app-dir/duplicate-layout-components/app/layout.jsx",
+            "status": "added",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/vercel/next.js/blob/c6cefce4cb01d20ae5e21986e809e8595d405c21/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fapp%2Flayout.jsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/c6cefce4cb01d20ae5e21986e809e8595d405c21/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fapp%2Flayout.jsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fapp%2Flayout.jsx?ref=c6cefce4cb01d20ae5e21986e809e8595d405c21",
+            "patch": "@@ -0,0 +1,7 @@\n+export default function RootLayout({ children }) {\n+  return (\n+    <html lang=\"en\">\n+      <body>{children}</body>\n+    </html>\n+  )\n+}"
+        },
+        {
+            "sha": "e2a3b1d25008985f28591354b7e247de8180e392",
+            "filename": "test/e2e/app-dir/duplicate-layout-components/app/page.jsx",
+            "status": "added",
+            "additions": 12,
+            "deletions": 0,
+            "changes": 12,
+            "blob_url": "https://github.com/vercel/next.js/blob/c6cefce4cb01d20ae5e21986e809e8595d405c21/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fapp%2Fpage.jsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/c6cefce4cb01d20ae5e21986e809e8595d405c21/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fapp%2Fpage.jsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fapp%2Fpage.jsx?ref=c6cefce4cb01d20ae5e21986e809e8595d405c21",
+            "patch": "@@ -0,0 +1,12 @@\n+import Link from 'next/link'\n+\n+export default function Page() {\n+  return (\n+    <main>\n+      <h1>Home Page</h1>\n+      <Link href=\"/solutions/404\" id=\"to-404\">\n+        Go to 404\n+      </Link>\n+    </main>\n+  )\n+}"
+        },
+        {
+            "sha": "5773eb13ac2d0c57332b629a81f12a29ad35ddae",
+            "filename": "test/e2e/app-dir/duplicate-layout-components/duplicate-layout-components.test.js",
+            "status": "added",
+            "additions": 21,
+            "deletions": 0,
+            "changes": 21,
+            "blob_url": "https://github.com/vercel/next.js/blob/c6cefce4cb01d20ae5e21986e809e8595d405c21/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fduplicate-layout-components.test.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/c6cefce4cb01d20ae5e21986e809e8595d405c21/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fduplicate-layout-components.test.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fduplicate-layout-components%2Fduplicate-layout-components.test.js?ref=c6cefce4cb01d20ae5e21986e809e8595d405c21",
+            "patch": "@@ -0,0 +1,21 @@\n+import { nextTestSetup } from 'e2e-utils'\n+\n+describe('app dir - duplicate layout components', () => {\n+  const { next, skipped } = nextTestSetup({\n+    files: __dirname,\n+    skipDeployment: true,\n+  })\n+\n+  if (skipped) {\n+    return\n+  }\n+\n+  it('should not duplicate layout elements when navigating to 404', async () => {\n+    const browser = await next.browser('/solutions/404')\n+\n+    // Verify counts haven't changed - no duplication\n+    expect((await browser.elementsByCss('body')).length).toBe(1)\n+    expect((await browser.elementsByCss('#header')).length).toBe(1)\n+    expect((await browser.elementsByCss('#footer')).length).toBe(1)\n+  })\n+})"
+        },
+        {
+            "sha": "ff8a7fcb382021baeed157593c140d7e999a124f",
+            "filename": "test/turbopack-build-tests-manifest.json",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/vercel/next.js/blob/c6cefce4cb01d20ae5e21986e809e8595d405c21/test%2Fturbopack-build-tests-manifest.json",
+            "raw_url": "https://github.com/vercel/next.js/raw/c6cefce4cb01d20ae5e21986e809e8595d405c21/test%2Fturbopack-build-tests-manifest.json",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fturbopack-build-tests-manifest.json?ref=c6cefce4cb01d20ae5e21986e809e8595d405c21",
+            "patch": "@@ -2348,6 +2348,15 @@\n     \"flakey\": [],\n     \"runtimeError\": false\n   },\n+  \"test/e2e/app-dir/duplicate-layout-components/duplicate-layout-components.test.js\": {\n+    \"passed\": [\n+      \"app dir - duplicate layout components should not duplicate layout elements when navigating to 404\"\n+    ],\n+    \"failed\": [],\n+    \"pending\": [],\n+    \"flakey\": [],\n+    \"runtimeError\": false\n+  },\n   \"test/e2e/app-dir/dynamic-requests/dynamic-requests.test.ts\": {\n     \"passed\": [\n       \"dynamic-requests should not error for dynamic requests in pages\","
+        },
+        {
+            "sha": "18cd73a004dd16503f5ae814064232f695e900ed",
+            "filename": "test/turbopack-dev-tests-manifest.json",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/vercel/next.js/blob/c6cefce4cb01d20ae5e21986e809e8595d405c21/test%2Fturbopack-dev-tests-manifest.json",
+            "raw_url": "https://github.com/vercel/next.js/raw/c6cefce4cb01d20ae5e21986e809e8595d405c21/test%2Fturbopack-dev-tests-manifest.json",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fturbopack-dev-tests-manifest.json?ref=c6cefce4cb01d20ae5e21986e809e8595d405c21",
+            "patch": "@@ -6162,6 +6162,15 @@\n     \"flakey\": [],\n     \"runtimeError\": false\n   },\n+  \"test/e2e/app-dir/duplicate-layout-components/duplicate-layout-components.test.js\": {\n+    \"passed\": [\n+      \"app dir - duplicate layout components should not duplicate layout elements when navigating to 404\"\n+    ],\n+    \"failed\": [],\n+    \"pending\": [],\n+    \"flakey\": [],\n+    \"runtimeError\": false\n+  },\n   \"test/e2e/app-dir/dynamic-requests/dynamic-requests.test.ts\": {\n     \"passed\": [\n       \"dynamic-requests should not error for dynamic requests in pages\","
+        }
+    ],
+    "stats": {
+        "total": 183,
+        "additions": 174,
+        "deletions": 9
+    }
+}

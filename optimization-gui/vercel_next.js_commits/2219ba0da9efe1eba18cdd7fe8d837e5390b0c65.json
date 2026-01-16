@@ -1,0 +1,48 @@
+{
+    "author": "devjiwonchoi",
+    "message": "[release] fix: correctly set tag during publish (#79548)\n\n### Why?\n\nThe `process.env.RELEASE_TYPE` handling was set incorrectly. It\nshould've been set to the \"trigger\" workflow, but instead, it was set to\nthe \"publish\" workflow. Therefore, the \"publish\" workflow needs to know\nwhich dist tag to set for publish.\n\n---------\n\nCo-authored-by: Sebastian Sebbie Silbermann <sebastian.silbermann@vercel.com>",
+    "sha": "2219ba0da9efe1eba18cdd7fe8d837e5390b0c65",
+    "files": [
+        {
+            "sha": "d009d4ff8bfcd71c75de2783cace11a6c4abb323",
+            "filename": ".github/workflows/build_and_deploy.yml",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 1,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/2219ba0da9efe1eba18cdd7fe8d837e5390b0c65/.github%2Fworkflows%2Fbuild_and_deploy.yml",
+            "raw_url": "https://github.com/vercel/next.js/raw/2219ba0da9efe1eba18cdd7fe8d837e5390b0c65/.github%2Fworkflows%2Fbuild_and_deploy.yml",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/.github%2Fworkflows%2Fbuild_and_deploy.yml?ref=2219ba0da9efe1eba18cdd7fe8d837e5390b0c65",
+            "patch": "@@ -611,7 +611,6 @@ jobs:\n         env:\n           GITHUB_TOKEN: ${{ secrets.RELEASE_BOT_GITHUB_TOKEN }}\n           NPM_TOKEN: ${{ secrets.NPM_TOKEN_ELEVATED }}\n-          RELEASE_TYPE: ${{ github.event.inputs.releaseType }}\n \n       # Add label to verify the PR is created from this workflow.\n       - name: Add label to PR"
+        },
+        {
+            "sha": "6683a88e810882e3364a101abe32ef4ddda8dfa8",
+            "filename": ".github/workflows/trigger_release_new.yml",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/2219ba0da9efe1eba18cdd7fe8d837e5390b0c65/.github%2Fworkflows%2Ftrigger_release_new.yml",
+            "raw_url": "https://github.com/vercel/next.js/raw/2219ba0da9efe1eba18cdd7fe8d837e5390b0c65/.github%2Fworkflows%2Ftrigger_release_new.yml",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/.github%2Fworkflows%2Ftrigger_release_new.yml?ref=2219ba0da9efe1eba18cdd7fe8d837e5390b0c65",
+            "patch": "@@ -113,3 +113,4 @@ jobs:\n           version: pnpm ci:version\n         env:\n           GITHUB_TOKEN: ${{ secrets.RELEASE_BOT_GITHUB_TOKEN }}\n+          RELEASE_TYPE: ${{ github.event.inputs.releaseType }}"
+        },
+        {
+            "sha": "33d076604cb79282e9986de8eb37d3c5abd4cb73",
+            "filename": "scripts/release/publish-npm.ts",
+            "status": "modified",
+            "additions": 90,
+            "deletions": 10,
+            "changes": 100,
+            "blob_url": "https://github.com/vercel/next.js/blob/2219ba0da9efe1eba18cdd7fe8d837e5390b0c65/scripts%2Frelease%2Fpublish-npm.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/2219ba0da9efe1eba18cdd7fe8d837e5390b0c65/scripts%2Frelease%2Fpublish-npm.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/scripts%2Frelease%2Fpublish-npm.ts?ref=2219ba0da9efe1eba18cdd7fe8d837e5390b0c65",
+            "patch": "@@ -1,17 +1,97 @@\n import execa from 'execa'\n+import semver from 'semver'\n+import { existsSync } from 'fs'\n+import { join } from 'path'\n+import { readdir, readFile } from 'fs/promises'\n+\n+async function fetchTagsFromRegistry(packageName: string) {\n+  const res = await fetch(\n+    `https://registry.npmjs.org/-/package/${packageName}/dist-tags`\n+  )\n+  const tags = await res.json()\n+  return tags\n+}\n+\n+async function getTag({\n+  name,\n+  version,\n+}: {\n+  name: string\n+  version: string\n+}): Promise<string> {\n+  const preConfigPath = join(process.cwd(), '.changeset', 'pre.json')\n+\n+  if (existsSync(preConfigPath)) {\n+    const { tag, mode } = JSON.parse(await readFile(preConfigPath, 'utf-8'))\n+    if (mode === 'pre') {\n+      if (!version.includes('-')) {\n+        throw new Error(\n+          `The changeset is in pre mode, but the version of \"${name}@${version}\" is not prerelease. It is likely a bug from versioning the packages.`\n+        )\n+      }\n+\n+      return tag\n+    }\n+  }\n+\n+  if (version.includes('-')) {\n+    throw new Error(\n+      `The changeset is not in pre mode, but the version of \"${name}@${version}\" is prerelease. It is likely a bug from versioning the packages.`\n+    )\n+  }\n+\n+  return 'latest'\n+}\n \n async function publishNpm() {\n-  const releaseType = process.env.RELEASE_TYPE\n-  const tag =\n-    releaseType === 'canary'\n-      ? 'canary'\n-      : releaseType === 'release-candidate'\n-        ? 'rc'\n-        : 'latest'\n-\n-  await execa('pnpm', ['changeset', 'publish', '--tag', tag], {\n-    stdio: 'inherit',\n+  if (!process.env.NPM_TOKEN) {\n+    throw new Error('NPM_TOKEN is not set')\n+  }\n+\n+  const packagesDir = join(process.cwd(), 'packages')\n+  const packageDirs = await readdir(packagesDir, {\n+    withFileTypes: true,\n   })\n+\n+  for (const packageDir of packageDirs) {\n+    if (!packageDir.isDirectory()) {\n+      continue\n+    }\n+\n+    const pkgJson = JSON.parse(\n+      await readFile(\n+        join(process.cwd(), 'packages', packageDir.name, 'package.json'),\n+        'utf-8'\n+      )\n+    )\n+\n+    if (pkgJson.private) {\n+      continue\n+    }\n+\n+    const tags = await fetchTagsFromRegistry(pkgJson.name)\n+    // If the current version is already published in the\n+    // registry, skip the process.\n+    if (semver.eq(pkgJson.version, tags.latest)) {\n+      console.log(\n+        `Skipping ${pkgJson.name}@${pkgJson.version} because it is already published.`\n+      )\n+      continue\n+    }\n+\n+    const tag = await getTag({\n+      name: pkgJson.name,\n+      version: pkgJson.version,\n+    })\n+\n+    const packagePath = join(packagesDir, packageDir.name)\n+    const args = ['publish', packagePath, '--tag', tag]\n+\n+    console.log(\n+      `Running command: \"pnpm ${args.join(' ')}\" for ${pkgJson.name}@${pkgJson.version}`\n+    )\n+    await execa('pnpm', args, { stdio: 'inherit' })\n+  }\n }\n \n publishNpm()"
+        }
+    ],
+    "stats": {
+        "total": 102,
+        "additions": 91,
+        "deletions": 11
+    }
+}

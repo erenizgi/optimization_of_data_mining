@@ -1,0 +1,60 @@
+{
+    "author": "ztanner",
+    "message": "[segment cache]: delay revalidation prefetch pings 300ms (#84981)\n\nAfter performing a router revalidation (ie in a server action, or\ncalling router.refresh()), we currently immediately re-prefetch any\nlinks on the page to ensure that subsequent navigations will be able to\nsee any changed data. This generally works fine when self-hosting/via\n`next start` because the same server that is responsible for writing to\nthe cache also handles serving it. However, when Next.js deployed and\nfronted by an external cache handler/CDN (eg deployed to Vercel), it can\ntake some time to propagate. On Vercel, the documented max amount of\ntime is 300ms. To alleviate stale data that could come about as a result\nof this, we will wait 300ms before triggering the prefetch again.",
+    "sha": "c56789599e706b64be3242f782236de222a9df29",
+    "files": [
+        {
+            "sha": "56f2801e9e55281891dad1391f62279a8254240b",
+            "filename": "packages/next/src/client/components/segment-cache-impl/cache.ts",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/vercel/next.js/blob/c56789599e706b64be3242f782236de222a9df29/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Fsegment-cache-impl%2Fcache.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/c56789599e706b64be3242f782236de222a9df29/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Fsegment-cache-impl%2Fcache.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Fsegment-cache-impl%2Fcache.ts?ref=c56789599e706b64be3242f782236de222a9df29",
+            "patch": "@@ -34,6 +34,7 @@ import {\n   isPrefetchTaskDirty,\n   type PrefetchTask,\n   type PrefetchSubtaskResult,\n+  startRevalidationCooldown,\n } from './scheduler'\n import { getAppBuildId } from '../../app-build-id'\n import { createHrefFromUrl } from '../router-reducer/create-href-from-url'\n@@ -327,6 +328,9 @@ export function revalidateEntireCache(\n ) {\n   currentCacheVersion++\n \n+  // Start a cooldown before re-prefetching to allow CDN cache propagation.\n+  startRevalidationCooldown()\n+\n   // Clearing the cache also effectively rejects any pending requests, because\n   // when the response is received, it gets written into a cache entry that is\n   // no longer reachable."
+        },
+        {
+            "sha": "7d34e2edaddef734d303a06e937ba00d55a18705",
+            "filename": "packages/next/src/client/components/segment-cache-impl/scheduler.ts",
+            "status": "modified",
+            "additions": 38,
+            "deletions": 0,
+            "changes": 38,
+            "blob_url": "https://github.com/vercel/next.js/blob/c56789599e706b64be3242f782236de222a9df29/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Fsegment-cache-impl%2Fscheduler.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/c56789599e706b64be3242f782236de222a9df29/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Fsegment-cache-impl%2Fscheduler.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Fsegment-cache-impl%2Fscheduler.ts?ref=c56789599e706b64be3242f782236de222a9df29",
+            "patch": "@@ -196,6 +196,33 @@ let didScheduleMicrotask = false\n // priority at a time. We reserve special network bandwidth for this task only.\n let mostRecentlyHoveredLink: PrefetchTask | null = null\n \n+// CDN cache propagation delay after revalidation (in milliseconds)\n+const REVALIDATION_COOLDOWN_MS = 300\n+\n+// Timeout handle for the revalidation cooldown. When non-null, prefetch\n+// requests are blocked to allow CDN cache propagation.\n+let revalidationCooldownTimeoutHandle: ReturnType<typeof setTimeout> | null =\n+  null\n+\n+/**\n+ * Called by the cache when revalidation occurs. Starts a cooldown period\n+ * during which prefetch requests are blocked to allow CDN cache propagation.\n+ */\n+export function startRevalidationCooldown(): void {\n+  // Clear any existing timeout in case multiple revalidations happen\n+  // in quick succession.\n+  if (revalidationCooldownTimeoutHandle !== null) {\n+    clearTimeout(revalidationCooldownTimeoutHandle)\n+  }\n+\n+  // Schedule the cooldown to expire after the delay.\n+  revalidationCooldownTimeoutHandle = setTimeout(() => {\n+    revalidationCooldownTimeoutHandle = null\n+    // Retry the prefetch queue now that the cooldown has expired.\n+    ensureWorkIsScheduled()\n+  }, REVALIDATION_COOLDOWN_MS)\n+}\n+\n export type IncludeDynamicData = null | 'full' | 'dynamic'\n \n /**\n@@ -348,8 +375,19 @@ function ensureWorkIsScheduled() {\n  * to avoid saturating the browser's internal network queue. This is a\n  * cooperative limit — prefetch tasks should check this before issuing\n  * new requests.\n+ *\n+ * Also checks if we're within the revalidation cooldown window, during which\n+ * prefetch requests are delayed to allow CDN cache propagation.\n  */\n function hasNetworkBandwidth(task: PrefetchTask): boolean {\n+  // Check if we're within the revalidation cooldown window\n+  if (revalidationCooldownTimeoutHandle !== null) {\n+    // We're within the cooldown window. Return false to prevent prefetching.\n+    // When the cooldown expires, the timeout will call ensureWorkIsScheduled()\n+    // to retry the queue.\n+    return false\n+  }\n+\n   // TODO: Also check if there's an in-progress navigation. We should never\n   // add prefetch requests to the network queue if an actual navigation is\n   // taking place, to ensure there's sufficient bandwidth for render-blocking"
+        },
+        {
+            "sha": "004f4a7d92daa6c79260fb4e0e7116259458ee03",
+            "filename": "test/e2e/app-dir/segment-cache/revalidation/segment-cache-revalidation.test.ts",
+            "status": "modified",
+            "additions": 50,
+            "deletions": 0,
+            "changes": 50,
+            "blob_url": "https://github.com/vercel/next.js/blob/c56789599e706b64be3242f782236de222a9df29/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Frevalidation%2Fsegment-cache-revalidation.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/c56789599e706b64be3242f782236de222a9df29/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Frevalidation%2Fsegment-cache-revalidation.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Frevalidation%2Fsegment-cache-revalidation.test.ts?ref=c56789599e706b64be3242f782236de222a9df29",
+            "patch": "@@ -314,4 +314,54 @@ describe('segment cache (revalidation)', () => {\n       'no-requests'\n     )\n   })\n+\n+  it('delay re-prefetch after revalidation to allow CDN propagation', async () => {\n+    let act: ReturnType<typeof createRouterAct>\n+    const browser = await next.browser('/', {\n+      beforePageLoad(page) {\n+        act = createRouterAct(page)\n+      },\n+    })\n+\n+    const linkVisibilityToggle = await browser.elementByCss(\n+      'input[data-link-accordion=\"/greeting\"]'\n+    )\n+\n+    // Reveal the link the target page to trigger a prefetch\n+    await act(\n+      async () => {\n+        await linkVisibilityToggle.click()\n+      },\n+      {\n+        includes: 'random-greeting',\n+      }\n+    )\n+\n+    // Perform an action that calls revalidatePath. This triggers a 300ms\n+    // cooldown before any new prefetch requests can be made.\n+    const revalidateByPath = await browser.elementById('revalidate-by-path')\n+    await revalidateByPath.click()\n+\n+    // Immediately after revalidation, no prefetch should have occurred yet\n+    await new Promise((resolve) => setTimeout(resolve, 50))\n+    TestLog.assert([])\n+\n+    // Halfway through cooldown (150ms), still no prefetch\n+    await new Promise((resolve) => setTimeout(resolve, 100))\n+    TestLog.assert([])\n+\n+    // After cooldown expires (300ms + buffer), prefetch should have occurred\n+    await new Promise((resolve) => setTimeout(resolve, 200))\n+    TestLog.assert(['REQUEST: random-greeting'])\n+\n+    // Navigate to the target page.\n+    await act(async () => {\n+      const link = await browser.elementByCss('a[href=\"/greeting\"]')\n+      await link.click()\n+      // Navigation should finish immediately because the page is\n+      // fully prefetched.\n+      const greeting = await browser.elementById('greeting')\n+      expect(await greeting.innerHTML()).toBe('random-greeting [1]')\n+    }, 'no-requests')\n+  })\n })"
+        },
+        {
+            "sha": "cefe17bad31c76687e743a65ff019f94c6824833",
+            "filename": "test/lib/router-act.ts",
+            "status": "modified",
+            "additions": 26,
+            "deletions": 1,
+            "changes": 27,
+            "blob_url": "https://github.com/vercel/next.js/blob/c56789599e706b64be3242f782236de222a9df29/test%2Flib%2Frouter-act.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/c56789599e706b64be3242f782236de222a9df29/test%2Flib%2Frouter-act.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Flib%2Frouter-act.ts?ref=c56789599e706b64be3242f782236de222a9df29",
+            "patch": "@@ -309,7 +309,32 @@ export function createRouterAct(\n       const remaining = new Set<PendingRSCRequest>()\n       let actualResponses: Array<ExpectedResponseConfig> = []\n       let alreadyMatched = new Map<string, string>()\n-      while (batch.pendingRequests.size > 0) {\n+\n+      // Track when the queue was last empty to implement a settling period\n+      let queueEmptyStartTime: number | null = null\n+      const SETTLING_PERIOD_MS = 500 // Wait 500ms after queue empties\n+\n+      while (\n+        batch.pendingRequests.size > 0 ||\n+        queueEmptyStartTime === null ||\n+        Date.now() - queueEmptyStartTime < SETTLING_PERIOD_MS\n+      ) {\n+        if (batch.pendingRequests.size > 0) {\n+          // Queue has requests, reset settling timer\n+          queueEmptyStartTime = null\n+        } else if (queueEmptyStartTime === null) {\n+          // Queue just became empty, start settling timer\n+          queueEmptyStartTime = Date.now()\n+        }\n+\n+        if (batch.pendingRequests.size === 0) {\n+          // Queue is empty during settling period, wait a bit and check again\n+          await new Promise((resolve) => setTimeout(resolve, 50))\n+          await waitForIdleCallback()\n+          await waitForPendingRequestChecks()\n+          continue\n+        }\n+\n         const pending = batch.pendingRequests\n         batch.pendingRequests = new Set()\n         for (const item of pending) {"
+        }
+    ],
+    "stats": {
+        "total": 119,
+        "additions": 118,
+        "deletions": 1
+    }
+}

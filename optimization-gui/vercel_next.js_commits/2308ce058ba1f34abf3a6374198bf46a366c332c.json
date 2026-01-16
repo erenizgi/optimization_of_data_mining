@@ -1,0 +1,48 @@
+{
+    "author": "fireairforce",
+    "message": "feat(turbopack): externalType support script (#80768)\n\nThis pr introduce a new external type: `Script`, which has the same\nbehaviour as webpack's\nhttps://webpack.js.org/configuration/externals/#externalstypescript\n\nAnd i also refer to the webpack's implement, this external type accept a\nrequest like: `root@script_url` which same as webpack:\n\n\n![image](https://github.com/user-attachments/assets/f5b7489d-c4e5-4daa-aa5b-f92e10051c0d)\n\nIn the utoo, we use it as follows:\n\n\nhttps://github.com/umijs/mako/blob/next/crates/pack-core/src/shared/resolve/externals_plugin.rs#L202-L208\n\nIt will generate runtime code to load the external package from the\n`script_url`",
+    "sha": "2308ce058ba1f34abf3a6374198bf46a366c332c",
+    "files": [
+        {
+            "sha": "acea3bbba36682b38484b1a5e502054b17297f44",
+            "filename": "turbopack/crates/turbopack-core/src/resolve/mod.rs",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 2,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/2308ce058ba1f34abf3a6374198bf46a366c332c/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fresolve%2Fmod.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/2308ce058ba1f34abf3a6374198bf46a366c332c/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fresolve%2Fmod.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fresolve%2Fmod.rs?ref=2308ce058ba1f34abf3a6374198bf46a366c332c",
+            "patch": "@@ -475,6 +475,7 @@ pub enum ExternalType {\n     CommonJs,\n     EcmaScriptModule,\n     Global,\n+    Script,\n }\n \n impl Display for ExternalType {\n@@ -484,6 +485,7 @@ impl Display for ExternalType {\n             ExternalType::EcmaScriptModule => write!(f, \"esm\"),\n             ExternalType::Url => write!(f, \"url\"),\n             ExternalType::Global => write!(f, \"global\"),\n+            ExternalType::Script => write!(f, \"script\"),\n         }\n     }\n }\n@@ -2779,15 +2781,14 @@ async fn resolve_import_map_result(\n                     **alias_lookup_path,\n                     request,\n                     match ty {\n-                        ExternalType::Url => options,\n                         // TODO is that root correct?\n                         ExternalType::CommonJs => {\n                             node_cjs_resolve_options(alias_lookup_path.root())\n                         }\n                         ExternalType::EcmaScriptModule => {\n                             node_esm_resolve_options(alias_lookup_path.root())\n                         }\n-                        ExternalType::Global => options,\n+                        ExternalType::Script | ExternalType::Url | ExternalType::Global => options,\n                     },\n                 )\n                 .await?"
+        },
+        {
+            "sha": "f1b50cdd6cbbef54514d18a805d7ee08ae6cadf9",
+            "filename": "turbopack/crates/turbopack-ecmascript/src/references/external_module.rs",
+            "status": "modified",
+            "additions": 57,
+            "deletions": 0,
+            "changes": 57,
+            "blob_url": "https://github.com/vercel/next.js/blob/2308ce058ba1f34abf3a6374198bf46a366c332c/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Freferences%2Fexternal_module.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/2308ce058ba1f34abf3a6374198bf46a366c332c/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Freferences%2Fexternal_module.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Freferences%2Fexternal_module.rs?ref=2308ce058ba1f34abf3a6374198bf46a366c332c",
+            "patch": "@@ -23,6 +23,7 @@ use crate::{\n     references::async_module::{AsyncModule, OptionAsyncModule},\n     runtime_functions::{\n         TURBOPACK_EXPORT_NAMESPACE, TURBOPACK_EXTERNAL_IMPORT, TURBOPACK_EXTERNAL_REQUIRE,\n+        TURBOPACK_LOAD_BY_URL,\n     },\n     utils::StringifyJs,\n };\n@@ -45,6 +46,7 @@ pub enum CachedExternalType {\n     EcmaScriptViaRequire,\n     EcmaScriptViaImport,\n     Global,\n+    Script,\n }\n \n impl Display for CachedExternalType {\n@@ -54,6 +56,7 @@ impl Display for CachedExternalType {\n             CachedExternalType::EcmaScriptViaRequire => write!(f, \"esm_require\"),\n             CachedExternalType::EcmaScriptViaImport => write!(f, \"esm_import\"),\n             CachedExternalType::Global => write!(f, \"global\"),\n+            CachedExternalType::Script => write!(f, \"script\"),\n         }\n     }\n }\n@@ -103,6 +106,60 @@ impl CachedExternalModule {\n                     )?;\n                 }\n             }\n+            CachedExternalType::Script => {\n+                // Parse the request format: \"variableName@url\"\n+                // e.g., \"foo@https://test.test.com\"\n+                if let Some(at_index) = self.request.find('@') {\n+                    let variable_name = &self.request[..at_index];\n+                    let url = &self.request[at_index + 1..];\n+\n+                    // Wrap the loading and variable access in a try-catch block\n+                    writeln!(code, \"let mod;\")?;\n+                    writeln!(code, \"try {{\")?;\n+\n+                    // First load the URL\n+                    writeln!(\n+                        code,\n+                        \"  await {TURBOPACK_LOAD_BY_URL}({});\",\n+                        StringifyJs(url)\n+                    )?;\n+\n+                    // Then get the variable from global with existence check\n+                    writeln!(\n+                        code,\n+                        \"  if (typeof global[{}] === 'undefined') {{\",\n+                        StringifyJs(variable_name)\n+                    )?;\n+                    writeln!(\n+                        code,\n+                        \"    throw new Error('Variable {} is not available on global object after \\\n+                         loading {}');\",\n+                        StringifyJs(variable_name),\n+                        StringifyJs(url)\n+                    )?;\n+                    writeln!(code, \"  }}\")?;\n+                    writeln!(code, \"  mod = global[{}];\", StringifyJs(variable_name))?;\n+\n+                    // Catch and re-throw errors with more context\n+                    writeln!(code, \"}} catch (error) {{\")?;\n+                    writeln!(\n+                        code,\n+                        \"  throw new Error('Failed to load external URL module {}: ' + \\\n+                         (error.message || error));\",\n+                        StringifyJs(&self.request)\n+                    )?;\n+                    writeln!(code, \"}}\")?;\n+                } else {\n+                    // Invalid format - throw error\n+                    writeln!(\n+                        code,\n+                        \"throw new Error('Invalid URL external format. Expected \\\"variable@url\\\", \\\n+                         got: {}');\",\n+                        StringifyJs(&self.request)\n+                    )?;\n+                    writeln!(code, \"const mod = undefined;\")?;\n+                }\n+            }\n             CachedExternalType::EcmaScriptViaRequire | CachedExternalType::CommonJs => {\n                 writeln!(\n                     code,"
+        },
+        {
+            "sha": "f88a8029ffdebcfa656aac233116c9750184ad82",
+            "filename": "turbopack/crates/turbopack/src/lib.rs",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/vercel/next.js/blob/2308ce058ba1f34abf3a6374198bf46a366c332c/turbopack%2Fcrates%2Fturbopack%2Fsrc%2Flib.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/2308ce058ba1f34abf3a6374198bf46a366c332c/turbopack%2Fcrates%2Fturbopack%2Fsrc%2Flib.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack%2Fsrc%2Flib.rs?ref=2308ce058ba1f34abf3a6374198bf46a366c332c",
+            "patch": "@@ -668,8 +668,7 @@ async fn externals_tracing_module_context(ty: ExternalType) -> Result<Vc<ModuleA\n         custom_conditions: match ty {\n             ExternalType::CommonJs => vec![\"require\".into()],\n             ExternalType::EcmaScriptModule => vec![\"import\".into()],\n-            ExternalType::Url => vec![],\n-            ExternalType::Global => vec![],\n+            ExternalType::Url | ExternalType::Global | ExternalType::Script => vec![],\n         },\n         ..Default::default()\n     };\n@@ -1019,6 +1018,7 @@ pub async fn replace_external(\n             }\n         }\n         ExternalType::Global => CachedExternalType::Global,\n+        ExternalType::Script => CachedExternalType::Script,\n         ExternalType::Url => {\n             // we don't want to wrap url externals.\n             return Ok(None);"
+        }
+    ],
+    "stats": {
+        "total": 66,
+        "additions": 62,
+        "deletions": 4
+    }
+}

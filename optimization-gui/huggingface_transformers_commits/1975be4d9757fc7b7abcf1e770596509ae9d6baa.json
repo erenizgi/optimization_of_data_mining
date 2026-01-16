@@ -1,0 +1,36 @@
+{
+    "author": "Rocketknight1",
+    "message": "Fix edge case for continue_final_message (#36404)\n\n* Fix edge case for continue_final_message\n\n* lstrip() correctly\n\n* Add regression test\n\n* Add a clearer error message when the final message is not present\n\n* Add a clearer error message when the final message is not present\n\n* Fix massive bug!",
+    "sha": "1975be4d9757fc7b7abcf1e770596509ae9d6baa",
+    "files": [
+        {
+            "sha": "83d5c649b5c5c5465f229d66da169e12c7ce0a15",
+            "filename": "src/transformers/tokenization_utils_base.py",
+            "status": "modified",
+            "additions": 24,
+            "deletions": 7,
+            "changes": 31,
+            "blob_url": "https://github.com/huggingface/transformers/blob/1975be4d9757fc7b7abcf1e770596509ae9d6baa/src%2Ftransformers%2Ftokenization_utils_base.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/1975be4d9757fc7b7abcf1e770596509ae9d6baa/src%2Ftransformers%2Ftokenization_utils_base.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Ftokenization_utils_base.py?ref=1975be4d9757fc7b7abcf1e770596509ae9d6baa",
+            "patch": "@@ -1702,13 +1702,30 @@ def apply_chat_template(\n             if continue_final_message:\n                 final_message = chat[-1][\"content\"]\n                 if isinstance(final_message, (list, tuple)):\n-                    final_message = final_message[-1][\"text\"]\n-                try:\n-                    rendered_chat = rendered_chat[: rendered_chat.rindex(final_message) + len(final_message)]\n-                except:  # noqa: E722\n-                    # Some chat templates like Llama-3.1 trim messages before rendering, so we must do the same here.\n-                    final_message = final_message.strip()\n-                    rendered_chat = rendered_chat[: rendered_chat.rindex(final_message) + len(final_message)]\n+                    for content_block in reversed(final_message):\n+                        if \"text\" in content_block:\n+                            # Pick the last text block in the message (the first one we hit while iterating in reverse)\n+                            final_message = content_block[\"text\"]\n+                            break\n+                    else:\n+                        raise ValueError(\n+                            \"continue_final_message is set but we could not find any text to continue\"\n+                            \"in the final message!\"\n+                        )\n+                if final_message.strip() not in rendered_chat:\n+                    raise ValueError(\n+                        \"continue_final_message is set but the final message does not appear in the chat after \"\n+                        \"applying the chat template! This can happen if the chat template deletes portions of \"\n+                        \"the final message. Please verify the chat template and final message in your chat to \"\n+                        \"ensure they are compatible.\"\n+                    )\n+                final_msg_loc = rendered_chat.rindex(final_message.strip())\n+                if rendered_chat[final_msg_loc : final_msg_loc + len(final_message.lstrip())] == final_message:\n+                    # The template preserves spacing or the message doesn't have trailing spacing, so things are simple\n+                    rendered_chat = rendered_chat[: final_msg_loc + len(final_message.lstrip())]\n+                else:\n+                    # The message has trailing spacing that was trimmed, so we must be more cautious\n+                    rendered_chat = rendered_chat[: final_msg_loc + len(final_message.strip())]\n             rendered.append(rendered_chat)\n \n         if not is_batched:"
+        },
+        {
+            "sha": "f7263dcb81851c1e38c605a9c95a616801e63f31",
+            "filename": "tests/test_tokenization_common.py",
+            "status": "modified",
+            "additions": 27,
+            "deletions": 0,
+            "changes": 27,
+            "blob_url": "https://github.com/huggingface/transformers/blob/1975be4d9757fc7b7abcf1e770596509ae9d6baa/tests%2Ftest_tokenization_common.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/1975be4d9757fc7b7abcf1e770596509ae9d6baa/tests%2Ftest_tokenization_common.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Ftest_tokenization_common.py?ref=1975be4d9757fc7b7abcf1e770596509ae9d6baa",
+            "patch": "@@ -1565,6 +1565,33 @@ def test_continue_final_message_with_trim(self):\n                     \"<|im_start|>system\\nsystem message<|im_end|>\\n<|im_start|>user\\nuser message<|im_end|>\\n<|im_start|>assistant\\nassistant message\",\n                 )\n \n+    @require_jinja\n+    def test_continue_final_message_with_decoy_earlier_message(self):\n+        \"\"\"Regression test for chat templates where an earlier message has similar content to the final message\n+        https://github.com/huggingface/transformers/issues/35433\"\"\"\n+\n+        dummy_template = \"\"\"\n+        {%- for message in messages %}\n+            {{- \"<|im_start|>\" + message['role'] + \"\\n\" + message['content'] | trim + \"<|im_end|>\" + \"\\n\"}}\n+        {%- endfor %}\"\"\"\n+        dummy_conversation = [\n+            {\"role\": \"user\", \"content\": \"hi 0\"},\n+            {\"role\": \"assistant\", \"content\": \"bye: 0\"},\n+            {\"role\": \"user\", \"content\": \"hi 1\"},\n+            {\"role\": \"assistant\", \"content\": \"bye: \"},\n+        ]\n+        tokenizers = self.get_tokenizers()\n+        for tokenizer in tokenizers:\n+            with self.subTest(f\"{tokenizer.__class__.__name__}\"):\n+                prefill_output = tokenizer.apply_chat_template(\n+                    dummy_conversation, chat_template=dummy_template, tokenize=False, continue_final_message=True\n+                )\n+                # Assert that the final message is unterminated\n+                self.assertEqual(\n+                    prefill_output,\n+                    \"<|im_start|>user\\nhi 0<|im_end|>\\n<|im_start|>assistant\\nbye: 0<|im_end|>\\n<|im_start|>user\\nhi 1<|im_end|>\\n<|im_start|>assistant\\nbye:\",\n+                )\n+\n     @require_jinja\n     def test_chat_template_dict(self):\n         dummy_template_1 = \"{{'a'}}\""
+        }
+    ],
+    "stats": {
+        "total": 58,
+        "additions": 51,
+        "deletions": 7
+    }
+}

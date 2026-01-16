@@ -1,0 +1,160 @@
+{
+    "author": "styfle",
+    "message": "fix(next/image): improve and simplify detect-content-type (#82118)\n\nAdd support for detecting more src image formats via magic number. The\nsrc image formats are handled as follows:\n\n- `image/jxl` - serve as is (since safari can render it)\n- `image/heic` - serve as is (since safari can render it)\n- `image/jp2` - serve as is (since safari can render it)\n- `application/pdf` - error (since no browser will render it)\n- `image/pic` - error (since no browser will render it)\n\nWe also fallback to `sharp().metadata()` if we can't detect the magic\nnumber to ensure correctness.",
+    "sha": "c49b7b11e85d64e5cefa79dc3372437fab451e4f",
+    "files": [
+        {
+            "sha": "125849d9c0e811f46d9873f33766249cba5d2377",
+            "filename": "packages/next/src/server/image-optimizer.ts",
+            "status": "modified",
+            "additions": 127,
+            "deletions": 52,
+            "changes": 179,
+            "blob_url": "https://github.com/vercel/next.js/blob/c49b7b11e85d64e5cefa79dc3372437fab451e4f/packages%2Fnext%2Fsrc%2Fserver%2Fimage-optimizer.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/c49b7b11e85d64e5cefa79dc3372437fab451e4f/packages%2Fnext%2Fsrc%2Fserver%2Fimage-optimizer.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fimage-optimizer.ts?ref=c49b7b11e85d64e5cefa79dc3372437fab451e4f",
+            "patch": "@@ -36,15 +36,19 @@ const AVIF = 'image/avif'\n const WEBP = 'image/webp'\n const PNG = 'image/png'\n const JPEG = 'image/jpeg'\n+const JXL = 'image/jxl'\n+const JP2 = 'image/jp2'\n+const HEIC = 'image/heic'\n const GIF = 'image/gif'\n const SVG = 'image/svg+xml'\n const ICO = 'image/x-icon'\n const ICNS = 'image/x-icns'\n const TIFF = 'image/tiff'\n const BMP = 'image/bmp'\n+const PDF = 'application/pdf'\n const CACHE_VERSION = 4\n const ANIMATABLE_TYPES = [WEBP, PNG, GIF]\n-const BYPASS_TYPES = [SVG, ICO, ICNS, BMP]\n+const BYPASS_TYPES = [SVG, ICO, ICNS, BMP, JXL, HEIC]\n const BLUR_IMG_SIZE = 8 // should match `next-image-loader`\n const BLUR_QUALITY = 70 // should match `next-image-loader`\n \n@@ -152,7 +156,9 @@ async function writeToCacheDir(\n  * it matches the \"magic number\" of known file signatures.\n  * https://en.wikipedia.org/wiki/List_of_file_signatures\n  */\n-export function detectContentType(buffer: Buffer) {\n+export async function detectContentType(\n+  buffer: Buffer\n+): Promise<string | null> {\n   if ([0xff, 0xd8, 0xff].every((b, i) => buffer[i] === b)) {\n     return JPEG\n   }\n@@ -198,7 +204,77 @@ export function detectContentType(buffer: Buffer) {\n   if ([0x42, 0x4d].every((b, i) => buffer[i] === b)) {\n     return BMP\n   }\n-  return null\n+  if ([0xff, 0x0a].every((b, i) => buffer[i] === b)) {\n+    return JXL\n+  }\n+  if (\n+    [\n+      0x00, 0x00, 0x00, 0x0c, 0x4a, 0x58, 0x4c, 0x20, 0x0d, 0x0a, 0x87, 0x0a,\n+    ].every((b, i) => buffer[i] === b)\n+  ) {\n+    return JXL\n+  }\n+  if (\n+    [0, 0, 0, 0, 0x66, 0x74, 0x79, 0x70, 0x68, 0x65, 0x69, 0x63].every(\n+      (b, i) => !b || buffer[i] === b\n+    )\n+  ) {\n+    return HEIC\n+  }\n+  if ([0x25, 0x50, 0x44, 0x46, 0x2d].every((b, i) => buffer[i] === b)) {\n+    return PDF\n+  }\n+  if (\n+    [\n+      0x00, 0x00, 0x00, 0x0c, 0x6a, 0x50, 0x20, 0x20, 0x0d, 0x0a, 0x87, 0x0a,\n+    ].every((b, i) => buffer[i] === b)\n+  ) {\n+    return JP2\n+  }\n+\n+  const sharp = getSharp(null)\n+  const meta = await sharp(buffer)\n+    .metadata()\n+    .catch((_) => null)\n+  switch (meta?.format) {\n+    case 'avif':\n+      return AVIF\n+    case 'webp':\n+      return WEBP\n+    case 'png':\n+      return PNG\n+    case 'jpeg':\n+    case 'jpg':\n+      return JPEG\n+    case 'gif':\n+      return GIF\n+    case 'svg':\n+      return SVG\n+    case 'jxl':\n+      return JXL\n+    case 'jp2':\n+      return JP2\n+    case 'tiff':\n+    case 'tif':\n+      return TIFF\n+    case 'pdf':\n+      return PDF\n+    case 'dcraw':\n+    case 'dz':\n+    case 'exr':\n+    case 'fits':\n+    case 'heif':\n+    case 'input':\n+    case 'magick':\n+    case 'openslide':\n+    case 'ppm':\n+    case 'rad':\n+    case 'raw':\n+    case 'v':\n+    case undefined:\n+    default:\n+      return null\n+  }\n }\n \n export class ImageOptimizerCache {\n@@ -702,58 +778,58 @@ export async function imageOptimizer(\n     getMaxAge(imageUpstream.cacheControl)\n   )\n \n-  const upstreamType =\n-    detectContentType(upstreamBuffer) ||\n-    imageUpstream.contentType?.toLowerCase().trim()\n-\n-  if (upstreamType) {\n-    if (\n-      upstreamType.startsWith('image/svg') &&\n-      !nextConfig.images.dangerouslyAllowSVG\n-    ) {\n-      if (!opts.silent) {\n-        Log.error(\n-          `The requested resource \"${href}\" has type \"${upstreamType}\" but dangerouslyAllowSVG is disabled`\n-        )\n-      }\n-      throw new ImageError(\n-        400,\n-        '\"url\" parameter is valid but image type is not allowed'\n+  const upstreamType = await detectContentType(upstreamBuffer)\n+\n+  if (\n+    !upstreamType ||\n+    !upstreamType.startsWith('image/') ||\n+    upstreamType.includes(',')\n+  ) {\n+    if (!opts.silent) {\n+      Log.error(\n+        \"The requested resource isn't a valid image for\",\n+        href,\n+        'received',\n+        upstreamType\n       )\n     }\n-    if (ANIMATABLE_TYPES.includes(upstreamType) && isAnimated(upstreamBuffer)) {\n-      if (!opts.silent) {\n-        Log.warnOnce(\n-          `The requested resource \"${href}\" is an animated image so it will not be optimized. Consider adding the \"unoptimized\" property to the <Image>.`\n-        )\n-      }\n-      return {\n-        buffer: upstreamBuffer,\n-        contentType: upstreamType,\n-        maxAge,\n-        etag: upstreamEtag,\n-        upstreamEtag,\n-      }\n+    throw new ImageError(400, \"The requested resource isn't a valid image.\")\n+  }\n+  if (\n+    upstreamType.startsWith('image/svg') &&\n+    !nextConfig.images.dangerouslyAllowSVG\n+  ) {\n+    if (!opts.silent) {\n+      Log.error(\n+        `The requested resource \"${href}\" has type \"${upstreamType}\" but dangerouslyAllowSVG is disabled. Consider adding the \"unoptimized\" property to the <Image>.`\n+      )\n     }\n-    if (BYPASS_TYPES.includes(upstreamType)) {\n-      return {\n-        buffer: upstreamBuffer,\n-        contentType: upstreamType,\n-        maxAge,\n-        etag: upstreamEtag,\n-        upstreamEtag,\n-      }\n+    throw new ImageError(\n+      400,\n+      '\"url\" parameter is valid but image type is not allowed'\n+    )\n+  }\n+  if (ANIMATABLE_TYPES.includes(upstreamType) && isAnimated(upstreamBuffer)) {\n+    if (!opts.silent) {\n+      Log.warnOnce(\n+        `The requested resource \"${href}\" is an animated image so it will not be optimized. Consider adding the \"unoptimized\" property to the <Image>.`\n+      )\n     }\n-    if (!upstreamType.startsWith('image/') || upstreamType.includes(',')) {\n-      if (!opts.silent) {\n-        Log.error(\n-          \"The requested resource isn't a valid image for\",\n-          href,\n-          'received',\n-          upstreamType\n-        )\n-      }\n-      throw new ImageError(400, \"The requested resource isn't a valid image.\")\n+    return {\n+      buffer: upstreamBuffer,\n+      contentType: upstreamType,\n+      maxAge,\n+      etag: upstreamEtag,\n+      upstreamEtag,\n+    }\n+  }\n+  if (BYPASS_TYPES.includes(upstreamType)) {\n+    return {\n+      buffer: upstreamBuffer,\n+      contentType: upstreamType,\n+      maxAge,\n+      etag: upstreamEtag,\n+      upstreamEtag,\n     }\n   }\n \n@@ -762,7 +838,6 @@ export async function imageOptimizer(\n   if (mimeType) {\n     contentType = mimeType\n   } else if (\n-    upstreamType?.startsWith('image/') &&\n     getExtension(upstreamType) &&\n     upstreamType !== WEBP &&\n     upstreamType !== AVIF"
+        },
+        {
+            "sha": "3202f59fe721d0ac40c4009665511b438cbc2379",
+            "filename": "packages/next/src/server/serve-static.ts",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/c49b7b11e85d64e5cefa79dc3372437fab451e4f/packages%2Fnext%2Fsrc%2Fserver%2Fserve-static.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/c49b7b11e85d64e5cefa79dc3372437fab451e4f/packages%2Fnext%2Fsrc%2Fserver%2Fserve-static.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fserve-static.ts?ref=c49b7b11e85d64e5cefa79dc3372437fab451e4f",
+            "patch": "@@ -6,6 +6,8 @@ import send from 'next/dist/compiled/send'\n send.mime.define({\n   'image/avif': ['avif'],\n   'image/x-icns': ['icns'],\n+  'image/jxl': ['jxl'],\n+  'image/heic': ['heic'],\n })\n \n export function serveStatic("
+        },
+        {
+            "sha": "748bdee125fac9ad63533da413de54fae0f46767",
+            "filename": "test/integration/image-optimizer/app/public/test.heic",
+            "status": "added",
+            "additions": 0,
+            "deletions": 0,
+            "changes": 0,
+            "blob_url": "https://github.com/vercel/next.js/blob/c49b7b11e85d64e5cefa79dc3372437fab451e4f/test%2Fintegration%2Fimage-optimizer%2Fapp%2Fpublic%2Ftest.heic",
+            "raw_url": "https://github.com/vercel/next.js/raw/c49b7b11e85d64e5cefa79dc3372437fab451e4f/test%2Fintegration%2Fimage-optimizer%2Fapp%2Fpublic%2Ftest.heic",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fintegration%2Fimage-optimizer%2Fapp%2Fpublic%2Ftest.heic?ref=c49b7b11e85d64e5cefa79dc3372437fab451e4f"
+        },
+        {
+            "sha": "0aa9268d723ff320c7352abfad1d312125b9921c",
+            "filename": "test/integration/image-optimizer/app/public/test.jp2",
+            "status": "added",
+            "additions": 0,
+            "deletions": 0,
+            "changes": 0,
+            "blob_url": "https://github.com/vercel/next.js/blob/c49b7b11e85d64e5cefa79dc3372437fab451e4f/test%2Fintegration%2Fimage-optimizer%2Fapp%2Fpublic%2Ftest.jp2",
+            "raw_url": "https://github.com/vercel/next.js/raw/c49b7b11e85d64e5cefa79dc3372437fab451e4f/test%2Fintegration%2Fimage-optimizer%2Fapp%2Fpublic%2Ftest.jp2",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fintegration%2Fimage-optimizer%2Fapp%2Fpublic%2Ftest.jp2?ref=c49b7b11e85d64e5cefa79dc3372437fab451e4f"
+        },
+        {
+            "sha": "d1a5a7d0da0294e2000808722841216f81165013",
+            "filename": "test/integration/image-optimizer/app/public/test.jxl",
+            "status": "added",
+            "additions": 0,
+            "deletions": 0,
+            "changes": 0,
+            "blob_url": "https://github.com/vercel/next.js/blob/c49b7b11e85d64e5cefa79dc3372437fab451e4f/test%2Fintegration%2Fimage-optimizer%2Fapp%2Fpublic%2Ftest.jxl",
+            "raw_url": "https://github.com/vercel/next.js/raw/c49b7b11e85d64e5cefa79dc3372437fab451e4f/test%2Fintegration%2Fimage-optimizer%2Fapp%2Fpublic%2Ftest.jxl",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fintegration%2Fimage-optimizer%2Fapp%2Fpublic%2Ftest.jxl?ref=c49b7b11e85d64e5cefa79dc3372437fab451e4f"
+        },
+        {
+            "sha": "5dd8db5d9d738edf262a17ed118545b1ee35394f",
+            "filename": "test/integration/image-optimizer/app/public/test.pdf",
+            "status": "added",
+            "additions": 0,
+            "deletions": 0,
+            "changes": 0,
+            "blob_url": "https://github.com/vercel/next.js/blob/c49b7b11e85d64e5cefa79dc3372437fab451e4f/test%2Fintegration%2Fimage-optimizer%2Fapp%2Fpublic%2Ftest.pdf",
+            "raw_url": "https://github.com/vercel/next.js/raw/c49b7b11e85d64e5cefa79dc3372437fab451e4f/test%2Fintegration%2Fimage-optimizer%2Fapp%2Fpublic%2Ftest.pdf",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fintegration%2Fimage-optimizer%2Fapp%2Fpublic%2Ftest.pdf?ref=c49b7b11e85d64e5cefa79dc3372437fab451e4f"
+        },
+        {
+            "sha": "85707d353f85347bab06cfa4ac8f67b03d913743",
+            "filename": "test/integration/image-optimizer/test/util.ts",
+            "status": "modified",
+            "additions": 49,
+            "deletions": 18,
+            "changes": 67,
+            "blob_url": "https://github.com/vercel/next.js/blob/c49b7b11e85d64e5cefa79dc3372437fab451e4f/test%2Fintegration%2Fimage-optimizer%2Ftest%2Futil.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/c49b7b11e85d64e5cefa79dc3372437fab451e4f/test%2Fintegration%2Fimage-optimizer%2Ftest%2Futil.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fintegration%2Fimage-optimizer%2Ftest%2Futil.ts?ref=c49b7b11e85d64e5cefa79dc3372437fab451e4f",
+            "patch": "@@ -219,25 +219,52 @@ export function runTests(ctx: RunTestsCtx) {\n     await expectWidth(res, 256)\n   })\n \n-  it('should maintain pic/pct', async () => {\n-    const query = { w: ctx.w, q: 90, url: '/test.pic' }\n+  it('should maintain jxl', async () => {\n+    const query = { w: ctx.w, q: 90, url: '/test.jxl' }\n     const res = await fetchViaHTTP(ctx.appPort, '/_next/image', query, {})\n     expect(res.status).toBe(200)\n-    expect(res.headers.get('Content-Type')).toContain('image/x-pict')\n+    expect(res.headers.get('Content-Type')).toContain('image/jxl')\n     expect(res.headers.get('Cache-Control')).toBe(\n       `public, max-age=${isDev ? 0 : minimumCacheTTL}, must-revalidate`\n     )\n     expect(res.headers.get('Vary')).toBe('Accept')\n     expect(res.headers.get('etag')).toBeTruthy()\n     expect(res.headers.get('Content-Disposition')).toBe(\n-      `${contentDispositionType}; filename=\"test.pic\"`\n+      `${contentDispositionType}; filename=\"test.jxl\"`\n     )\n-    const actual = await res.text()\n-    const expected = await fs.readFile(\n-      join(ctx.appDir, 'public', 'test.pic'),\n-      'utf8'\n+    await expectWidth(res, 800)\n+  })\n+\n+  it('should maintain heic', async () => {\n+    const query = { w: ctx.w, q: 90, url: '/test.heic' }\n+    const res = await fetchViaHTTP(ctx.appPort, '/_next/image', query, {})\n+    expect(res.status).toBe(200)\n+    expect(res.headers.get('Content-Type')).toContain('image/heic')\n+    expect(res.headers.get('Cache-Control')).toBe(\n+      `public, max-age=${isDev ? 0 : minimumCacheTTL}, must-revalidate`\n     )\n-    expect(actual).toMatch(expected)\n+    expect(res.headers.get('Vary')).toBe('Accept')\n+    expect(res.headers.get('etag')).toBeTruthy()\n+    expect(res.headers.get('Content-Disposition')).toBe(\n+      `${contentDispositionType}; filename=\"test.heic\"`\n+    )\n+    await expectWidth(res, 400)\n+  })\n+\n+  it('should maintain jp2', async () => {\n+    const query = { w: ctx.w, q: 90, url: '/test.jp2' }\n+    const res = await fetchViaHTTP(ctx.appPort, '/_next/image', query, {})\n+    expect(res.status).toBe(200)\n+    expect(res.headers.get('Content-Type')).toContain('image/jp2')\n+    expect(res.headers.get('Cache-Control')).toBe(\n+      `public, max-age=${isDev ? 0 : minimumCacheTTL}, must-revalidate`\n+    )\n+    expect(res.headers.get('Vary')).toBe('Accept')\n+    expect(res.headers.get('etag')).toBeTruthy()\n+    expect(res.headers.get('Content-Disposition')).toBe(\n+      `${contentDispositionType}; filename=\"test.jp2\"`\n+    )\n+    await expectWidth(res, 1)\n   })\n \n   it('should maintain animated gif', async () => {\n@@ -339,12 +366,6 @@ export function runTests(ctx: RunTestsCtx) {\n         'utf8'\n       )\n       expect(actual).toMatch(expected)\n-      expect(ctx.nextOutput).not.toContain(\n-        `The requested resource isn't a valid image`\n-      )\n-      expect(ctx.nextOutput).not.toContain(\n-        `valid but image type is not allowed`\n-      )\n     })\n   } else {\n     it('should not allow vector svg', async () => {\n@@ -381,7 +402,7 @@ export function runTests(ctx: RunTestsCtx) {\n       const res = await fetchViaHTTP(ctx.appPort, '/_next/image', query, opts)\n       expect(res.status).toBe(400)\n       expect(await res.text()).toContain(\n-        '\"url\" parameter is valid but image type is not allowed'\n+        \"The requested resource isn't a valid image\"\n       )\n     })\n \n@@ -396,6 +417,16 @@ export function runTests(ctx: RunTestsCtx) {\n     })\n   }\n \n+  it('should not allow pdf format', async () => {\n+    const query = { w: ctx.w, q: 90, url: '/test.pdf' }\n+    const opts = { headers: { accept: 'image/webp' } }\n+    const res = await fetchViaHTTP(ctx.appPort, '/_next/image', query, opts)\n+    expect(res.status).toBe(400)\n+    expect(await res.text()).toContain(\n+      \"The requested resource isn't a valid image\"\n+    )\n+  })\n+\n   it('should maintain ico format', async () => {\n     const query = { w: ctx.w, q: 90, url: `/test.ico` }\n     const opts = { headers: { accept: 'image/webp' } }\n@@ -1092,8 +1123,8 @@ export function runTests(ctx: RunTestsCtx) {\n     const opts = { headers: { accept: 'image/webp' } }\n     const res = await fetchViaHTTP(ctx.appPort, '/_next/image', query, opts)\n     expect(res.status).toBe(400)\n-    expect(await res.text()).toBe(\n-      `Unable to optimize image and unable to fallback to upstream image`\n+    expect(await res.text()).toContain(\n+      \"The requested resource isn't a valid image\"\n     )\n   })\n "
+        },
+        {
+            "sha": "6788976bed318c0d4df2881fd40748abb8a2c9e7",
+            "filename": "test/production/pages-dir/production/fixture/public/xss.svg",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 9,
+            "changes": 20,
+            "blob_url": "https://github.com/vercel/next.js/blob/c49b7b11e85d64e5cefa79dc3372437fab451e4f/test%2Fproduction%2Fpages-dir%2Fproduction%2Ffixture%2Fpublic%2Fxss.svg",
+            "raw_url": "https://github.com/vercel/next.js/raw/c49b7b11e85d64e5cefa79dc3372437fab451e4f/test%2Fproduction%2Fpages-dir%2Fproduction%2Ffixture%2Fpublic%2Fxss.svg",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fproduction%2Fpages-dir%2Fproduction%2Ffixture%2Fpublic%2Fxss.svg?ref=c49b7b11e85d64e5cefa79dc3372437fab451e4f",
+            "patch": "@@ -1,9 +1,11 @@\n-<html xmlns=\"http://www.w3.org/1999/xhtml\">\n-<head>\n-  <title>XSS</title>\n-</head>\n-<body>\n-  <p id=\"msg\">safe</p>\n-  <script>document.getElementById('msg').textContent='hacked'</script>\n-</body>\n-</html>\n+<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n+<svg width=\"100\" height=\"100\" xmlns=\"http://www.w3.org/2000/svg\">\n+  <rect id=\"box\" x=\"0\" y=\"0\" width=\"100\" height=\"100\" fill=\"red\" />\n+\n+  <script type=\"application/javascript\"><![CDATA[\n+    if (!document.getElementById('msg')) {\n+      document.body.innerHTML = '<p id=\"msg\">safe</p>'\n+    }\n+    document.getElementById('msg').textContent='hacked'\n+  ]]></script>\n+</svg>"
+        },
+        {
+            "sha": "87ad8029d4ae7ecdd09a7b606aeadf7c3a82d2b8",
+            "filename": "test/unit/image-optimizer/detect-content-type.test.ts",
+            "status": "modified",
+            "additions": 44,
+            "deletions": 10,
+            "changes": 54,
+            "blob_url": "https://github.com/vercel/next.js/blob/c49b7b11e85d64e5cefa79dc3372437fab451e4f/test%2Funit%2Fimage-optimizer%2Fdetect-content-type.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/c49b7b11e85d64e5cefa79dc3372437fab451e4f/test%2Funit%2Fimage-optimizer%2Fdetect-content-type.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Funit%2Fimage-optimizer%2Fdetect-content-type.test.ts?ref=c49b7b11e85d64e5cefa79dc3372437fab451e4f",
+            "patch": "@@ -8,42 +8,76 @@ const getImage = (filepath) => readFile(join(__dirname, filepath))\n describe('detectContentType', () => {\n   it('should return jpg', async () => {\n     const buffer = await getImage('./images/test.jpg')\n-    expect(detectContentType(buffer)).toBe('image/jpeg')\n+    expect(await detectContentType(buffer)).toBe('image/jpeg')\n   })\n   it('should return png', async () => {\n     const buffer = await getImage('./images/test.png')\n-    expect(detectContentType(buffer)).toBe('image/png')\n+    expect(await detectContentType(buffer)).toBe('image/png')\n   })\n   it('should return webp', async () => {\n     const buffer = await getImage('./images/animated.webp')\n-    expect(detectContentType(buffer)).toBe('image/webp')\n+    expect(await detectContentType(buffer)).toBe('image/webp')\n   })\n   it('should return svg', async () => {\n     const buffer = await getImage('./images/test.svg')\n-    expect(detectContentType(buffer)).toBe('image/svg+xml')\n+    expect(await detectContentType(buffer)).toBe('image/svg+xml')\n   })\n   it('should return svg for inline svg', async () => {\n     const buffer = await getImage('./images/test-inline.svg')\n-    expect(detectContentType(buffer)).toBe('image/svg+xml')\n+    expect(await detectContentType(buffer)).toBe('image/svg+xml')\n+  })\n+  it('should return svg when starts with space', async () => {\n+    const buffer = Buffer.from(\n+      ' <svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 1 1\"></svg>'\n+    )\n+    expect(await detectContentType(buffer)).toBe('image/svg+xml')\n+  })\n+  it('should return svg when starts with newline', async () => {\n+    const buffer = Buffer.from(\n+      '\\n<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 1 1\"></svg>'\n+    )\n+    expect(await detectContentType(buffer)).toBe('image/svg+xml')\n+  })\n+  it('should return svg when starts with tab', async () => {\n+    const buffer = Buffer.from(\n+      '\\t<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 1 1\"></svg>'\n+    )\n+    expect(await detectContentType(buffer)).toBe('image/svg+xml')\n   })\n   it('should return avif', async () => {\n     const buffer = await getImage('./images/test.avif')\n-    expect(detectContentType(buffer)).toBe('image/avif')\n+    expect(await detectContentType(buffer)).toBe('image/avif')\n   })\n   it('should return icon', async () => {\n     const buffer = await getImage('./images/test.ico')\n-    expect(detectContentType(buffer)).toBe('image/x-icon')\n+    expect(await detectContentType(buffer)).toBe('image/x-icon')\n   })\n   it('should return icns', async () => {\n     const buffer = await getImage('./images/test.icns')\n-    expect(detectContentType(buffer)).toBe('image/x-icns')\n+    expect(await detectContentType(buffer)).toBe('image/x-icns')\n+  })\n+  it('should return jxl', async () => {\n+    const buffer = await getImage('./images/test.jxl')\n+    expect(await detectContentType(buffer)).toBe('image/jxl')\n+  })\n+  it('should return jp2', async () => {\n+    const buffer = await getImage('./images/test.jp2')\n+    expect(await detectContentType(buffer)).toBe('image/jp2')\n+  })\n+  it('should return heic', async () => {\n+    const buffer = await getImage('./images/test.heic')\n+    expect(await detectContentType(buffer)).toBe('image/heic')\n+  })\n+  it('should return pdf', async () => {\n+    const buffer = await getImage('./images/test.pdf')\n+    expect(await detectContentType(buffer)).toBe('application/pdf')\n   })\n   it('should return tiff', async () => {\n     const buffer = await getImage('./images/test.tiff')\n-    expect(detectContentType(buffer)).toBe('image/tiff')\n+    expect(await detectContentType(buffer)).toBe('image/tiff')\n   })\n   it('should return bmp', async () => {\n     const buffer = await getImage('./images/test.bmp')\n-    expect(detectContentType(buffer)).toBe('image/bmp')\n+    expect(await detectContentType(buffer)).toBe('image/bmp')\n   })\n })"
+        },
+        {
+            "sha": "748bdee125fac9ad63533da413de54fae0f46767",
+            "filename": "test/unit/image-optimizer/images/test.heic",
+            "status": "added",
+            "additions": 0,
+            "deletions": 0,
+            "changes": 0,
+            "blob_url": "https://github.com/vercel/next.js/blob/c49b7b11e85d64e5cefa79dc3372437fab451e4f/test%2Funit%2Fimage-optimizer%2Fimages%2Ftest.heic",
+            "raw_url": "https://github.com/vercel/next.js/raw/c49b7b11e85d64e5cefa79dc3372437fab451e4f/test%2Funit%2Fimage-optimizer%2Fimages%2Ftest.heic",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Funit%2Fimage-optimizer%2Fimages%2Ftest.heic?ref=c49b7b11e85d64e5cefa79dc3372437fab451e4f"
+        },
+        {
+            "sha": "0aa9268d723ff320c7352abfad1d312125b9921c",
+            "filename": "test/unit/image-optimizer/images/test.jp2",
+            "status": "added",
+            "additions": 0,
+            "deletions": 0,
+            "changes": 0,
+            "blob_url": "https://github.com/vercel/next.js/blob/c49b7b11e85d64e5cefa79dc3372437fab451e4f/test%2Funit%2Fimage-optimizer%2Fimages%2Ftest.jp2",
+            "raw_url": "https://github.com/vercel/next.js/raw/c49b7b11e85d64e5cefa79dc3372437fab451e4f/test%2Funit%2Fimage-optimizer%2Fimages%2Ftest.jp2",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Funit%2Fimage-optimizer%2Fimages%2Ftest.jp2?ref=c49b7b11e85d64e5cefa79dc3372437fab451e4f"
+        },
+        {
+            "sha": "d1a5a7d0da0294e2000808722841216f81165013",
+            "filename": "test/unit/image-optimizer/images/test.jxl",
+            "status": "added",
+            "additions": 0,
+            "deletions": 0,
+            "changes": 0,
+            "blob_url": "https://github.com/vercel/next.js/blob/c49b7b11e85d64e5cefa79dc3372437fab451e4f/test%2Funit%2Fimage-optimizer%2Fimages%2Ftest.jxl",
+            "raw_url": "https://github.com/vercel/next.js/raw/c49b7b11e85d64e5cefa79dc3372437fab451e4f/test%2Funit%2Fimage-optimizer%2Fimages%2Ftest.jxl",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Funit%2Fimage-optimizer%2Fimages%2Ftest.jxl?ref=c49b7b11e85d64e5cefa79dc3372437fab451e4f"
+        },
+        {
+            "sha": "5dd8db5d9d738edf262a17ed118545b1ee35394f",
+            "filename": "test/unit/image-optimizer/images/test.pdf",
+            "status": "added",
+            "additions": 0,
+            "deletions": 0,
+            "changes": 0,
+            "blob_url": "https://github.com/vercel/next.js/blob/c49b7b11e85d64e5cefa79dc3372437fab451e4f/test%2Funit%2Fimage-optimizer%2Fimages%2Ftest.pdf",
+            "raw_url": "https://github.com/vercel/next.js/raw/c49b7b11e85d64e5cefa79dc3372437fab451e4f/test%2Funit%2Fimage-optimizer%2Fimages%2Ftest.pdf",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Funit%2Fimage-optimizer%2Fimages%2Ftest.pdf?ref=c49b7b11e85d64e5cefa79dc3372437fab451e4f"
+        }
+    ],
+    "stats": {
+        "total": 322,
+        "additions": 233,
+        "deletions": 89
+    }
+}

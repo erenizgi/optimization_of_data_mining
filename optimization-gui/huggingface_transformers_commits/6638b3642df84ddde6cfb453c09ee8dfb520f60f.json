@@ -1,0 +1,36 @@
+{
+    "author": "sywangyi",
+    "message": "xpu optimization for generation case (#39573)\n\n* xpu optimization for generation case\n\nSigned-off-by: Wang, Yi A <yi.a.wang@intel.com>\n\n* fix ci failure\n\nSigned-off-by: Wang, Yi A <yi.a.wang@intel.com>\n\n---------\n\nSigned-off-by: Wang, Yi A <yi.a.wang@intel.com>",
+    "sha": "6638b3642df84ddde6cfb453c09ee8dfb520f60f",
+    "files": [
+        {
+            "sha": "bd56e462e37180531f94a3847c3ff2372058496e",
+            "filename": "src/transformers/integrations/sdpa_attention.py",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 4,
+            "changes": 16,
+            "blob_url": "https://github.com/huggingface/transformers/blob/6638b3642df84ddde6cfb453c09ee8dfb520f60f/src%2Ftransformers%2Fintegrations%2Fsdpa_attention.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/6638b3642df84ddde6cfb453c09ee8dfb520f60f/src%2Ftransformers%2Fintegrations%2Fsdpa_attention.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fintegrations%2Fsdpa_attention.py?ref=6638b3642df84ddde6cfb453c09ee8dfb520f60f",
+            "patch": "@@ -2,14 +2,16 @@\n \n import torch\n \n-from ..utils import logging\n+from ..utils import is_torch_xpu_available, logging\n from ..utils.import_utils import is_torch_greater_or_equal\n \n \n logger = logging.get_logger(__name__)\n \n \n _is_torch_greater_or_equal_than_2_5 = is_torch_greater_or_equal(\"2.5\", accept_dev=True)\n+_is_torch_greater_or_equal_than_2_8 = is_torch_greater_or_equal(\"2.8\", accept_dev=True)\n+_is_torch_xpu_available = is_torch_xpu_available()\n \n \n def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:\n@@ -26,9 +28,15 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:\n \n def use_gqa_in_sdpa(attention_mask: Optional[torch.Tensor], key: torch.Tensor) -> bool:\n     # GQA can only be used under the following conditions\n-    # 1. torch version >= 2.5\n-    # 2. attention_mask is None (otherwise it will fall back to the math kernel)\n-    # 3. key is not a torch.fx.Proxy (otherwise it will fail with a tracing error)\n+    # 1.cuda\n+    #   - torch version >= 2.5\n+    #   - attention_mask is None (otherwise it will fall back to the math kernel)\n+    #   - key is not a torch.fx.Proxy (otherwise it will fail with a tracing error)\n+    # 2.xpu\n+    #   - torch version >= 2.8\n+    #   - key is not a torch.fx.Proxy (otherwise it will fail with a tracing error)\n+    if _is_torch_xpu_available:\n+        return _is_torch_greater_or_equal_than_2_8 and not isinstance(key, torch.fx.Proxy)\n     return _is_torch_greater_or_equal_than_2_5 and attention_mask is None and not isinstance(key, torch.fx.Proxy)\n \n "
+        },
+        {
+            "sha": "6a73d0dd5def28fd22177084f95d047cba8500fc",
+            "filename": "src/transformers/masking_utils.py",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 3,
+            "changes": 18,
+            "blob_url": "https://github.com/huggingface/transformers/blob/6638b3642df84ddde6cfb453c09ee8dfb520f60f/src%2Ftransformers%2Fmasking_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/6638b3642df84ddde6cfb453c09ee8dfb520f60f/src%2Ftransformers%2Fmasking_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmasking_utils.py?ref=6638b3642df84ddde6cfb453c09ee8dfb520f60f",
+            "patch": "@@ -20,6 +20,7 @@\n \n from .cache_utils import Cache\n from .configuration_utils import PretrainedConfig\n+from .utils import is_torch_xpu_available\n from .utils.generic import GeneralInterface\n from .utils.import_utils import is_torch_flex_attn_available, is_torch_greater_or_equal, is_torchdynamo_compiling\n \n@@ -33,6 +34,7 @@\n \n _is_torch_greater_or_equal_than_2_5 = is_torch_greater_or_equal(\"2.5\", accept_dev=True)\n _is_torch_greater_or_equal_than_2_6 = is_torch_greater_or_equal(\"2.6\", accept_dev=True)\n+_is_torch_xpu_available = is_torch_xpu_available()\n \n if _is_torch_greater_or_equal_than_2_6:\n     from torch._dynamo._trace_wrapped_higher_order_op import TransformGetItemToIndex\n@@ -225,11 +227,18 @@ def _ignore_causal_mask_sdpa(\n     if (\n         not is_tracing\n         # only cases when lower and upper diags are the same, see https://github.com/pytorch/pytorch/issues/108108\n-        and (query_length == 1 or kv_length == query_length)\n+        and (query_length == 1 or (kv_length == query_length or _is_torch_xpu_available))\n         # in this case we need to add special patterns to the mask so cannot be skipped otherwise\n         and (local_attention_size is None or kv_length < local_attention_size)\n         # In this case, we need to add padding to the mask, so cannot be skipped otherwise\n-        and (padding_mask is None or padding_mask.all())\n+        and (\n+            padding_mask is None\n+            or (\n+                padding_mask.all()\n+                if not _is_torch_xpu_available or query_length == 1\n+                else padding_mask[:, :query_length].all()\n+            )\n+        )\n     ):\n         return True\n \n@@ -770,7 +779,10 @@ def create_causal_mask(\n \n     # Do not allow skip if we are compiling (this is to match BC)\n     # TODO: cyril -> probably revisit and remove this, but a lot of tests rely on it\n-    allow_is_causal_skip = not past_key_values.is_compileable if past_key_values is not None else True\n+    if _is_torch_xpu_available:\n+        allow_is_causal_skip = True\n+    else:\n+        allow_is_causal_skip = not past_key_values.is_compileable if past_key_values is not None else True\n \n     # If we detected packing format\n     if packed_sequence_mask is not None and _is_torch_greater_or_equal_than_2_6:"
+        }
+    ],
+    "stats": {
+        "total": 34,
+        "additions": 27,
+        "deletions": 7
+    }
+}

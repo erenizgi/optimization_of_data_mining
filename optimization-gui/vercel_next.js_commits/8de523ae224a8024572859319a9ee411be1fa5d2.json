@@ -1,0 +1,144 @@
+{
+    "author": "unstubbable",
+    "message": "Fix streaming server actions (#86148)\n\nBy accident, the responses for server actions that fetch something and\ndon't revalidate are currently not streamed to the browser until the\n`fetch` calls are fully resolved. In the simplest case this happens when\na server action returns the response body of a `fetch` call. This is\nespecially critical if that response is itself streaming, for example\nfor a chat app. In that case the client didn't see any updates until the\nwhole stream was resolved. It affected mostly dev mode (due to the HMR\nfetch cache), but also prod if the fetch was explicitly marked as\ncacheable.\n\nThe cause of the issue is that we are awaiting `pendingRevalidates` (in\nwhich the cache-writing promise is stored) after executing the action\nand before rendering. However, when we skip rendering and return the\naction directly this is unnecessary and blocks the response. Instead, we\ncan defer awaiting the `pendingRevalidates` using `waitUntil`, as we do\nafter rendering. This is executed at the very end, before the response\nis closed.",
+    "sha": "8de523ae224a8024572859319a9ee411be1fa5d2",
+    "files": [
+        {
+            "sha": "d96d2c016c65676936c855626f585574ff4037b3",
+            "filename": "packages/next/src/server/app-render/action-handler.ts",
+            "status": "modified",
+            "additions": 78,
+            "deletions": 54,
+            "changes": 132,
+            "blob_url": "https://github.com/vercel/next.js/blob/8de523ae224a8024572859319a9ee411be1fa5d2/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Faction-handler.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/8de523ae224a8024572859319a9ee411be1fa5d2/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Faction-handler.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Faction-handler.ts?ref=8de523ae224a8024572859319a9ee411be1fa5d2",
+            "patch": "@@ -617,8 +617,9 @@ export async function handleAction({\n           type: 'done',\n           result: await generateFlight(req, ctx, requestStore, {\n             actionResult: promise,\n-            // We didn't execute an action, so no revalidations could have occurred. We can skip rendering the page.\n-            skipFlight: true,\n+            // We didn't execute an action, so no revalidations could have\n+            // occurred. We can skip rendering the page.\n+            skipPageRendering: true,\n             temporaryReferences,\n           }),\n         }\n@@ -729,16 +730,16 @@ export async function handleAction({\n                 // Only warn if it's a server action, otherwise skip for other post requests\n                 warnBadServerActionRequest()\n \n-                const actionReturnedState =\n-                  await executeActionAndPrepareForRender(\n-                    action as () => Promise<unknown>,\n-                    [],\n-                    workStore,\n-                    requestStore\n-                  )\n+                const { actionResult } = await executeActionAndPrepareForRender(\n+                  action as () => Promise<unknown>,\n+                  [],\n+                  workStore,\n+                  requestStore,\n+                  actionWasForwarded\n+                )\n \n                 const formState = await decodeFormState(\n-                  actionReturnedState,\n+                  actionResult,\n                   formData,\n                   serverModuleMap\n                 )\n@@ -923,16 +924,16 @@ export async function handleAction({\n                 // Only warn if it's a server action, otherwise skip for other post requests\n                 warnBadServerActionRequest()\n \n-                const actionReturnedState =\n-                  await executeActionAndPrepareForRender(\n-                    action as () => Promise<unknown>,\n-                    [],\n-                    workStore,\n-                    requestStore\n-                  )\n+                const { actionResult } = await executeActionAndPrepareForRender(\n+                  action as () => Promise<unknown>,\n+                  [],\n+                  workStore,\n+                  requestStore,\n+                  actionWasForwarded\n+                )\n \n                 const formState = await decodeFormState(\n-                  actionReturnedState,\n+                  actionResult,\n                   formData,\n                   serverModuleMap\n                 )\n@@ -1022,27 +1023,32 @@ export async function handleAction({\n             actionId!\n           ]\n \n-        const returnVal = await executeActionAndPrepareForRender(\n-          actionHandler,\n-          boundActionArguments,\n-          workStore,\n-          requestStore\n-        ).finally(() => {\n-          addRevalidationHeader(res, { workStore, requestStore })\n-        })\n+        const { actionResult, skipPageRendering } =\n+          await executeActionAndPrepareForRender(\n+            actionHandler,\n+            boundActionArguments,\n+            workStore,\n+            requestStore,\n+            actionWasForwarded\n+          ).finally(() => {\n+            addRevalidationHeader(res, { workStore, requestStore })\n+          })\n \n         // For form actions, we need to continue rendering the page.\n         if (isFetchAction) {\n-          const actionResult = await generateFlight(req, ctx, requestStore, {\n-            actionResult: Promise.resolve(returnVal),\n-            // if the page was not revalidated, or if the action was forwarded from another worker, we can skip the rendering the flight tree\n-            skipFlight: !workStore.pathWasRevalidated || actionWasForwarded,\n-            temporaryReferences,\n-          })\n-\n           return {\n             type: 'done',\n-            result: actionResult,\n+            result: await generateFlight(req, ctx, requestStore, {\n+              actionResult: Promise.resolve(actionResult),\n+              skipPageRendering,\n+              temporaryReferences,\n+              // If we skip page rendering, we need to ensure pending\n+              // revalidates are awaited before closing the response. Otherwise,\n+              // this will be done after rendering the page.\n+              waitUntil: skipPageRendering\n+                ? executeRevalidates(workStore)\n+                : undefined,\n+            }),\n           }\n         } else {\n           // TODO: this shouldn't be reachable, because all non-fetch codepaths return early.\n@@ -1101,7 +1107,7 @@ export async function handleAction({\n         return {\n           type: 'done',\n           result: await generateFlight(req, ctx, requestStore, {\n-            skipFlight: false,\n+            skipPageRendering: false,\n             actionResult: promise,\n             temporaryReferences,\n           }),\n@@ -1138,8 +1144,10 @@ export async function handleAction({\n         type: 'done',\n         result: await generateFlight(req, ctx, requestStore, {\n           actionResult: promise,\n-          // if the page was not revalidated, or if the action was forwarded from another worker, we can skip the rendering the flight tree\n-          skipFlight: !workStore.pathWasRevalidated || actionWasForwarded,\n+          // If the page was not revalidated, or if the action was forwarded\n+          // from another worker, we can skip rendering the page.\n+          skipPageRendering:\n+            !workStore.pathWasRevalidated || actionWasForwarded,\n           temporaryReferences,\n         }),\n       }\n@@ -1156,29 +1164,45 @@ async function executeActionAndPrepareForRender<\n   action: TFn,\n   args: Parameters<TFn>,\n   workStore: WorkStore,\n-  requestStore: RequestStore\n-): Promise<Awaited<ReturnType<TFn>>> {\n+  requestStore: RequestStore,\n+  actionWasForwarded: boolean\n+): Promise<{\n+  actionResult: Awaited<ReturnType<TFn>>\n+  skipPageRendering: boolean\n+}> {\n   requestStore.phase = 'action'\n+  let skipPageRendering = actionWasForwarded\n+\n   try {\n-    return await workUnitAsyncStorage.run(requestStore, () =>\n+    const actionResult = await workUnitAsyncStorage.run(requestStore, () =>\n       action.apply(null, args)\n     )\n-  } finally {\n-    requestStore.phase = 'render'\n \n-    // When we switch to the render phase, cookies() will return\n-    // `workUnitStore.cookies` instead of `workUnitStore.userspaceMutableCookies`.\n-    // We want the render to see any cookie writes that we performed during the action,\n-    // so we need to update the immutable cookies to reflect the changes.\n-    synchronizeMutableCookies(requestStore)\n+    // If the page was not revalidated, or if the action was forwarded from\n+    // another worker, we can skip rendering the page.\n+    skipPageRendering ||= !workStore.pathWasRevalidated\n \n-    // The server action might have toggled draft mode, so we need to reflect\n-    // that in the work store to be up-to-date for subsequent rendering.\n-    workStore.isDraftMode = requestStore.draftMode.isEnabled\n-\n-    // If the action called revalidateTag/revalidatePath, then that might affect data used by the subsequent render,\n-    // so we need to make sure all revalidations are applied before that\n-    await executeRevalidates(workStore)\n+    return { actionResult, skipPageRendering }\n+  } finally {\n+    if (!skipPageRendering) {\n+      requestStore.phase = 'render'\n+\n+      // When we switch to the render phase, cookies() will return\n+      // `workUnitStore.cookies` instead of\n+      // `workUnitStore.userspaceMutableCookies`. We want the render to see any\n+      // cookie writes that we performed during the action, so we need to update\n+      // the immutable cookies to reflect the changes.\n+      synchronizeMutableCookies(requestStore)\n+\n+      // The server action might have toggled draft mode, so we need to reflect\n+      // that in the work store to be up-to-date for subsequent rendering.\n+      workStore.isDraftMode = requestStore.draftMode.isEnabled\n+\n+      // If the action called revalidateTag/revalidatePath, then that might\n+      // affect data used by the subsequent render, so we need to make sure all\n+      // revalidations are applied before that.\n+      await executeRevalidates(workStore)\n+    }\n   }\n }\n "
+        },
+        {
+            "sha": "cb05115ced45e49b6b7877f6e82dbdc393ebde67",
+            "filename": "packages/next/src/server/app-render/app-render.tsx",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 6,
+            "changes": 15,
+            "blob_url": "https://github.com/vercel/next.js/blob/8de523ae224a8024572859319a9ee411be1fa5d2/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fapp-render.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/8de523ae224a8024572859319a9ee411be1fa5d2/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fapp-render.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fapp-render.tsx?ref=8de523ae224a8024572859319a9ee411be1fa5d2",
+            "patch": "@@ -453,7 +453,7 @@ async function generateDynamicRSCPayload(\n   ctx: AppRenderContext,\n   options?: {\n     actionResult?: ActionResult\n-    skipFlight?: boolean\n+    skipPageRendering?: boolean\n     runtimePrefetchSentinel?: number\n   }\n ): Promise<RSCPayload> {\n@@ -485,7 +485,7 @@ async function generateDynamicRSCPayload(\n \n   const serveStreamingMetadata = !!ctx.renderOpts.serveStreamingMetadata\n \n-  if (!options?.skipFlight) {\n+  if (!options?.skipPageRendering) {\n     const preloadCallbacks: PreloadCallbacks = []\n \n     const { Viewport, Metadata, MetadataOutlet } = createMetadataComponents({\n@@ -588,10 +588,11 @@ async function generateDynamicFlightRenderResult(\n   requestStore: RequestStore,\n   options?: {\n     actionResult: ActionResult\n-    skipFlight: boolean\n+    skipPageRendering: boolean\n     componentTree?: CacheNodeSeedData\n     preloadCallbacks?: PreloadCallbacks\n     temporaryReferences?: WeakMap<any, string>\n+    waitUntil?: Promise<unknown>\n   }\n ): Promise<RenderResult> {\n   const {\n@@ -649,9 +650,11 @@ async function generateDynamicFlightRenderResult(\n     }\n   )\n \n-  return new FlightRenderResult(flightReadableStream, {\n-    fetchMetrics: workStore.fetchMetrics,\n-  })\n+  return new FlightRenderResult(\n+    flightReadableStream,\n+    { fetchMetrics: workStore.fetchMetrics },\n+    options?.waitUntil\n+  )\n }\n \n type RenderToReadableStreamServerOptions = NonNullable<"
+        },
+        {
+            "sha": "005c618294e8bb1a865f34ae60aba650f1ee0bf1",
+            "filename": "packages/next/src/server/app-render/flight-render-result.ts",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 2,
+            "changes": 9,
+            "blob_url": "https://github.com/vercel/next.js/blob/8de523ae224a8024572859319a9ee411be1fa5d2/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fflight-render-result.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/8de523ae224a8024572859319a9ee411be1fa5d2/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fflight-render-result.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fflight-render-result.ts?ref=8de523ae224a8024572859319a9ee411be1fa5d2",
+            "patch": "@@ -7,8 +7,13 @@ import RenderResult, { type RenderResultMetadata } from '../render-result'\n export class FlightRenderResult extends RenderResult {\n   constructor(\n     response: string | ReadableStream<Uint8Array>,\n-    metadata: RenderResultMetadata = {}\n+    metadata: RenderResultMetadata = {},\n+    waitUntil?: Promise<unknown>\n   ) {\n-    super(response, { contentType: RSC_CONTENT_TYPE_HEADER, metadata })\n+    super(response, {\n+      contentType: RSC_CONTENT_TYPE_HEADER,\n+      metadata,\n+      waitUntil,\n+    })\n   }\n }"
+        },
+        {
+            "sha": "327ce73a2aaba5df1829a41eb1a8a7d1837465ac",
+            "filename": "packages/next/src/server/lib/patch-fetch.ts",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 11,
+            "changes": 23,
+            "blob_url": "https://github.com/vercel/next.js/blob/8de523ae224a8024572859319a9ee411be1fa5d2/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Fpatch-fetch.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/8de523ae224a8024572859319a9ee411be1fa5d2/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Fpatch-fetch.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Fpatch-fetch.ts?ref=8de523ae224a8024572859319a9ee411be1fa5d2",
+            "patch": "@@ -220,25 +220,26 @@ async function createCachedDynamicResponse(\n     .finally(handleUnlock)\n \n   const pendingRevalidateKey = `cache-set-${cacheKey}`\n-  workStore.pendingRevalidates ??= {}\n+  const pendingRevalidates = (workStore.pendingRevalidates ??= {})\n \n-  if (pendingRevalidateKey in workStore.pendingRevalidates) {\n-    // there is already a pending revalidate entry that we need to await to\n-    // avoid race conditions\n-    await workStore.pendingRevalidates[pendingRevalidateKey]\n+  let pendingRevalidatePromise = Promise.resolve()\n+  if (pendingRevalidateKey in pendingRevalidates) {\n+    // There is already a pending revalidate entry that we need to await to\n+    // avoid race conditions.\n+    pendingRevalidatePromise = pendingRevalidates[pendingRevalidateKey]\n   }\n \n-  workStore.pendingRevalidates[pendingRevalidateKey] = cacheSetPromise.finally(\n-    () => {\n+  pendingRevalidates[pendingRevalidateKey] = pendingRevalidatePromise\n+    .then(() => cacheSetPromise)\n+    .finally(() => {\n       // If the pending revalidate is not present in the store, then we have\n       // nothing to delete.\n-      if (!workStore.pendingRevalidates?.[pendingRevalidateKey]) {\n+      if (!pendingRevalidates?.[pendingRevalidateKey]) {\n         return\n       }\n \n-      delete workStore.pendingRevalidates[pendingRevalidateKey]\n-    }\n-  )\n+      delete pendingRevalidates[pendingRevalidateKey]\n+    })\n \n   return cloned2\n }"
+        },
+        {
+            "sha": "0129982d631568327b157f29a32d97c8c3583d97",
+            "filename": "test/e2e/app-dir/actions-streaming/actions-streaming.test.ts",
+            "status": "added",
+            "additions": 43,
+            "deletions": 0,
+            "changes": 43,
+            "blob_url": "https://github.com/vercel/next.js/blob/8de523ae224a8024572859319a9ee411be1fa5d2/test%2Fe2e%2Fapp-dir%2Factions-streaming%2Factions-streaming.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/8de523ae224a8024572859319a9ee411be1fa5d2/test%2Fe2e%2Fapp-dir%2Factions-streaming%2Factions-streaming.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Factions-streaming%2Factions-streaming.test.ts?ref=8de523ae224a8024572859319a9ee411be1fa5d2",
+            "patch": "@@ -0,0 +1,43 @@\n+import { nextTestSetup } from 'e2e-utils'\n+import { retry, waitFor } from 'next-test-utils'\n+\n+describe('actions-streaming', () => {\n+  const { next } = nextTestSetup({\n+    files: __dirname,\n+  })\n+\n+  describe('actions returning a ReadableStream', () => {\n+    it('should properly stream the response without buffering', async () => {\n+      const browser = await next.browser('/readable-stream')\n+      await browser.elementById('stream-button').click()\n+\n+      expect(await browser.elementById('stream-button').text()).toBe(\n+        'Streaming...'\n+      )\n+\n+      // If we're streaming properly, we should see the first chunks arrive\n+      // quickly.\n+      expect(await browser.elementByCss('h3').text()).toMatch(\n+        /Received \\d+ chunks/\n+      )\n+      expect(await browser.elementById('chunks').text()).toInclude(\n+        'Lorem ipsum dolor sit'\n+      )\n+\n+      // Finally, wait for the response to finish streaming.\n+      await waitFor(5000)\n+      await retry(\n+        async () => {\n+          expect(await browser.elementByCss('h3').text()).toBe(\n+            'Received 50 chunks'\n+          )\n+          expect(await browser.elementById('stream-button').text()).toBe(\n+            'Start Stream'\n+          )\n+        },\n+        10000,\n+        1000\n+      )\n+    })\n+  })\n+})"
+        },
+        {
+            "sha": "888614deda3ba5d744d1a7e5dac131038dba2b12",
+            "filename": "test/e2e/app-dir/actions-streaming/app/layout.tsx",
+            "status": "added",
+            "additions": 8,
+            "deletions": 0,
+            "changes": 8,
+            "blob_url": "https://github.com/vercel/next.js/blob/8de523ae224a8024572859319a9ee411be1fa5d2/test%2Fe2e%2Fapp-dir%2Factions-streaming%2Fapp%2Flayout.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/8de523ae224a8024572859319a9ee411be1fa5d2/test%2Fe2e%2Fapp-dir%2Factions-streaming%2Fapp%2Flayout.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Factions-streaming%2Fapp%2Flayout.tsx?ref=8de523ae224a8024572859319a9ee411be1fa5d2",
+            "patch": "@@ -0,0 +1,8 @@\n+import { ReactNode } from 'react'\n+export default function Root({ children }: { children: ReactNode }) {\n+  return (\n+    <html>\n+      <body>{children}</body>\n+    </html>\n+  )\n+}"
+        },
+        {
+            "sha": "7a7d84c4ffc74f00a75cdf115c51f023d7a3fd2e",
+            "filename": "test/e2e/app-dir/actions-streaming/app/page.tsx",
+            "status": "added",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/vercel/next.js/blob/8de523ae224a8024572859319a9ee411be1fa5d2/test%2Fe2e%2Fapp-dir%2Factions-streaming%2Fapp%2Fpage.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/8de523ae224a8024572859319a9ee411be1fa5d2/test%2Fe2e%2Fapp-dir%2Factions-streaming%2Fapp%2Fpage.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Factions-streaming%2Fapp%2Fpage.tsx?ref=8de523ae224a8024572859319a9ee411be1fa5d2",
+            "patch": "@@ -0,0 +1,9 @@\n+import Link from 'next/link'\n+\n+export default function Page() {\n+  return (\n+    <p>\n+      <Link href=\"/readable-stream\">Readable Stream</Link>\n+    </p>\n+  )\n+}"
+        },
+        {
+            "sha": "7c4e256892b221d09930535d47af130362c9d4e9",
+            "filename": "test/e2e/app-dir/actions-streaming/app/readable-stream/actions.ts",
+            "status": "added",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/vercel/next.js/blob/8de523ae224a8024572859319a9ee411be1fa5d2/test%2Fe2e%2Fapp-dir%2Factions-streaming%2Fapp%2Freadable-stream%2Factions.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/8de523ae224a8024572859319a9ee411be1fa5d2/test%2Fe2e%2Fapp-dir%2Factions-streaming%2Fapp%2Freadable-stream%2Factions.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Factions-streaming%2Fapp%2Freadable-stream%2Factions.ts?ref=8de523ae224a8024572859319a9ee411be1fa5d2",
+            "patch": "@@ -0,0 +1,7 @@\n+'use server'\n+\n+export async function streamData(origin: string) {\n+  const response = await fetch(new URL('/readable-stream/api', origin))\n+\n+  return response.body!\n+}"
+        },
+        {
+            "sha": "4e24d9a45bd0f053e4732904f85d65a3206bc3b3",
+            "filename": "test/e2e/app-dir/actions-streaming/app/readable-stream/api/route.ts",
+            "status": "added",
+            "additions": 20,
+            "deletions": 0,
+            "changes": 20,
+            "blob_url": "https://github.com/vercel/next.js/blob/8de523ae224a8024572859319a9ee411be1fa5d2/test%2Fe2e%2Fapp-dir%2Factions-streaming%2Fapp%2Freadable-stream%2Fapi%2Froute.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/8de523ae224a8024572859319a9ee411be1fa5d2/test%2Fe2e%2Fapp-dir%2Factions-streaming%2Fapp%2Freadable-stream%2Fapi%2Froute.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Factions-streaming%2Fapp%2Freadable-stream%2Fapi%2Froute.ts?ref=8de523ae224a8024572859319a9ee411be1fa5d2",
+            "patch": "@@ -0,0 +1,20 @@\n+import { setTimeout } from 'timers/promises'\n+\n+const loremIpsum =\n+  'Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt.\\n'\n+\n+export async function GET() {\n+  const encoder = new TextEncoder()\n+\n+  const stream = new ReadableStream({\n+    async start(controller) {\n+      for (let i = 0; i < 50; i++) {\n+        await setTimeout(100)\n+        controller.enqueue(encoder.encode(loremIpsum))\n+      }\n+      controller.close()\n+    },\n+  })\n+\n+  return new Response(stream, { headers: { 'Content-Type': 'text/plain' } })\n+}"
+        },
+        {
+            "sha": "c24697533d0ca88236b67fabd0cc1ea186df9acd",
+            "filename": "test/e2e/app-dir/actions-streaming/app/readable-stream/page.tsx",
+            "status": "added",
+            "additions": 51,
+            "deletions": 0,
+            "changes": 51,
+            "blob_url": "https://github.com/vercel/next.js/blob/8de523ae224a8024572859319a9ee411be1fa5d2/test%2Fe2e%2Fapp-dir%2Factions-streaming%2Fapp%2Freadable-stream%2Fpage.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/8de523ae224a8024572859319a9ee411be1fa5d2/test%2Fe2e%2Fapp-dir%2Factions-streaming%2Fapp%2Freadable-stream%2Fpage.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Factions-streaming%2Fapp%2Freadable-stream%2Fpage.tsx?ref=8de523ae224a8024572859319a9ee411be1fa5d2",
+            "patch": "@@ -0,0 +1,51 @@\n+'use client'\n+\n+import { useState } from 'react'\n+import { streamData } from './actions'\n+\n+export default function Page() {\n+  const [chunks, setChunks] = useState<string[] | null>(null)\n+  const [isStreaming, setIsStreaming] = useState(false)\n+\n+  const handleClick = async () => {\n+    setChunks(null)\n+    setIsStreaming(true)\n+\n+    const stream = await streamData(window.location.origin)\n+    const reader = stream.getReader()\n+    const decoder = new TextDecoder()\n+\n+    try {\n+      while (true) {\n+        const { done, value } = await reader.read()\n+        if (done) {\n+          break\n+        }\n+        const chunk = decoder.decode(value, { stream: true })\n+        setChunks((prev) => (prev ? [...prev, chunk] : [chunk]))\n+      }\n+    } finally {\n+      reader.releaseLock()\n+      setIsStreaming(false)\n+    }\n+  }\n+\n+  return (\n+    <div>\n+      <button disabled={isStreaming} onClick={handleClick} id=\"stream-button\">\n+        {isStreaming ? 'Streaming...' : 'Start Stream'}\n+      </button>\n+\n+      {chunks && (\n+        <>\n+          <h3>Received {chunks.length} chunks</h3>\n+          <ol id=\"chunks\">\n+            {chunks.map((chunk, i) => (\n+              <li key={i}>{chunk}</li>\n+            ))}\n+          </ol>\n+        </>\n+      )}\n+    </div>\n+  )\n+}"
+        },
+        {
+            "sha": "807126e4cf0bf5b1c8c917e6e0148a27331587d1",
+            "filename": "test/e2e/app-dir/actions-streaming/next.config.js",
+            "status": "added",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/vercel/next.js/blob/8de523ae224a8024572859319a9ee411be1fa5d2/test%2Fe2e%2Fapp-dir%2Factions-streaming%2Fnext.config.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/8de523ae224a8024572859319a9ee411be1fa5d2/test%2Fe2e%2Fapp-dir%2Factions-streaming%2Fnext.config.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Factions-streaming%2Fnext.config.js?ref=8de523ae224a8024572859319a9ee411be1fa5d2",
+            "patch": "@@ -0,0 +1,6 @@\n+/**\n+ * @type {import('next').NextConfig}\n+ */\n+const nextConfig = {}\n+\n+module.exports = nextConfig"
+        }
+    ],
+    "stats": {
+        "total": 323,
+        "additions": 250,
+        "deletions": 73
+    }
+}

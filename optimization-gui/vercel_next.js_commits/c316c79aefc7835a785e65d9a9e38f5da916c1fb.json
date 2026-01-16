@@ -1,0 +1,60 @@
+{
+    "author": "unstubbable",
+    "message": "[Cache Components] Fix revalidation of prerendered route handlers (#83375)\n\nWhen a prerendered and deployed route handler is revalidated, we can not\nrely on having a cache handler that does in-memory caching. So we need\nto provide a prerender resume data cache (RDC) instead, to ensure that\nthe revalidation doesn't fail with the following error:\n\n```\nError: Dynamic server usage: Route / couldn't be rendered statically because it used IO that was not cached.\n```\n\nRoute handlers are never resumed, so it's counter-intuitive to use an\nRDC for this scenario. However, we need the data cache to store cached\nresults in memory during the prospective prerender, so that they can be\nretrieved during the final prerender within microtasks.\n\nIn a follow-up, we should replace the `prerenderResumeDataCache` and\n`renderResumeDataCache` with a single `dataCache` property that is\nconceptually not tied to resuming, and also avoids the unnecessary\ncomplexity of using a mutable and an immutable resume data cache.\n\ncloses NAR-350",
+    "sha": "c316c79aefc7835a785e65d9a9e38f5da916c1fb",
+    "files": [
+        {
+            "sha": "ec49d0de639e88ef170f71da0b9b70bfa952f2d1",
+            "filename": "packages/next/src/server/route-modules/app-route/module.ts",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 4,
+            "changes": 19,
+            "blob_url": "https://github.com/vercel/next.js/blob/c316c79aefc7835a785e65d9a9e38f5da916c1fb/packages%2Fnext%2Fsrc%2Fserver%2Froute-modules%2Fapp-route%2Fmodule.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/c316c79aefc7835a785e65d9a9e38f5da916c1fb/packages%2Fnext%2Fsrc%2Fserver%2Froute-modules%2Fapp-route%2Fmodule.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Froute-modules%2Fapp-route%2Fmodule.ts?ref=c316c79aefc7835a785e65d9a9e38f5da916c1fb",
+            "patch": "@@ -84,6 +84,7 @@ import { INFINITE_CACHE } from '../../../lib/constants'\n import { executeRevalidates } from '../../revalidation-utils'\n import { trackPendingModules } from '../../app-render/module-loading/track-module-loading.external'\n import { InvariantError } from '../../../shared/lib/invariant-error'\n+import { createPrerenderResumeDataCache } from '../../resume-data-cache/resume-data-cache'\n \n export class WrappedNextRouterError {\n   constructor(\n@@ -379,6 +380,18 @@ export class AppRouteRouteModule extends RouteModule<\n           const cacheSignal = new CacheSignal()\n           let dynamicTracking = createDynamicTrackingState(undefined)\n \n+          // TODO: Route handlers are never resumed, so it's counter-intuitive\n+          // to use an RDC here. However, we need the data cache to store cached\n+          // results in memory during the prospective prerender, so that they\n+          // can be retrieved during the final prerender within microtasks. This\n+          // is crucial when doing revalidations of a deployed route handler,\n+          // where the default cache handler does not do any in-memory caching.\n+          // We should replace the `prerenderResumeDataCache` and\n+          // `renderResumeDataCache` with a single `dataCache` property that is\n+          // conceptually not tied to resuming, and also avoids the unnecessary\n+          // complexity of using a mutable and an immutable resume data cache.\n+          const prerenderResumeDataCache = createPrerenderResumeDataCache()\n+\n           const prospectiveRoutePrerenderStore: PrerenderStore =\n             (prerenderStore = {\n               type: 'prerender',\n@@ -399,8 +412,7 @@ export class AppRouteRouteModule extends RouteModule<\n               expire: INFINITE_CACHE,\n               stale: INFINITE_CACHE,\n               tags: [...implicitTags.tags],\n-              // TODO: Shouldn't we provide an RDC here?\n-              prerenderResumeDataCache: null,\n+              prerenderResumeDataCache,\n               renderResumeDataCache: null,\n               hmrRefreshHash: undefined,\n               captureOwnerStack: undefined,\n@@ -492,8 +504,7 @@ export class AppRouteRouteModule extends RouteModule<\n             expire: INFINITE_CACHE,\n             stale: INFINITE_CACHE,\n             tags: [...implicitTags.tags],\n-            // TODO: Shouldn't we provide an RDC here?\n-            prerenderResumeDataCache: null,\n+            prerenderResumeDataCache,\n             renderResumeDataCache: null,\n             hmrRefreshHash: undefined,\n             captureOwnerStack: undefined,"
+        },
+        {
+            "sha": "4d5211fe08c72ba76ab8850b67ddaf549fe45ad0",
+            "filename": "test/e2e/app-dir/use-cache-route-handler-only/app/node/route.ts",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 5,
+            "changes": 16,
+            "blob_url": "https://github.com/vercel/next.js/blob/c316c79aefc7835a785e65d9a9e38f5da916c1fb/test%2Fe2e%2Fapp-dir%2Fuse-cache-route-handler-only%2Fapp%2Fnode%2Froute.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/c316c79aefc7835a785e65d9a9e38f5da916c1fb/test%2Fe2e%2Fapp-dir%2Fuse-cache-route-handler-only%2Fapp%2Fnode%2Froute.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fuse-cache-route-handler-only%2Fapp%2Fnode%2Froute.ts?ref=c316c79aefc7835a785e65d9a9e38f5da916c1fb",
+            "patch": "@@ -1,13 +1,19 @@\n-async function getCachedRandom() {\n+import { setTimeout } from 'timers/promises'\n+\n+async function getCachedDate() {\n   'use cache'\n-  return Math.random()\n+\n+  // Simulate I/O latency.\n+  await setTimeout(200)\n+\n+  return new Date().toISOString()\n }\n \n export async function GET() {\n-  const rand1 = await getCachedRandom()\n-  const rand2 = await getCachedRandom()\n+  const date1 = await getCachedDate()\n+  const date2 = await getCachedDate()\n \n-  const response = JSON.stringify({ rand1, rand2 })\n+  const response = JSON.stringify({ date1, date2 })\n \n   return new Response(response, {\n     headers: { 'content-type': 'application/json' },"
+        },
+        {
+            "sha": "88ad2a6ac5b5766177e4779c446af8d5ef6fd435",
+            "filename": "test/e2e/app-dir/use-cache-route-handler-only/app/revalidate/route.ts",
+            "status": "added",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/vercel/next.js/blob/c316c79aefc7835a785e65d9a9e38f5da916c1fb/test%2Fe2e%2Fapp-dir%2Fuse-cache-route-handler-only%2Fapp%2Frevalidate%2Froute.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/c316c79aefc7835a785e65d9a9e38f5da916c1fb/test%2Fe2e%2Fapp-dir%2Fuse-cache-route-handler-only%2Fapp%2Frevalidate%2Froute.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fuse-cache-route-handler-only%2Fapp%2Frevalidate%2Froute.ts?ref=c316c79aefc7835a785e65d9a9e38f5da916c1fb",
+            "patch": "@@ -0,0 +1,7 @@\n+import { revalidatePath } from 'next/cache'\n+\n+export async function POST() {\n+  revalidatePath('/node')\n+\n+  return new Response(null, { status: 204 })\n+}"
+        },
+        {
+            "sha": "323288f4cce13e3f26b55c60a65482a6e6541ebf",
+            "filename": "test/e2e/app-dir/use-cache-route-handler-only/use-cache-route-handler-only.test.ts",
+            "status": "modified",
+            "additions": 17,
+            "deletions": 2,
+            "changes": 19,
+            "blob_url": "https://github.com/vercel/next.js/blob/c316c79aefc7835a785e65d9a9e38f5da916c1fb/test%2Fe2e%2Fapp-dir%2Fuse-cache-route-handler-only%2Fuse-cache-route-handler-only.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/c316c79aefc7835a785e65d9a9e38f5da916c1fb/test%2Fe2e%2Fapp-dir%2Fuse-cache-route-handler-only%2Fuse-cache-route-handler-only.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fuse-cache-route-handler-only%2Fuse-cache-route-handler-only.test.ts?ref=c316c79aefc7835a785e65d9a9e38f5da916c1fb",
+            "patch": "@@ -9,8 +9,23 @@ describe('use-cache-route-handler-only', () => {\n \n   it('should cache results in node route handlers', async () => {\n     const response = await next.fetch('/node')\n-    const { rand1, rand2 } = await response.json()\n+    const { date1, date2 } = await response.json()\n \n-    expect(rand1).toEqual(rand2)\n+    expect(date1).toBe(date2)\n+  })\n+\n+  it('should be able to revalidate prerendered route handlers', async () => {\n+    const response1 = await next.fetch('/node')\n+    const { date1: date1a } = await response1.json()\n+\n+    // Revalidate the prerendered response.\n+    await next.fetch('/revalidate', { method: 'POST' })\n+\n+    // Fetch the response again. This should trigger a blocking revalidation.\n+    const response2 = await next.fetch('/node')\n+    expect(response2.status).toBe(200)\n+\n+    const { date1: date1b } = await response2.json()\n+    expect(date1a).not.toBe(date1b)\n   })\n })"
+        }
+    ],
+    "stats": {
+        "total": 61,
+        "additions": 50,
+        "deletions": 11
+    }
+}

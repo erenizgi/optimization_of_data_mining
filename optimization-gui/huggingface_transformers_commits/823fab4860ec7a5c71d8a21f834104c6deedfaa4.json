@@ -1,0 +1,72 @@
+{
+    "author": "SunMarc",
+    "message": "Fix bnb fsdp loading for pre-quantized checkpoint (#41415)\n\n* fix\n\n* fix\n\n* get_param_name\n\n* fix device name",
+    "sha": "823fab4860ec7a5c71d8a21f834104c6deedfaa4",
+    "files": [
+        {
+            "sha": "5455a8da863c3d1aa2b487f54d6b5f6789f4e23a",
+            "filename": "src/transformers/modeling_utils.py",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 12,
+            "changes": 20,
+            "blob_url": "https://github.com/huggingface/transformers/blob/823fab4860ec7a5c71d8a21f834104c6deedfaa4/src%2Ftransformers%2Fmodeling_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/823fab4860ec7a5c71d8a21f834104c6deedfaa4/src%2Ftransformers%2Fmodeling_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodeling_utils.py?ref=823fab4860ec7a5c71d8a21f834104c6deedfaa4",
+            "patch": "@@ -761,21 +761,17 @@ def _load_state_dict_into_meta_model(\n                 # and then cast it to CPU to avoid excessive memory usage on each GPU\n                 # in comparison to the sharded model across GPUs.\n                 if is_fsdp_enabled() or is_deepspeed_zero3_enabled():\n-                    param_name = hf_quantizer.update_param_name(param_name)\n+                    param_name = hf_quantizer.get_param_name(param_name)\n                     module, param_type = get_module_from_name(model, param_name)\n                     value = getattr(module, param_type)\n-                    # special case for gpt_oss model, we wait for the param to be leave the meta device before casting it to cpu\n-                    if model.config.model_type == \"gpt_oss\" and value.device.type == \"meta\":\n+                    # We need to wait until the quantized value is created\n+                    if value.device.type == \"meta\":\n                         continue\n-                    param_to = \"cpu\"\n-                    if is_fsdp_enabled() and not is_local_dist_rank_0():\n-                        param_to = \"meta\"\n-                    val_kwargs = {}\n-                    if (hasattr(module, \"weight\") and module.weight.__class__.__name__ == \"Int8Params\") or (\n-                        value.dtype == torch.uint8 or value.dtype == torch.int8\n-                    ):\n+                    val_kwargs = value.__dict__\n+                    if not value.is_floating_point():\n                         val_kwargs[\"requires_grad\"] = False\n-                    value = type(value)(value.data.to(param_to), **val_kwargs, **value.__dict__)\n+                    device = \"meta\" if is_fsdp_enabled() and not is_local_dist_rank_0() else \"cpu\"\n+                    value = type(value)(value.data.to(device), **val_kwargs)\n                     setattr(module, param_type, value)\n \n         # Remove the param from the state dict if it was not loaded on the fly to avoid wasting memory\n@@ -5752,7 +5748,7 @@ def caching_allocator_warmup(model: PreTrainedModel, expanded_device_map: dict,\n         # For example in the case of MXFP4 quantization, we need to update the param name to the original param name\n         # because the checkpoint contains blocks, and scales, but since we are dequantizing, we need to use the original param name\n         if hf_quantizer is not None:\n-            param_name = hf_quantizer.update_param_name(param_name)\n+            param_name = hf_quantizer.get_param_name(param_name)\n \n         try:\n             param = model.get_parameter_or_buffer(param_name)"
+        },
+        {
+            "sha": "8d0452cbd945be5abe257ac7c72858c99a8e9005",
+            "filename": "src/transformers/quantizers/base.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/huggingface/transformers/blob/823fab4860ec7a5c71d8a21f834104c6deedfaa4/src%2Ftransformers%2Fquantizers%2Fbase.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/823fab4860ec7a5c71d8a21f834104c6deedfaa4/src%2Ftransformers%2Fquantizers%2Fbase.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fquantizers%2Fbase.py?ref=823fab4860ec7a5c71d8a21f834104c6deedfaa4",
+            "patch": "@@ -283,7 +283,7 @@ def _dequantize(self, model):\n             f\"{self.quantization_config.quant_method} has no implementation of `dequantize`, please raise an issue on GitHub.\"\n         )\n \n-    def update_param_name(self, param_name: str) -> str:\n+    def get_param_name(self, param_name: str) -> str:\n         \"\"\"\n         Override this method if you want to adjust the `param_name`.\n         \"\"\""
+        },
+        {
+            "sha": "d1aefcd3a9883cd3f63f6b87233241d19aed6ea0",
+            "filename": "src/transformers/quantizers/quantizer_bnb_4bit.py",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 5,
+            "changes": 21,
+            "blob_url": "https://github.com/huggingface/transformers/blob/823fab4860ec7a5c71d8a21f834104c6deedfaa4/src%2Ftransformers%2Fquantizers%2Fquantizer_bnb_4bit.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/823fab4860ec7a5c71d8a21f834104c6deedfaa4/src%2Ftransformers%2Fquantizers%2Fquantizer_bnb_4bit.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fquantizers%2Fquantizer_bnb_4bit.py?ref=823fab4860ec7a5c71d8a21f834104c6deedfaa4",
+            "patch": "@@ -129,6 +129,19 @@ def param_needs_quantization(self, model: \"PreTrainedModel\", param_name: str, **\n         module, name = get_module_from_name(model, param_name)\n         return isinstance(module, bnb.nn.Linear4bit) and name != \"bias\"\n \n+    def get_param_name(self, param_name: str) -> str:\n+        \"\"\"\n+        Get the right param_name in order to get the module associated with the param.\n+        This is useful for quantized stats lile absmax or quant_map as we need to update the param_name to get the module as they are stored in ...weight.absmax.\n+        \"\"\"\n+        if self.pre_quantized:\n+            # We need to get the param name of quantized weights and not its components. Otherwise, we won't be able to get the nn.Module associated.\n+            if any(param_name.endswith(x) for x in self.bnb_keys):\n+                param_name = (\n+                    param_name.rsplit(\".\", 1)[0] if \"quant_state.\" not in param_name else param_name.rsplit(\".\", 2)[0]\n+                )\n+        return param_name\n+\n     def create_quantized_param(\n         self,\n         model: \"PreTrainedModel\",\n@@ -139,12 +152,10 @@ def create_quantized_param(\n     ):\n         import bitsandbytes as bnb\n \n-        is_quant_stat = any(param_name.endswith(x) for x in self.bnb_keys)\n         full_name = param_name\n-        if is_quant_stat:\n-            param_name = (\n-                param_name.rsplit(\".\", 1)[0] if \"quant_state.\" not in param_name else param_name.rsplit(\".\", 2)[0]\n-            )\n+\n+        # update param name to get the weights instead of the quantized stats\n+        param_name = self.get_param_name(param_name)\n         module, tensor_name = get_module_from_name(model, param_name)\n \n         # `torch.Tensor.to(<int num>)` is not supported by `torch_npu` (see this [issue](https://github.com/Ascend/pytorch/issues/16))."
+        },
+        {
+            "sha": "4b256ffc732433745b609a4d750f9125196d6ad1",
+            "filename": "src/transformers/quantizers/quantizer_mxfp4.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/huggingface/transformers/blob/823fab4860ec7a5c71d8a21f834104c6deedfaa4/src%2Ftransformers%2Fquantizers%2Fquantizer_mxfp4.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/823fab4860ec7a5c71d8a21f834104c6deedfaa4/src%2Ftransformers%2Fquantizers%2Fquantizer_mxfp4.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fquantizers%2Fquantizer_mxfp4.py?ref=823fab4860ec7a5c71d8a21f834104c6deedfaa4",
+            "patch": "@@ -365,7 +365,7 @@ def update_ep_plan(self, config):\n                 )\n         return config\n \n-    def update_param_name(self, param_name: str) -> str:\n+    def get_param_name(self, param_name: str) -> str:\n         if self.quantization_config.dequantize:\n             if \"_blocks\" in param_name:\n                 return param_name.replace(\"_blocks\", \"\")"
+        },
+        {
+            "sha": "4189f1bf3da04df6d0878c1465c200447055f191",
+            "filename": "tests/quantization/mxfp4/test_mxfp4.py",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 6,
+            "changes": 12,
+            "blob_url": "https://github.com/huggingface/transformers/blob/823fab4860ec7a5c71d8a21f834104c6deedfaa4/tests%2Fquantization%2Fmxfp4%2Ftest_mxfp4.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/823fab4860ec7a5c71d8a21f834104c6deedfaa4/tests%2Fquantization%2Fmxfp4%2Ftest_mxfp4.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fquantization%2Fmxfp4%2Ftest_mxfp4.py?ref=823fab4860ec7a5c71d8a21f834104c6deedfaa4",
+            "patch": "@@ -265,7 +265,7 @@ def test_update_expected_keys(self):\n \n         self.assertEqual(set(updated_keys), set(expected_updated))\n \n-    def test_update_param_name_dequantize(self):\n+    def test_get_param_name_dequantize(self):\n         \"\"\"Test parameter name updating when dequantizing\"\"\"\n         from transformers.quantizers.quantizer_mxfp4 import Mxfp4HfQuantizer\n \n@@ -274,28 +274,28 @@ def test_update_param_name_dequantize(self):\n \n         # Should remove _blocks suffix\n         param_name = \"model.layers.0.mlp.experts.gate_up_proj_blocks\"\n-        updated_name = quantizer.update_param_name(param_name)\n+        updated_name = quantizer.get_param_name(param_name)\n         self.assertEqual(updated_name, \"model.layers.0.mlp.experts.gate_up_proj\")\n \n         # Should remove _scales suffix\n         param_name = \"model.layers.0.mlp.experts.down_proj_scales\"\n-        updated_name = quantizer.update_param_name(param_name)\n+        updated_name = quantizer.get_param_name(param_name)\n         self.assertEqual(updated_name, \"model.layers.0.mlp.experts.down_proj\")\n \n         # Should not change other names\n         param_name = \"model.embed_tokens.weight\"\n-        updated_name = quantizer.update_param_name(param_name)\n+        updated_name = quantizer.get_param_name(param_name)\n         self.assertEqual(updated_name, \"model.embed_tokens.weight\")\n \n-    def test_update_param_name_no_dequantize(self):\n+    def test_get_param_name_no_dequantize(self):\n         \"\"\"Test parameter name updating when not dequantizing\"\"\"\n         from transformers.quantizers.quantizer_mxfp4 import Mxfp4HfQuantizer\n \n         config = Mxfp4Config(dequantize=False)\n         quantizer = Mxfp4HfQuantizer(config)\n \n         param_name = \"model.layers.0.mlp.experts.gate_up_proj_blocks\"\n-        updated_name = quantizer.update_param_name(param_name)\n+        updated_name = quantizer.get_param_name(param_name)\n         self.assertEqual(updated_name, param_name)\n \n     def test_is_trainable(self):"
+        }
+    ],
+    "stats": {
+        "total": 57,
+        "additions": 32,
+        "deletions": 25
+    }
+}

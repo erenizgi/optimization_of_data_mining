@@ -1,0 +1,84 @@
+{
+    "author": "ztanner",
+    "message": "fix: unstable_cache should perform blocking revalidation during ISR revalidation (#83820)\n\nWhen ISR revalidation occurs and `unstable_cache` entries are stale,\nNext.js returns stale cached data instead of waiting for fresh data.\nThis differs from fetch() behavior, which performs foreground\nrevalidation during ISR\n([ref](https://github.com/vercel/next.js/blob/canary/packages/next/src/server/lib/patch-fetch.ts#L936-L939)).\nThis PR adds similar handling to ensure that when we're revalidating an\nISR page, we ensure any stale `unstable_cache` entries are revalidated\nbefore returning the final response.\n\nFixes NEXT-4693",
+    "sha": "19bc1acccbd2a80193d163f9851188e47dbec3f8",
+    "files": [
+        {
+            "sha": "af2fded76932bfe0eb95fee37fcbfdfe32befdf4",
+            "filename": "packages/next/src/server/web/spec-extension/unstable-cache.ts",
+            "status": "modified",
+            "additions": 32,
+            "deletions": 9,
+            "changes": 41,
+            "blob_url": "https://github.com/vercel/next.js/blob/19bc1acccbd2a80193d163f9851188e47dbec3f8/packages%2Fnext%2Fsrc%2Fserver%2Fweb%2Fspec-extension%2Funstable-cache.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/19bc1acccbd2a80193d163f9851188e47dbec3f8/packages%2Fnext%2Fsrc%2Fserver%2Fweb%2Fspec-extension%2Funstable-cache.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fweb%2Fspec-extension%2Funstable-cache.ts?ref=19bc1acccbd2a80193d163f9851188e47dbec3f8",
+            "patch": "@@ -238,18 +238,19 @@ export function unstable_cache<T extends Callback>(\n                 cacheEntry.value.data.body !== undefined\n                   ? JSON.parse(cacheEntry.value.data.body)\n                   : undefined\n+\n               if (cacheEntry.isStale) {\n-                // In App Router we return the stale result and revalidate in the background\n                 if (!workStore.pendingRevalidates) {\n                   workStore.pendingRevalidates = {}\n                 }\n \n-                // We run the cache function asynchronously and save the result when it completes\n-                workStore.pendingRevalidates[invocationKey] =\n-                  workUnitAsyncStorage\n+                // Check if there's already a pending revalidation to avoid duplicate work\n+                if (!workStore.pendingRevalidates[invocationKey]) {\n+                  // Create the revalidation promise\n+                  const revalidationPromise = workUnitAsyncStorage\n                     .run(innerCacheStore, cb, ...args)\n-                    .then((result) => {\n-                      return cacheNewResult(\n+                    .then(async (result) => {\n+                      await cacheNewResult(\n                         result,\n                         incrementalCache,\n                         cacheKey,\n@@ -258,15 +259,37 @@ export function unstable_cache<T extends Callback>(\n                         fetchIdx,\n                         fetchUrl\n                       )\n+                      return result\n                     })\n-                    // @TODO This error handling seems wrong. We swallow the error?\n-                    .catch((err) =>\n+                    .catch((err) => {\n+                      // @TODO This error handling seems wrong. We swallow the error?\n                       console.error(\n                         `revalidating cache with key: ${invocationKey}`,\n                         err\n                       )\n-                    )\n+                      // Return the stale value on error for foreground revalidation\n+                      return cachedResponse\n+                    })\n+\n+                  // Attach the empty catch here so we don't get a \"unhandled promise\n+                  // rejection\" warning. (Behavior is matched with patch-fetch)\n+                  if (workStore.isRevalidate) {\n+                    revalidationPromise.catch(() => {})\n+                  }\n+\n+                  workStore.pendingRevalidates[invocationKey] =\n+                    revalidationPromise\n+                }\n+\n+                // Check if we need to do foreground revalidation\n+                if (workStore.isRevalidate) {\n+                  // When the page is revalidating and the cache entry is stale,\n+                  // we need to wait for fresh data (blocking revalidate)\n+                  return workStore.pendingRevalidates[invocationKey]\n+                }\n+                // Otherwise, we're doing background revalidation - return stale immediately\n               }\n+\n               // We had a valid cache entry so we return it here\n               return cachedResponse\n             }"
+        },
+        {
+            "sha": "ee25315af36fc54f4ce96c10ecd5609dede17198",
+            "filename": "test/experimental-tests-manifest.json",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/19bc1acccbd2a80193d163f9851188e47dbec3f8/test%2Fexperimental-tests-manifest.json",
+            "raw_url": "https://github.com/vercel/next.js/raw/19bc1acccbd2a80193d163f9851188e47dbec3f8/test%2Fexperimental-tests-manifest.json",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fexperimental-tests-manifest.json?ref=19bc1acccbd2a80193d163f9851188e47dbec3f8",
+            "patch": "@@ -354,7 +354,8 @@\n       \"test/production/app-dir/typed-routes-with-webpack-worker/typed-routes-with-webpack-worker.test.ts\",\n       \"test/production/app-dir/unexpected-error/unexpected-error.test.ts\",\n       \"test/production/app-dir/worker-restart/worker-restart.test.ts\",\n-      \"test/production/app-dir/resume-data-cache/resume-data-cache.test.ts\"\n+      \"test/production/app-dir/resume-data-cache/resume-data-cache.test.ts\",\n+      \"test/production/app-dir/unstable-cache-foreground-revalidate/unstable-cache-foreground-revalidate.test.ts\"\n     ]\n   }\n }"
+        },
+        {
+            "sha": "df96d0a0b4ea5b85593112019d4bc172d2179278",
+            "filename": "test/production/app-dir/unstable-cache-foreground-revalidate/app/isr-10/page.js",
+            "status": "added",
+            "additions": 44,
+            "deletions": 0,
+            "changes": 44,
+            "blob_url": "https://github.com/vercel/next.js/blob/19bc1acccbd2a80193d163f9851188e47dbec3f8/test%2Fproduction%2Fapp-dir%2Funstable-cache-foreground-revalidate%2Fapp%2Fisr-10%2Fpage.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/19bc1acccbd2a80193d163f9851188e47dbec3f8/test%2Fproduction%2Fapp-dir%2Funstable-cache-foreground-revalidate%2Fapp%2Fisr-10%2Fpage.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fproduction%2Fapp-dir%2Funstable-cache-foreground-revalidate%2Fapp%2Fisr-10%2Fpage.js?ref=19bc1acccbd2a80193d163f9851188e47dbec3f8",
+            "patch": "@@ -0,0 +1,44 @@\n+import { unstable_cache } from 'next/cache'\n+\n+export const revalidate = 10\n+\n+const getCachedData = unstable_cache(\n+  async () => {\n+    const generatedAt = Date.now()\n+\n+    // Log when this function is actually executed\n+    console.log('[TEST] unstable_cache callback executed at:', generatedAt)\n+\n+    // Add a delay to simulate expensive operation\n+    await new Promise((resolve) => setTimeout(resolve, 100))\n+\n+    return {\n+      generatedAt,\n+      random: Math.random(),\n+    }\n+  },\n+  ['cached-data'],\n+  {\n+    revalidate: 5,\n+  }\n+)\n+\n+export default async function Page() {\n+  const pageRenderStart = Date.now()\n+  console.log('[TEST] Page render started at:', pageRenderStart)\n+\n+  const cachedData = await getCachedData()\n+\n+  console.log(\n+    '[TEST] Page render completed with cache data from:',\n+    cachedData.generatedAt\n+  )\n+\n+  return (\n+    <div>\n+      <div id=\"page-time\">{pageRenderStart}</div>\n+      <div id=\"cache-generated-at\">{cachedData.generatedAt}</div>\n+      <div id=\"random\">{cachedData.random}</div>\n+    </div>\n+  )\n+}"
+        },
+        {
+            "sha": "803f17d863c8ad887c14588aab3487e473367b41",
+            "filename": "test/production/app-dir/unstable-cache-foreground-revalidate/app/layout.js",
+            "status": "added",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/vercel/next.js/blob/19bc1acccbd2a80193d163f9851188e47dbec3f8/test%2Fproduction%2Fapp-dir%2Funstable-cache-foreground-revalidate%2Fapp%2Flayout.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/19bc1acccbd2a80193d163f9851188e47dbec3f8/test%2Fproduction%2Fapp-dir%2Funstable-cache-foreground-revalidate%2Fapp%2Flayout.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fproduction%2Fapp-dir%2Funstable-cache-foreground-revalidate%2Fapp%2Flayout.js?ref=19bc1acccbd2a80193d163f9851188e47dbec3f8",
+            "patch": "@@ -0,0 +1,7 @@\n+export default function RootLayout({ children }) {\n+  return (\n+    <html>\n+      <body>{children}</body>\n+    </html>\n+  )\n+}"
+        },
+        {
+            "sha": "4ba52ba2c8df6758685c8f65f490306b5c44eb76",
+            "filename": "test/production/app-dir/unstable-cache-foreground-revalidate/next.config.js",
+            "status": "added",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/19bc1acccbd2a80193d163f9851188e47dbec3f8/test%2Fproduction%2Fapp-dir%2Funstable-cache-foreground-revalidate%2Fnext.config.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/19bc1acccbd2a80193d163f9851188e47dbec3f8/test%2Fproduction%2Fapp-dir%2Funstable-cache-foreground-revalidate%2Fnext.config.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fproduction%2Fapp-dir%2Funstable-cache-foreground-revalidate%2Fnext.config.js?ref=19bc1acccbd2a80193d163f9851188e47dbec3f8",
+            "patch": "@@ -0,0 +1 @@\n+module.exports = {}"
+        },
+        {
+            "sha": "0bde13545dcf4c040fb58cfdd9d56cde71ab4dbb",
+            "filename": "test/production/app-dir/unstable-cache-foreground-revalidate/unstable-cache-foreground-revalidate.test.ts",
+            "status": "added",
+            "additions": 74,
+            "deletions": 0,
+            "changes": 74,
+            "blob_url": "https://github.com/vercel/next.js/blob/19bc1acccbd2a80193d163f9851188e47dbec3f8/test%2Fproduction%2Fapp-dir%2Funstable-cache-foreground-revalidate%2Funstable-cache-foreground-revalidate.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/19bc1acccbd2a80193d163f9851188e47dbec3f8/test%2Fproduction%2Fapp-dir%2Funstable-cache-foreground-revalidate%2Funstable-cache-foreground-revalidate.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fproduction%2Fapp-dir%2Funstable-cache-foreground-revalidate%2Funstable-cache-foreground-revalidate.test.ts?ref=19bc1acccbd2a80193d163f9851188e47dbec3f8",
+            "patch": "@@ -0,0 +1,74 @@\n+import { nextTestSetup } from 'e2e-utils'\n+\n+describe('unstable-cache-foreground-revalidate', () => {\n+  const { next, isNextDev } = nextTestSetup({\n+    files: __dirname,\n+    skipDeployment: true,\n+  })\n+\n+  if (isNextDev) {\n+    it.skip('should not run in dev mode', () => {})\n+    return\n+  }\n+\n+  it('should block and wait for fresh data when ISR page revalidate time is greater than unstable_cache TTL', async () => {\n+    // Initial render to warm up cache\n+    await next.render('/isr-10')\n+\n+    // Record initial log position\n+    const initialLogLength = next.cliOutput.length\n+\n+    // Wait for both ISR and unstable_cache to become stale\n+    await new Promise((resolve) => setTimeout(resolve, 11000))\n+\n+    // This request triggers ISR background revalidation\n+    await next.render('/isr-10')\n+\n+    // Wait for ISR background revalidation to complete\n+    await new Promise((resolve) => setTimeout(resolve, 2000))\n+\n+    // Get logs since the initial render\n+    const logs = next.cliOutput.substring(initialLogLength)\n+\n+    const cacheExecutions = [\n+      ...logs.matchAll(/\\[TEST\\] unstable_cache callback executed at: (\\d+)/g),\n+    ]\n+    const completions = [\n+      ...logs.matchAll(\n+        /\\[TEST\\] Page render completed with cache data from: (\\d+)/g\n+      ),\n+    ]\n+\n+    if (completions.length === 0) {\n+      throw new Error('No page completions found in logs')\n+    }\n+\n+    const lastCompletion = completions[completions.length - 1]\n+    const lastCacheExecution =\n+      cacheExecutions.length > 0\n+        ? cacheExecutions[cacheExecutions.length - 1]\n+        : null\n+\n+    if (!lastCacheExecution) {\n+      throw new Error(\n+        `Expected cache execution during ISR revalidation but found none. ` +\n+          `Cache executions: ${cacheExecutions.length}, Page completions: ${completions.length}`\n+      )\n+    }\n+\n+    const cacheExecutedAt = parseInt(lastCacheExecution[1])\n+    const cacheDataFrom = parseInt(lastCompletion[1])\n+    const timeDiff = Math.abs(cacheExecutedAt - cacheDataFrom)\n+\n+    console.log('ISR revalidation timing:')\n+    console.log('- Cache executed at:', cacheExecutedAt)\n+    console.log('- ISR used cache data from:', cacheDataFrom)\n+    console.log('- Time difference:', timeDiff, 'ms')\n+\n+    // With foreground revalidation:\n+    // - ISR waits for fresh data, so timestamps should match (< 1000ms difference)\n+    // Without foreground revalidation:\n+    // - ISR uses stale data, so timestamps will be far apart (> 10000ms)\n+    expect(timeDiff).toBeLessThan(1000)\n+  })\n+})"
+        }
+    ],
+    "stats": {
+        "total": 170,
+        "additions": 160,
+        "deletions": 10
+    }
+}

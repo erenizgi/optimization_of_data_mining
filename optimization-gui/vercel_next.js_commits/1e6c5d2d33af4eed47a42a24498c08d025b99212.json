@@ -1,0 +1,96 @@
+{
+    "author": "kdy1",
+    "message": "feat(turbopack): Implement side-effect optimization (#78047)\n\n### What?\n\nImplement side-effect-free optimization for turbopack. This is required to build applications properly and to reduce the final bundle size. The advanced tree shaking consists of module splitting and module merging. The module splitting is done only once per module, and module merging is done naturally by the chunking functions because split modules are still modules. This PR implements optimization for the module merging part - the optimization in this PR allows skipping intermediate modules between the requested module and the resolved module.\n\n\n\n### Why?\n\n\n\n### How?\n - Closes PACK-3500\n\n - Closes #72947\n \t- This is a retry of https://github.com/vercel/next.js/pull/72947.\n\n---------\n\nCo-authored-by: Niklas Mischkulnig <4586894+mischnic@users.noreply.github.com>",
+    "sha": "1e6c5d2d33af4eed47a42a24498c08d025b99212",
+    "files": [
+        {
+            "sha": "aa6edae48152e7e482dedfd68ce119334a2bacd4",
+            "filename": "turbopack/crates/turbopack-ecmascript/src/references/esm/base.rs",
+            "status": "modified",
+            "additions": 31,
+            "deletions": 3,
+            "changes": 34,
+            "blob_url": "https://github.com/vercel/next.js/blob/1e6c5d2d33af4eed47a42a24498c08d025b99212/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Freferences%2Fesm%2Fbase.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/1e6c5d2d33af4eed47a42a24498c08d025b99212/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Freferences%2Fesm%2Fbase.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Freferences%2Fesm%2Fbase.rs?ref=1e6c5d2d33af4eed47a42a24498c08d025b99212",
+            "patch": "@@ -13,6 +13,7 @@ use turbopack_core::{\n         ChunkableModuleReference, ChunkingContext, ChunkingType, ChunkingTypeOption,\n         ModuleChunkItemIdExt,\n     },\n+    context::AssetContext,\n     issue::{\n         Issue, IssueExt, IssueSeverity, IssueSource, IssueStage, OptionIssueSource,\n         OptionStyledString, StyledString,\n@@ -23,7 +24,7 @@ use turbopack_core::{\n     resolve::{\n         origin::{ResolveOrigin, ResolveOriginExt},\n         parse::Request,\n-        ExternalType, ModulePart, ModuleResolveResult, ModuleResolveResultItem,\n+        ExternalType, ModulePart, ModuleResolveResult, ModuleResolveResultItem, RequestKey,\n     },\n };\n use turbopack_resolve::ecmascript::esm_resolve;\n@@ -38,6 +39,7 @@ use crate::{\n     runtime_functions::{TURBOPACK_EXTERNAL_IMPORT, TURBOPACK_EXTERNAL_REQUIRE, TURBOPACK_IMPORT},\n     tree_shake::{asset::EcmascriptModulePartAsset, TURBOPACK_PART_IMPORT_SOURCE},\n     utils::module_id_to_lit,\n+    TreeShakingMode,\n };\n \n #[turbo_tasks::value]\n@@ -168,18 +170,44 @@ impl ModuleReference for EsmAssetReference {\n             EcmaScriptModulesReferenceSubType::Import\n         };\n \n+        if let Some(ModulePart::Evaluation) = &self.export_name {\n+            let module: ResolvedVc<crate::EcmascriptModuleAsset> =\n+                ResolvedVc::try_downcast_type(self.origin)\n+                    .expect(\"EsmAssetReference origin should be a EcmascriptModuleAsset\");\n+\n+            let tree_shaking_mode = module.options().await?.tree_shaking_mode;\n+\n+            if let Some(TreeShakingMode::ModuleFragments) = tree_shaking_mode {\n+                let side_effect_free_packages = module.asset_context().side_effect_free_packages();\n+\n+                if *module\n+                    .is_marked_as_side_effect_free(side_effect_free_packages)\n+                    .await?\n+                {\n+                    return Ok(ModuleResolveResult {\n+                        primary: Box::new([(\n+                            RequestKey::default(),\n+                            ModuleResolveResultItem::Ignore,\n+                        )]),\n+                        affecting_sources: Default::default(),\n+                    }\n+                    .cell());\n+                }\n+            }\n+        }\n+\n         if let Request::Module { module, .. } = &*self.request.await? {\n             if module == TURBOPACK_PART_IMPORT_SOURCE {\n                 if let Some(part) = &self.export_name {\n                     let module: ResolvedVc<crate::EcmascriptModuleAsset> =\n                         ResolvedVc::try_downcast_type(self.origin)\n                             .expect(\"EsmAssetReference origin should be a EcmascriptModuleAsset\");\n \n-                    return Ok(*ModuleResolveResult::module(\n+                    return Ok(*ModuleResolveResult::module(ResolvedVc::upcast(\n                         EcmascriptModulePartAsset::select_part(*module, part.clone())\n                             .to_resolved()\n                             .await?,\n-                    ));\n+                    )));\n                 }\n \n                 bail!(\"export_name is required for part import\")"
+        },
+        {
+            "sha": "4af63d3d54a704417ec4e6e5ceed54fc4531e5c8",
+            "filename": "turbopack/crates/turbopack-ecmascript/src/references/esm/export.rs",
+            "status": "modified",
+            "additions": 48,
+            "deletions": 3,
+            "changes": 51,
+            "blob_url": "https://github.com/vercel/next.js/blob/1e6c5d2d33af4eed47a42a24498c08d025b99212/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Freferences%2Fesm%2Fexport.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/1e6c5d2d33af4eed47a42a24498c08d025b99212/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Freferences%2Fesm%2Fexport.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Freferences%2Fesm%2Fexport.rs?ref=1e6c5d2d33af4eed47a42a24498c08d025b99212",
+            "patch": "@@ -24,6 +24,7 @@ use turbopack_core::{\n     module::Module,\n     module_graph::ModuleGraph,\n     reference::ModuleReference,\n+    resolve::ModulePart,\n };\n \n use super::base::ReferencedAsset;\n@@ -33,6 +34,8 @@ use crate::{\n     magic_identifier,\n     parse::ParseResult,\n     runtime_functions::{TURBOPACK_DYNAMIC, TURBOPACK_ESM},\n+    tree_shake::asset::EcmascriptModulePartAsset,\n+    EcmascriptModuleAsset,\n };\n \n #[derive(Clone, Hash, Debug, PartialEq, Eq, Serialize, Deserialize, TraceRawVcs, NonLocalValue)]\n@@ -177,9 +180,9 @@ pub async fn follow_reexports(\n \n         // Try to find the export in the star exports\n         if !exports_ref.star_exports.is_empty() && &*export_name != \"default\" {\n-            let result = get_all_export_names(*module).await?;\n-            if let Some(m) = result.esm_exports.get(&export_name) {\n-                module = *m;\n+            let result = find_export_from_reexports(*module, export_name.clone()).await?;\n+            if let Some(m) = result.esm_export {\n+                module = m;\n                 continue;\n             }\n             return match &result.dynamic_exporting_modules[..] {\n@@ -269,6 +272,48 @@ async fn handle_declared_export(\n     }))\n }\n \n+#[turbo_tasks::value]\n+struct FindExportFromReexportsResult {\n+    esm_export: Option<ResolvedVc<Box<dyn EcmascriptChunkPlaceable>>>,\n+    dynamic_exporting_modules: Vec<ResolvedVc<Box<dyn EcmascriptChunkPlaceable>>>,\n+}\n+\n+#[turbo_tasks::function]\n+async fn find_export_from_reexports(\n+    module: ResolvedVc<Box<dyn EcmascriptChunkPlaceable>>,\n+    export_name: RcStr,\n+) -> Result<Vc<FindExportFromReexportsResult>> {\n+    if let Some(module) =\n+        Vc::try_resolve_downcast_type::<EcmascriptModulePartAsset>(*module).await?\n+    {\n+        if matches!(module.await?.part, ModulePart::Exports) {\n+            let module_part = EcmascriptModulePartAsset::select_part(\n+                *module.await?.full_module,\n+                ModulePart::export(export_name.clone()),\n+            );\n+\n+            // If we apply this logic to EcmascriptModuleAsset, we will resolve everything in the\n+            // target module.\n+            if (Vc::try_resolve_downcast_type::<EcmascriptModuleAsset>(module_part).await?)\n+                .is_none()\n+            {\n+                return Ok(find_export_from_reexports(\n+                    Vc::upcast(module_part),\n+                    export_name,\n+                ));\n+            }\n+        }\n+    }\n+\n+    let all_export_names = get_all_export_names(*module).await?;\n+    let esm_export = all_export_names.esm_exports.get(&export_name).copied();\n+    Ok(FindExportFromReexportsResult {\n+        esm_export,\n+        dynamic_exporting_modules: all_export_names.dynamic_exporting_modules.clone(),\n+    }\n+    .cell())\n+}\n+\n #[turbo_tasks::value]\n struct AllExportNamesResult {\n     esm_exports: FxIndexMap<RcStr, ResolvedVc<Box<dyn EcmascriptChunkPlaceable>>>,"
+        },
+        {
+            "sha": "5b58d808047a7eac8a3b892ebf628a2cc6ddf55c",
+            "filename": "turbopack/crates/turbopack-ecmascript/src/tree_shake/asset.rs",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/1e6c5d2d33af4eed47a42a24498c08d025b99212/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Ftree_shake%2Fasset.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/1e6c5d2d33af4eed47a42a24498c08d025b99212/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Ftree_shake%2Fasset.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Ftree_shake%2Fasset.rs?ref=1e6c5d2d33af4eed47a42a24498c08d025b99212",
+            "patch": "@@ -122,7 +122,7 @@ impl EcmascriptModulePartAsset {\n     pub async fn select_part(\n         module: Vc<EcmascriptModuleAsset>,\n         part: ModulePart,\n-    ) -> Result<Vc<Box<dyn Module>>> {\n+    ) -> Result<Vc<Box<dyn EcmascriptChunkPlaceable>>> {\n         let SplitResult::Ok { entrypoints, .. } = &*split_module(module).await? else {\n             return Ok(Vc::upcast(module));\n         };"
+        },
+        {
+            "sha": "d68ab3a7e96d3c0c1010ab60eb5d55d0b70731ae",
+            "filename": "turbopack/crates/turbopack-ecmascript/src/tree_shake/graph.rs",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 0,
+            "changes": 13,
+            "blob_url": "https://github.com/vercel/next.js/blob/1e6c5d2d33af4eed47a42a24498c08d025b99212/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Ftree_shake%2Fgraph.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/1e6c5d2d33af4eed47a42a24498c08d025b99212/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Ftree_shake%2Fgraph.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Ftree_shake%2Fgraph.rs?ref=1e6c5d2d33af4eed47a42a24498c08d025b99212",
+            "patch": "@@ -717,6 +717,19 @@ impl DepGraph {\n                 },\n             )));\n \n+        if !star_reexports.is_empty() {\n+            let mut module = Module::dummy();\n+            outputs.insert(Key::StarExports, modules.len() as u32);\n+\n+            for star in &star_reexports {\n+                module\n+                    .body\n+                    .push(ModuleItem::ModuleDecl(ModuleDecl::ExportAll(star.clone())));\n+            }\n+\n+            modules.push(module);\n+        }\n+\n         SplitModuleResult {\n             entrypoints: outputs,\n             part_deps,"
+        },
+        {
+            "sha": "b55eba6349e3ffc9bc8797c77eb042821f6d9623",
+            "filename": "turbopack/crates/turbopack-ecmascript/src/tree_shake/mod.rs",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 1,
+            "changes": 6,
+            "blob_url": "https://github.com/vercel/next.js/blob/1e6c5d2d33af4eed47a42a24498c08d025b99212/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Ftree_shake%2Fmod.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/1e6c5d2d33af4eed47a42a24498c08d025b99212/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Ftree_shake%2Fmod.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Ftree_shake%2Fmod.rs?ref=1e6c5d2d33af4eed47a42a24498c08d025b99212",
+            "patch": "@@ -374,6 +374,7 @@ pub(crate) enum Key {\n     ModuleEvaluation,\n     Export(RcStr),\n     Exports,\n+    StarExports,\n }\n \n /// Converts [ModulePart] to the index.\n@@ -407,7 +408,10 @@ async fn get_part_id(result: &SplitResult, part: &ModulePart) -> Result<u32> {\n \n     // This is required to handle `export * from 'foo'`\n     if let ModulePart::Export(..) = part {\n-        if let Some(&v) = entrypoints.get(&Key::Exports) {\n+        if let Some(&v) = entrypoints\n+            .get(&Key::StarExports)\n+            .or_else(|| entrypoints.get(&Key::Exports))\n+        {\n             return Ok(v);\n         }\n     }"
+        },
+        {
+            "sha": "b2a8a3837c2dca6a39a918cf28def44adc2ab839",
+            "filename": "turbopack/crates/turbopack-tests/tests/execution/turbopack/tree-shaking/basic/input/index.js",
+            "status": "renamed",
+            "additions": 0,
+            "deletions": 0,
+            "changes": 0,
+            "blob_url": "https://github.com/vercel/next.js/blob/1e6c5d2d33af4eed47a42a24498c08d025b99212/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Ftree-shaking%2Fbasic%2Finput%2Findex.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/1e6c5d2d33af4eed47a42a24498c08d025b99212/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Ftree-shaking%2Fbasic%2Finput%2Findex.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Ftree-shaking%2Fbasic%2Finput%2Findex.js?ref=1e6c5d2d33af4eed47a42a24498c08d025b99212",
+            "previous_filename": "turbopack/crates/turbopack-tests/tests/execution/turbopack/tree-shaking/.basic/input/index.js"
+        },
+        {
+            "sha": "000d78a6b3cbbc7dcf47535adef096194689fc10",
+            "filename": "turbopack/crates/turbopack-tests/tests/execution/turbopack/tree-shaking/basic/options.json",
+            "status": "renamed",
+            "additions": 0,
+            "deletions": 0,
+            "changes": 0,
+            "blob_url": "https://github.com/vercel/next.js/blob/1e6c5d2d33af4eed47a42a24498c08d025b99212/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Ftree-shaking%2Fbasic%2Foptions.json",
+            "raw_url": "https://github.com/vercel/next.js/raw/1e6c5d2d33af4eed47a42a24498c08d025b99212/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Ftree-shaking%2Fbasic%2Foptions.json",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Ftree-shaking%2Fbasic%2Foptions.json?ref=1e6c5d2d33af4eed47a42a24498c08d025b99212",
+            "previous_filename": "turbopack/crates/turbopack-tests/tests/execution/turbopack/tree-shaking/.basic/options.json"
+        }
+    ],
+    "stats": {
+        "total": 106,
+        "additions": 98,
+        "deletions": 8
+    }
+}

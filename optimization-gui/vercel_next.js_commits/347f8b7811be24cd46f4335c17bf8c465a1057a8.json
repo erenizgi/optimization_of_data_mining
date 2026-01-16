@@ -1,0 +1,36 @@
+{
+    "author": "ijjk",
+    "message": "Handle hash change in all files for static env (#77058)\n\nContinuation of https://github.com/vercel/next.js/pull/77038 this\nensures we replace hash changes in all assets so no stale hashes are\nleft present and we don't have to keep a static list to update. This\nalso ensures the server still treats the outputs as `compile` unless if\nonly env `generate` is run.\n\nx-ref: [slack\nthread](https://vercel.slack.com/archives/C07BVA6HM17/p1741840160742479?thread_ts=1741722738.816639&cid=C07BVA6HM17)",
+    "sha": "347f8b7811be24cd46f4335c17bf8c465a1057a8",
+    "files": [
+        {
+            "sha": "e33ceabedae4794fbda8ebf5ac74e6cf3ed8ff78",
+            "filename": "packages/next/src/build/index.ts",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 7,
+            "changes": 15,
+            "blob_url": "https://github.com/vercel/next.js/blob/347f8b7811be24cd46f4335c17bf8c465a1057a8/packages%2Fnext%2Fsrc%2Fbuild%2Findex.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/347f8b7811be24cd46f4335c17bf8c465a1057a8/packages%2Fnext%2Fsrc%2Fbuild%2Findex.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Findex.ts?ref=347f8b7811be24cd46f4335c17bf8c465a1057a8",
+            "patch": "@@ -2255,7 +2255,9 @@ export default async function build(\n                 trustHostHeader: ciEnvironment.hasNextSupport,\n \n                 // @ts-expect-error internal field TODO: fix this, should use a separate mechanism to pass the info.\n-                isExperimentalCompile: isCompileMode,\n+                isExperimentalCompile:\n+                  isCompileMode ||\n+                  (isGenerateMode && config.experimental.generateOnlyEnv),\n               },\n             },\n             appDir: dir,\n@@ -2506,20 +2508,19 @@ export default async function build(\n             await inlineStaticEnv({\n               distDir,\n               config,\n-              buildId,\n             })\n           })\n \n         // users might only want to inline env during experimental generate\n-        // instead of also prerendering e.g. for testmode so exit after\n+        // instead of also prerendering e.g. for test mode so exit after\n         if (config.experimental.generateOnlyEnv) {\n           Log.info(\n-            'Only inlining static env due to experimental.generateOnlyEnv'\n+            'Inlined static env, exiting due to experimental.generateOnlyEnv'\n           )\n+          await flushAllTraces()\n+          teardownTraceSubscriber()\n+          process.exit(0)\n         }\n-        await flushAllTraces()\n-        teardownTraceSubscriber()\n-        process.exit(0)\n       }\n \n       const middlewareManifest: MiddlewareManifest = await readManifest("
+        },
+        {
+            "sha": "e29df103b7656e49421de55d3a835c1cdfecbb8a",
+            "filename": "packages/next/src/lib/inline-static-env.ts",
+            "status": "modified",
+            "additions": 17,
+            "deletions": 18,
+            "changes": 35,
+            "blob_url": "https://github.com/vercel/next.js/blob/347f8b7811be24cd46f4335c17bf8c465a1057a8/packages%2Fnext%2Fsrc%2Flib%2Finline-static-env.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/347f8b7811be24cd46f4335c17bf8c465a1057a8/packages%2Fnext%2Fsrc%2Flib%2Finline-static-env.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Flib%2Finline-static-env.ts?ref=347f8b7811be24cd46f4335c17bf8c465a1057a8",
+            "patch": "@@ -5,38 +5,31 @@ import { promisify } from 'util'\n import globOriginal from 'next/dist/compiled/glob'\n import { Sema } from 'next/dist/compiled/async-sema'\n import type { NextConfigComplete } from '../server/config-shared'\n-import { BUILD_MANIFEST } from '../shared/lib/constants'\n import { getNextConfigEnv, getStaticEnv } from './static-env'\n \n const glob = promisify(globOriginal)\n \n export async function inlineStaticEnv({\n   distDir,\n   config,\n-  buildId,\n }: {\n   distDir: string\n-  buildId: string\n   config: NextConfigComplete\n }) {\n   const nextConfigEnv = getNextConfigEnv(config)\n   const staticEnv = getStaticEnv(config)\n \n   const serverDir = path.join(distDir, 'server')\n-  const serverChunks = await glob('**/*.js', {\n+  const serverChunks = await glob('**/*.{js,json,js.map}', {\n     cwd: serverDir,\n   })\n   const clientDir = path.join(distDir, 'static')\n-  const clientChunks = await glob('**/*.js', {\n+  const clientChunks = await glob('**/*.{js,json,js.map}', {\n     cwd: clientDir,\n   })\n-  const webpackRuntimeFile = clientChunks.find((item) =>\n-    item.match(/webpack-[a-z0-9]{16}/)\n-  )\n-\n-  if (!webpackRuntimeFile) {\n-    throw new Error(`Invariant failed to find webpack runtime chunk`)\n-  }\n+  const manifestChunks = await glob('*.{js,json,js.map}', {\n+    cwd: distDir,\n+  })\n \n   const inlineSema = new Sema(8)\n   const nextConfigEnvKeys = Object.keys(nextConfigEnv).map((item) =>\n@@ -48,6 +41,9 @@ export async function inlineStaticEnv({\n     'g'\n   )\n   const changedClientFiles: Array<{ file: string; content: string }> = []\n+  const filesToCheck = new Set<string>(\n+    manifestChunks.map((f) => path.join(distDir, f))\n+  )\n \n   for (const [parentDir, files] of [\n     [serverDir, serverChunks],\n@@ -72,6 +68,7 @@ export async function inlineStaticEnv({\n         if (content !== newContent && parentDir === clientDir) {\n           changedClientFiles.push({ file, content: newContent })\n         }\n+        filesToCheck.add(filepath)\n         inlineSema.release()\n       })\n     )\n@@ -98,16 +95,18 @@ export async function inlineStaticEnv({\n       .substring(0, 16)\n \n     hashChanges.push({ originalHash, newHash })\n+\n     const filepath = path.join(clientDir, file)\n-    await fs.promises.rename(filepath, filepath.replace(originalHash, newHash))\n+    const newFilepath = filepath.replace(originalHash, newHash)\n+\n+    filesToCheck.delete(filepath)\n+    filesToCheck.add(newFilepath)\n+\n+    await fs.promises.rename(filepath, newFilepath)\n   }\n \n   // update build-manifest and webpack-runtime with new hashes\n-  for (const file of [\n-    path.join(distDir, BUILD_MANIFEST),\n-    path.join(distDir, 'static', webpackRuntimeFile),\n-    path.join(distDir, 'static', buildId, '_buildManifest.js'),\n-  ]) {\n+  for (let file of filesToCheck) {\n     const content = await fs.promises.readFile(file, 'utf-8')\n     let newContent = content\n "
+        }
+    ],
+    "stats": {
+        "total": 50,
+        "additions": 25,
+        "deletions": 25
+    }
+}

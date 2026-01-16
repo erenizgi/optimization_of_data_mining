@@ -1,0 +1,144 @@
+{
+    "author": "acdlite",
+    "message": "Fix: Server refresh() should not purge client cache (#86878)\n\nThe server form of refresh() is used to re-render all the dynamic data\non the current page. Unlike updateTag/revalidateTag, it does not affect\nany cached data, so the client cache should not evict any of its\nentries.",
+    "sha": "8c5af211d580b2b94c535cf4ff4e8be57c963491",
+    "files": [
+        {
+            "sha": "0fb127005bf5a60a7a707d0387216e84670950ff",
+            "filename": "packages/next/src/client/components/app-router-headers.ts",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/8c5af211d580b2b94c535cf4ff4e8be57c963491/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Fapp-router-headers.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/8c5af211d580b2b94c535cf4ff4e8be57c963491/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Fapp-router-headers.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Fapp-router-headers.ts?ref=8c5af211d580b2b94c535cf4ff4e8be57c963491",
+            "patch": "@@ -34,3 +34,6 @@ export const NEXT_IS_PRERENDER_HEADER = 'x-nextjs-prerender' as const\n export const NEXT_ACTION_NOT_FOUND_HEADER = 'x-nextjs-action-not-found' as const\n export const NEXT_REQUEST_ID_HEADER = 'x-nextjs-request-id' as const\n export const NEXT_HTML_REQUEST_ID_HEADER = 'x-nextjs-html-request-id' as const\n+\n+// TODO: Should this include nextjs in the name, like the others?\n+export const NEXT_ACTION_REVALIDATED_HEADER = 'x-action-revalidated' as const"
+        },
+        {
+            "sha": "21d854df8dc95b404b807914c3410e092842cc07",
+            "filename": "packages/next/src/client/components/router-reducer/reducers/server-action-reducer.ts",
+            "status": "modified",
+            "additions": 28,
+            "deletions": 33,
+            "changes": 61,
+            "blob_url": "https://github.com/vercel/next.js/blob/8c5af211d580b2b94c535cf4ff4e8be57c963491/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Frouter-reducer%2Freducers%2Fserver-action-reducer.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/8c5af211d580b2b94c535cf4ff4e8be57c963491/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Frouter-reducer%2Freducers%2Fserver-action-reducer.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Frouter-reducer%2Freducers%2Fserver-action-reducer.ts?ref=8c5af211d580b2b94c535cf4ff4e8be57c963491",
+            "patch": "@@ -54,6 +54,12 @@ import {\n   navigate as navigateUsingSegmentCache,\n } from '../../segment-cache/navigation'\n import type { NormalizedSearch } from '../../segment-cache/cache-key'\n+import {\n+  ActionDidNotRevalidate,\n+  ActionDidRevalidateDynamicOnly,\n+  ActionDidRevalidateStaticAndDynamic,\n+  type ActionRevalidationKind,\n+} from '../../../../shared/lib/action-revalidation-kind'\n \n const createFromFetch =\n   createFromFetchBrowser as (typeof import('react-server-dom-webpack/client.browser'))['createFromFetch']\n@@ -77,16 +83,12 @@ if (\n type FetchServerActionResult = {\n   redirectLocation: URL | undefined\n   redirectType: RedirectType | undefined\n+  revalidationKind: ActionRevalidationKind\n   actionResult: ActionResult | undefined\n   actionFlightData: NormalizedFlightData[] | string | undefined\n   actionFlightDataRenderedSearch: NormalizedSearch | undefined\n   actionFlightDataCouldBeIntercepted: boolean | undefined\n   isPrerender: boolean\n-  revalidatedParts: {\n-    tag: boolean\n-    cookie: boolean\n-    paths: string[]\n-  }\n }\n \n async function fetchServerAction(\n@@ -160,19 +162,20 @@ async function fetchServerAction(\n   }\n \n   const isPrerender = !!res.headers.get(NEXT_IS_PRERENDER_HEADER)\n-  let revalidatedParts: FetchServerActionResult['revalidatedParts']\n+\n+  let revalidationKind: ActionRevalidationKind = ActionDidNotRevalidate\n   try {\n-    const revalidatedHeader = JSON.parse(\n-      res.headers.get('x-action-revalidated') || '[[],0,0]'\n-    )\n-    revalidatedParts = {\n-      paths: revalidatedHeader[0] || [],\n-      tag: !!revalidatedHeader[1],\n-      cookie: !!revalidatedHeader[2],\n+    const revalidationHeader = res.headers.get('x-action-revalidated')\n+    if (revalidationHeader) {\n+      const parsedKind = JSON.parse(revalidationHeader)\n+      if (\n+        parsedKind === ActionDidRevalidateStaticAndDynamic ||\n+        parsedKind === ActionDidRevalidateDynamicOnly\n+      ) {\n+        revalidationKind = parsedKind\n+      }\n     }\n-  } catch (e) {\n-    revalidatedParts = NO_REVALIDATED_PARTS\n-  }\n+  } catch {}\n \n   const redirectLocation = location\n     ? assignLocation(\n@@ -239,17 +242,11 @@ async function fetchServerAction(\n     actionFlightDataCouldBeIntercepted,\n     redirectLocation,\n     redirectType,\n-    revalidatedParts,\n+    revalidationKind,\n     isPrerender,\n   }\n }\n \n-const NO_REVALIDATED_PARTS = {\n-  paths: [],\n-  tag: false,\n-  cookie: false,\n-}\n-\n /*\n  * This reducer is responsible for calling the server action and processing any side-effects from the server action.\n  * It does not mutate the state by itself but rather delegates to other reducers to do the actual mutation.\n@@ -280,20 +277,15 @@ export function serverActionReducer(\n \n   return fetchServerAction(state, nextUrl, action).then(\n     async ({\n+      revalidationKind,\n       actionResult,\n       actionFlightData: flightData,\n       actionFlightDataRenderedSearch: flightDataRenderedSearch,\n       actionFlightDataCouldBeIntercepted: flightDataCouldBeIntercepted,\n       redirectLocation,\n       redirectType,\n-      revalidatedParts,\n     }) => {\n-      const actionDidRevalidateCache =\n-        revalidatedParts.paths.length > 0 ||\n-        revalidatedParts.tag ||\n-        revalidatedParts.cookie\n-\n-      if (actionDidRevalidateCache) {\n+      if (revalidationKind !== ActionDidNotRevalidate) {\n         // Store whether this action triggered any revalidation\n         // The action queue will use this information to potentially\n         // trigger a refresh action if the action was discarded\n@@ -302,7 +294,9 @@ export function serverActionReducer(\n \n         // If there was a revalidation, evict the entire prefetch cache.\n         // TODO: Evict only segments with matching tags and/or paths.\n-        revalidateEntireCache(nextUrl, state.tree)\n+        if (revalidationKind === ActionDidRevalidateStaticAndDynamic) {\n+          revalidateEntireCache(nextUrl, state.tree)\n+        }\n       }\n \n       if (redirectLocation !== undefined) {\n@@ -341,7 +335,7 @@ export function serverActionReducer(\n         // Did the action trigger a redirect?\n         redirectLocation === undefined &&\n         // Did the action revalidate any data?\n-        !actionDidRevalidateCache &&\n+        revalidationKind === ActionDidNotRevalidate &&\n         // Did the server render new data?\n         flightData === undefined\n       ) {\n@@ -382,7 +376,8 @@ export function serverActionReducer(\n \n       // If the action triggered a revalidation of the cache, we should also\n       // refresh all the dynamic data.\n-      const shouldRefreshDynamicData = actionDidRevalidateCache\n+      const shouldRefreshDynamicData =\n+        revalidationKind !== ActionDidNotRevalidate\n \n       // The server may have sent back new data. If so, we will perform a\n       // \"seeded\" navigation that uses the data from the response."
+        },
+        {
+            "sha": "b59d153f89d14471430e007e004a902b98873a65",
+            "filename": "packages/next/src/server/app-render/action-handler.ts",
+            "status": "modified",
+            "additions": 31,
+            "deletions": 9,
+            "changes": 40,
+            "blob_url": "https://github.com/vercel/next.js/blob/8c5af211d580b2b94c535cf4ff4e8be57c963491/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Faction-handler.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/8c5af211d580b2b94c535cf4ff4e8be57c963491/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Faction-handler.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Faction-handler.ts?ref=8c5af211d580b2b94c535cf4ff4e8be57c963491",
+            "patch": "@@ -14,6 +14,7 @@ import {\n   NEXT_ROUTER_PREFETCH_HEADER,\n   NEXT_ROUTER_SEGMENT_PREFETCH_HEADER,\n   NEXT_URL,\n+  NEXT_ACTION_REVALIDATED_HEADER,\n } from '../../client/components/app-router-headers'\n import {\n   getAccessFallbackHTTPStatus,\n@@ -63,6 +64,10 @@ import { executeRevalidates } from '../revalidation-utils'\n import { getRequestMeta } from '../request-meta'\n import { setCacheBustingSearchParam } from '../../client/components/router-reducer/set-cache-busting-search-param'\n import { getServerModuleMap } from './manifests-singleton'\n+import {\n+  ActionDidNotRevalidate,\n+  ActionDidRevalidateStaticAndDynamic,\n+} from '../../shared/lib/action-revalidation-kind'\n \n function formDataFromSearchQueryString(query: string) {\n   const searchParams = new URLSearchParams(query)\n@@ -141,9 +146,10 @@ function addRevalidationHeader(\n   // client router cache as they may be stale. And if a path was revalidated, the\n   // client needs to invalidate all subtrees below that path.\n \n-  // To keep the header size small, we use a tuple of\n-  // [[revalidatedPaths], isTagRevalidated ? 1 : 0, isCookieRevalidated ? 1 : 0]\n-  // instead of a JSON object.\n+  // TODO: Currently we don't send the specific tags or paths to the client,\n+  // we just send a flag indicating that all the static data on the client\n+  // should be invalidated. In the future, this will likely be a Bloom filter\n+  // or bitmask of some kind.\n \n   // TODO-APP: Currently the prefetch cache doesn't have subtree information,\n   // so we need to invalidate the entire cache if a path was revalidated.\n@@ -157,10 +163,22 @@ function addRevalidationHeader(\n     ? 1\n     : 0\n \n-  res.setHeader(\n-    'x-action-revalidated',\n-    JSON.stringify([[], isTagRevalidated, isCookieRevalidated])\n-  )\n+  // First check if a tag, cookie, or path was revalidated.\n+  if (isTagRevalidated || isCookieRevalidated) {\n+    res.setHeader(\n+      NEXT_ACTION_REVALIDATED_HEADER,\n+      JSON.stringify(ActionDidRevalidateStaticAndDynamic)\n+    )\n+  } else if (\n+    // Check for refresh() actions. This will invalidate only the dynamic data.\n+    workStore.pathWasRevalidated !== undefined &&\n+    workStore.pathWasRevalidated !== ActionDidNotRevalidate\n+  ) {\n+    res.setHeader(\n+      NEXT_ACTION_REVALIDATED_HEADER,\n+      JSON.stringify(workStore.pathWasRevalidated)\n+    )\n+  }\n }\n \n /**\n@@ -1137,7 +1155,9 @@ export async function handleAction({\n           // If the page was not revalidated, or if the action was forwarded\n           // from another worker, we can skip rendering the page.\n           skipPageRendering:\n-            !workStore.pathWasRevalidated || actionWasForwarded,\n+            workStore.pathWasRevalidated === undefined ||\n+            workStore.pathWasRevalidated === ActionDidNotRevalidate ||\n+            actionWasForwarded,\n           temporaryReferences,\n         }),\n       }\n@@ -1170,7 +1190,9 @@ async function executeActionAndPrepareForRender<\n \n     // If the page was not revalidated, or if the action was forwarded from\n     // another worker, we can skip rendering the page.\n-    skipPageRendering ||= !workStore.pathWasRevalidated\n+    skipPageRendering ||=\n+      workStore.pathWasRevalidated === undefined ||\n+      workStore.pathWasRevalidated === ActionDidNotRevalidate\n \n     return { actionResult, skipPageRendering }\n   } finally {"
+        },
+        {
+            "sha": "ca22465538d828927fb8ad01c2a18d63daca6e92",
+            "filename": "packages/next/src/server/app-render/work-async-storage.external.ts",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/8c5af211d580b2b94c535cf4ff4e8be57c963491/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fwork-async-storage.external.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/8c5af211d580b2b94c535cf4ff4e8be57c963491/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fwork-async-storage.external.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fwork-async-storage.external.ts?ref=8c5af211d580b2b94c535cf4ff4e8be57c963491",
+            "patch": "@@ -10,6 +10,7 @@ import type { CacheLife } from '../use-cache/cache-life'\n import { workAsyncStorageInstance } from './work-async-storage-instance' with { 'turbopack-transition': 'next-shared' }\n import type { LazyResult } from '../lib/lazy-result'\n import type { DigestedError } from './create-error-handler'\n+import type { ActionRevalidationKind } from '../../shared/lib/action-revalidation-kind'\n \n export interface WorkStore {\n   readonly isStaticGeneration: boolean\n@@ -61,7 +62,7 @@ export interface WorkStore {\n   invalidDynamicUsageError?: Error\n \n   nextFetchId?: number\n-  pathWasRevalidated?: boolean\n+  pathWasRevalidated?: ActionRevalidationKind\n \n   /**\n    * Tags that were revalidated during the current request. They need to be sent"
+        },
+        {
+            "sha": "2120d7e5ab3ee140eff50489d2773362c7da4e1d",
+            "filename": "packages/next/src/server/web/spec-extension/adapters/request-cookies.ts",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/8c5af211d580b2b94c535cf4ff4e8be57c963491/packages%2Fnext%2Fsrc%2Fserver%2Fweb%2Fspec-extension%2Fadapters%2Frequest-cookies.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/8c5af211d580b2b94c535cf4ff4e8be57c963491/packages%2Fnext%2Fsrc%2Fserver%2Fweb%2Fspec-extension%2Fadapters%2Frequest-cookies.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fweb%2Fspec-extension%2Fadapters%2Frequest-cookies.ts?ref=8c5af211d580b2b94c535cf4ff4e8be57c963491",
+            "patch": "@@ -4,6 +4,7 @@ import { ResponseCookies } from '../cookies'\n import { ReflectAdapter } from './reflect'\n import { workAsyncStorage } from '../../../app-render/work-async-storage.external'\n import type { RequestStore } from '../../../app-render/work-unit-async-storage.external'\n+import { ActionDidRevalidateStaticAndDynamic } from '../../../../shared/lib/action-revalidation-kind'\n \n /**\n  * @internal\n@@ -116,7 +117,7 @@ export class MutableRequestCookiesAdapter {\n       // TODO-APP: change method of getting workStore\n       const workStore = workAsyncStorage.getStore()\n       if (workStore) {\n-        workStore.pathWasRevalidated = true\n+        workStore.pathWasRevalidated = ActionDidRevalidateStaticAndDynamic\n       }\n \n       const allCookies = responseCookies.getAll()"
+        },
+        {
+            "sha": "93109275f21c2a90f28790dee7c8816233d810a2",
+            "filename": "packages/next/src/server/web/spec-extension/revalidate.ts",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 3,
+            "changes": 11,
+            "blob_url": "https://github.com/vercel/next.js/blob/8c5af211d580b2b94c535cf4ff4e8be57c963491/packages%2Fnext%2Fsrc%2Fserver%2Fweb%2Fspec-extension%2Frevalidate.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/8c5af211d580b2b94c535cf4ff4e8be57c963491/packages%2Fnext%2Fsrc%2Fserver%2Fweb%2Fspec-extension%2Frevalidate.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fweb%2Fspec-extension%2Frevalidate.ts?ref=8c5af211d580b2b94c535cf4ff4e8be57c963491",
+            "patch": "@@ -11,6 +11,10 @@ import { workAsyncStorage } from '../../app-render/work-async-storage.external'\n import { workUnitAsyncStorage } from '../../app-render/work-unit-async-storage.external'\n import { DynamicServerError } from '../../../client/components/hooks-server-context'\n import { InvariantError } from '../../../shared/lib/invariant-error'\n+import {\n+  ActionDidRevalidateDynamicOnly,\n+  ActionDidRevalidateStaticAndDynamic as ActionDidRevalidate,\n+} from '../../../shared/lib/action-revalidation-kind'\n \n type CacheLifeConfig = {\n   expire?: number\n@@ -73,8 +77,9 @@ export function refresh() {\n   }\n \n   if (workStore) {\n-    // TODO: break this to it's own field\n-    workStore.pathWasRevalidated = true\n+    // The Server Action version of refresh() only revalidates the dynamic data\n+    // on the client. It doesn't affect cached data.\n+    workStore.pathWasRevalidated = ActionDidRevalidateDynamicOnly\n   }\n }\n \n@@ -226,6 +231,6 @@ function revalidate(\n \n   if (!profile || cacheLife?.expire === 0) {\n     // TODO: only revalidate if the path matches\n-    store.pathWasRevalidated = true\n+    store.pathWasRevalidated = ActionDidRevalidate\n   }\n }"
+        },
+        {
+            "sha": "2cd640d8bcb9cdeb8725973a85c0f2d485c032fe",
+            "filename": "packages/next/src/shared/lib/action-revalidation-kind.ts",
+            "status": "added",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/8c5af211d580b2b94c535cf4ff4e8be57c963491/packages%2Fnext%2Fsrc%2Fshared%2Flib%2Faction-revalidation-kind.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/8c5af211d580b2b94c535cf4ff4e8be57c963491/packages%2Fnext%2Fsrc%2Fshared%2Flib%2Faction-revalidation-kind.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fshared%2Flib%2Faction-revalidation-kind.ts?ref=8c5af211d580b2b94c535cf4ff4e8be57c963491",
+            "patch": "@@ -0,0 +1,5 @@\n+export type ActionRevalidationKind = 0 | 1 | 2\n+\n+export const ActionDidNotRevalidate = 0\n+export const ActionDidRevalidateStaticAndDynamic = 1\n+export const ActionDidRevalidateDynamicOnly = 2"
+        },
+        {
+            "sha": "8a68b3cf111244b69b9d7e5310182369a780e1df",
+            "filename": "test/e2e/app-dir/segment-cache/refresh/app/dashboard/client.tsx",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/8c5af211d580b2b94c535cf4ff4e8be57c963491/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Frefresh%2Fapp%2Fdashboard%2Fclient.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/8c5af211d580b2b94c535cf4ff4e8be57c963491/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Frefresh%2Fapp%2Fdashboard%2Fclient.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Frefresh%2Fapp%2Fdashboard%2Fclient.tsx?ref=8c5af211d580b2b94c535cf4ff4e8be57c963491",
+            "patch": "@@ -11,7 +11,7 @@ export function ClientRefreshButton() {\n         router.refresh()\n       }}\n     >\n-      Refresh\n+      Client refresh\n     </button>\n   )\n }"
+        },
+        {
+            "sha": "31ff623530e7304f20fb79d6a4a7d4b6b0ed2634",
+            "filename": "test/e2e/app-dir/segment-cache/refresh/app/dashboard/layout.tsx",
+            "status": "modified",
+            "additions": 18,
+            "deletions": 0,
+            "changes": 18,
+            "blob_url": "https://github.com/vercel/next.js/blob/8c5af211d580b2b94c535cf4ff4e8be57c963491/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Frefresh%2Fapp%2Fdashboard%2Flayout.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/8c5af211d580b2b94c535cf4ff4e8be57c963491/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Frefresh%2Fapp%2Fdashboard%2Flayout.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Frefresh%2Fapp%2Fdashboard%2Flayout.tsx?ref=8c5af211d580b2b94c535cf4ff4e8be57c963491",
+            "patch": "@@ -1,5 +1,19 @@\n import { LinkAccordion } from '../../components/link-accordion'\n import { ClientRefreshButton } from './client'\n+import { refresh } from 'next/cache'\n+\n+function ServerRefreshButton() {\n+  return (\n+    <form\n+      action={async () => {\n+        'use server'\n+        refresh()\n+      }}\n+    >\n+      <button id=\"server-refresh-button\">Server refresh</button>\n+    </form>\n+  )\n+}\n \n export default function DashboardLayout({\n   navbar,\n@@ -14,6 +28,7 @@ export default function DashboardLayout({\n         {navbar}\n         <div>\n           <ClientRefreshButton />\n+          <ServerRefreshButton />\n         </div>\n         <ul>\n           <li>\n@@ -22,6 +37,9 @@ export default function DashboardLayout({\n           <li>\n             <LinkAccordion href=\"/dashboard/analytics\">Analytics</LinkAccordion>\n           </li>\n+          <li>\n+            <LinkAccordion href=\"/docs\">Docs</LinkAccordion>\n+          </li>\n         </ul>\n       </div>\n       <div>{main}</div>"
+        },
+        {
+            "sha": "90f7877bc8cb31c9289b3938b5ec7e44353bf64f",
+            "filename": "test/e2e/app-dir/segment-cache/refresh/app/docs/page.tsx",
+            "status": "added",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/8c5af211d580b2b94c535cf4ff4e8be57c963491/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Frefresh%2Fapp%2Fdocs%2Fpage.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/8c5af211d580b2b94c535cf4ff4e8be57c963491/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Frefresh%2Fapp%2Fdocs%2Fpage.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Frefresh%2Fapp%2Fdocs%2Fpage.tsx?ref=8c5af211d580b2b94c535cf4ff4e8be57c963491",
+            "patch": "@@ -0,0 +1,3 @@\n+export default function DocsPage() {\n+  return <div id=\"docs-page\">Static docs page</div>\n+}"
+        },
+        {
+            "sha": "70ba86fd1af3c562f11505a452ba691329aa07e7",
+            "filename": "test/e2e/app-dir/segment-cache/refresh/segment-cache-refresh.test.ts",
+            "status": "modified",
+            "additions": 91,
+            "deletions": 5,
+            "changes": 96,
+            "blob_url": "https://github.com/vercel/next.js/blob/8c5af211d580b2b94c535cf4ff4e8be57c963491/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Frefresh%2Fsegment-cache-refresh.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/8c5af211d580b2b94c535cf4ff4e8be57c963491/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Frefresh%2Fsegment-cache-refresh.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Frefresh%2Fsegment-cache-refresh.test.ts?ref=8c5af211d580b2b94c535cf4ff4e8be57c963491",
+            "patch": "@@ -11,7 +11,7 @@ describe('segment cache (refresh)', () => {\n     return\n   }\n \n-  it('refreshes data inside reused default parallel route slots', async () => {\n+  it('router.refresh() refreshes both cached and dynamic data', async () => {\n     // Load the main Dashboard page. This will render the nav bar into the\n     // @navbar slot.\n     let page: Playwright.Page\n@@ -34,22 +34,108 @@ describe('segment cache (refresh)', () => {\n       await link.click()\n     })\n \n-    // Click the refresh button and confirm the navigation bar is re-rendered,\n-    // even though it's not part of the Analytics page.\n+    // Reveal the link to the docs page to prefetch it.\n     await act(\n       async () => {\n-        const refreshButton = await browser.elementById('client-refresh-button')\n-        await refreshButton.click()\n+        const toggleDocsLink = await browser.elementByCss(\n+          'input[data-link-accordion=\"/docs\"]'\n+        )\n+        await toggleDocsLink.click()\n       },\n+      {\n+        includes: 'Static docs page',\n+      }\n+    )\n+\n+    // Click the client refresh button and confirm the navigation bar is\n+    // re-rendered, even though it's not part of the Analytics page.\n+    await act(async () => {\n+      const refreshButton = await browser.elementById('client-refresh-button')\n+      await refreshButton.click()\n+    }, [\n       {\n         includes: 'Navbar dynamic render counter',\n+      },\n+      {\n+        // router.refresh() also purges Cache Components from the client cache,\n+        // so we must re-prefetch the docs page\n+        includes: 'Static docs page',\n+      },\n+    ])\n+\n+    const navbarDynamicRenderCounter = await browser.elementById(\n+      'navbar-dynamic-render-counter'\n+    )\n+    // If this is still 0, then the nav bar was not successfully refreshed\n+    expect(await navbarDynamicRenderCounter.textContent()).toBe('1')\n+  })\n+\n+  it('Server Action refresh() refreshes dynamic data only, not cached', async () => {\n+    // Load the main Dashboard page. This will render the nav bar into the\n+    // @navbar slot.\n+    let page: Playwright.Page\n+    const browser = await next.browser('/dashboard', {\n+      beforePageLoad(p: Playwright.Page) {\n+        page = p\n+      },\n+    })\n+    const act = createRouterAct(page)\n+\n+    // Navigate to the Analytics page. The analytics page does not match the\n+    // @navbar slot, so the client reuses the one that was rendered by the\n+    // previous page.\n+    await act(async () => {\n+      const toggleAnalyticsLink = await browser.elementByCss(\n+        'input[data-link-accordion=\"/dashboard/analytics\"]'\n+      )\n+      await toggleAnalyticsLink.click()\n+      const link = await browser.elementByCss('a[href=\"/dashboard/analytics\"]')\n+      await link.click()\n+    })\n+\n+    // Reveal the link to the docs page to prefetch it.\n+    await act(\n+      async () => {\n+        const toggleDocsLink = await browser.elementByCss(\n+          'input[data-link-accordion=\"/docs\"]'\n+        )\n+        await toggleDocsLink.click()\n+      },\n+      {\n+        includes: 'Static docs page',\n       }\n     )\n \n+    // Click the server refresh button and confirm the navigation bar is\n+    // re-rendered, even though it's not part of the Analytics page.\n+    await act(async () => {\n+      const refreshButton = await browser.elementById('server-refresh-button')\n+      await refreshButton.click()\n+    }, [\n+      {\n+        includes: 'Navbar dynamic render counter',\n+      },\n+      {\n+        // The server form of refresh() does _not_ purge Cache Components from\n+        // the client cache, so we shouldn't need to re-prefetch the docs page.\n+        includes: 'Static docs page',\n+        block: 'reject',\n+      },\n+    ])\n+\n     const navbarDynamicRenderCounter = await browser.elementById(\n       'navbar-dynamic-render-counter'\n     )\n     // If this is still 0, then the nav bar was not successfully refreshed\n     expect(await navbarDynamicRenderCounter.textContent()).toBe('1')\n+\n+    // Confirm that navigating the the docs page does not require any\n+    // additional requests.\n+    await act(async () => {\n+      const link = await browser.elementByCss('a[href=\"/docs\"]')\n+      await link.click()\n+      const docsPage = await browser.elementById('docs-page')\n+      expect(await docsPage.textContent()).toBe('Static docs page')\n+    }, 'no-requests')\n   })\n })"
+        }
+    ],
+    "stats": {
+        "total": 245,
+        "additions": 192,
+        "deletions": 53
+    }
+}

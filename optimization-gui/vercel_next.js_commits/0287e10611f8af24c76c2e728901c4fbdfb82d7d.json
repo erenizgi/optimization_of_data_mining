@@ -1,0 +1,120 @@
+{
+    "author": "lubieowoce",
+    "message": "fix(edge): run after() if request is cancelled mid-streaming (#76013)\n\n### What\r\n- Fixes an issue where `after()` in an edge page would not run if the\r\nrequest was cancelled/aborted\r\n- Unskips the `runs callbacks if redirect() was called` test which was\r\ndisabled to not block other things\r\n\r\n### Background\r\n\r\nThis was initially hit in #75882, during which the `runs callbacks if\r\nredirect() was called` test started failing when using experimental\r\nreact + turbo in dev mode. Turns out that this happenws because\r\nsomething got slower and we weren't finishing the redirect response in\r\ntime, i.e. before the browser disconnected and started loading the page\r\nit got redirected to.\r\n\r\nIt's relevant that the response didn't finish streaming, because in\r\n`edge`, we use that as the trigger to start running `after()` callbacks.\r\nIn particular, we instrument the response stream using\r\n`trackStreamConsumed`. The problem was that this function didn't handle\r\nthe stream being cancelled, which is what happens when a request is\r\naborted mid-streaming, so `after()` never ended up executing.\r\n\r\nThis PR fixes that and adds some tests for cancellation and interrupted\r\nstreaming.",
+    "sha": "0287e10611f8af24c76c2e728901c4fbdfb82d7d",
+    "files": [
+        {
+            "sha": "7f528ef6f1c0d58de6ecd07242c8ada4dc6c06c6",
+            "filename": "packages/next/src/server/web/web-on-close.test.ts",
+            "status": "added",
+            "additions": 106,
+            "deletions": 0,
+            "changes": 106,
+            "blob_url": "https://github.com/vercel/next.js/blob/0287e10611f8af24c76c2e728901c4fbdfb82d7d/packages%2Fnext%2Fsrc%2Fserver%2Fweb%2Fweb-on-close.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/0287e10611f8af24c76c2e728901c4fbdfb82d7d/packages%2Fnext%2Fsrc%2Fserver%2Fweb%2Fweb-on-close.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fweb%2Fweb-on-close.test.ts?ref=0287e10611f8af24c76c2e728901c4fbdfb82d7d",
+            "patch": "@@ -0,0 +1,106 @@\n+import { DetachedPromise } from '../../lib/detached-promise'\n+import { trackStreamConsumed } from './web-on-close'\n+\n+describe('trackStreamConsumed', () => {\n+  it('calls onEnd when the stream finishes', async () => {\n+    const endPromise = new DetachedPromise<void>()\n+    const onEnd = jest.fn(endPromise.resolve)\n+\n+    const { stream: inputStream, controller } =\n+      readableStreamWithController<string>()\n+    const trackedStream = trackStreamConsumed(inputStream, onEnd)\n+\n+    const reader = trackedStream.getReader()\n+    controller.enqueue('one')\n+    controller.enqueue('two')\n+    await reader.read()\n+    await reader.read()\n+    expect(onEnd).not.toHaveBeenCalled()\n+\n+    controller.close()\n+\n+    await expect(reader.read()).resolves.toEqual({\n+      done: true,\n+      value: undefined,\n+    })\n+\n+    await endPromise.promise\n+    expect(onEnd).toHaveBeenCalledTimes(1)\n+  })\n+\n+  it('calls onEnd when the stream errors', async () => {\n+    const endPromise = new DetachedPromise<void>()\n+    const onEnd = jest.fn(endPromise.resolve)\n+\n+    const { stream: inputStream, controller } =\n+      readableStreamWithController<string>()\n+    const trackedStream = trackStreamConsumed(inputStream, onEnd)\n+\n+    const reader = trackedStream.getReader()\n+    controller.enqueue('one')\n+    controller.enqueue('two')\n+    await reader.read()\n+    await reader.read()\n+    expect(onEnd).not.toHaveBeenCalled()\n+\n+    const error = new Error('kaboom')\n+    controller.error(error)\n+\n+    // if the underlying stream errors, we should error as well\n+    await expect(reader.read()).rejects.toThrow(error)\n+\n+    await endPromise.promise\n+    expect(onEnd).toHaveBeenCalledTimes(1)\n+  })\n+\n+  it('calls onEnd when the stream is cancelled', async () => {\n+    const endPromise = new DetachedPromise<void>()\n+    const onEnd = jest.fn(endPromise.resolve)\n+\n+    const cancelledPromise = new DetachedPromise<unknown>()\n+    const onCancel = jest.fn(cancelledPromise.resolve)\n+\n+    const { stream: inputStream, controller } =\n+      readableStreamWithController<string>(onCancel)\n+    const trackedStream = trackStreamConsumed(inputStream, onEnd)\n+\n+    const reader = trackedStream.getReader()\n+    controller.enqueue('one')\n+    controller.enqueue('two')\n+    await reader.read()\n+    await reader.read()\n+    expect(onEnd).not.toHaveBeenCalled()\n+\n+    const cancellationReason = new Error('cancelled')\n+    await reader.cancel(cancellationReason)\n+\n+    // from a reader's perspective, a cancelled stream behaves like it's done\n+    // (which is a bit weird honestly?)\n+    await expect(reader.read()).resolves.toEqual({\n+      done: true,\n+      value: undefined,\n+    })\n+\n+    await endPromise.promise\n+    expect(onEnd).toHaveBeenCalledTimes(1)\n+\n+    //  the cancellation should propagate to back to the underlying stream\n+    await cancelledPromise.promise\n+    expect(onCancel).toHaveBeenCalledWith(cancellationReason)\n+  })\n+})\n+\n+function readableStreamWithController<TChunk>(\n+  onCancel?: (reason: unknown) => void\n+) {\n+  let controller: ReadableStreamDefaultController<TChunk> = undefined!\n+  const stream = new ReadableStream<TChunk>({\n+    start(_controller) {\n+      controller = _controller\n+    },\n+    cancel(reason) {\n+      onCancel?.(reason)\n+    },\n+  })\n+  return { controller, stream }\n+}"
+        },
+        {
+            "sha": "8fe419d44d8fcb037b6e1ded6e18bd5e9e11bb5d",
+            "filename": "packages/next/src/server/web/web-on-close.ts",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 6,
+            "changes": 17,
+            "blob_url": "https://github.com/vercel/next.js/blob/0287e10611f8af24c76c2e728901c4fbdfb82d7d/packages%2Fnext%2Fsrc%2Fserver%2Fweb%2Fweb-on-close.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/0287e10611f8af24c76c2e728901c4fbdfb82d7d/packages%2Fnext%2Fsrc%2Fserver%2Fweb%2Fweb-on-close.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fweb%2Fweb-on-close.ts?ref=0287e10611f8af24c76c2e728901c4fbdfb82d7d",
+            "patch": "@@ -22,12 +22,17 @@ export function trackStreamConsumed<TChunk>(\n   stream: ReadableStream<TChunk>,\n   onEnd: () => void\n ): ReadableStream<TChunk> {\n-  const closePassThrough = new TransformStream<TChunk, TChunk>({\n-    flush: () => {\n-      return onEnd()\n-    },\n-  })\n-  return stream.pipeThrough(closePassThrough)\n+  // NOTE: This function must handle `stream` being aborted or cancelled,\n+  // so it can't just be this:\n+  //\n+  //   return stream.pipeThrough(new TransformStream({ flush() { onEnd() } }))\n+  //\n+  // because that doesn't handle cancellations.\n+  // (and cancellation handling via `Transformer.cancel` is only available in node >20)\n+  const dest = new TransformStream()\n+  const runOnEnd = () => onEnd()\n+  stream.pipeTo(dest.writable).then(runOnEnd, runOnEnd)\n+  return dest.readable\n }\n \n export class CloseController {"
+        },
+        {
+            "sha": "0d76ab80da7c74066e47258c0c6c44f4c458f087",
+            "filename": "test/e2e/app-dir/next-after-app/app/edge/interrupted/incomplete-stream/end/page.js",
+            "status": "added",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/0287e10611f8af24c76c2e728901c4fbdfb82d7d/test%2Fe2e%2Fapp-dir%2Fnext-after-app%2Fapp%2Fedge%2Finterrupted%2Fincomplete-stream%2Fend%2Fpage.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/0287e10611f8af24c76c2e728901c4fbdfb82d7d/test%2Fe2e%2Fapp-dir%2Fnext-after-app%2Fapp%2Fedge%2Finterrupted%2Fincomplete-stream%2Fend%2Fpage.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fnext-after-app%2Fapp%2Fedge%2Finterrupted%2Fincomplete-stream%2Fend%2Fpage.js?ref=0287e10611f8af24c76c2e728901c4fbdfb82d7d",
+            "patch": "@@ -0,0 +1 @@\n+export { default } from '../../../../nodejs/interrupted/incomplete-stream/end/page'"
+        },
+        {
+            "sha": "36da1cdc6915471c099ce839b06e054de6fd71e9",
+            "filename": "test/e2e/app-dir/next-after-app/app/edge/interrupted/incomplete-stream/hang/page.js",
+            "status": "added",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/0287e10611f8af24c76c2e728901c4fbdfb82d7d/test%2Fe2e%2Fapp-dir%2Fnext-after-app%2Fapp%2Fedge%2Finterrupted%2Fincomplete-stream%2Fhang%2Fpage.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/0287e10611f8af24c76c2e728901c4fbdfb82d7d/test%2Fe2e%2Fapp-dir%2Fnext-after-app%2Fapp%2Fedge%2Finterrupted%2Fincomplete-stream%2Fhang%2Fpage.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fnext-after-app%2Fapp%2Fedge%2Finterrupted%2Fincomplete-stream%2Fhang%2Fpage.js?ref=0287e10611f8af24c76c2e728901c4fbdfb82d7d",
+            "patch": "@@ -0,0 +1 @@\n+export { default } from '../../../../nodejs/interrupted/incomplete-stream/hang/page'"
+        },
+        {
+            "sha": "5bf39849638b35fbddb7f6a0ead705d6e92b9bed",
+            "filename": "test/e2e/app-dir/next-after-app/app/edge/interrupted/incomplete-stream/start/page.js",
+            "status": "added",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/0287e10611f8af24c76c2e728901c4fbdfb82d7d/test%2Fe2e%2Fapp-dir%2Fnext-after-app%2Fapp%2Fedge%2Finterrupted%2Fincomplete-stream%2Fstart%2Fpage.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/0287e10611f8af24c76c2e728901c4fbdfb82d7d/test%2Fe2e%2Fapp-dir%2Fnext-after-app%2Fapp%2Fedge%2Finterrupted%2Fincomplete-stream%2Fstart%2Fpage.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fnext-after-app%2Fapp%2Fedge%2Finterrupted%2Fincomplete-stream%2Fstart%2Fpage.js?ref=0287e10611f8af24c76c2e728901c4fbdfb82d7d",
+            "patch": "@@ -0,0 +1 @@\n+export { default } from '../../../../nodejs/interrupted/incomplete-stream/start/page'"
+        },
+        {
+            "sha": "98220f359ad2e7e05a34f05e9e6d4dc570b3e62b",
+            "filename": "test/e2e/app-dir/next-after-app/app/nodejs/interrupted/incomplete-stream/end/page.js",
+            "status": "added",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/vercel/next.js/blob/0287e10611f8af24c76c2e728901c4fbdfb82d7d/test%2Fe2e%2Fapp-dir%2Fnext-after-app%2Fapp%2Fnodejs%2Finterrupted%2Fincomplete-stream%2Fend%2Fpage.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/0287e10611f8af24c76c2e728901c4fbdfb82d7d/test%2Fe2e%2Fapp-dir%2Fnext-after-app%2Fapp%2Fnodejs%2Finterrupted%2Fincomplete-stream%2Fend%2Fpage.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fnext-after-app%2Fapp%2Fnodejs%2Finterrupted%2Fincomplete-stream%2Fend%2Fpage.js?ref=0287e10611f8af24c76c2e728901c4fbdfb82d7d",
+            "patch": "@@ -0,0 +1,7 @@\n+export default function Page() {\n+  return (\n+    <main>\n+      <h1>End</h1>\n+    </main>\n+  )\n+}"
+        },
+        {
+            "sha": "319366c3c79f5ad077fc9bf28dcb362d29edee16",
+            "filename": "test/e2e/app-dir/next-after-app/app/nodejs/interrupted/incomplete-stream/hang/page.js",
+            "status": "added",
+            "additions": 34,
+            "deletions": 0,
+            "changes": 34,
+            "blob_url": "https://github.com/vercel/next.js/blob/0287e10611f8af24c76c2e728901c4fbdfb82d7d/test%2Fe2e%2Fapp-dir%2Fnext-after-app%2Fapp%2Fnodejs%2Finterrupted%2Fincomplete-stream%2Fhang%2Fpage.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/0287e10611f8af24c76c2e728901c4fbdfb82d7d/test%2Fe2e%2Fapp-dir%2Fnext-after-app%2Fapp%2Fnodejs%2Finterrupted%2Fincomplete-stream%2Fhang%2Fpage.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fnext-after-app%2Fapp%2Fnodejs%2Finterrupted%2Fincomplete-stream%2Fhang%2Fpage.js?ref=0287e10611f8af24c76c2e728901c4fbdfb82d7d",
+            "patch": "@@ -0,0 +1,34 @@\n+import { connection, after } from 'next/server'\n+import { Suspense } from 'react'\n+import { cliLog } from '../../../../../utils/log'\n+\n+export default async function Page() {\n+  await connection()\n+  after(() => {\n+    cliLog({\n+      source: '[page] /interrupted/incomplete-stream/hang',\n+    })\n+  })\n+  return (\n+    <main>\n+      <h1>Hanging forever</h1>\n+      <Suspense\n+        fallback={\n+          <div id=\"loading-fallback\">\n+            {\n+              // we're going to look for this string in the streamed response,\n+              // make sure it doesn't show up in the literal form someplace else\n+              'Loading' + (Math.random() > 1 ? 'impossible' : '') + '...'\n+            }\n+          </div>\n+        }\n+      >\n+        <HangForever />\n+      </Suspense>\n+    </main>\n+  )\n+}\n+\n+async function HangForever() {\n+  await new Promise((_resolve) => {})\n+}"
+        },
+        {
+            "sha": "557b4d03fdaad34a2ecd3c6007b8ed93f7550b93",
+            "filename": "test/e2e/app-dir/next-after-app/app/nodejs/interrupted/incomplete-stream/start/page.js",
+            "status": "added",
+            "additions": 14,
+            "deletions": 0,
+            "changes": 14,
+            "blob_url": "https://github.com/vercel/next.js/blob/0287e10611f8af24c76c2e728901c4fbdfb82d7d/test%2Fe2e%2Fapp-dir%2Fnext-after-app%2Fapp%2Fnodejs%2Finterrupted%2Fincomplete-stream%2Fstart%2Fpage.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/0287e10611f8af24c76c2e728901c4fbdfb82d7d/test%2Fe2e%2Fapp-dir%2Fnext-after-app%2Fapp%2Fnodejs%2Finterrupted%2Fincomplete-stream%2Fstart%2Fpage.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fnext-after-app%2Fapp%2Fnodejs%2Finterrupted%2Fincomplete-stream%2Fstart%2Fpage.js?ref=0287e10611f8af24c76c2e728901c4fbdfb82d7d",
+            "patch": "@@ -0,0 +1,14 @@\n+'use client'\n+\n+import Link from 'next/link'\n+import { usePathname } from 'next/navigation'\n+\n+export default function Page() {\n+  const pathname = usePathname()\n+  return (\n+    <main>\n+      <h1>Start</h1>\n+      <Link href={pathname.replace('/start', '/hang')}>hang</Link>\n+    </main>\n+  )\n+}"
+        },
+        {
+            "sha": "7aa3c4532718b10b80ac476674b4f073c81ebbb9",
+            "filename": "test/e2e/app-dir/next-after-app/index.test.ts",
+            "status": "modified",
+            "additions": 69,
+            "deletions": 14,
+            "changes": 83,
+            "blob_url": "https://github.com/vercel/next.js/blob/0287e10611f8af24c76c2e728901c4fbdfb82d7d/test%2Fe2e%2Fapp-dir%2Fnext-after-app%2Findex.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/0287e10611f8af24c76c2e728901c4fbdfb82d7d/test%2Fe2e%2Fapp-dir%2Fnext-after-app%2Findex.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fnext-after-app%2Findex.test.ts?ref=0287e10611f8af24c76c2e728901c4fbdfb82d7d",
+            "patch": "@@ -8,7 +8,7 @@ import * as Log from './utils/log'\n const runtimes = ['nodejs', 'edge']\n \n describe.each(runtimes)('after() in %s runtime', (runtimeValue) => {\n-  const { next, isNextDeploy, skipped, isTurbopack } = nextTestSetup({\n+  const { next, isNextDeploy, skipped } = nextTestSetup({\n     files: __dirname,\n     // `patchFile` and reading runtime logs are not supported in a deployed environment\n     skipDeployment: true,\n@@ -100,21 +100,18 @@ describe.each(runtimes)('after() in %s runtime', (runtimeValue) => {\n     // This is currently broken with Turbopack.\n     // https://github.com/vercel/next.js/pull/75989\n \n-    ;(isTurbopack ? it.skip : it)(\n-      'runs callbacks if redirect() was called',\n-      async () => {\n-        await next.browser(pathPrefix + '/interrupted/calls-redirect')\n+    it('runs callbacks if redirect() was called', async () => {\n+      await next.browser(pathPrefix + '/interrupted/calls-redirect')\n \n-        await retry(() => {\n-          expect(getLogs()).toContainEqual({\n-            source: '[page] /interrupted/calls-redirect',\n-          })\n-          expect(getLogs()).toContainEqual({\n-            source: '[page] /interrupted/redirect-target',\n-          })\n+      await retry(() => {\n+        expect(getLogs()).toContainEqual({\n+          source: '[page] /interrupted/calls-redirect',\n         })\n-      }\n-    )\n+        expect(getLogs()).toContainEqual({\n+          source: '[page] /interrupted/redirect-target',\n+        })\n+      })\n+    })\n \n     it('runs callbacks if notFound() was called', async () => {\n       await next.browser(pathPrefix + '/interrupted/calls-not-found')\n@@ -129,6 +126,64 @@ describe.each(runtimes)('after() in %s runtime', (runtimeValue) => {\n         source: '[page] /interrupted/throws-error',\n       })\n     })\n+\n+    it('runs callbacks if a request is aborted before the page finishes streaming', async () => {\n+      const abortController = new AbortController()\n+      const res = await next.fetch(\n+        pathPrefix + '/interrupted/incomplete-stream/hang',\n+        { signal: abortController.signal }\n+      )\n+      expect(res.status).toBe(200)\n+\n+      const textDecoder = new TextDecoder()\n+      for await (const rawChunk of res.body) {\n+        const chunk =\n+          typeof rawChunk === 'string' ? rawChunk : textDecoder.decode(rawChunk)\n+        // we found the loading fallback for the part that hangs forever, so we know we won't progress any further\n+        if (chunk.includes('Loading...')) {\n+          break\n+        }\n+      }\n+      abortController.abort()\n+\n+      await retry(() => {\n+        expect(getLogs()).toContainEqual({\n+          source: '[page] /interrupted/incomplete-stream/hang',\n+        })\n+      })\n+    })\n+\n+    it('runs callbacks if the browser disconnects before the page finishes streaming', async () => {\n+      // `next.browser()` always waits for the `load` event, which we don't want here.\n+      // (because the page hangs forever while streaming and will thus never fire `load`)\n+      // but we can't easily bypass that, so go to a dummy page first\n+      const browser = await next.browser(\n+        pathPrefix + '/interrupted/incomplete-stream/start'\n+      )\n+      expect(await browser.elementByCss('h1').text()).toEqual('Start')\n+\n+      // navigate to a page that hangs forever while streaming...\n+      // NOTE: this needs to be a soft navigation (using Link), playwright seems to hang otherwise\n+      await browser.elementByCss('a').click()\n+      await retry(async () => {\n+        expect(await browser.hasElementByCssSelector('#loading-fallback')).toBe(\n+          true\n+        )\n+      })\n+\n+      // ...but navigate away before streaming is finished (it hangs forever, so it will never finish)\n+      await browser.get(\n+        new URL(pathPrefix + '/interrupted/incomplete-stream/end', next.url)\n+          .href\n+      )\n+      expect(await browser.elementByCss('h1').text()).toEqual('End')\n+\n+      await retry(async () => {\n+        expect(getLogs()).toContainEqual({\n+          source: '[page] /interrupted/incomplete-stream/hang',\n+        })\n+      })\n+    })\n   })\n \n   it('runs in middleware', async () => {"
+        }
+    ],
+    "stats": {
+        "total": 264,
+        "additions": 244,
+        "deletions": 20
+    }
+}

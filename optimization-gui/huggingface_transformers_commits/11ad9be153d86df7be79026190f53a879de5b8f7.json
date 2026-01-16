@@ -1,0 +1,72 @@
+{
+    "author": "SunMarc",
+    "message": "Better typing for num_items_in_batch (#38728)\n\n* fix\n\n* style\n\n* type checking ?\n\n* maybe this ?\n\n* fix\n\n* can't be an int anymore\n\n* fix",
+    "sha": "11ad9be153d86df7be79026190f53a879de5b8f7",
+    "files": [
+        {
+            "sha": "7174344487f313744819c7bb7f7d9248ad470c21",
+            "filename": "docs/source/en/trainer.md",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 2,
+            "changes": 7,
+            "blob_url": "https://github.com/huggingface/transformers/blob/11ad9be153d86df7be79026190f53a879de5b8f7/docs%2Fsource%2Fen%2Ftrainer.md",
+            "raw_url": "https://github.com/huggingface/transformers/raw/11ad9be153d86df7be79026190f53a879de5b8f7/docs%2Fsource%2Fen%2Ftrainer.md",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/docs%2Fsource%2Fen%2Ftrainer.md?ref=11ad9be153d86df7be79026190f53a879de5b8f7",
+            "patch": "@@ -187,14 +187,17 @@ from torch import nn\n from transformers import Trainer\n \n class CustomTrainer(Trainer):\n-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):\n+    def compute_losss(self, model: nn.Module, inputs: dict[str, Union[torch.Tensor, Any]], return_outputs: bool = False num_items_in_batch: Optional[torch.Tensor] = None):\n         labels = inputs.pop(\"labels\")\n         # forward pass\n         outputs = model(**inputs)\n         logits = outputs.get(\"logits\")\n         # compute custom loss for 3 labels with different weights\n-        loss_fct = nn.CrossEntropyLoss(weight=torch.tensor([1.0, 2.0, 3.0], device=model.device))\n+        reduction = \"mean\" if num_items_in_batch is not None else \"sum\"\n+        loss_fct = nn.CrossEntropyLoss(weight=torch.tensor([1.0, 2.0, 3.0], device=model.device, reduction=reduction))\n         loss = loss_fct(logits.view(-1, self.model.config.num_labels), labels.view(-1))\n+        if num_items_in_batch is not None:\n+            loss = loss / num_items_in_batch\n         return (loss, outputs) if return_outputs else loss\n ```\n "
+        },
+        {
+            "sha": "764d28d6f34b3572d45477059bee075b8b7c7381",
+            "filename": "src/transformers/loss/loss_utils.py",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 7,
+            "changes": 12,
+            "blob_url": "https://github.com/huggingface/transformers/blob/11ad9be153d86df7be79026190f53a879de5b8f7/src%2Ftransformers%2Floss%2Floss_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/11ad9be153d86df7be79026190f53a879de5b8f7/src%2Ftransformers%2Floss%2Floss_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Floss%2Floss_utils.py?ref=11ad9be153d86df7be79026190f53a879de5b8f7",
+            "patch": "@@ -28,18 +28,16 @@\n def fixed_cross_entropy(\n     source: torch.Tensor,\n     target: torch.Tensor,\n-    num_items_in_batch: Optional[int] = None,\n+    num_items_in_batch: Optional[torch.Tensor] = None,\n     ignore_index: int = -100,\n     **kwargs,\n ) -> torch.Tensor:\n     reduction = \"sum\" if num_items_in_batch is not None else \"mean\"\n     loss = nn.functional.cross_entropy(source, target, ignore_index=ignore_index, reduction=reduction)\n     if reduction == \"sum\":\n-        if not isinstance(num_items_in_batch, torch.Tensor):\n-            num_items_in_batch = torch.tensor(num_items_in_batch, device=loss.device, dtype=loss.dtype)\n-        elif num_items_in_batch.device != loss.device:\n+        # just in case users pass an int for num_items_in_batch, which could be the case for custom trainer\n+        if torch.is_tensor(num_items_in_batch):\n             num_items_in_batch = num_items_in_batch.to(loss.device)\n-\n         loss = loss / num_items_in_batch\n     return loss\n \n@@ -48,7 +46,7 @@ def ForCausalLMLoss(\n     logits,\n     labels,\n     vocab_size: int,\n-    num_items_in_batch: Optional[int] = None,\n+    num_items_in_batch: Optional[torch.Tensor] = None,\n     ignore_index: int = -100,\n     shift_labels: Optional[torch.Tensor] = None,\n     **kwargs,\n@@ -74,7 +72,7 @@ def ForMaskedLMLoss(\n     logits: torch.Tensor,\n     labels: torch.Tensor,\n     vocab_size: int,\n-    num_items_in_batch: Optional[int] = None,\n+    num_items_in_batch: Optional[torch.Tensor] = None,\n     ignore_index: int = -100,\n     **kwargs,\n ):"
+        },
+        {
+            "sha": "7ec12010a88c7c9d878e5f8fa8a96f7a2d1bfa57",
+            "filename": "src/transformers/trainer.py",
+            "status": "modified",
+            "additions": 34,
+            "deletions": 6,
+            "changes": 40,
+            "blob_url": "https://github.com/huggingface/transformers/blob/11ad9be153d86df7be79026190f53a879de5b8f7/src%2Ftransformers%2Ftrainer.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/11ad9be153d86df7be79026190f53a879de5b8f7/src%2Ftransformers%2Ftrainer.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Ftrainer.py?ref=11ad9be153d86df7be79026190f53a879de5b8f7",
+            "patch": "@@ -34,7 +34,7 @@\n from collections.abc import Mapping\n from functools import partial\n from pathlib import Path\n-from typing import TYPE_CHECKING, Any, Callable, Optional, Union\n+from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional, Tuple, Union\n \n \n # Integrations must be imported before ML frameworks:\n@@ -3714,7 +3714,10 @@ def autocast_smart_context_manager(self, cache_enabled: Optional[bool] = True):\n         return ctx_manager\n \n     def training_step(\n-        self, model: nn.Module, inputs: dict[str, Union[torch.Tensor, Any]], num_items_in_batch=None\n+        self,\n+        model: nn.Module,\n+        inputs: dict[str, Union[torch.Tensor, Any]],\n+        num_items_in_batch: Optional[torch.Tensor] = None,\n     ) -> torch.Tensor:\n         \"\"\"\n         Perform a training step on a batch of inputs.\n@@ -3783,7 +3786,7 @@ def training_step(\n                 scaled_loss.backward()\n         else:\n             # Finally we need to normalize the loss for reporting if GA loss bug is not fixed during compute loss\n-            if not self.model_accepts_loss_kwargs and self.compute_loss_func is None:\n+            if (not self.model_accepts_loss_kwargs or num_items_in_batch is None) and self.compute_loss_func is None:\n                 loss = loss / self.args.gradient_accumulation_steps\n \n             # Turning off loss scaling w.r.t. gradient accumulation when DeepSpeed is enabled\n@@ -3795,11 +3798,31 @@ def training_step(\n \n             return loss.detach()\n \n-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):\n+    def compute_loss(\n+        self,\n+        model: nn.Module,\n+        inputs: dict[str, Union[torch.Tensor, Any]],\n+        return_outputs: bool = False,\n+        num_items_in_batch: Optional[torch.Tensor] = None,\n+    ):\n         \"\"\"\n         How the loss is computed by Trainer. By default, all models return the loss in the first element.\n \n-        Subclass and override for custom behavior.\n+        Args:\n+            model (`nn.Module`):\n+                The model to compute the loss for.\n+            inputs (`Dict[str, Union[torch.Tensor, Any]]`):\n+                The input data for the model.\n+            return_outputs (`bool`, *optional*, defaults to `False`):\n+                Whether to return the model outputs along with the loss.\n+            num_items_in_batch (Optional[torch.Tensor], *optional*):\n+                The number of items in the batch. If num_items_in_batch is not passed,\n+\n+        Returns:\n+            The loss of the model along with its output if return_outputs was set to True\n+\n+        Subclass and override for custom behavior. If you are not using `num_items_in_batch` when computing your loss,\n+        make sure to overwrite `self.model_accepts_loss_kwargs` to `False`. Otherwise, the loss calculationg might be slightly inacurate when performing gradient accumulation.\n         \"\"\"\n         if (self.label_smoother is not None or self.compute_loss_func is not None) and \"labels\" in inputs:\n             labels = inputs.pop(\"labels\")\n@@ -5257,7 +5280,12 @@ def _fsdp_qlora_plugin_updates(self):\n                     self.model.hf_quantizer.quantization_config.bnb_4bit_quant_storage, override=True\n                 )\n \n-    def get_batch_samples(self, epoch_iterator, num_batches, device):\n+    def get_batch_samples(\n+        self, epoch_iterator: Iterator, num_batches: int, device: torch.device\n+    ) -> Tuple[list, Optional[torch.Tensor]]:\n+        \"\"\"\n+        Collects a specified number of batches from the epoch iterator and optionally counts the number of items in the batches to properly scale the loss.\n+        \"\"\"\n         batch_samples = []\n         num_items_in_batch = None\n "
+        },
+        {
+            "sha": "067af41c2e8b8b1ce60675e116474e1ab20895ed",
+            "filename": "src/transformers/utils/generic.py",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/huggingface/transformers/blob/11ad9be153d86df7be79026190f53a879de5b8f7/src%2Ftransformers%2Futils%2Fgeneric.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/11ad9be153d86df7be79026190f53a879de5b8f7/src%2Ftransformers%2Futils%2Fgeneric.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Futils%2Fgeneric.py?ref=11ad9be153d86df7be79026190f53a879de5b8f7",
+            "patch": "@@ -853,12 +853,12 @@ class LossKwargs(TypedDict, total=False):\n     Keyword arguments to be passed to the loss function\n \n     Attributes:\n-        num_items_in_batch (`int`, *optional*):\n+        num_items_in_batch (`Optional[torch.Tensor]`, *optional*):\n             Number of items in the batch. It is recommended to pass it when\n             you are doing gradient accumulation.\n     \"\"\"\n \n-    num_items_in_batch: Optional[int]\n+    num_items_in_batch: Optional[\"torch.Tensor\"]\n \n \n def is_timm_config_dict(config_dict: dict[str, Any]) -> bool:"
+        },
+        {
+            "sha": "f185c30daeca67a80e7f908133f64f1d4fc8cf3b",
+            "filename": "tests/test_modeling_common.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/huggingface/transformers/blob/11ad9be153d86df7be79026190f53a879de5b8f7/tests%2Ftest_modeling_common.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/11ad9be153d86df7be79026190f53a879de5b8f7/tests%2Ftest_modeling_common.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Ftest_modeling_common.py?ref=11ad9be153d86df7be79026190f53a879de5b8f7",
+            "patch": "@@ -944,7 +944,7 @@ def test_causal_lm_can_accept_kwargs(self):\n                     model = AutoModelForCausalLM.from_pretrained(\n                         tmpdir, torch_dtype=torch.float32, device_map=torch_device\n                     )\n-                    inputs_dict[\"num_items_in_batch\"] = inputs_dict[\"input_ids\"].shape[0]\n+                    inputs_dict[\"num_items_in_batch\"] = torch.tensor(inputs_dict[\"input_ids\"].shape[0])\n                     inputs_dict[\"labels\"] = inputs_dict[\"input_ids\"]\n                     _ = model(**inputs_dict, return_dict=False)\n "
+        }
+    ],
+    "stats": {
+        "total": 65,
+        "additions": 47,
+        "deletions": 18
+    }
+}

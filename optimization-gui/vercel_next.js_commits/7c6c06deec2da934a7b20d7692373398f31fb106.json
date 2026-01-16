@@ -1,0 +1,84 @@
+{
+    "author": "sokra",
+    "message": "Turbopack: show timing event for database compaction (#82369)\n\n### What?\n\n- show timing event for database compaction\n- show timing event for persistent caching in dev too",
+    "sha": "7c6c06deec2da934a7b20d7692373398f31fb106",
+    "files": [
+        {
+            "sha": "54aa9b6d7099d5c44c6544860b9fe04989a9a0ad",
+            "filename": "packages/next/src/server/dev/hot-reloader-turbopack.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/7c6c06deec2da934a7b20d7692373398f31fb106/packages%2Fnext%2Fsrc%2Fserver%2Fdev%2Fhot-reloader-turbopack.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/7c6c06deec2da934a7b20d7692373398f31fb106/packages%2Fnext%2Fsrc%2Fserver%2Fdev%2Fhot-reloader-turbopack.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fdev%2Fhot-reloader-turbopack.ts?ref=7c6c06deec2da934a7b20d7692373398f31fb106",
+            "patch": "@@ -258,7 +258,7 @@ export async function createHotReloaderTurbopack(\n     }\n   )\n   backgroundLogCompilationEvents(project, {\n-    eventTypes: ['StartupCacheInvalidationEvent'],\n+    eventTypes: ['StartupCacheInvalidationEvent', 'TimingEvent'],\n   })\n   setBundlerFindSourceMapImplementation(\n     getSourceMapFromTurbopack.bind(null, project, projectPath)"
+        },
+        {
+            "sha": "59ed03d0e62b04ab0c604025c760fd33df6cdc6f",
+            "filename": "turbopack/crates/turbo-persistence/src/db.rs",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 3,
+            "changes": 7,
+            "blob_url": "https://github.com/vercel/next.js/blob/7c6c06deec2da934a7b20d7692373398f31fb106/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fdb.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/7c6c06deec2da934a7b20d7692373398f31fb106/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fdb.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fdb.rs?ref=7c6c06deec2da934a7b20d7692373398f31fb106",
+            "patch": "@@ -650,7 +650,7 @@ impl TurboPersistence {\n     /// files is above the given threshold. The coverage is the average number of SST files that\n     /// need to be read to find a key. It also limits the maximum number of SST files that are\n     /// merged at once, which is the main factor for the runtime of the compaction.\n-    pub fn compact(&self, compact_config: &CompactConfig) -> Result<()> {\n+    pub fn compact(&self, compact_config: &CompactConfig) -> Result<bool> {\n         if self.read_only {\n             bail!(\"Compaction is not allowed on a read only database\");\n         }\n@@ -689,7 +689,8 @@ impl TurboPersistence {\n             .context(\"Failed to compact database\")?;\n         }\n \n-        if !new_meta_files.is_empty() {\n+        let has_changes = !new_meta_files.is_empty();\n+        if has_changes {\n             self.commit(CommitOptions {\n                 new_meta_files,\n                 new_sst_files,\n@@ -704,7 +705,7 @@ impl TurboPersistence {\n \n         self.active_write_operation.store(false, Ordering::Release);\n \n-        Ok(())\n+        Ok(has_changes)\n     }\n \n     /// Internal function to perform a compaction."
+        },
+        {
+            "sha": "a465ae251d6120b7bb503018b804fdc71c2911e5",
+            "filename": "turbopack/crates/turbo-tasks-backend/src/database/turbo.rs",
+            "status": "modified",
+            "additions": 40,
+            "deletions": 23,
+            "changes": 63,
+            "blob_url": "https://github.com/vercel/next.js/blob/7c6c06deec2da934a7b20d7692373398f31fb106/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fdatabase%2Fturbo.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/7c6c06deec2da934a7b20d7692373398f31fb106/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fdatabase%2Fturbo.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fdatabase%2Fturbo.rs?ref=7c6c06deec2da934a7b20d7692373398f31fb106",
+            "patch": "@@ -1,15 +1,11 @@\n-use std::{\n-    cmp::max,\n-    path::PathBuf,\n-    sync::Arc,\n-    thread::{JoinHandle, available_parallelism, spawn},\n-};\n+use std::{cmp::max, path::PathBuf, sync::Arc, thread::available_parallelism, time::Instant};\n \n use anyhow::{Ok, Result};\n use parking_lot::Mutex;\n use turbo_persistence::{\n     ArcSlice, CompactConfig, KeyBase, StoreKey, TurboPersistence, ValueBuffer,\n };\n+use turbo_tasks::{JoinHandle, message_queue::TimingEvent, spawn, turbo_tasks};\n \n use crate::database::{\n     key_value_database::{KeySpace, KeyValueDatabase},\n@@ -84,7 +80,7 @@ impl KeyValueDatabase for TurboKeyValueDatabase {\n     ) -> Result<WriteBatch<'_, Self::SerialWriteBatch<'_>, Self::ConcurrentWriteBatch<'_>>> {\n         // Wait for the compaction to finish\n         if let Some(join_handle) = self.compact_join_handle.lock().take() {\n-            join_handle.join().unwrap()?;\n+            join_handle.join()?;\n         }\n         // Start a new write batch\n         Ok(WriteBatch::concurrent(TurboWriteBatch {\n@@ -100,23 +96,44 @@ impl KeyValueDatabase for TurboKeyValueDatabase {\n     fn shutdown(&self) -> Result<()> {\n         // Wait for the compaction to finish\n         if let Some(join_handle) = self.compact_join_handle.lock().take() {\n-            join_handle.join().unwrap()?;\n+            join_handle.join()?;\n         }\n         // Compact the database on shutdown\n-        self.db.compact(&CompactConfig {\n-            max_merge_segment_count: if self.is_ci {\n-                // Fully compact in CI to reduce cache size\n-                usize::MAX\n-            } else {\n-                available_parallelism().map_or(4, |c| max(4, c.get()))\n-            },\n-            ..COMPACT_CONFIG\n-        })?;\n+        if self.is_ci {\n+            // Fully compact in CI to reduce cache size\n+            do_compact(&self.db, \"Finished database compaction\", usize::MAX)?;\n+        } else {\n+            // Compact with a reasonable limit in non-CI environments\n+            do_compact(\n+                &self.db,\n+                \"Finished database compaction\",\n+                available_parallelism().map_or(4, |c| max(4, c.get())),\n+            )?;\n+        }\n         // Shutdown the database\n         self.db.shutdown()\n     }\n }\n \n+fn do_compact(\n+    db: &TurboPersistence,\n+    message: &'static str,\n+    max_merge_segment_count: usize,\n+) -> Result<()> {\n+    let start = Instant::now();\n+    // Compact the database with the given max merge segment count\n+    let ran = db.compact(&CompactConfig {\n+        max_merge_segment_count,\n+        ..COMPACT_CONFIG\n+    })?;\n+    if ran {\n+        let elapsed = start.elapsed();\n+        turbo_tasks()\n+            .send_compilation_event(Arc::new(TimingEvent::new(message.to_string(), elapsed)));\n+    }\n+    Ok(())\n+}\n+\n pub struct TurboWriteBatch<'a> {\n     batch: turbo_persistence::WriteBatch<WriteBuffer<'static>, 5>,\n     db: &'a Arc<TurboPersistence>,\n@@ -144,12 +161,12 @@ impl<'a> BaseWriteBatch<'a> for TurboWriteBatch<'a> {\n         if let Some(compact_join_handle) = self.compact_join_handle {\n             // Start a new compaction in the background\n             let db = self.db.clone();\n-            let handle = spawn(move || {\n-                db.compact(&CompactConfig {\n-                    max_merge_segment_count: available_parallelism()\n-                        .map_or(4, |c| max(4, c.get() / 2)),\n-                    ..COMPACT_CONFIG\n-                })\n+            let handle = spawn(async move {\n+                do_compact(\n+                    &db,\n+                    \"Finished database compaction\",\n+                    available_parallelism().map_or(4, |c| max(4, c.get() / 2)),\n+                )\n             });\n             compact_join_handle.lock().replace(handle);\n         }"
+        },
+        {
+            "sha": "302b919ef3521dd8ade077c1b945e3c6b0d1f5ae",
+            "filename": "turbopack/crates/turbo-tasks/src/lib.rs",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/7c6c06deec2da934a7b20d7692373398f31fb106/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Flib.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/7c6c06deec2da934a7b20d7692373398f31fb106/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Flib.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Flib.rs?ref=7c6c06deec2da934a7b20d7692373398f31fb106",
+            "patch": "@@ -118,7 +118,7 @@ use rustc_hash::FxHasher;\n pub use scope::scope;\n pub use serialization_invalidation::SerializationInvalidator;\n pub use shrink_to_fit::ShrinkToFit;\n-pub use spawn::{JoinHandle, spawn, spawn_blocking, spawn_thread};\n+pub use spawn::{JoinHandle, block_for_future, spawn, spawn_blocking, spawn_thread};\n pub use state::{State, TransientState};\n pub use task::{SharedReference, TypedSharedReference, task_input::TaskInput};\n pub use task_execution_reason::TaskExecutionReason;"
+        },
+        {
+            "sha": "a170a2342e8ab03807081bbe094081d9097a4ec4",
+            "filename": "turbopack/crates/turbo-tasks/src/manager.rs",
+            "status": "modified",
+            "additions": 21,
+            "deletions": 18,
+            "changes": 39,
+            "blob_url": "https://github.com/vercel/next.js/blob/7c6c06deec2da934a7b20d7692373398f31fb106/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fmanager.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/7c6c06deec2da934a7b20d7692373398f31fb106/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fmanager.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fmanager.rs?ref=7c6c06deec2da934a7b20d7692373398f31fb106",
+            "patch": "@@ -1058,27 +1058,30 @@ impl<B: Backend + 'static> TurboTasks<B> {\n     }\n \n     pub async fn stop_and_wait(&self) {\n-        self.backend.stopping(self);\n-        self.stopped.store(true, Ordering::Release);\n-        {\n-            let listener = self\n-                .event\n-                .listen_with_note(|| || \"wait for stop\".to_string());\n-            if self.currently_scheduled_tasks.load(Ordering::Acquire) != 0 {\n-                listener.await;\n+        turbo_tasks_future_scope(self.pin(), async move {\n+            self.backend.stopping(self);\n+            self.stopped.store(true, Ordering::Release);\n+            {\n+                let listener = self\n+                    .event\n+                    .listen_with_note(|| || \"wait for stop\".to_string());\n+                if self.currently_scheduled_tasks.load(Ordering::Acquire) != 0 {\n+                    listener.await;\n+                }\n             }\n-        }\n-        {\n-            let listener = self.event_background.listen();\n-            if self\n-                .currently_scheduled_background_jobs\n-                .load(Ordering::Acquire)\n-                != 0\n             {\n-                listener.await;\n+                let listener = self.event_background.listen();\n+                if self\n+                    .currently_scheduled_background_jobs\n+                    .load(Ordering::Acquire)\n+                    != 0\n+                {\n+                    listener.await;\n+                }\n             }\n-        }\n-        self.backend.stop(self);\n+            self.backend.stop(self);\n+        })\n+        .await;\n     }\n \n     #[track_caller]"
+        },
+        {
+            "sha": "7a217194a0c9c09b55e6dae2e540b958daa6fb50",
+            "filename": "turbopack/crates/turbo-tasks/src/spawn.rs",
+            "status": "modified",
+            "additions": 18,
+            "deletions": 1,
+            "changes": 19,
+            "blob_url": "https://github.com/vercel/next.js/blob/7c6c06deec2da934a7b20d7692373398f31fb106/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fspawn.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/7c6c06deec2da934a7b20d7692373398f31fb106/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fspawn.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fspawn.rs?ref=7c6c06deec2da934a7b20d7692373398f31fb106",
+            "patch": "@@ -8,7 +8,7 @@ use std::{\n \n use anyhow::Result;\n use futures::{FutureExt, ready};\n-use tokio::runtime::Handle;\n+use tokio::{runtime::Handle, task::block_in_place};\n use tracing::{Instrument, Span, info_span};\n use turbo_tasks_malloc::{AllocationInfo, TurboMalloc};\n \n@@ -23,6 +23,12 @@ pub struct JoinHandle<T> {\n     join_handle: tokio::task::JoinHandle<(Result<T, TurboTasksPanic>, Duration, AllocationInfo)>,\n }\n \n+impl<T: Send + 'static> JoinHandle<T> {\n+    pub fn join(self) -> T {\n+        block_for_future(self)\n+    }\n+}\n+\n impl<T> Future for JoinHandle<T> {\n     type Output = T;\n \n@@ -87,3 +93,14 @@ pub fn spawn_thread(func: impl FnOnce() + Send + 'static) {\n         })\n     });\n }\n+\n+/// Blocking waits for a future to complete. This blocks the current thread potentially staling\n+/// other concurrent futures (but not other concurrent tasks). Try to avoid this method infavor of\n+/// awaiting the future instead.\n+pub fn block_for_future<T: Send>(future: impl Future<Output = T> + Send + 'static) -> T {\n+    let handle = Handle::current();\n+    block_in_place(|| {\n+        let _span = info_span!(\"blocking\").entered();\n+        handle.block_on(future)\n+    })\n+}"
+        }
+    ],
+    "stats": {
+        "total": 132,
+        "additions": 85,
+        "deletions": 47
+    }
+}

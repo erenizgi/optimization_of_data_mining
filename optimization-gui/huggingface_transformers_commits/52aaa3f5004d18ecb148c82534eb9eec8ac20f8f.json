@@ -1,0 +1,48 @@
+{
+    "author": "sbucaille",
+    "message": "[EfficientLoFTR] dynamic image size support (#40329)\n\n* fix: reverted efficientloftr embeddings computation to inference time with lru cache\n\n* fix: added dtype and device for torch ones and zeros creation\n\n* fix: fixed embed height and width computation with aggregation\n\n* fix: make style\n\n* fix error message\n\n* fix fa2 tests\n\n---------\n\nCo-authored-by: qubvel <qubvel@gmail.com>",
+    "sha": "52aaa3f5004d18ecb148c82534eb9eec8ac20f8f",
+    "files": [
+        {
+            "sha": "1e7a84d7f53995afdd3398acaf178b1d310bd738",
+            "filename": "src/transformers/models/efficientloftr/configuration_efficientloftr.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 5,
+            "changes": 6,
+            "blob_url": "https://github.com/huggingface/transformers/blob/52aaa3f5004d18ecb148c82534eb9eec8ac20f8f/src%2Ftransformers%2Fmodels%2Fefficientloftr%2Fconfiguration_efficientloftr.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/52aaa3f5004d18ecb148c82534eb9eec8ac20f8f/src%2Ftransformers%2Fmodels%2Fefficientloftr%2Fconfiguration_efficientloftr.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fefficientloftr%2Fconfiguration_efficientloftr.py?ref=52aaa3f5004d18ecb148c82534eb9eec8ac20f8f",
+            "patch": "@@ -68,8 +68,6 @@ class EfficientLoFTRConfig(PretrainedConfig):\n             Kernel size used for the fine feature matching\n         batch_norm_eps (`float`, *optional*, defaults to 1e-05):\n             The epsilon used by the batch normalization layers.\n-        embedding_size (`List`, *optional*, defaults to [15, 20]):\n-            The size (height, width) of the embedding for the position embeddings.\n         rope_theta (`float`, *optional*, defaults to 10000.0):\n             The base period of the RoPE embeddings.\n         partial_rotary_factor (`float`, *optional*, defaults to 4.0):\n@@ -130,7 +128,6 @@ def __init__(\n         coarse_matching_border_removal: int = 2,\n         fine_kernel_size: int = 8,\n         batch_norm_eps: float = 1e-5,\n-        embedding_size: Optional[list[int]] = None,\n         rope_theta: float = 10000.0,\n         partial_rotary_factor: float = 4.0,\n         rope_scaling: Optional[dict] = None,\n@@ -163,7 +160,7 @@ def __init__(\n         self.hidden_size = hidden_size\n         if self.hidden_size != self.out_features[-1]:\n             raise ValueError(\n-                f\"hidden_size should be equal to the last value in out_features. hidden_size = {self.hidden_size}, out_features = {self.stage_out_channels}\"\n+                f\"hidden_size should be equal to the last value in out_features. hidden_size = {self.hidden_size}, out_features = {self.out_features[-1]}\"\n             )\n \n         self.activation_function = activation_function\n@@ -187,7 +184,6 @@ def __init__(\n         self.fine_matching_regress_temperature = fine_matching_regress_temperature\n \n         self.num_key_value_heads = num_attention_heads\n-        self.embedding_size = embedding_size if embedding_size is not None else [15, 20]\n         self.rope_theta = rope_theta\n         self.rope_scaling = rope_scaling if rope_scaling is not None else {\"rope_type\": \"default\"}\n "
+        },
+        {
+            "sha": "f5a20a7cc87dea233db5f4ddc3313df44f72c9d5",
+            "filename": "src/transformers/models/efficientloftr/modeling_efficientloftr.py",
+            "status": "modified",
+            "additions": 20,
+            "deletions": 10,
+            "changes": 30,
+            "blob_url": "https://github.com/huggingface/transformers/blob/52aaa3f5004d18ecb148c82534eb9eec8ac20f8f/src%2Ftransformers%2Fmodels%2Fefficientloftr%2Fmodeling_efficientloftr.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/52aaa3f5004d18ecb148c82534eb9eec8ac20f8f/src%2Ftransformers%2Fmodels%2Fefficientloftr%2Fmodeling_efficientloftr.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fefficientloftr%2Fmodeling_efficientloftr.py?ref=52aaa3f5004d18ecb148c82534eb9eec8ac20f8f",
+            "patch": "@@ -23,6 +23,7 @@\n from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS\n from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel\n from ...processing_utils import Unpack\n+from ...pytorch_utils import compile_compatible_method_lru_cache\n from ...utils import (\n     ModelOutput,\n     TransformersKwargs,\n@@ -68,6 +69,20 @@ class KeypointMatchingOutput(ModelOutput):\n     attentions: Optional[tuple[torch.FloatTensor]] = None\n \n \n+@compile_compatible_method_lru_cache(maxsize=32)\n+def compute_embeddings(inv_freq: torch.Tensor, embed_height: int, embed_width: int, hidden_size: int) -> torch.Tensor:\n+    i_indices = torch.ones(embed_height, embed_width, dtype=inv_freq.dtype, device=inv_freq.device)\n+    j_indices = torch.ones(embed_height, embed_width, dtype=inv_freq.dtype, device=inv_freq.device)\n+    i_indices = i_indices.cumsum(0).unsqueeze(-1)\n+    j_indices = j_indices.cumsum(1).unsqueeze(-1)\n+\n+    emb = torch.zeros(1, embed_height, embed_width, hidden_size // 2, dtype=inv_freq.dtype, device=inv_freq.device)\n+    emb[:, :, :, 0::2] = i_indices * inv_freq\n+    emb[:, :, :, 1::2] = j_indices * inv_freq\n+\n+    return emb\n+\n+\n class EfficientLoFTRRotaryEmbedding(nn.Module):\n     inv_freq: torch.Tensor  # fix linting for `register_buffer`\n \n@@ -80,23 +95,18 @@ def __init__(self, config: EfficientLoFTRConfig, device=None):\n         inv_freq, _ = self.rope_init_fn(self.config, device)\n         inv_freq_expanded = inv_freq[None, None, None, :].float().expand(1, 1, 1, -1)\n \n-        embed_height, embed_width = config.embedding_size\n-        i_indices = torch.ones(embed_height, embed_width).cumsum(0).float().unsqueeze(-1)\n-        j_indices = torch.ones(embed_height, embed_width).cumsum(1).float().unsqueeze(-1)\n-\n-        emb = torch.zeros(1, embed_height, embed_width, self.config.hidden_size // 2)\n-        emb[:, :, :, 0::2] = i_indices * inv_freq_expanded\n-        emb[:, :, :, 1::2] = j_indices * inv_freq_expanded\n-\n-        self.register_buffer(\"inv_freq\", emb, persistent=False)\n+        self.register_buffer(\"inv_freq\", inv_freq_expanded, persistent=False)\n \n     @torch.no_grad()\n     def forward(\n         self, x: torch.Tensor, position_ids: Optional[tuple[torch.LongTensor, torch.LongTensor]] = None\n     ) -> tuple[torch.Tensor, torch.Tensor]:\n+        feats_height, feats_width = x.shape[-2:]\n+        embed_height = (feats_height - self.config.q_aggregation_kernel_size) // self.config.q_aggregation_stride + 1\n+        embed_width = (feats_width - self.config.q_aggregation_kernel_size) // self.config.q_aggregation_stride + 1\n         device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != \"mps\" else \"cpu\"\n         with torch.autocast(device_type=device_type, enabled=False):  # Force float32\n-            emb = self.inv_freq\n+            emb = compute_embeddings(self.inv_freq, embed_height, embed_width, self.config.hidden_size)\n             sin = emb.sin()\n             cos = emb.cos()\n "
+        },
+        {
+            "sha": "35b3452a1f9302b79a10f12332227c5e0b7a7b00",
+            "filename": "tests/models/efficientloftr/test_modeling_efficientloftr.py",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/huggingface/transformers/blob/52aaa3f5004d18ecb148c82534eb9eec8ac20f8f/tests%2Fmodels%2Fefficientloftr%2Ftest_modeling_efficientloftr.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/52aaa3f5004d18ecb148c82534eb9eec8ac20f8f/tests%2Fmodels%2Fefficientloftr%2Ftest_modeling_efficientloftr.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fefficientloftr%2Ftest_modeling_efficientloftr.py?ref=52aaa3f5004d18ecb148c82534eb9eec8ac20f8f",
+            "patch": "@@ -50,15 +50,15 @@ def __init__(\n         image_width=80,\n         image_height=60,\n         stage_num_blocks: list[int] = [1, 1, 1],\n-        out_features: list[int] = [32, 32, 64],\n+        out_features: list[int] = [32, 32, 128],\n         stage_stride: list[int] = [2, 1, 2],\n         q_aggregation_kernel_size: int = 1,\n         kv_aggregation_kernel_size: int = 1,\n         q_aggregation_stride: int = 1,\n         kv_aggregation_stride: int = 1,\n         num_attention_layers: int = 2,\n         num_attention_heads: int = 8,\n-        hidden_size: int = 64,\n+        hidden_size: int = 128,\n         coarse_matching_threshold: float = 0.0,\n         fine_kernel_size: int = 2,\n         coarse_matching_border_removal: int = 0,"
+        }
+    ],
+    "stats": {
+        "total": 40,
+        "additions": 23,
+        "deletions": 17
+    }
+}

@@ -1,0 +1,60 @@
+{
+    "author": "sokra",
+    "message": "Turbopack: Fix sst filter handling and order for meta files (#80147)\n\n### What?\n\n* fixes a bug where it crashes with `Unable to open static sorted file 00000286.sst` after a compaction which leaves a partial meta file.\n  meta files need to be handled in reverse order as higher sequence numbers override lower ones\n* fixes another bug where SST files in meta files were processed in incorrect order\n  This could cause reading outdated values, maybe causing the incorrect graph problem or stale tasks/errors",
+    "sha": "840a9ed4e00e5609485b76c3bc9658a9df730798",
+    "files": [
+        {
+            "sha": "1ebe6f314796c611db46440cc4b433c88853f225",
+            "filename": "turbopack/crates/turbo-persistence/src/db.rs",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 3,
+            "changes": 9,
+            "blob_url": "https://github.com/vercel/next.js/blob/840a9ed4e00e5609485b76c3bc9658a9df730798/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fdb.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/840a9ed4e00e5609485b76c3bc9658a9df730798/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fdb.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fdb.rs?ref=840a9ed4e00e5609485b76c3bc9658a9df730798",
+            "patch": "@@ -333,7 +333,7 @@ impl TurboPersistence {\n             .collect::<Result<Vec<MetaFile>>>()?;\n \n         let mut sst_filter = SstFilter::new();\n-        for meta_file in meta_files.iter_mut() {\n+        for meta_file in meta_files.iter_mut().rev() {\n             sst_filter.apply_filter(meta_file);\n         }\n \n@@ -468,7 +468,7 @@ impl TurboPersistence {\n             .collect::<Result<Vec<_>>>()?;\n \n         let mut sst_filter = SstFilter::new();\n-        for meta_file in new_meta_files.iter_mut() {\n+        for meta_file in new_meta_files.iter_mut().rev() {\n             sst_filter.apply_filter(meta_file);\n         }\n \n@@ -501,10 +501,12 @@ impl TurboPersistence {\n \n         {\n             let mut inner = self.inner.write();\n-            for meta_file in inner.meta_files.iter_mut() {\n+            for meta_file in inner.meta_files.iter_mut().rev() {\n                 sst_filter.apply_filter(meta_file);\n             }\n             inner.meta_files.append(&mut new_meta_files);\n+            // apply_and_get_remove need to run in reverse order\n+            inner.meta_files.reverse();\n             inner.meta_files.retain(|meta| {\n                 if sst_filter.apply_and_get_remove(meta) {\n                     meta_seq_numbers_to_delete.push(meta.sequence_number());\n@@ -513,6 +515,7 @@ impl TurboPersistence {\n                     true\n                 }\n             });\n+            inner.meta_files.reverse();\n             has_delete_file = !sst_seq_numbers_to_delete.is_empty()\n                 || !blob_seq_numbers_to_delete.is_empty()\n                 || !meta_seq_numbers_to_delete.is_empty();"
+        },
+        {
+            "sha": "b73ae376e2d57e52c506d6f4ec9f9b735f3af690",
+            "filename": "turbopack/crates/turbo-persistence/src/meta_file.rs",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/840a9ed4e00e5609485b76c3bc9658a9df730798/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fmeta_file.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/840a9ed4e00e5609485b76c3bc9658a9df730798/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fmeta_file.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fmeta_file.rs?ref=840a9ed4e00e5609485b76c3bc9658a9df730798",
+            "patch": "@@ -258,7 +258,7 @@ impl MetaFile {\n             return Ok(MetaLookupResult::FamilyMiss);\n         }\n         let mut miss_result = MetaLookupResult::RangeMiss;\n-        for entry in self.entries.iter() {\n+        for entry in self.entries.iter().rev() {\n             if key_hash < entry.min_hash || key_hash > entry.max_hash {\n                 continue;\n             }"
+        },
+        {
+            "sha": "c0c6520dbaca10521ae3b48379002335f542506b",
+            "filename": "turbopack/crates/turbo-persistence/src/sst_filter.rs",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 20,
+            "changes": 31,
+            "blob_url": "https://github.com/vercel/next.js/blob/840a9ed4e00e5609485b76c3bc9658a9df730798/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fsst_filter.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/840a9ed4e00e5609485b76c3bc9658a9df730798/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fsst_filter.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Fsst_filter.rs?ref=840a9ed4e00e5609485b76c3bc9658a9df730798",
+            "patch": "@@ -22,14 +22,11 @@ impl SstFilter {\n         meta.retain_entries(|seq| match self.0.entry(seq) {\n             Entry::Occupied(mut e) => {\n                 let state = e.get_mut();\n-                match state {\n-                    SstState::Active => false,\n-                    SstState::UnusedObsolete => {\n-                        *state = SstState::Obsolete;\n-                        false\n-                    }\n-                    SstState::Obsolete => false,\n+                if matches!(state, SstState::UnusedObsolete) {\n+                    // the obsolete state is used now\n+                    *state = SstState::Obsolete;\n                 }\n+                false\n             }\n             Entry::Vacant(e) => {\n                 e.insert(SstState::Active);\n@@ -47,20 +44,14 @@ impl SstFilter {\n     pub fn apply_and_get_remove(&mut self, meta: &MetaFile) -> bool {\n         let mut used = false;\n         for seq in meta.obsolete_sst_files() {\n-            match self.0.entry(*seq) {\n-                Entry::Occupied(e) => match e.get() {\n-                    SstState::Active => {}\n-                    SstState::UnusedObsolete => {\n-                        e.remove();\n-                    }\n-                    SstState::Obsolete => {\n-                        e.remove();\n-                        used = true;\n-                    }\n-                },\n-                Entry::Vacant(e) => {\n-                    e.insert(SstState::UnusedObsolete);\n+            if let Entry::Occupied(e) = self.0.entry(*seq) {\n+                if matches!(e.get(), SstState::Obsolete) {\n+                    // This obsolete sst entry was used, so we need to keep the meta file.\n+                    used = true;\n                 }\n+                // Only the first obsolete sst entry is needed, so we can clear this flag, so\n+                // that following meta files won't see it as used anymore.\n+                e.remove();\n             }\n         }\n "
+        },
+        {
+            "sha": "f812eb6ea9f5a0bf121d090335afe298297bef8d",
+            "filename": "turbopack/crates/turbo-persistence/src/tests.rs",
+            "status": "modified",
+            "additions": 80,
+            "deletions": 0,
+            "changes": 80,
+            "blob_url": "https://github.com/vercel/next.js/blob/840a9ed4e00e5609485b76c3bc9658a9df730798/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Ftests.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/840a9ed4e00e5609485b76c3bc9658a9df730798/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Ftests.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-persistence%2Fsrc%2Ftests.rs?ref=840a9ed4e00e5609485b76c3bc9658a9df730798",
+            "patch": "@@ -477,3 +477,83 @@ fn persist_changes() -> Result<()> {\n \n     Ok(())\n }\n+\n+#[test]\n+fn partial_compaction() -> Result<()> {\n+    let tempdir = tempfile::tempdir()?;\n+    let path = tempdir.path();\n+\n+    const READ_COUNT: u32 = 2_000; // we'll read every 10th value, so writes are 10x this value\n+    fn put(b: &WriteBatch<(u8, [u8; 4]), 1>, key: u8, value: u8) -> Result<()> {\n+        for i in 0..(READ_COUNT * 10) {\n+            b.put(0, (key, i.to_be_bytes()), vec![value].into())?;\n+        }\n+        Ok(())\n+    }\n+    fn check(db: &TurboPersistence, key: u8, value: u8) -> Result<()> {\n+        for i in 0..READ_COUNT {\n+            // read every 10th item\n+            let i = i * 10;\n+            assert_eq!(\n+                db.get(0, &(key, i.to_be_bytes()))?.as_deref(),\n+                Some(&[value][..]),\n+                \"Key {key} {i} expected {value}\"\n+            );\n+        }\n+        Ok(())\n+    }\n+\n+    for i in 0..50 {\n+        println!(\"--- Iteration {i} ---\");\n+        println!(\"Add more entries\");\n+        {\n+            let db = TurboPersistence::open(path.to_path_buf())?;\n+            let b = db.write_batch::<_, 1>()?;\n+            put(&b, i, i)?;\n+            put(&b, i + 1, i)?;\n+            put(&b, i + 2, i)?;\n+            db.commit_write_batch(b)?;\n+\n+            for j in 0..i {\n+                check(&db, j, j)?;\n+            }\n+            check(&db, i, i)?;\n+            check(&db, i + 1, i)?;\n+            check(&db, i + 2, i)?;\n+\n+            db.shutdown()?;\n+        }\n+\n+        println!(\"Compaction\");\n+        {\n+            let db = TurboPersistence::open(path.to_path_buf())?;\n+\n+            db.compact(3.0, 3, u64::MAX)?;\n+\n+            for j in 0..i {\n+                check(&db, j, j)?;\n+            }\n+            check(&db, i, i)?;\n+            check(&db, i + 1, i)?;\n+            check(&db, i + 2, i)?;\n+\n+            db.shutdown()?;\n+        }\n+\n+        println!(\"Restore check\");\n+        {\n+            let db = TurboPersistence::open(path.to_path_buf())?;\n+\n+            for j in 0..i {\n+                check(&db, j, j)?;\n+            }\n+            check(&db, i, i)?;\n+            check(&db, i + 1, i)?;\n+            check(&db, i + 2, i)?;\n+\n+            db.shutdown()?;\n+        }\n+    }\n+\n+    Ok(())\n+}"
+        }
+    ],
+    "stats": {
+        "total": 122,
+        "additions": 98,
+        "deletions": 24
+    }
+}

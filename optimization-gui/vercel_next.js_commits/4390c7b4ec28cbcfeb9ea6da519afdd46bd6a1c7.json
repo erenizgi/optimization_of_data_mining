@@ -1,0 +1,48 @@
+{
+    "author": "mischnic",
+    "message": "Turbopack: use tracing context for config watching (#86576)\n\nIt was using the `evaluate_context` to watch the config (and transitively imported files) for changes.\nThat was incorrect for various reasons though: any errors during that caused the build to fail, and it didn't actually collect all referenced files.\n\nTurns out we already have multiple options to enable this, as NFT and \"config watching\" are really the same thing:\n\n```\nResolveOptions.loose_errors: true\n(ResolveOptionsContext.collect_affecting_sources: true)\nModuleOptionsContext.analyze_mode: AnalyzeMode::Tracing\nModuleOptionsContext.tree_shaking_mode: None\n```\n\n~~technically, `any_content_changed_of_module` should actually watch the `affecting_sources` as well though?~~",
+    "sha": "4390c7b4ec28cbcfeb9ea6da519afdd46bd6a1c7",
+    "files": [
+        {
+            "sha": "d14824cd28f2281de332ebf32965b5fd998b3aa6",
+            "filename": "turbopack/crates/turbopack-node/src/transforms/postcss.rs",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 1,
+            "changes": 7,
+            "blob_url": "https://github.com/vercel/next.js/blob/4390c7b4ec28cbcfeb9ea6da519afdd46bd6a1c7/turbopack%2Fcrates%2Fturbopack-node%2Fsrc%2Ftransforms%2Fpostcss.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/4390c7b4ec28cbcfeb9ea6da519afdd46bd6a1c7/turbopack%2Fcrates%2Fturbopack-node%2Fsrc%2Ftransforms%2Fpostcss.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-node%2Fsrc%2Ftransforms%2Fpostcss.rs?ref=4390c7b4ec28cbcfeb9ea6da519afdd46bd6a1c7",
+            "patch": "@@ -103,6 +103,7 @@ fn postcss_configs() -> Vc<Vec<RcStr>> {\n #[turbo_tasks::value]\n pub struct PostCssTransform {\n     evaluate_context: ResolvedVc<Box<dyn AssetContext>>,\n+    config_tracing_context: ResolvedVc<Box<dyn AssetContext>>,\n     execution_context: ResolvedVc<ExecutionContext>,\n     config_location: PostCssConfigLocation,\n     source_maps: bool,\n@@ -113,12 +114,14 @@ impl PostCssTransform {\n     #[turbo_tasks::function]\n     pub fn new(\n         evaluate_context: ResolvedVc<Box<dyn AssetContext>>,\n+        config_tracing_context: ResolvedVc<Box<dyn AssetContext>>,\n         execution_context: ResolvedVc<ExecutionContext>,\n         config_location: PostCssConfigLocation,\n         source_maps: bool,\n     ) -> Vc<Self> {\n         PostCssTransform {\n             evaluate_context,\n+            config_tracing_context,\n             execution_context,\n             config_location,\n             source_maps,\n@@ -134,6 +137,7 @@ impl SourceTransform for PostCssTransform {\n         Vc::upcast(\n             PostCssTransformedAsset {\n                 evaluate_context: self.evaluate_context,\n+                config_tracing_context: self.config_tracing_context,\n                 execution_context: self.execution_context,\n                 config_location: self.config_location,\n                 source,\n@@ -147,6 +151,7 @@ impl SourceTransform for PostCssTransform {\n #[turbo_tasks::value]\n struct PostCssTransformedAsset {\n     evaluate_context: ResolvedVc<Box<dyn AssetContext>>,\n+    config_tracing_context: ResolvedVc<Box<dyn AssetContext>>,\n     execution_context: ResolvedVc<ExecutionContext>,\n     config_location: PostCssConfigLocation,\n     source: ResolvedVc<Box<dyn Source>>,\n@@ -483,7 +488,7 @@ impl PostCssTransformedAsset {\n         let source_map = self.source_map;\n \n         // This invalidates the transform when the config changes.\n-        let config_changed = config_changed(*evaluate_context, config_path.clone())\n+        let config_changed = config_changed(*self.config_tracing_context, config_path.clone())\n             .to_resolved()\n             .await?;\n "
+        },
+        {
+            "sha": "f2f14c9e11e4a1a12f76942ec436b21711ee64ed",
+            "filename": "turbopack/crates/turbopack/src/evaluate_context.rs",
+            "status": "modified",
+            "additions": 31,
+            "deletions": 7,
+            "changes": 38,
+            "blob_url": "https://github.com/vercel/next.js/blob/4390c7b4ec28cbcfeb9ea6da519afdd46bd6a1c7/turbopack%2Fcrates%2Fturbopack%2Fsrc%2Fevaluate_context.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/4390c7b4ec28cbcfeb9ea6da519afdd46bd6a1c7/turbopack%2Fcrates%2Fturbopack%2Fsrc%2Fevaluate_context.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack%2Fsrc%2Fevaluate_context.rs?ref=4390c7b4ec28cbcfeb9ea6da519afdd46bd6a1c7",
+            "patch": "@@ -17,7 +17,7 @@ use turbopack_node::execution_context::ExecutionContext;\n use turbopack_resolve::resolve_options_context::ResolveOptionsContext;\n \n use crate::{\n-    ModuleAssetContext,\n+    ModuleAssetContext, externals_tracing_module_context,\n     module_options::{EcmascriptOptionsContext, ModuleOptionsContext, TypescriptTransformOptions},\n     transition::TransitionOptions,\n };\n@@ -29,6 +29,14 @@ pub fn node_build_environment() -> Vc<Environment> {\n     ))\n }\n \n+async fn node_env_value(env: Vc<Box<dyn ProcessEnv>>) -> Result<RcStr> {\n+    if let Some(node_env) = &*env.read(rcstr!(\"NODE_ENV\")).await? {\n+        Ok(node_env.clone())\n+    } else {\n+        Ok(rcstr!(\"development\"))\n+    }\n+}\n+\n #[turbo_tasks::function]\n pub async fn node_evaluate_asset_context(\n     execution_context: Vc<ExecutionContext>,\n@@ -51,12 +59,7 @@ pub async fn node_evaluate_asset_context(\n         .resolved_cell(),\n     );\n     let import_map = import_map.resolved_cell();\n-    let node_env: RcStr =\n-        if let Some(node_env) = &*execution_context.env().read(rcstr!(\"NODE_ENV\")).await? {\n-            node_env.clone()\n-        } else {\n-            rcstr!(\"development\")\n-        };\n+    let node_env = node_env_value(execution_context.env()).await?;\n \n     // base context used for node_modules (and context for app code will be derived\n     // from this)\n@@ -115,3 +118,24 @@ pub async fn node_evaluate_asset_context(\n         layer,\n     )))\n }\n+\n+#[turbo_tasks::function]\n+pub async fn config_tracing_module_context(\n+    execution_context: Vc<ExecutionContext>,\n+) -> Result<Vc<Box<dyn AssetContext>>> {\n+    let node_env = node_env_value(execution_context.env()).await?;\n+\n+    Ok(Vc::upcast(externals_tracing_module_context(\n+        CompileTimeInfo::builder(node_build_environment().to_resolved().await?)\n+            .defines(\n+                compile_time_defines!(\n+                    process.turbopack = true,\n+                    process.env.NODE_ENV = node_env.into_owned(),\n+                    process.env.TURBOPACK = true\n+                )\n+                .resolved_cell(),\n+            )\n+            .cell()\n+            .await?,\n+    )))\n+}"
+        },
+        {
+            "sha": "2e2b9d3c869a471520cb309311f61a3f5d4be384",
+            "filename": "turbopack/crates/turbopack/src/module_options/mod.rs",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 1,
+            "changes": 4,
+            "blob_url": "https://github.com/vercel/next.js/blob/4390c7b4ec28cbcfeb9ea6da519afdd46bd6a1c7/turbopack%2Fcrates%2Fturbopack%2Fsrc%2Fmodule_options%2Fmod.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/4390c7b4ec28cbcfeb9ea6da519afdd46bd6a1c7/turbopack%2Fcrates%2Fturbopack%2Fsrc%2Fmodule_options%2Fmod.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack%2Fsrc%2Fmodule_options%2Fmod.rs?ref=4390c7b4ec28cbcfeb9ea6da519afdd46bd6a1c7",
+            "patch": "@@ -34,7 +34,8 @@ use turbopack_node::{\n use turbopack_wasm::source::WebAssemblySourceType;\n \n use crate::{\n-    evaluate_context::node_evaluate_asset_context, resolve_options_context::ResolveOptionsContext,\n+    evaluate_context::{config_tracing_module_context, node_evaluate_asset_context},\n+    resolve_options_context::ResolveOptionsContext,\n };\n \n #[turbo_tasks::function]\n@@ -695,6 +696,7 @@ impl ModuleOptions {\n                                     Layer::new(rcstr!(\"postcss\")),\n                                     true,\n                                 ),\n+                                config_tracing_module_context(*execution_context),\n                                 *execution_context,\n                                 options.config_location,\n                                 matches!(css_source_maps, SourceMapsType::Full),"
+        }
+    ],
+    "stats": {
+        "total": 49,
+        "additions": 40,
+        "deletions": 9
+    }
+}

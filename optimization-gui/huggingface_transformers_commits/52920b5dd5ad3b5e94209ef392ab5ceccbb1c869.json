@@ -1,0 +1,60 @@
+{
+    "author": "gante",
+    "message": "Cache: don't throw warnings on `gemma2` when instantiating a new cache (#33595)",
+    "sha": "52920b5dd5ad3b5e94209ef392ab5ceccbb1c869",
+    "files": [
+        {
+            "sha": "d42b15c14abf9bf4d554c5a6ac7d4743b3da722c",
+            "filename": "src/transformers/cache_utils.py",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 1,
+            "changes": 10,
+            "blob_url": "https://github.com/huggingface/transformers/blob/52920b5dd5ad3b5e94209ef392ab5ceccbb1c869/src%2Ftransformers%2Fcache_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/52920b5dd5ad3b5e94209ef392ab5ceccbb1c869/src%2Ftransformers%2Fcache_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fcache_utils.py?ref=52920b5dd5ad3b5e94209ef392ab5ceccbb1c869",
+            "patch": "@@ -1660,7 +1660,15 @@ def get_max_length(self) -> Optional[int]:\n         return self.max_cache_len\n \n     def get_seq_length(self, layer_idx: Optional[int] = 0):\n-        return None\n+        # Occupied cache == any slot in the 3rd dim (sequence length) holds a non-zero value. To save on compute, let's\n+        # limit the check to the first batch member and head dimension.\n+        # TODO: deprecate this function in favor of `cache_position`\n+        if layer_idx != 0:\n+            raise ValueError(\n+                \"`get_seq_length` on `HybridCache` may get inconsistent results depending on the layer index. \"\n+                \"Using the `layer_idx` argument is not supported.\"\n+            )\n+        return (self.key_cache[layer_idx][0, 0].any(dim=-1)).sum()\n \n     def reset(self):\n         \"\"\"Resets the cache values while preserving the objects\"\"\""
+        },
+        {
+            "sha": "be964c9aed018a888281c64645518a642e088074",
+            "filename": "src/transformers/models/gemma2/modeling_gemma2.py",
+            "status": "modified",
+            "additions": 14,
+            "deletions": 27,
+            "changes": 41,
+            "blob_url": "https://github.com/huggingface/transformers/blob/52920b5dd5ad3b5e94209ef392ab5ceccbb1c869/src%2Ftransformers%2Fmodels%2Fgemma2%2Fmodeling_gemma2.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/52920b5dd5ad3b5e94209ef392ab5ceccbb1c869/src%2Ftransformers%2Fmodels%2Fgemma2%2Fmodeling_gemma2.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fgemma2%2Fmodeling_gemma2.py?ref=52920b5dd5ad3b5e94209ef392ab5ceccbb1c869",
+            "patch": "@@ -710,20 +710,13 @@ def _check_and_enable_sdpa(cls, config, hard_check_only: bool = False):\n             config.n_positions - 1]`.\n \n             [What are position IDs?](../glossary#position-ids)\n-        past_key_values (`Cache` or `tuple(tuple(torch.FloatTensor))`, *optional*):\n+        past_key_values (`HybridCache`, *optional*):\n             Pre-computed hidden-states (key and values in the self-attention blocks and in the cross-attention\n             blocks) that can be used to speed up sequential decoding. This typically consists in the `past_key_values`\n             returned by the model at a previous stage of decoding, when `use_cache=True` or `config.use_cache=True`.\n \n-            Two formats are allowed:\n-            - a [`~cache_utils.Cache`] instance, see our\n-            [kv cache guide](https://huggingface.co/docs/transformers/en/kv_cache);\n-            - Tuple of `tuple(torch.FloatTensor)` of length `config.n_layers`, with each tuple having 2 tensors of\n-            shape `(batch_size, num_heads, sequence_length, embed_size_per_head)`). This is also known as the legacy\n-            cache format.\n-\n-            The model will output the same cache format that is fed as input. If no `past_key_values` are passed, the\n-            legacy cache format will be returned.\n+            Gemma 2 uses a unique cache class, [`HybridCache`], and does not guarantee full compatibility with other\n+            cache classes.\n \n             If `past_key_values` are used, the user can optionally input only the last `input_ids` (those that don't\n             have their past key value states given to this model) of shape `(batch_size, 1)` instead of all `input_ids`\n@@ -789,7 +782,7 @@ def forward(\n         input_ids: torch.LongTensor = None,\n         attention_mask: Optional[torch.Tensor] = None,\n         position_ids: Optional[torch.LongTensor] = None,\n-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,\n+        past_key_values: Optional[HybridCache] = None,\n         inputs_embeds: Optional[torch.FloatTensor] = None,\n         use_cache: Optional[bool] = None,\n         output_attentions: Optional[bool] = None,\n@@ -818,19 +811,8 @@ def forward(\n         if inputs_embeds is None:\n             inputs_embeds = self.embed_tokens(input_ids)\n \n-        if cache_position is None:\n-            if past_key_values is None:\n-                cache_position = torch.arange(0, inputs_embeds.shape[1], device=inputs_embeds.device)\n-            else:\n-                raise ValueError(\"When `past_key_values` is passed, `cache_position` must be too\")\n-\n-        # Probably a forward call with caching, so we set up cache for one call only\n-        if use_cache and past_key_values is None and not self.training:\n-            logger.warning_once(\n-                \"You are calling the model with `use_cache=True` but didn't pass `past_key_values` while not training. \",\n-                \"If you want to compute with cache, make sure to pass an instance of `HybridCache`. An empty `HybridCache` instance \"\n-                \"will be created for this call. See for more: (https://huggingface.co/docs/transformers/main/en/internal/generation_utils#transformers.HybridCache)\",\n-            )\n+        # Instantiate an empty cache if needed.\n+        if use_cache and past_key_values is None:\n             batch_size, seq_len, _ = inputs_embeds.shape\n             past_key_values = HybridCache(\n                 self.config,\n@@ -840,6 +822,11 @@ def forward(\n                 dtype=inputs_embeds.dtype,\n             )\n \n+        if cache_position is None:\n+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0\n+            cache_position = torch.arange(\n+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device\n+            )\n         if position_ids is None:\n             position_ids = cache_position.unsqueeze(0)\n \n@@ -912,7 +899,7 @@ def _update_causal_mask(\n         attention_mask: torch.Tensor,\n         input_tensor: torch.Tensor,\n         cache_position: torch.Tensor,\n-        past_key_values: Cache,\n+        past_key_values: HybridCache,\n         output_attentions: bool,\n     ):\n         # Flash Attention currently doesn't support static cache but Gemma2 work only with static cache.\n@@ -981,7 +968,7 @@ def forward(\n         input_ids: torch.LongTensor = None,\n         attention_mask: Optional[torch.Tensor] = None,\n         position_ids: Optional[torch.LongTensor] = None,\n-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,\n+        past_key_values: Optional[HybridCache] = None,\n         inputs_embeds: Optional[torch.FloatTensor] = None,\n         labels: Optional[torch.LongTensor] = None,\n         use_cache: Optional[bool] = None,\n@@ -1202,7 +1189,7 @@ def forward(\n         input_ids: torch.LongTensor = None,\n         attention_mask: Optional[torch.Tensor] = None,\n         position_ids: Optional[torch.LongTensor] = None,\n-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,\n+        past_key_values: Optional[HybridCache] = None,\n         inputs_embeds: Optional[torch.FloatTensor] = None,\n         labels: Optional[torch.LongTensor] = None,\n         use_cache: Optional[bool] = None,"
+        },
+        {
+            "sha": "d91b057ef28ec4f8f1a33a407b66dabe076fdf85",
+            "filename": "src/transformers/models/mimi/modeling_mimi.py",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 2,
+            "changes": 12,
+            "blob_url": "https://github.com/huggingface/transformers/blob/52920b5dd5ad3b5e94209ef392ab5ceccbb1c869/src%2Ftransformers%2Fmodels%2Fmimi%2Fmodeling_mimi.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/52920b5dd5ad3b5e94209ef392ab5ceccbb1c869/src%2Ftransformers%2Fmodels%2Fmimi%2Fmodeling_mimi.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fmimi%2Fmodeling_mimi.py?ref=52920b5dd5ad3b5e94209ef392ab5ceccbb1c869",
+            "patch": "@@ -1000,8 +1000,16 @@ def forward(\n             )\n             use_cache = False\n \n-        if use_cache and past_key_values is None and not self.training:\n-            past_key_values = DynamicCache.from_legacy_cache(past_key_values)\n+        if use_cache and not isinstance(past_key_values, Cache):\n+            if past_key_values is None:\n+                past_key_values = DynamicCache()\n+            else:\n+                past_key_values = DynamicCache.from_legacy_cache(past_key_values)\n+                logger.warning_once(\n+                    \"We detected that you are passing `past_key_values` as a tuple of tuples. This is deprecated and \"\n+                    \"will be removed in v4.47. Please convert your cache or use an appropriate `Cache` class \"\n+                    \"(https://huggingface.co/docs/transformers/kv_cache#legacy-cache-format)\"\n+                )\n \n         if cache_position is None:\n             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0"
+        },
+        {
+            "sha": "4e7b3553460f89c4ade7469f396f1801a5606cdf",
+            "filename": "tests/models/gemma2/test_modeling_gemma2.py",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/huggingface/transformers/blob/52920b5dd5ad3b5e94209ef392ab5ceccbb1c869/tests%2Fmodels%2Fgemma2%2Ftest_modeling_gemma2.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/52920b5dd5ad3b5e94209ef392ab5ceccbb1c869/tests%2Fmodels%2Fgemma2%2Ftest_modeling_gemma2.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fgemma2%2Ftest_modeling_gemma2.py?ref=52920b5dd5ad3b5e94209ef392ab5ceccbb1c869",
+            "patch": "@@ -86,10 +86,15 @@ def setUp(self):\n     def test_model_outputs_equivalence(self, **kwargs):\n         pass\n \n+    @parameterized.expand([(\"float16\",), (\"bfloat16\",), (\"float32\",)])\n     @unittest.skip(\"Gemma2's eager attn/sdpa attn outputs are expected to be different\")\n     def test_eager_matches_sdpa_inference(self):\n         pass\n \n+    @unittest.skip(\"Gemma2's eager attn/sdpa attn outputs are expected to be different\")\n+    def test_eager_matches_sdpa_generate(self):\n+        pass\n+\n     @parameterized.expand([(\"random\",), (\"same\",)])\n     @unittest.skip(\"Gemma2 has HybridCache which is not compatible with assisted decoding\")\n     def test_assisted_decoding_matches_greedy_search(self, assistant_type):"
+        }
+    ],
+    "stats": {
+        "total": 68,
+        "additions": 38,
+        "deletions": 30
+    }
+}

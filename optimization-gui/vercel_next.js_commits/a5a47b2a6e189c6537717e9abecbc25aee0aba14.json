@@ -1,0 +1,132 @@
+{
+    "author": "devjiwonchoi",
+    "message": "fix: throw error during build when invalid export for Proxy (#84886)\n\n### Why?\n\nWhen Proxy/Middleware had invalid exports (valid: named function `proxy`\nfor `proxy.js`, named function `middleware` for `middleware.js`, or\ndefault function), it errored during runtime but not during build.\n\nThis error can sneak into production as it only throws during runtime.\n\n### How?\n\nWalk AST of the Proxy/Middleware file, and if a valid export is not\nfound, throw during build.\n\n---------\n\nCo-authored-by: Benjamin Woodruff <benjamin.woodruff@vercel.com>",
+    "sha": "a5a47b2a6e189c6537717e9abecbc25aee0aba14",
+    "files": [
+        {
+            "sha": "49c4a44c73ecabf09d3a02efe0a2f5e02e88e6c7",
+            "filename": "crates/next-core/src/middleware.rs",
+            "status": "modified",
+            "additions": 105,
+            "deletions": 3,
+            "changes": 108,
+            "blob_url": "https://github.com/vercel/next.js/blob/a5a47b2a6e189c6537717e9abecbc25aee0aba14/crates%2Fnext-core%2Fsrc%2Fmiddleware.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/a5a47b2a6e189c6537717e9abecbc25aee0aba14/crates%2Fnext-core%2Fsrc%2Fmiddleware.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/crates%2Fnext-core%2Fsrc%2Fmiddleware.rs?ref=a5a47b2a6e189c6537717e9abecbc25aee0aba14",
+            "patch": "@@ -2,7 +2,13 @@ use anyhow::Result;\n use turbo_rcstr::{RcStr, rcstr};\n use turbo_tasks::{ResolvedVc, Vc, fxindexmap};\n use turbo_tasks_fs::FileSystemPath;\n-use turbopack_core::{context::AssetContext, module::Module, reference_type::ReferenceType};\n+use turbopack_core::{\n+    context::AssetContext,\n+    issue::{Issue, IssueExt, IssueSeverity, IssueStage, OptionStyledString, StyledString},\n+    module::Module,\n+    reference_type::ReferenceType,\n+};\n+use turbopack_ecmascript::chunk::{EcmascriptChunkPlaceable, EcmascriptExports};\n \n use crate::util::load_next_js_template;\n \n@@ -32,13 +38,64 @@ pub async fn get_middleware_module(\n     // Determine if this is a proxy file by checking the module path\n     let userland_path = userland_module.ident().path().await?;\n     let is_proxy = userland_path.file_stem() == Some(\"proxy\");\n-    let page_path = if is_proxy { \"/proxy\" } else { \"/middleware\" };\n+    let (file_type, function_name, page_path) = if is_proxy {\n+        (\"Proxy\", \"proxy\", \"/proxy\")\n+    } else {\n+        (\"Middleware\", \"middleware\", \"/middleware\")\n+    };\n+\n+    // Validate that the module has the required exports\n+    if let Some(ecma_module) =\n+        Vc::try_resolve_sidecast::<Box<dyn EcmascriptChunkPlaceable>>(*userland_module).await?\n+    {\n+        let exports = ecma_module.get_exports().await?;\n+\n+        // Check if the module has the required exports\n+        let has_valid_export = match &*exports {\n+            // ESM modules - check for named or default export\n+            EcmascriptExports::EsmExports(esm_exports) => {\n+                let esm_exports = esm_exports.await?;\n+                let has_default = esm_exports.exports.contains_key(\"default\");\n+                let expected_named = function_name;\n+                let has_named = esm_exports.exports.contains_key(expected_named);\n+                has_default || has_named\n+            }\n+            // CommonJS modules are valid (they can have module.exports or exports.default)\n+            EcmascriptExports::CommonJs | EcmascriptExports::Value => true,\n+            // DynamicNamespace might be valid for certain module types\n+            EcmascriptExports::DynamicNamespace => true,\n+            // None/Unknown likely indicate parsing errors - skip validation\n+            // The parsing error will be emitted separately by Turbopack\n+            EcmascriptExports::None | EcmascriptExports::Unknown => true,\n+            // EmptyCommonJs is a legitimate case of missing exports\n+            EcmascriptExports::EmptyCommonJs => false,\n+        };\n+\n+        if !has_valid_export {\n+            MiddlewareMissingExportIssue {\n+                file_type: file_type.into(),\n+                function_name: function_name.into(),\n+                file_path: (*userland_path).clone(),\n+            }\n+            .resolved_cell()\n+            .emit();\n+\n+            // Continue execution instead of bailing - let the module be processed anyway\n+            // The runtime template will still catch this at runtime\n+        }\n+    }\n+    // If we can't cast to EcmascriptChunkPlaceable, continue without validation\n+    // (might be a special module type that doesn't support export checking)\n \n     // Load the file from the next.js codebase.\n     let source = load_next_js_template(\n         \"middleware.js\",\n         project_root,\n-        &[(\"VAR_USERLAND\", INNER), (\"VAR_DEFINITION_PAGE\", page_path)],\n+        &[\n+            (\"VAR_USERLAND\", INNER),\n+            (\"VAR_DEFINITION_PAGE\", page_path),\n+            (\"VAR_MODULE_RELATIVE_PATH\", userland_path.path.as_str()),\n+        ],\n         &[],\n         &[],\n     )\n@@ -57,3 +114,48 @@ pub async fn get_middleware_module(\n \n     Ok(module)\n }\n+\n+#[turbo_tasks::value]\n+struct MiddlewareMissingExportIssue {\n+    file_type: RcStr,     // \"Proxy\" or \"Middleware\"\n+    function_name: RcStr, // \"proxy\" or \"middleware\"\n+    file_path: FileSystemPath,\n+}\n+\n+#[turbo_tasks::value_impl]\n+impl Issue for MiddlewareMissingExportIssue {\n+    #[turbo_tasks::function]\n+    fn stage(&self) -> Vc<IssueStage> {\n+        IssueStage::Transform.into()\n+    }\n+\n+    fn severity(&self) -> IssueSeverity {\n+        IssueSeverity::Error\n+    }\n+\n+    #[turbo_tasks::function]\n+    fn file_path(&self) -> Vc<FileSystemPath> {\n+        self.file_path.clone().cell()\n+    }\n+\n+    #[turbo_tasks::function]\n+    fn title(&self) -> Vc<StyledString> {\n+        let file_name = self.file_path.file_name();\n+\n+        StyledString::Line(vec![\n+            StyledString::Text(rcstr!(\"The \")),\n+            StyledString::Code(self.file_type.clone()),\n+            StyledString::Text(rcstr!(\" file \\\"\")),\n+            StyledString::Code(format!(\"./{}\", file_name).into()),\n+            StyledString::Text(rcstr!(\"\\\" must export a function named \")),\n+            StyledString::Code(format!(\"`{}`\", self.function_name).into()),\n+            StyledString::Text(rcstr!(\" or a default function.\")),\n+        ])\n+        .cell()\n+    }\n+\n+    #[turbo_tasks::function]\n+    fn description(&self) -> Vc<OptionStyledString> {\n+        Vc::cell(None)\n+    }\n+}"
+        },
+        {
+            "sha": "3d357aedf905be27d06475ce7aad20e52f6445e0",
+            "filename": "packages/next/errors.json",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 1,
+            "changes": 4,
+            "blob_url": "https://github.com/vercel/next.js/blob/a5a47b2a6e189c6537717e9abecbc25aee0aba14/packages%2Fnext%2Ferrors.json",
+            "raw_url": "https://github.com/vercel/next.js/raw/a5a47b2a6e189c6537717e9abecbc25aee0aba14/packages%2Fnext%2Ferrors.json",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Ferrors.json?ref=a5a47b2a6e189c6537717e9abecbc25aee0aba14",
+            "patch": "@@ -879,5 +879,7 @@\n   \"878\": \"Config options `skipProxyUrlNormalize` and `skipMiddlewareUrlNormalize` cannot be set at the same time. Please use `skipProxyUrlNormalize` instead.\",\n   \"879\": \"Config options `experimental.proxyClientMaxBodySize` and `experimental.middlewareClientMaxBodySize` cannot be set at the same time. Please use `experimental.proxyClientMaxBodySize` instead.\",\n   \"880\": \"Config options `experimental.proxyPrefetch` and `experimental.middlewarePrefetch` cannot be set at the same time. Please use `experimental.proxyPrefetch` instead.\",\n-  \"881\": \"Invalid render stage: %s\"\n+  \"881\": \"Invalid render stage: %s\",\n+  \"882\": \"The %s file \\\"./%s\\\" must export a function named \\\\`%s\\\\` or a default function.\",\n+  \"883\": \"The %s file \\\"%s\\\" must export a function named \\\\`%s\\\\` or a default function.\"\n }"
+        },
+        {
+            "sha": "132837e9760b2497d2bd21943cfc4af99229332b",
+            "filename": "packages/next/src/build/analysis/get-page-static-info.ts",
+            "status": "modified",
+            "additions": 111,
+            "deletions": 2,
+            "changes": 113,
+            "blob_url": "https://github.com/vercel/next.js/blob/a5a47b2a6e189c6537717e9abecbc25aee0aba14/packages%2Fnext%2Fsrc%2Fbuild%2Fanalysis%2Fget-page-static-info.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/a5a47b2a6e189c6537717e9abecbc25aee0aba14/packages%2Fnext%2Fsrc%2Fbuild%2Fanalysis%2Fget-page-static-info.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Fanalysis%2Fget-page-static-info.ts?ref=a5a47b2a6e189c6537717e9abecbc25aee0aba14",
+            "patch": "@@ -2,14 +2,19 @@ import type { NextConfig } from '../../server/config-shared'\n import type { RouteHas } from '../../lib/load-custom-routes'\n \n import { promises as fs } from 'fs'\n+import { basename } from 'path'\n import { LRUCache } from '../../server/lib/lru-cache'\n import {\n   extractExportedConstValue,\n   UnsupportedValueError,\n } from './extract-const-value'\n import { parseModule } from './parse-module'\n import * as Log from '../output/log'\n-import { SERVER_RUNTIME } from '../../lib/constants'\n+import {\n+  SERVER_RUNTIME,\n+  MIDDLEWARE_FILENAME,\n+  PROXY_FILENAME,\n+} from '../../lib/constants'\n import { tryToParsePath } from '../../lib/try-to-parse-path'\n import { isAPIRoute } from '../../lib/is-api-route'\n import { isEdgeRuntime } from '../../lib/is-edge-runtime'\n@@ -37,7 +42,7 @@ import { normalizeAppPath } from '../../shared/lib/router/utils/app-paths'\n import { normalizePagePath } from '../../shared/lib/page-path/normalize-page-path'\n \n const PARSE_PATTERN =\n-  /(?<!(_jsx|jsx-))runtime|preferredRegion|getStaticProps|getServerSideProps|generateStaticParams|export const|generateImageMetadata|generateSitemaps/\n+  /(?<!(_jsx|jsx-))runtime|preferredRegion|getStaticProps|getServerSideProps|generateStaticParams|export const|generateImageMetadata|generateSitemaps|middleware|proxy/\n \n export type MiddlewareMatcher = {\n   regexp: string\n@@ -296,6 +301,108 @@ function checkExports(\n   return {}\n }\n \n+function validateMiddlewareProxyExports({\n+  ast,\n+  page,\n+  pageFilePath,\n+}: {\n+  ast: any\n+  page: string\n+  pageFilePath: string\n+}): void {\n+  // Only validate in build. In development, it will error at runtime.\n+  if (process.env.NODE_ENV !== 'production') {\n+    return\n+  }\n+\n+  // Check if this is middleware/proxy\n+  const isMiddleware =\n+    page === `/${MIDDLEWARE_FILENAME}` || page === `/src/${MIDDLEWARE_FILENAME}`\n+  const isProxy =\n+    page === `/${PROXY_FILENAME}` || page === `/src/${PROXY_FILENAME}`\n+\n+  if (!isMiddleware && !isProxy) {\n+    return\n+  }\n+\n+  if (!ast || !Array.isArray(ast.body)) {\n+    return\n+  }\n+\n+  const fileName = isProxy ? 'proxy' : 'middleware'\n+\n+  // Parse AST to get export info (since checkExports doesn't return middleware/proxy info)\n+  let hasDefaultExport = false\n+  let hasMiddlewareExport = false\n+  let hasProxyExport = false\n+\n+  for (const node of ast.body) {\n+    if (\n+      node.type === 'ExportDefaultDeclaration' ||\n+      node.type === 'ExportDefaultExpression'\n+    ) {\n+      hasDefaultExport = true\n+    }\n+\n+    if (\n+      node.type === 'ExportDeclaration' &&\n+      node.declaration?.type === 'FunctionDeclaration'\n+    ) {\n+      const id = node.declaration.identifier?.value\n+      if (id === 'middleware') {\n+        hasMiddlewareExport = true\n+      }\n+      if (id === 'proxy') {\n+        hasProxyExport = true\n+      }\n+    }\n+\n+    if (\n+      node.type === 'ExportDeclaration' &&\n+      node.declaration?.type === 'VariableDeclaration'\n+    ) {\n+      const id = node.declaration?.declarations[0]?.id.value\n+      if (id === 'middleware') {\n+        hasMiddlewareExport = true\n+      }\n+      if (id === 'proxy') {\n+        hasProxyExport = true\n+      }\n+    }\n+\n+    if (node.type === 'ExportNamedDeclaration') {\n+      for (const specifier of node.specifiers) {\n+        if (\n+          specifier.type === 'ExportSpecifier' &&\n+          specifier.orig?.type === 'Identifier'\n+        ) {\n+          // Use the exported name if it exists (for aliased exports like `export { foo as proxy }`),\n+          // otherwise fall back to the original name (for simple re-exports like `export { proxy }`)\n+          const exportedIdentifier = specifier.exported || specifier.orig\n+          const value = exportedIdentifier.value\n+          if (value === 'middleware') {\n+            hasMiddlewareExport = true\n+          }\n+          if (value === 'proxy') {\n+            hasProxyExport = true\n+          }\n+        }\n+      }\n+    }\n+  }\n+\n+  const hasValidExport =\n+    hasDefaultExport ||\n+    (isMiddleware && hasMiddlewareExport) ||\n+    (isProxy && hasProxyExport)\n+\n+  if (!hasValidExport) {\n+    throw new Error(\n+      `The ${fileName === 'proxy' ? 'Proxy' : 'Middleware'} file \"./${basename(pageFilePath)}\" must export a function named \\`${fileName}\\` or a default function.`\n+    )\n+  }\n+}\n+\n async function tryToReadFile(filePath: string, shouldThrow: boolean) {\n   try {\n     return await fs.readFile(filePath, {\n@@ -497,6 +604,7 @@ export async function getAppPageStaticInfo({\n   }\n \n   const ast = await parseModule(pageFilePath, content)\n+  validateMiddlewareProxyExports({ ast, page, pageFilePath })\n \n   const {\n     generateStaticParams,\n@@ -592,6 +700,7 @@ export async function getPagesPageStaticInfo({\n   }\n \n   const ast = await parseModule(pageFilePath, content)\n+  validateMiddlewareProxyExports({ ast, page, pageFilePath })\n \n   const { getServerSideProps, getStaticProps, exports } = checkExports(\n     ast,"
+        },
+        {
+            "sha": "2124934ad08c85fe0c3fc1a2e645ab0f832374a5",
+            "filename": "packages/next/src/build/templates/middleware.ts",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 1,
+            "changes": 4,
+            "blob_url": "https://github.com/vercel/next.js/blob/a5a47b2a6e189c6537717e9abecbc25aee0aba14/packages%2Fnext%2Fsrc%2Fbuild%2Ftemplates%2Fmiddleware.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/a5a47b2a6e189c6537717e9abecbc25aee0aba14/packages%2Fnext%2Fsrc%2Fbuild%2Ftemplates%2Fmiddleware.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Ftemplates%2Fmiddleware.ts?ref=a5a47b2a6e189c6537717e9abecbc25aee0aba14",
+            "patch": "@@ -12,13 +12,15 @@ import { isNextRouterError } from '../../client/components/is-next-router-error'\n const mod = { ..._mod }\n \n const page = 'VAR_DEFINITION_PAGE'\n+// Turbopack does not add a `./` prefix to the relative file path, but Webpack does.\n+const relativeFilePath = 'VAR_MODULE_RELATIVE_PATH'\n // @ts-expect-error `page` will be replaced during build\n const isProxy = page === '/proxy' || page === '/src/proxy'\n const handler = (isProxy ? mod.proxy : mod.middleware) || mod.default\n \n if (typeof handler !== 'function') {\n   throw new Error(\n-    `The ${isProxy ? 'Proxy' : 'Middleware'} \"${page}\" must export a ${isProxy ? '`proxy`' : '`middleware`'} or a \\`default\\` function`\n+    `The ${isProxy ? 'Proxy' : 'Middleware'} file \"${relativeFilePath.startsWith('.') ? relativeFilePath : `./${relativeFilePath}`}\" must export a function named \\`${isProxy ? 'proxy' : 'middleware'}\\` or a default function.`\n   )\n }\n "
+        },
+        {
+            "sha": "f2374cf8730dd52df816ae58812ac932322b4beb",
+            "filename": "packages/next/src/build/webpack/loaders/next-middleware-loader.ts",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/a5a47b2a6e189c6537717e9abecbc25aee0aba14/packages%2Fnext%2Fsrc%2Fbuild%2Fwebpack%2Floaders%2Fnext-middleware-loader.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/a5a47b2a6e189c6537717e9abecbc25aee0aba14/packages%2Fnext%2Fsrc%2Fbuild%2Fwebpack%2Floaders%2Fnext-middleware-loader.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Fwebpack%2Floaders%2Fnext-middleware-loader.ts?ref=a5a47b2a6e189c6537717e9abecbc25aee0aba14",
+            "patch": "@@ -70,5 +70,8 @@ export default async function middlewareLoader(this: any) {\n   return await loadEntrypoint('middleware', {\n     VAR_USERLAND: pagePath,\n     VAR_DEFINITION_PAGE: page,\n+    // Turbopack sets `VAR_USERLAND` to `INNER_MIDDLEWARE_MODULE`, so use\n+    // `VAR_MODULE_RELATIVE_PATH` for error messages.\n+    VAR_MODULE_RELATIVE_PATH: pagePath,\n   })\n }"
+        },
+        {
+            "sha": "888614deda3ba5d744d1a7e5dac131038dba2b12",
+            "filename": "test/e2e/app-dir/proxy-missing-export/app/layout.tsx",
+            "status": "added",
+            "additions": 8,
+            "deletions": 0,
+            "changes": 8,
+            "blob_url": "https://github.com/vercel/next.js/blob/a5a47b2a6e189c6537717e9abecbc25aee0aba14/test%2Fe2e%2Fapp-dir%2Fproxy-missing-export%2Fapp%2Flayout.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/a5a47b2a6e189c6537717e9abecbc25aee0aba14/test%2Fe2e%2Fapp-dir%2Fproxy-missing-export%2Fapp%2Flayout.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fproxy-missing-export%2Fapp%2Flayout.tsx?ref=a5a47b2a6e189c6537717e9abecbc25aee0aba14",
+            "patch": "@@ -0,0 +1,8 @@\n+import { ReactNode } from 'react'\n+export default function Root({ children }: { children: ReactNode }) {\n+  return (\n+    <html>\n+      <body>{children}</body>\n+    </html>\n+  )\n+}"
+        },
+        {
+            "sha": "ff7159d9149feeb1eb8f4b7bbeadb2e26c20b053",
+            "filename": "test/e2e/app-dir/proxy-missing-export/app/page.tsx",
+            "status": "added",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/a5a47b2a6e189c6537717e9abecbc25aee0aba14/test%2Fe2e%2Fapp-dir%2Fproxy-missing-export%2Fapp%2Fpage.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/a5a47b2a6e189c6537717e9abecbc25aee0aba14/test%2Fe2e%2Fapp-dir%2Fproxy-missing-export%2Fapp%2Fpage.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fproxy-missing-export%2Fapp%2Fpage.tsx?ref=a5a47b2a6e189c6537717e9abecbc25aee0aba14",
+            "patch": "@@ -0,0 +1,3 @@\n+export default function Page() {\n+  return <p>hello world</p>\n+}"
+        },
+        {
+            "sha": "807126e4cf0bf5b1c8c917e6e0148a27331587d1",
+            "filename": "test/e2e/app-dir/proxy-missing-export/next.config.js",
+            "status": "added",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/vercel/next.js/blob/a5a47b2a6e189c6537717e9abecbc25aee0aba14/test%2Fe2e%2Fapp-dir%2Fproxy-missing-export%2Fnext.config.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/a5a47b2a6e189c6537717e9abecbc25aee0aba14/test%2Fe2e%2Fapp-dir%2Fproxy-missing-export%2Fnext.config.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fproxy-missing-export%2Fnext.config.js?ref=a5a47b2a6e189c6537717e9abecbc25aee0aba14",
+            "patch": "@@ -0,0 +1,6 @@\n+/**\n+ * @type {import('next').NextConfig}\n+ */\n+const nextConfig = {}\n+\n+module.exports = nextConfig"
+        },
+        {
+            "sha": "61813a45ee11cb485c587010150109b51690ab16",
+            "filename": "test/e2e/app-dir/proxy-missing-export/proxy-missing-export.test.ts",
+            "status": "added",
+            "additions": 109,
+            "deletions": 0,
+            "changes": 109,
+            "blob_url": "https://github.com/vercel/next.js/blob/a5a47b2a6e189c6537717e9abecbc25aee0aba14/test%2Fe2e%2Fapp-dir%2Fproxy-missing-export%2Fproxy-missing-export.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/a5a47b2a6e189c6537717e9abecbc25aee0aba14/test%2Fe2e%2Fapp-dir%2Fproxy-missing-export%2Fproxy-missing-export.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fproxy-missing-export%2Fproxy-missing-export.test.ts?ref=a5a47b2a6e189c6537717e9abecbc25aee0aba14",
+            "patch": "@@ -0,0 +1,109 @@\n+import { nextTestSetup } from 'e2e-utils'\n+import { join } from 'node:path'\n+import { writeFile } from 'node:fs/promises'\n+\n+const errorMessage =\n+  'The Proxy file \"./proxy.ts\" must export a function named `proxy` or a default function.'\n+\n+describe('proxy-missing-export', () => {\n+  const { next, isNextDev, skipped } = nextTestSetup({\n+    files: __dirname,\n+    skipDeployment: true,\n+    skipStart: true,\n+  })\n+\n+  if (skipped) {\n+    return\n+  }\n+\n+  it('should error when proxy file has invalid export named middleware', async () => {\n+    await writeFile(\n+      join(next.testDir, 'proxy.ts'),\n+      'export function middleware() {}'\n+    )\n+\n+    if (isNextDev) {\n+      await next.start().catch(() => {})\n+      // Use .catch() because Turbopack errors during compile and exits before runtime.\n+      await next.browser('/').catch(() => {})\n+      expect(next.cliOutput).toContain(errorMessage)\n+    } else {\n+      const { cliOutput } = await next.build()\n+      expect(cliOutput).toContain(errorMessage)\n+    }\n+\n+    await next.stop()\n+  })\n+\n+  it('should NOT error when proxy file has a default function export', async () => {\n+    await writeFile(\n+      join(next.testDir, 'proxy.ts'),\n+      'export default function handler() {}'\n+    )\n+\n+    await next.start()\n+\n+    const browser = await next.browser('/')\n+    expect(await browser.elementByCss('p').text()).toBe('hello world')\n+\n+    await next.stop()\n+  })\n+\n+  it('should NOT error when proxy file has a default arrow function export', async () => {\n+    await writeFile(join(next.testDir, 'proxy.ts'), 'export default () => {}')\n+\n+    await next.start()\n+\n+    const browser = await next.browser('/')\n+    expect(await browser.elementByCss('p').text()).toBe('hello world')\n+\n+    await next.stop()\n+  })\n+\n+  it('should NOT error when proxy file has a named declaration function export', async () => {\n+    await writeFile(\n+      join(next.testDir, 'proxy.ts'),\n+      'const proxy = function() {}; export { proxy };'\n+    )\n+\n+    await next.start()\n+\n+    const browser = await next.browser('/')\n+    expect(await browser.elementByCss('p').text()).toBe('hello world')\n+\n+    await next.stop()\n+  })\n+\n+  it('should NOT error when proxy file has a named declaration arrow function export', async () => {\n+    await writeFile(\n+      join(next.testDir, 'proxy.ts'),\n+      'const proxy = () => {}; export { proxy };'\n+    )\n+\n+    await next.start()\n+\n+    const browser = await next.browser('/')\n+    expect(await browser.elementByCss('p').text()).toBe('hello world')\n+\n+    await next.stop()\n+  })\n+\n+  it('should error when proxy file has a named export with different name alias', async () => {\n+    await writeFile(\n+      join(next.testDir, 'proxy.ts'),\n+      'const proxy = () => {}; export { proxy as handler };'\n+    )\n+\n+    if (isNextDev) {\n+      await next.start().catch(() => {})\n+      // Use .catch() because Turbopack errors during compile and exits before runtime.\n+      await next.browser('/').catch(() => {})\n+      expect(next.cliOutput).toContain(errorMessage)\n+    } else {\n+      const { cliOutput } = await next.build()\n+      expect(cliOutput).toContain(errorMessage)\n+    }\n+\n+    await next.stop()\n+  })\n+})"
+        },
+        {
+            "sha": "0a24f5b185ccbc88abc34e002aba89f082a115eb",
+            "filename": "test/production/exported-runtimes-value-validation/invalid-middleware/middleware.js",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/a5a47b2a6e189c6537717e9abecbc25aee0aba14/test%2Fproduction%2Fexported-runtimes-value-validation%2Finvalid-middleware%2Fmiddleware.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/a5a47b2a6e189c6537717e9abecbc25aee0aba14/test%2Fproduction%2Fexported-runtimes-value-validation%2Finvalid-middleware%2Fmiddleware.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fproduction%2Fexported-runtimes-value-validation%2Finvalid-middleware%2Fmiddleware.js?ref=a5a47b2a6e189c6537717e9abecbc25aee0aba14",
+            "patch": "@@ -1,3 +1,5 @@\n+export default function () {}\n+\n const dynamicPath = `/:foobar`\n \n export const config = {"
+        }
+    ],
+    "stats": {
+        "total": 360,
+        "additions": 353,
+        "deletions": 7
+    }
+}

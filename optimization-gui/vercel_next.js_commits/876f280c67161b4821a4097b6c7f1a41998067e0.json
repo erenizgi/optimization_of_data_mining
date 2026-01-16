@@ -1,0 +1,72 @@
+{
+    "author": "mischnic",
+    "message": "Turbopack: pass cache handler path as relative path to Rust (#82780)\n\nPreparation for using this as an entry for NFT tracing from the Rust side. This simplifies the path handling on the Rust side.\nWe do the same for the `images.loaderFile` already.",
+    "sha": "876f280c67161b4821a4097b6c7f1a41998067e0",
+    "files": [
+        {
+            "sha": "f840a4341f68bc1b5b2158df0c522262dcf5881c",
+            "filename": "crates/next-core/src/next_config.rs",
+            "status": "modified",
+            "additions": 28,
+            "deletions": 4,
+            "changes": 32,
+            "blob_url": "https://github.com/vercel/next.js/blob/876f280c67161b4821a4097b6c7f1a41998067e0/crates%2Fnext-core%2Fsrc%2Fnext_config.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/876f280c67161b4821a4097b6c7f1a41998067e0/crates%2Fnext-core%2Fsrc%2Fnext_config.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/crates%2Fnext-core%2Fsrc%2Fnext_config.rs?ref=876f280c67161b4821a4097b6c7f1a41998067e0",
+            "patch": "@@ -29,6 +29,7 @@ use turbopack_ecmascript_plugins::transform::{\n use turbopack_node::transforms::webpack::{WebpackLoaderItem, WebpackLoaderItems};\n \n use crate::{\n+    app_structure::FileSystemPathVec,\n     mode::NextMode,\n     next_import_map::mdx_import_source_file,\n     next_shared::{\n@@ -1127,6 +1128,9 @@ pub struct OptionalMdxTransformOptions(Option<ResolvedVc<MdxTransformOptions>>);\n \n pub struct OptionSubResourceIntegrity(Option<SubResourceIntegrity>);\n \n+#[turbo_tasks::value(transparent)]\n+pub struct OptionFileSystemPath(Option<FileSystemPath>);\n+\n #[turbo_tasks::value(transparent)]\n pub struct OptionServerActions(Option<ServerActions>);\n \n@@ -1226,8 +1230,12 @@ impl NextConfig {\n     }\n \n     #[turbo_tasks::function]\n-    pub fn cache_handler(&self) -> Vc<Option<RcStr>> {\n-        Vc::cell(self.cache_handler.clone())\n+    pub fn cache_handler(&self, project_path: FileSystemPath) -> Result<Vc<OptionFileSystemPath>> {\n+        if let Some(handler) = &self.cache_handler {\n+            Ok(Vc::cell(Some(project_path.join(handler)?)))\n+        } else {\n+            Ok(Vc::cell(None))\n+        }\n     }\n \n     #[turbo_tasks::function]\n@@ -1359,8 +1367,7 @@ impl NextConfig {\n                         // emit an issue to prevent users from encountering duplicate module names.\n                         if ext.contains(\"*\") && rename_as.as_ref().is_some_and(|r| !r.contains(\"*\"))\n                         {\n-                            let config_file_path =\n-                                project_path.join(&format!(\"./{}\", self.config_file_name))?;\n+                            let config_file_path = project_path.join(&self.config_file_name)?;\n \n                             InvalidLoaderRuleError {\n                                 ext: ext.clone(),\n@@ -1481,6 +1488,23 @@ impl NextConfig {\n         Vc::cell(self.modularize_imports.clone().unwrap_or_default())\n     }\n \n+    #[turbo_tasks::function]\n+    pub fn experimental_cache_handlers(\n+        &self,\n+        project_path: FileSystemPath,\n+    ) -> Result<Vc<FileSystemPathVec>> {\n+        if let Some(handlers) = &self.experimental.cache_handlers {\n+            Ok(Vc::cell(\n+                handlers\n+                    .values()\n+                    .map(|h| project_path.join(h))\n+                    .collect::<Result<Vec<_>>>()?,\n+            ))\n+        } else {\n+            Ok(Vc::cell(vec![]))\n+        }\n+    }\n+\n     #[turbo_tasks::function]\n     pub fn experimental_swc_plugins(&self) -> Vc<SwcPlugins> {\n         Vc::cell(self.experimental.swc_plugins.clone().unwrap_or_default())"
+        },
+        {
+            "sha": "1ef5fe68fe93594a2bdeb83fab64c7f8076f6f90",
+            "filename": "packages/next/src/build/swc/index.ts",
+            "status": "modified",
+            "additions": 51,
+            "deletions": 24,
+            "changes": 75,
+            "blob_url": "https://github.com/vercel/next.js/blob/876f280c67161b4821a4097b6c7f1a41998067e0/packages%2Fnext%2Fsrc%2Fbuild%2Fswc%2Findex.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/876f280c67161b4821a4097b6c7f1a41998067e0/packages%2Fnext%2Fsrc%2Fbuild%2Fswc%2Findex.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Fswc%2Findex.ts?ref=876f280c67161b4821a4097b6c7f1a41998067e0",
+            "patch": "@@ -873,45 +873,72 @@ function bindingToApi(\n     let nextConfigSerializable = augmentNextConfig(nextConfig, projectPath)\n \n     nextConfigSerializable.generateBuildId =\n-      await nextConfig.generateBuildId?.()\n+      await nextConfigSerializable.generateBuildId?.()\n \n     // TODO: these functions takes arguments, have to be supported in a different way\n     nextConfigSerializable.exportPathMap = {}\n-    nextConfigSerializable.webpack = nextConfig.webpack && {}\n+    nextConfigSerializable.webpack = nextConfigSerializable.webpack && {}\n \n     if (nextConfigSerializable.turbopack?.rules) {\n       ensureLoadersHaveSerializableOptions(\n         nextConfigSerializable.turbopack?.rules\n       )\n     }\n \n-    nextConfigSerializable.modularizeImports =\n-      nextConfigSerializable.modularizeImports\n-        ? Object.fromEntries(\n-            Object.entries<any>(nextConfigSerializable.modularizeImports).map(\n-              ([mod, config]) => [\n-                mod,\n-                {\n-                  ...config,\n-                  transform:\n-                    typeof config.transform === 'string'\n-                      ? config.transform\n-                      : Object.entries(config.transform).map(([key, value]) => [\n-                          key,\n-                          value,\n-                        ]),\n-                },\n-              ]\n-            )\n-          )\n-        : undefined\n+    if (nextConfigSerializable.modularizeImports) {\n+      nextConfigSerializable.modularizeImports = Object.fromEntries(\n+        Object.entries<any>(nextConfigSerializable.modularizeImports).map(\n+          ([mod, config]) => [\n+            mod,\n+            {\n+              ...config,\n+              transform:\n+                typeof config.transform === 'string'\n+                  ? config.transform\n+                  : Object.entries(config.transform),\n+            },\n+          ]\n+        )\n+      )\n+    }\n \n     // loaderFile is an absolute path, we need it to be relative for turbopack.\n     if (nextConfigSerializable.images.loaderFile) {\n       nextConfigSerializable.images = {\n-        ...nextConfig.images,\n+        ...nextConfigSerializable.images,\n         loaderFile:\n-          './' + path.relative(projectPath, nextConfig.images.loaderFile),\n+          './' +\n+          path.relative(projectPath, nextConfigSerializable.images.loaderFile),\n+      }\n+    }\n+\n+    // cacheHandler can be an absolute path, we need it to be relative for turbopack.\n+    if (nextConfigSerializable.cacheHandler) {\n+      nextConfigSerializable.cacheHandler =\n+        './' +\n+        (path.isAbsolute(nextConfigSerializable.cacheHandler)\n+          ? path.relative(projectPath, nextConfigSerializable.cacheHandler)\n+          : nextConfigSerializable.cacheHandler)\n+    }\n+    if (nextConfigSerializable.experimental?.cacheHandlers) {\n+      nextConfigSerializable.experimental = {\n+        ...nextConfigSerializable.experimental,\n+        cacheHandlers: Object.fromEntries(\n+          Object.entries(\n+            nextConfigSerializable.experimental.cacheHandlers as Record<\n+              string,\n+              string\n+            >\n+          )\n+            .filter(([_, value]) => value != null)\n+            .map(([key, value]) => [\n+              key,\n+              './' +\n+                (path.isAbsolute(value)\n+                  ? path.relative(projectPath, value)\n+                  : value),\n+            ])\n+        ),\n       }\n     }\n "
+        },
+        {
+            "sha": "7092b09389e90c806fb2a80e4e95b72be6bc2871",
+            "filename": "test/e2e/app-dir/app-static/app-static-custom-handler.test.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/876f280c67161b4821a4097b6c7f1a41998067e0/test%2Fe2e%2Fapp-dir%2Fapp-static%2Fapp-static-custom-handler.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/876f280c67161b4821a4097b6c7f1a41998067e0/test%2Fe2e%2Fapp-dir%2Fapp-static%2Fapp-static-custom-handler.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fapp-static%2Fapp-static-custom-handler.test.ts?ref=876f280c67161b4821a4097b6c7f1a41998067e0",
+            "patch": "@@ -1,2 +1,2 @@\n-process.env.CUSTOM_CACHE_HANDLER = require.resolve('./cache-handler.js')\n+process.env.CUSTOM_CACHE_HANDLER = '1'\n require('./app-static.test')"
+        },
+        {
+            "sha": "7110edcf4336974d45072c2ae935ee0afea17441",
+            "filename": "test/e2e/app-dir/app-static/next.config.js",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 1,
+            "changes": 4,
+            "blob_url": "https://github.com/vercel/next.js/blob/876f280c67161b4821a4097b6c7f1a41998067e0/test%2Fe2e%2Fapp-dir%2Fapp-static%2Fnext.config.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/876f280c67161b4821a4097b6c7f1a41998067e0/test%2Fe2e%2Fapp-dir%2Fapp-static%2Fnext.config.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fapp-static%2Fnext.config.js?ref=876f280c67161b4821a4097b6c7f1a41998067e0",
+            "patch": "@@ -3,7 +3,9 @@ module.exports = {\n   logging: {\n     fetches: {},\n   },\n-  cacheHandler: process.env.CUSTOM_CACHE_HANDLER,\n+  cacheHandler: process.env.CUSTOM_CACHE_HANDLER\n+    ? require.resolve('./cache-handler.js')\n+    : undefined,\n \n   rewrites: async () => {\n     return {"
+        },
+        {
+            "sha": "99354dfb9d819aa5947fbadc01c22c2d5c4436fb",
+            "filename": "test/e2e/app-dir/use-cache-unknown-cache-kind/use-cache-unknown-cache-kind.test.ts",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 13,
+            "changes": 23,
+            "blob_url": "https://github.com/vercel/next.js/blob/876f280c67161b4821a4097b6c7f1a41998067e0/test%2Fe2e%2Fapp-dir%2Fuse-cache-unknown-cache-kind%2Fuse-cache-unknown-cache-kind.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/876f280c67161b4821a4097b6c7f1a41998067e0/test%2Fe2e%2Fapp-dir%2Fuse-cache-unknown-cache-kind%2Fuse-cache-unknown-cache-kind.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fuse-cache-unknown-cache-kind%2Fuse-cache-unknown-cache-kind.test.ts?ref=876f280c67161b4821a4097b6c7f1a41998067e0",
+            "patch": "@@ -1,5 +1,4 @@\n import { nextTestSetup } from 'e2e-utils'\n-import { NextConfig } from 'next'\n import {\n   assertHasRedbox,\n   assertNoRedbox,\n@@ -12,17 +11,6 @@ import { createSandbox } from 'development-sandbox'\n \n const isRspack = !!process.env.NEXT_RSPACK\n \n-const nextConfigWithCacheHandler: NextConfig = {\n-  experimental: {\n-    cacheComponents: true,\n-    cacheHandlers: {\n-      custom: require.resolve(\n-        'next/dist/server/lib/cache-handlers/default.external'\n-      ),\n-    },\n-  },\n-}\n-\n describe('use-cache-unknown-cache-kind', () => {\n   const { next, isNextStart, isTurbopack, skipped } = nextTestSetup({\n     files: __dirname,\n@@ -191,7 +179,16 @@ describe('use-cache-unknown-cache-kind', () => {\n \n       await session.patch(\n         'next.config.js',\n-        `module.exports = ${JSON.stringify(nextConfigWithCacheHandler)}`\n+        `module.exports = {\n+          experimental: {\n+            cacheComponents: true,\n+            cacheHandlers: {\n+              custom: require.resolve(\n+                'next/dist/server/lib/cache-handlers/default.external'\n+              ),\n+            },\n+          },\n+        }`\n       )\n \n       await retry(async () => {"
+        }
+    ],
+    "stats": {
+        "total": 136,
+        "additions": 93,
+        "deletions": 43
+    }
+}

@@ -1,0 +1,48 @@
+{
+    "author": "IlyasMoutawwakil",
+    "message": "Make cache traceable (#35873)\n\nsimply make cache traceable",
+    "sha": "5e2183f344911aa82aba0b83778a4f196cff378e",
+    "files": [
+        {
+            "sha": "dd12aa57512e1e4c0af0c377b1ed0dabda396690",
+            "filename": "src/transformers/cache_utils.py",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 19,
+            "changes": 25,
+            "blob_url": "https://github.com/huggingface/transformers/blob/5e2183f344911aa82aba0b83778a4f196cff378e/src%2Ftransformers%2Fcache_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/5e2183f344911aa82aba0b83778a4f196cff378e/src%2Ftransformers%2Fcache_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fcache_utils.py?ref=5e2183f344911aa82aba0b83778a4f196cff378e",
+            "patch": "@@ -9,12 +9,7 @@\n from packaging import version\n \n from .configuration_utils import PretrainedConfig\n-from .utils import (\n-    is_hqq_available,\n-    is_optimum_quanto_available,\n-    is_torchdynamo_compiling,\n-    logging,\n-)\n+from .utils import is_hqq_available, is_optimum_quanto_available, logging\n from .utils.deprecation import deprecate_kwarg\n \n \n@@ -24,7 +19,7 @@\n logger = logging.get_logger(__name__)\n \n \n-class Cache(torch.nn.Module):\n+class Cache:\n     \"\"\"\n     Base, abstract class for all caches. The actual data structure is specific to each subclass.\n     \"\"\"\n@@ -1140,18 +1135,10 @@ def __init__(\n                 layer_device = self.device\n             new_layer_key_cache = torch.zeros(cache_shape, dtype=self.dtype, device=layer_device)\n             new_layer_value_cache = torch.zeros(cache_shape, dtype=self.dtype, device=layer_device)\n-            # Notes:\n-            # 1. `mark_static_address` is used to tag the cache as an fixed data pointer, preventing cuda graph\n-            #     breaks when updating the cache. It can't be used if the cache code is being compiled (but in that case\n-            #     it is not needed anyway)\n-            # 2. `torch.export()` requires mutations to be registered as buffers.\n-            if not is_torchdynamo_compiling():\n-                self.register_buffer(f\"key_cache_{idx}\", torch.zeros(cache_shape, dtype=dtype, device=layer_device))\n-                self.register_buffer(f\"value_cache_{idx}\", torch.zeros(cache_shape, dtype=dtype, device=layer_device))\n-                new_layer_key_cache = getattr(self, f\"key_cache_{idx}\")\n-                new_layer_value_cache = getattr(self, f\"value_cache_{idx}\")\n-                torch._dynamo.mark_static_address(new_layer_key_cache)\n-                torch._dynamo.mark_static_address(new_layer_value_cache)\n+            # Note: `mark_static_address` is used to tag the cache as a fixed data pointer,\n+            # preventing compiled graph breaks when updating the cache.\n+            torch._dynamo.mark_static_address(new_layer_key_cache)\n+            torch._dynamo.mark_static_address(new_layer_value_cache)\n             self.key_cache.append(new_layer_key_cache)\n             self.value_cache.append(new_layer_value_cache)\n "
+        },
+        {
+            "sha": "4ee525ddf8e182b3b1a80020fee09f5862208269",
+            "filename": "src/transformers/integrations/executorch.py",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 8,
+            "changes": 20,
+            "blob_url": "https://github.com/huggingface/transformers/blob/5e2183f344911aa82aba0b83778a4f196cff378e/src%2Ftransformers%2Fintegrations%2Fexecutorch.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/5e2183f344911aa82aba0b83778a4f196cff378e/src%2Ftransformers%2Fintegrations%2Fexecutorch.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fintegrations%2Fexecutorch.py?ref=5e2183f344911aa82aba0b83778a4f196cff378e",
+            "patch": "@@ -16,10 +16,7 @@\n \n \n if is_torch_available():\n-    from transformers import (\n-        PreTrainedModel,\n-        StaticCache,\n-    )\n+    from transformers import PreTrainedModel, StaticCache\n     from transformers.pytorch_utils import is_torch_greater_or_equal_than_2_3\n \n \n@@ -72,9 +69,13 @@ def __init__(self, model: PreTrainedModel):\n             config=self.model.config,\n             batch_size=self.model.generation_config.cache_config.batch_size,\n             max_cache_len=self.model.generation_config.cache_config.max_cache_len,\n-            dtype=self.model.dtype,\n             device=self.model.generation_config.cache_config.device,\n+            dtype=self.model.dtype,\n         )\n+        for i in range(len(self.static_cache.key_cache)):\n+            self.register_buffer(f\"key_cache_{i}\", self.static_cache.key_cache[i], persistent=False)\n+            self.register_buffer(f\"value_cache_{i}\", self.static_cache.value_cache[i], persistent=False)\n+\n         self.is_causal = any(\"CausalLM\" in arch for arch in self.model.config.architectures)\n         if self.is_causal:\n             causal_mask = torch.tril(\n@@ -109,12 +110,15 @@ def forward(self, input_ids: torch.Tensor, cache_position: torch.Tensor):\n         \"\"\"\n         _, seqlen = input_ids.shape\n         attn_mask = self.mask[cache_position, :seqlen] if self.is_causal else None\n+        position_ids = cache_position.unsqueeze(0)\n+        past_key_values = self.static_cache\n+\n         outs = self.model(\n             input_ids=input_ids,\n             attention_mask=attn_mask,\n-            position_ids=cache_position.unsqueeze(0),\n+            position_ids=position_ids,\n             cache_position=cache_position,\n-            past_key_values=self.static_cache,\n+            past_key_values=past_key_values,\n             use_cache=True,\n         )\n         return outs.logits\n@@ -143,7 +147,7 @@ def generate(\n         prompt_token_len = prompt_token_ids.shape[-1]\n         max_generation_length = prompt_token_len + max_new_tokens\n         for buffer_name, buffer in exported_program.named_buffers():\n-            if buffer_name.startswith(\"static_cache.key_cache\"):\n+            if buffer_name.startswith(\"key_cache\"):\n                 max_cache_len = buffer.shape[2]\n                 max_generation_length = min(max_generation_length, max_cache_len)\n                 break"
+        },
+        {
+            "sha": "a8b8b1eff2e2105ef84625ee8c76705acf88d634",
+            "filename": "tests/utils/test_cache_utils.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 3,
+            "changes": 6,
+            "blob_url": "https://github.com/huggingface/transformers/blob/5e2183f344911aa82aba0b83778a4f196cff378e/tests%2Futils%2Ftest_cache_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/5e2183f344911aa82aba0b83778a4f196cff378e/tests%2Futils%2Ftest_cache_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Futils%2Ftest_cache_utils.py?ref=5e2183f344911aa82aba0b83778a4f196cff378e",
+            "patch": "@@ -215,11 +215,11 @@ def test_static_cache_exportability(self):\n         # Check if the exported model is configured with the `StaticCache` correctly\n         n_static_key_caches = n_static_value_caches = 0\n         for buffer_name, buffer in exported_program.named_buffers():\n-            if buffer_name.startswith(\"static_cache.key_cache\"):\n+            if buffer_name.startswith(\"key_cache\"):\n                 self.assertTrue(buffer.shape[0] == batch_size)\n                 self.assertTrue(buffer.shape[2] == max_cache_len)\n                 n_static_key_caches = n_static_key_caches + 1\n-            if buffer_name.startswith(\"static_cache.value_cache\"):\n+            if buffer_name.startswith(\"value_cache\"):\n                 self.assertTrue(buffer.shape[0] == batch_size)\n                 self.assertTrue(buffer.shape[2] == max_cache_len)\n                 n_static_value_caches = n_static_value_caches + 1\n@@ -619,4 +619,4 @@ def test_cache_copy(self):\n             \"You are a helpful assistant. Help me to write a blogpost about travelling.\\n\\nTraveling is an enriching experience that broadens our horizons and exposes us to new cultures, landscapes, and people. Whether it's a week\",\n             'You are a helpful assistant. What is the capital of France?\\n\\n\\n## Response:Paris is the capital of France.\\n\\n\\n\\n\\n\\n## Query:\\n\\nIn a detailed analysis, compare the economic impacts of the introduction of the'\n         ]  # fmt: skip\n-        self.assertTrue(responses == EXPECTED_DECODED_TEXT)\n+        self.assertEqual(responses, EXPECTED_DECODED_TEXT)"
+        }
+    ],
+    "stats": {
+        "total": 51,
+        "additions": 21,
+        "deletions": 30
+    }
+}

@@ -1,0 +1,120 @@
+{
+    "author": "ztanner",
+    "message": "[middleware]: add upper bound to cloneBodyStream (#84539)\n\n<!-- Thanks for opening a PR! Your contribution is much appreciated.\nTo make sure your PR is handled as smoothly as possible we request that\nyou follow the checklist sections below.\nChoose the right checklist for the change(s) that you're making:\n\n## For Contributors\n\n### Improving Documentation\n\n- Run `pnpm prettier-fix` to fix formatting issues before opening the\nPR.\n- Read the Docs Contribution Guide to ensure your contribution follows\nthe docs guidelines:\nhttps://nextjs.org/docs/community/contribution-guide\n\n### Fixing a bug\n\n- Related issues linked using `fixes #number`\n- Tests added. See:\nhttps://github.com/vercel/next.js/blob/canary/contributing/core/testing.md#writing-tests-for-nextjs\n- Errors have a helpful link attached, see\nhttps://github.com/vercel/next.js/blob/canary/contributing.md\n\n### Adding a feature\n\n- Implements an existing feature request or RFC. Make sure the feature\nrequest has been accepted for implementation before opening a PR. (A\ndiscussion must be opened, see\nhttps://github.com/vercel/next.js/discussions/new?category=ideas)\n- Related issues/discussions are linked using `fixes #number`\n- e2e tests added\n(https://github.com/vercel/next.js/blob/canary/contributing/core/testing.md#writing-tests-for-nextjs)\n- Documentation added\n- Telemetry added. In case of a feature if it's used or not.\n- Errors have a helpful link attached, see\nhttps://github.com/vercel/next.js/blob/canary/contributing.md\n\n\n## For Maintainers\n\n- Minimal description (aim for explaining to someone not on the team to\nunderstand the PR)\n- When linking to a Slack thread, you might want to share details of the\nconclusion\n- Link both the Linear (Fixes NEXT-xxx) and the GitHub issues\n- Add review comments if necessary to explain to the reviewer the logic\nbehind a change\n\n### What?\n\n### Why?\n\n### How?\n\nCloses NEXT-\nFixes #\n\n-->\n\n---------\n\nCo-authored-by: JJ Kasper <jj@jjsweb.site>",
+    "sha": "714a702068c5d5c95354b2b76159e57832b25799",
+    "files": [
+        {
+            "sha": "0b0cd22179a7a78cce4efdb18019033664f87337",
+            "filename": "packages/next/errors.json",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 1,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/714a702068c5d5c95354b2b76159e57832b25799/packages%2Fnext%2Ferrors.json",
+            "raw_url": "https://github.com/vercel/next.js/raw/714a702068c5d5c95354b2b76159e57832b25799/packages%2Fnext%2Ferrors.json",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Ferrors.json?ref=714a702068c5d5c95354b2b76159e57832b25799",
+            "patch": "@@ -857,5 +857,8 @@\n   \"856\": \"`lockfileTryAcquireSync` is not supported by the wasm bindings.\",\n   \"857\": \"`lockfileUnlock` is not supported by the wasm bindings.\",\n   \"858\": \"`lockfileUnlockSync` is not supported by the wasm bindings.\",\n-  \"859\": \"An IO error occurred while attempting to create and acquire the lockfile\"\n+  \"859\": \"An IO error occurred while attempting to create and acquire the lockfile\",\n+  \"860\": \"Client Max Body Size must be a valid number (bytes) or filesize format string (e.g., \\\"5mb\\\")\",\n+  \"861\": \"Client Max Body Size must be larger than 0 bytes\",\n+  \"862\": \"Request body exceeded %s\"\n }"
+        },
+        {
+            "sha": "d005106ec434464cf2a6213505b29d9ec6e58e39",
+            "filename": "packages/next/src/server/body-streams.ts",
+            "status": "modified",
+            "additions": 28,
+            "deletions": 3,
+            "changes": 31,
+            "blob_url": "https://github.com/vercel/next.js/blob/714a702068c5d5c95354b2b76159e57832b25799/packages%2Fnext%2Fsrc%2Fserver%2Fbody-streams.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/714a702068c5d5c95354b2b76159e57832b25799/packages%2Fnext%2Fsrc%2Fserver%2Fbody-streams.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fbody-streams.ts?ref=714a702068c5d5c95354b2b76159e57832b25799",
+            "patch": "@@ -1,6 +1,9 @@\n import type { IncomingMessage } from 'http'\n import type { Readable } from 'stream'\n import { PassThrough } from 'stream'\n+import bytes from 'next/dist/compiled/bytes'\n+\n+const DEFAULT_BODY_CLONE_SIZE_LIMIT = 10 * 1024 * 1024 // 10MB\n \n export function requestToBodyStream(\n   context: { ReadableStream: typeof ReadableStream },\n@@ -38,7 +41,8 @@ export interface CloneableBody {\n }\n \n export function getCloneableBody<T extends IncomingMessage>(\n-  readable: T\n+  readable: T,\n+  sizeLimit?: number\n ): CloneableBody {\n   let buffered: Readable | null = null\n \n@@ -76,13 +80,34 @@ export function getCloneableBody<T extends IncomingMessage>(\n       const input = buffered ?? readable\n       const p1 = new PassThrough()\n       const p2 = new PassThrough()\n+\n+      let bytesRead = 0\n+      const bodySizeLimit = sizeLimit ?? DEFAULT_BODY_CLONE_SIZE_LIMIT\n+      let limitExceeded = false\n+\n       input.on('data', (chunk) => {\n+        if (limitExceeded) return\n+\n+        bytesRead += chunk.length\n+\n+        if (bytesRead > bodySizeLimit) {\n+          limitExceeded = true\n+          const error = new Error(\n+            `Request body exceeded ${bytes.format(bodySizeLimit)}`\n+          )\n+          p1.destroy(error)\n+          p2.destroy(error)\n+          return\n+        }\n+\n         p1.push(chunk)\n         p2.push(chunk)\n       })\n       input.on('end', () => {\n-        p1.push(null)\n-        p2.push(null)\n+        if (!limitExceeded) {\n+          p1.push(null)\n+          p2.push(null)\n+        }\n       })\n       buffered = p2\n       return p1"
+        },
+        {
+            "sha": "4ad7138af75831f05af73780b6b1f504e456bc92",
+            "filename": "packages/next/src/server/config-shared.ts",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/vercel/next.js/blob/714a702068c5d5c95354b2b76159e57832b25799/packages%2Fnext%2Fsrc%2Fserver%2Fconfig-shared.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/714a702068c5d5c95354b2b76159e57832b25799/packages%2Fnext%2Fsrc%2Fserver%2Fconfig-shared.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fconfig-shared.ts?ref=714a702068c5d5c95354b2b76159e57832b25799",
+            "patch": "@@ -797,6 +797,12 @@ export interface ExperimentalConfig {\n    */\n   isolatedDevBuild?: boolean\n \n+  /**\n+   * Body size limit for request bodies with middleware configured.\n+   * Defaults to 10MB. Can be specified as a number (bytes) or string (e.g. '5mb').\n+   */\n+  middlewareClientMaxBodySize?: SizeLimit\n+\n   /**\n    * Enable the Model Context Protocol (MCP) server for AI-assisted development.\n    * When enabled, Next.js will expose an MCP server at `/_next/mcp` that provides"
+        },
+        {
+            "sha": "b5ef5cd02d3ac46f9450cf63657db8913cbaffc6",
+            "filename": "packages/next/src/server/config.ts",
+            "status": "modified",
+            "additions": 26,
+            "deletions": 0,
+            "changes": 26,
+            "blob_url": "https://github.com/vercel/next.js/blob/714a702068c5d5c95354b2b76159e57832b25799/packages%2Fnext%2Fsrc%2Fserver%2Fconfig.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/714a702068c5d5c95354b2b76159e57832b25799/packages%2Fnext%2Fsrc%2Fserver%2Fconfig.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fconfig.ts?ref=714a702068c5d5c95354b2b76159e57832b25799",
+            "patch": "@@ -701,6 +701,32 @@ function assignDefaultsAndValidate(\n     }\n   }\n \n+  // Normalize & validate experimental.middlewareClientMaxBodySize\n+  if (typeof result.experimental?.middlewareClientMaxBodySize !== 'undefined') {\n+    const middlewareClientMaxBodySize =\n+      result.experimental.middlewareClientMaxBodySize\n+    let normalizedValue: number\n+\n+    if (typeof middlewareClientMaxBodySize === 'string') {\n+      const bytes =\n+        require('next/dist/compiled/bytes') as typeof import('next/dist/compiled/bytes')\n+      normalizedValue = bytes.parse(middlewareClientMaxBodySize)\n+    } else if (typeof middlewareClientMaxBodySize === 'number') {\n+      normalizedValue = middlewareClientMaxBodySize\n+    } else {\n+      throw new Error(\n+        'Client Max Body Size must be a valid number (bytes) or filesize format string (e.g., \"5mb\")'\n+      )\n+    }\n+\n+    if (isNaN(normalizedValue) || normalizedValue < 1) {\n+      throw new Error('Client Max Body Size must be larger than 0 bytes')\n+    }\n+\n+    // Store the normalized value as a number\n+    result.experimental.middlewareClientMaxBodySize = normalizedValue\n+  }\n+\n   warnOptionHasBeenMovedOutOfExperimental(\n     result,\n     'transpilePackages',"
+        },
+        {
+            "sha": "0f42b68e7330e603fdf4e31c2f7ee4dce161e029",
+            "filename": "packages/next/src/server/lib/router-utils/resolve-routes.ts",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 1,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/714a702068c5d5c95354b2b76159e57832b25799/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Frouter-utils%2Fresolve-routes.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/714a702068c5d5c95354b2b76159e57832b25799/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Frouter-utils%2Fresolve-routes.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Frouter-utils%2Fresolve-routes.ts?ref=714a702068c5d5c95354b2b76159e57832b25799",
+            "patch": "@@ -175,7 +175,10 @@ export function getResolveRoutes(\n     addRequestMeta(req, 'initProtocol', protocol)\n \n     if (!isUpgradeReq) {\n-      addRequestMeta(req, 'clonableBody', getCloneableBody(req))\n+      const bodySizeLimit = config.experimental.middlewareClientMaxBodySize as\n+        | number\n+        | undefined\n+      addRequestMeta(req, 'clonableBody', getCloneableBody(req, bodySizeLimit))\n     }\n \n     const maybeAddTrailingSlash = (pathname: string) => {"
+        },
+        {
+            "sha": "2eb245e1c2223e21c96d8b375c3221eb9226a2bc",
+            "filename": "packages/next/src/server/next-server.ts",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 1,
+            "changes": 8,
+            "blob_url": "https://github.com/vercel/next.js/blob/714a702068c5d5c95354b2b76159e57832b25799/packages%2Fnext%2Fsrc%2Fserver%2Fnext-server.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/714a702068c5d5c95354b2b76159e57832b25799/packages%2Fnext%2Fsrc%2Fserver%2Fnext-server.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fnext-server.ts?ref=714a702068c5d5c95354b2b76159e57832b25799",
+            "patch": "@@ -1952,7 +1952,13 @@ export default class NextNodeServer extends BaseServer<\n     addRequestMeta(req, 'initProtocol', protocol)\n \n     if (!isUpgradeReq) {\n-      addRequestMeta(req, 'clonableBody', getCloneableBody(req.originalRequest))\n+      const bodySizeLimit = this.nextConfig.experimental\n+        ?.middlewareClientMaxBodySize as number | undefined\n+      addRequestMeta(\n+        req,\n+        'clonableBody',\n+        getCloneableBody(req.originalRequest, bodySizeLimit)\n+      )\n     }\n   }\n "
+        },
+        {
+            "sha": "7752aa7d12c13f8acd4b21ec28273034dc933942",
+            "filename": "test/e2e/client-max-body-size/app/api/echo/route.ts",
+            "status": "added",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/714a702068c5d5c95354b2b76159e57832b25799/test%2Fe2e%2Fclient-max-body-size%2Fapp%2Fapi%2Fecho%2Froute.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/714a702068c5d5c95354b2b76159e57832b25799/test%2Fe2e%2Fclient-max-body-size%2Fapp%2Fapi%2Fecho%2Froute.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fclient-max-body-size%2Fapp%2Fapi%2Fecho%2Froute.ts?ref=714a702068c5d5c95354b2b76159e57832b25799",
+            "patch": "@@ -0,0 +1,5 @@\n+import { NextRequest, NextResponse } from 'next/server'\n+\n+export async function POST(request: NextRequest) {\n+  return new NextResponse('Hello World', { status: 200 })\n+}"
+        },
+        {
+            "sha": "dd4326ecf8fb3e23663bda29b05c4f77bf1837c1",
+            "filename": "test/e2e/client-max-body-size/index.test.ts",
+            "status": "added",
+            "additions": 223,
+            "deletions": 0,
+            "changes": 223,
+            "blob_url": "https://github.com/vercel/next.js/blob/714a702068c5d5c95354b2b76159e57832b25799/test%2Fe2e%2Fclient-max-body-size%2Findex.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/714a702068c5d5c95354b2b76159e57832b25799/test%2Fe2e%2Fclient-max-body-size%2Findex.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fclient-max-body-size%2Findex.test.ts?ref=714a702068c5d5c95354b2b76159e57832b25799",
+            "patch": "@@ -0,0 +1,223 @@\n+import { nextTestSetup } from 'e2e-utils'\n+import { fetchViaHTTP } from 'next-test-utils'\n+\n+describe('client-max-body-size', () => {\n+  describe('default 10MB limit', () => {\n+    const { next, skipped } = nextTestSetup({\n+      files: __dirname,\n+      // Deployed environment has it's own configured limits.\n+      skipDeployment: true,\n+    })\n+\n+    if (skipped) return\n+\n+    it('should reject request body over 10MB by default', async () => {\n+      const bodySize = 11 * 1024 * 1024 // 11MB\n+      const body = 'x'.repeat(bodySize)\n+\n+      const res = await fetchViaHTTP(\n+        next.url,\n+        '/api/echo',\n+        {},\n+        {\n+          body,\n+          method: 'POST',\n+        }\n+      )\n+\n+      expect(res.status).toBe(400)\n+      expect(next.cliOutput).toContain('Request body exceeded 10MB')\n+    })\n+\n+    it('should accept request body at exactly 10MB', async () => {\n+      const bodySize = 10 * 1024 * 1024 // 10MB\n+      const body = 'y'.repeat(bodySize)\n+\n+      const res = await fetchViaHTTP(\n+        next.url,\n+        '/api/echo',\n+        {},\n+        {\n+          body,\n+          method: 'POST',\n+        }\n+      )\n+\n+      expect(res.status).toBe(200)\n+      const responseBody = await res.text()\n+      expect(responseBody).toBe('Hello World')\n+    })\n+\n+    it('should accept request body under 10MB', async () => {\n+      const bodySize = 5 * 1024 * 1024 // 5MB\n+      const body = 'z'.repeat(bodySize)\n+\n+      const res = await fetchViaHTTP(\n+        next.url,\n+        '/api/echo',\n+        {},\n+        {\n+          body,\n+          method: 'POST',\n+        }\n+      )\n+\n+      expect(res.status).toBe(200)\n+      const responseBody = await res.text()\n+      expect(responseBody).toBe('Hello World')\n+    })\n+  })\n+\n+  describe('custom limit with string format', () => {\n+    const { next, skipped } = nextTestSetup({\n+      files: __dirname,\n+      skipDeployment: true,\n+      nextConfig: {\n+        experimental: {\n+          middlewareClientMaxBodySize: '5mb',\n+        },\n+      },\n+    })\n+\n+    if (skipped) return\n+\n+    it('should reject request body over custom 5MB limit', async () => {\n+      const bodySize = 6 * 1024 * 1024 // 6MB\n+      const body = 'a'.repeat(bodySize)\n+\n+      const res = await fetchViaHTTP(\n+        next.url,\n+        '/api/echo',\n+        {},\n+        {\n+          body,\n+          method: 'POST',\n+        }\n+      )\n+\n+      expect(res.status).toBe(400)\n+      expect(next.cliOutput).toContain('Request body exceeded 5MB')\n+    })\n+\n+    it('should accept request body under custom 5MB limit', async () => {\n+      const bodySize = 4 * 1024 * 1024 // 4MB\n+      const body = 'b'.repeat(bodySize)\n+\n+      const res = await fetchViaHTTP(\n+        next.url,\n+        '/api/echo',\n+        {},\n+        {\n+          body,\n+          method: 'POST',\n+        }\n+      )\n+\n+      expect(res.status).toBe(200)\n+      const responseBody = await res.text()\n+      expect(responseBody).toBe('Hello World')\n+    })\n+  })\n+\n+  describe('custom limit with number format', () => {\n+    const { next, skipped } = nextTestSetup({\n+      files: __dirname,\n+      skipDeployment: true,\n+      nextConfig: {\n+        experimental: {\n+          middlewareClientMaxBodySize: 2 * 1024 * 1024, // 2MB in bytes\n+        },\n+      },\n+    })\n+\n+    if (skipped) return\n+\n+    it('should reject request body over custom 2MB limit', async () => {\n+      const bodySize = 3 * 1024 * 1024 // 3MB\n+      const body = 'c'.repeat(bodySize)\n+\n+      const res = await fetchViaHTTP(\n+        next.url,\n+        '/api/echo',\n+        {},\n+        {\n+          body,\n+          method: 'POST',\n+        }\n+      )\n+\n+      expect(res.status).toBe(400)\n+      expect(next.cliOutput).toContain('Request body exceeded 2MB')\n+    })\n+\n+    it('should accept request body under custom 2MB limit', async () => {\n+      const bodySize = 1 * 1024 * 1024 // 1MB\n+      const body = 'd'.repeat(bodySize)\n+\n+      const res = await fetchViaHTTP(\n+        next.url,\n+        '/api/echo',\n+        {},\n+        {\n+          body,\n+          method: 'POST',\n+        }\n+      )\n+\n+      expect(res.status).toBe(200)\n+      const responseBody = await res.text()\n+      expect(responseBody).toBe('Hello World')\n+    })\n+  })\n+\n+  describe('large custom limit', () => {\n+    const { next, skipped } = nextTestSetup({\n+      files: __dirname,\n+      skipDeployment: true,\n+      nextConfig: {\n+        experimental: {\n+          middlewareClientMaxBodySize: '50mb',\n+        },\n+      },\n+    })\n+\n+    if (skipped) return\n+\n+    it('should accept request body up to 50MB with custom limit', async () => {\n+      const bodySize = 20 * 1024 * 1024 // 20MB\n+      const body = 'e'.repeat(bodySize)\n+\n+      const res = await fetchViaHTTP(\n+        next.url,\n+        '/api/echo',\n+        {},\n+        {\n+          body,\n+          method: 'POST',\n+        }\n+      )\n+\n+      expect(res.status).toBe(200)\n+      const responseBody = await res.text()\n+      expect(responseBody).toBe('Hello World')\n+    })\n+\n+    it('should reject request body over custom 50MB limit', async () => {\n+      const bodySize = 51 * 1024 * 1024 // 51MB\n+      const body = 'f'.repeat(bodySize)\n+\n+      const res = await fetchViaHTTP(\n+        next.url,\n+        '/api/echo',\n+        {},\n+        {\n+          body,\n+          method: 'POST',\n+        }\n+      )\n+\n+      expect(res.status).toBe(400)\n+      expect(next.cliOutput).toContain('Request body exceeded 50MB')\n+    })\n+  })\n+})"
+        },
+        {
+            "sha": "decb3774533d29e7ba35a1c5873681737f96dfa9",
+            "filename": "test/e2e/client-max-body-size/middleware.ts",
+            "status": "added",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/vercel/next.js/blob/714a702068c5d5c95354b2b76159e57832b25799/test%2Fe2e%2Fclient-max-body-size%2Fmiddleware.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/714a702068c5d5c95354b2b76159e57832b25799/test%2Fe2e%2Fclient-max-body-size%2Fmiddleware.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fclient-max-body-size%2Fmiddleware.ts?ref=714a702068c5d5c95354b2b76159e57832b25799",
+            "patch": "@@ -0,0 +1,9 @@\n+import { NextRequest, NextResponse } from 'next/server'\n+\n+export async function middleware(request: NextRequest) {\n+  return NextResponse.next()\n+}\n+\n+export const config = {\n+  matcher: '/api/:path*',\n+}"
+        }
+    ],
+    "stats": {
+        "total": 318,
+        "additions": 312,
+        "deletions": 6
+    }
+}

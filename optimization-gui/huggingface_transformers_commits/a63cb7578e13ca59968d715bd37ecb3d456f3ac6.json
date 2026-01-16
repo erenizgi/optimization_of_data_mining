@@ -1,0 +1,48 @@
+{
+    "author": "gathierry",
+    "message": "update seed_worker to set seed based on worker_id and rank (#37980)\n\n* update seed_worker to set seed based on worker_id and rank\n\n* test case\n\n* set output_dir as remove tmp dir",
+    "sha": "a63cb7578e13ca59968d715bd37ecb3d456f3ac6",
+    "files": [
+        {
+            "sha": "5886146002f131e4fdf8adf2a3c858bc39a70271",
+            "filename": "src/transformers/trainer.py",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 1,
+            "changes": 5,
+            "blob_url": "https://github.com/huggingface/transformers/blob/a63cb7578e13ca59968d715bd37ecb3d456f3ac6/src%2Ftransformers%2Ftrainer.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/a63cb7578e13ca59968d715bd37ecb3d456f3ac6/src%2Ftransformers%2Ftrainer.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Ftrainer.py?ref=a63cb7578e13ca59968d715bd37ecb3d456f3ac6",
+            "patch": "@@ -32,6 +32,7 @@\n import time\n import warnings\n from collections.abc import Mapping\n+from functools import partial\n from pathlib import Path\n from typing import TYPE_CHECKING, Any, Callable, Optional, Union\n \n@@ -1028,7 +1029,9 @@ def get_train_dataloader(self) -> DataLoader:\n         if not isinstance(train_dataset, torch.utils.data.IterableDataset):\n             dataloader_params[\"sampler\"] = self._get_train_sampler()\n             dataloader_params[\"drop_last\"] = self.args.dataloader_drop_last\n-            dataloader_params[\"worker_init_fn\"] = seed_worker\n+            dataloader_params[\"worker_init_fn\"] = partial(\n+                seed_worker, num_workers=self.args.dataloader_num_workers, rank=self.args.process_index\n+            )\n             dataloader_params[\"prefetch_factor\"] = self.args.dataloader_prefetch_factor\n \n         return self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))"
+        },
+        {
+            "sha": "5556c1d43ec81d85972eba2b9989824cc9e4b5d3",
+            "filename": "src/transformers/trainer_utils.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 2,
+            "changes": 5,
+            "blob_url": "https://github.com/huggingface/transformers/blob/a63cb7578e13ca59968d715bd37ecb3d456f3ac6/src%2Ftransformers%2Ftrainer_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/a63cb7578e13ca59968d715bd37ecb3d456f3ac6/src%2Ftransformers%2Ftrainer_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Ftrainer_utils.py?ref=a63cb7578e13ca59968d715bd37ecb3d456f3ac6",
+            "patch": "@@ -49,11 +49,12 @@\n     import torch\n \n \n-def seed_worker(_):\n+def seed_worker(worker_id: int, num_workers: int, rank: int):\n     \"\"\"\n     Helper function to set worker seed during Dataloader initialization.\n     \"\"\"\n-    worker_seed = torch.initial_seed() % 2**32\n+    init_seed = torch.initial_seed() % 2**32\n+    worker_seed = num_workers * rank + init_seed\n     set_seed(worker_seed)\n \n "
+        },
+        {
+            "sha": "f4fececf1051dfe8886593ace9476160da4b2aa0",
+            "filename": "tests/trainer/test_trainer_distributed_worker_seed.py",
+            "status": "added",
+            "additions": 89,
+            "deletions": 0,
+            "changes": 89,
+            "blob_url": "https://github.com/huggingface/transformers/blob/a63cb7578e13ca59968d715bd37ecb3d456f3ac6/tests%2Ftrainer%2Ftest_trainer_distributed_worker_seed.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/a63cb7578e13ca59968d715bd37ecb3d456f3ac6/tests%2Ftrainer%2Ftest_trainer_distributed_worker_seed.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Ftrainer%2Ftest_trainer_distributed_worker_seed.py?ref=a63cb7578e13ca59968d715bd37ecb3d456f3ac6",
+            "patch": "@@ -0,0 +1,89 @@\n+import random\n+\n+import numpy as np\n+import torch\n+import torch.distributed as dist\n+import torch.nn as nn\n+from torch.utils.data import Dataset\n+\n+from transformers import (\n+    HfArgumentParser,\n+    Trainer,\n+    TrainingArguments,\n+    set_seed,\n+)\n+from transformers.testing_utils import (\n+    TestCasePlus,\n+    execute_subprocess_async,\n+    get_torch_dist_unique_port,\n+    require_torch_multi_gpu,\n+)\n+\n+\n+def gather_from_all_gpus(tensor, world_size):\n+    # Prepare a list to gather tensors from all processes\n+    gather_list = [torch.zeros_like(tensor) for _ in range(world_size)]\n+    dist.all_gather(gather_list, tensor)\n+    return gather_list  # List of tensors from all ranks\n+\n+\n+class DummyDataset(Dataset):\n+    def __init__(self):\n+        self.length = 64\n+\n+    def __len__(self):\n+        return self.length\n+\n+    def __getitem__(self, i) -> int:\n+        x = random.random()\n+        y = np.random.random()\n+        z = torch.rand([]).item()\n+        return {\"x\": torch.tensor([x, y, z])}\n+\n+\n+class DummyModel(nn.Module):\n+    def __init__(self):\n+        super().__init__()\n+        self.fc = nn.Linear(3, 1)\n+\n+    def forward(self, x):\n+        local_tensor = torch.tensor(x, device=\"cuda\")\n+        gathered = gather_from_all_gpus(local_tensor, dist.get_world_size())\n+        assert not all(torch.allclose(t, gathered[0]) for t in gathered[1:])\n+        y = self.fc(x)\n+        return (y.mean(), y)\n+\n+\n+class TestTrainerDistributedWorkerSeed(TestCasePlus):\n+    @require_torch_multi_gpu\n+    def test_trainer(self):\n+        device_count = torch.cuda.device_count()\n+        output_dir = self.get_auto_remove_tmp_dir()\n+        distributed_args = f\"\"\"--nproc_per_node={device_count}\n+            --master_port={get_torch_dist_unique_port()}\n+            {self.test_file_dir}/test_trainer_distributed_worker_seed.py\n+        \"\"\".split()\n+        args = f\"--output_dir {output_dir}\".split()\n+        cmd = [\"torchrun\"] + distributed_args + args\n+        execute_subprocess_async(cmd, env=self.get_env())\n+\n+\n+def run_distributed_training(training_args):\n+    set_seed(42)\n+    model = DummyModel()\n+    dataset = DummyDataset()\n+    training_args.max_steps = 10\n+    # dataloader_num_workers must be > 0 to enable worker_init_fn\n+    training_args.dataloader_num_workers = 2\n+    trainer = Trainer(\n+        model,\n+        training_args,\n+        train_dataset=dataset,\n+    )\n+    trainer.train()\n+\n+\n+if __name__ == \"__main__\":\n+    parser = HfArgumentParser((TrainingArguments,))\n+    training_args = parser.parse_args_into_dataclasses()[0]\n+    run_distributed_training(training_args)"
+        }
+    ],
+    "stats": {
+        "total": 99,
+        "additions": 96,
+        "deletions": 3
+    }
+}

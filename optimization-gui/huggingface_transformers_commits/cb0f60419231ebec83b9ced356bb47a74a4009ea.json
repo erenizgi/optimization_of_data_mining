@@ -1,0 +1,48 @@
+{
+    "author": "HighCWu",
+    "message": "Fix HQQ model param device transfer issue (#38466)\n\n* Fix HQQ model param device transfer issue\n\n* modify a comment\n\n* clear the code and add test for hqq device/dtype\n\n* fix test hqq code quality of imports\n\n---------\n\nCo-authored-by: Marc Sun <57196510+SunMarc@users.noreply.github.com>",
+    "sha": "cb0f60419231ebec83b9ced356bb47a74a4009ea",
+    "files": [
+        {
+            "sha": "3b235d9aeac50569d8f2c88b5bc53e9b39754804",
+            "filename": "src/transformers/modeling_utils.py",
+            "status": "modified",
+            "additions": 39,
+            "deletions": 4,
+            "changes": 43,
+            "blob_url": "https://github.com/huggingface/transformers/blob/cb0f60419231ebec83b9ced356bb47a74a4009ea/src%2Ftransformers%2Fmodeling_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/cb0f60419231ebec83b9ced356bb47a74a4009ea/src%2Ftransformers%2Fmodeling_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodeling_utils.py?ref=cb0f60419231ebec83b9ced356bb47a74a4009ea",
+            "patch": "@@ -3897,7 +3897,20 @@ def get_memory_footprint(self, return_buffers=True):\n     @wraps(torch.nn.Module.cuda)\n     def cuda(self, *args, **kwargs):\n         if getattr(self, \"quantization_method\", None) == QuantizationMethod.HQQ:\n-            raise ValueError(\"`.cuda` is not supported for HQQ-quantized models.\")\n+            from hqq.core.quantize import HQQLinear\n+\n+            # Since HQQLinear stores some tensors in the 'meta' attribute,\n+            # it's necessary to manually call the `cuda` method on HQQLinear layers.\n+            super().cuda(*args, **kwargs)\n+            for module in self.modules():\n+                if isinstance(module, HQQLinear):\n+                    if len(args) > 0:\n+                        device = args[0]\n+                    else:\n+                        device = kwargs.get(\"device\", \"cuda\")\n+                    module.cuda(device)\n+            return self\n+\n         # Checks if the model has been loaded in 4-bit or 8-bit with BNB\n         if getattr(self, \"quantization_method\", None) == QuantizationMethod.BITS_AND_BYTES:\n             if getattr(self, \"is_loaded_in_8bit\", False):\n@@ -3910,8 +3923,7 @@ def cuda(self, *args, **kwargs):\n                     \"Calling `cuda()` is not supported for `4-bit` quantized models with the installed version of bitsandbytes. \"\n                     f\"The current device is `{self.device}`. If you intended to move the model, please install bitsandbytes >= 0.43.2.\"\n                 )\n-        else:\n-            return super().cuda(*args, **kwargs)\n+        return super().cuda(*args, **kwargs)\n \n     @wraps(torch.nn.Module.to)\n     def to(self, *args, **kwargs):\n@@ -3926,7 +3938,30 @@ def to(self, *args, **kwargs):\n                     break\n \n         if getattr(self, \"quantization_method\", None) == QuantizationMethod.HQQ:\n-            raise ValueError(\"`.to` is not supported for HQQ-quantized models.\")\n+            from hqq.core.quantize import HQQLinear\n+\n+            # Since HQQLinear stores some tensors in the 'meta' attribute, we must\n+            # explicitly move the parameters to the target device for each HQQLinear layer after `to`.\n+            super().to(*args, **kwargs)\n+            for module in self.modules():\n+                if isinstance(module, HQQLinear):\n+                    if \"device\" in kwargs:\n+                        device = kwargs[\"device\"]\n+                    else:\n+                        device = args[0]\n+                    if \"dtype\" in kwargs:\n+                        dtype = kwargs[\"dtype\"]\n+                    elif dtype_present_in_args:\n+                        dtype = arg\n+                    else:\n+                        dtype = None\n+                    # Due to the current messy implementation of HQQLinear, updating `compute_dtype`\n+                    # followed by calling the `cuda` method achieves the intended behavior of `to`,\n+                    # even when the target device is CPU.\n+                    if dtype is not None:\n+                        module.compute_dtype = dtype\n+                    module.cuda(device)\n+            return self\n \n         if dtype_present_in_args and getattr(self, \"quantization_method\", None) == QuantizationMethod.QUARK:\n             raise ValueError(\"Casting a Quark quantized model to a new `dtype` is not supported.\")"
+        },
+        {
+            "sha": "6061c72c24932576b78d12a85fac62a461a77cac",
+            "filename": "src/transformers/quantizers/quantizer_hqq.py",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/huggingface/transformers/blob/cb0f60419231ebec83b9ced356bb47a74a4009ea/src%2Ftransformers%2Fquantizers%2Fquantizer_hqq.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/cb0f60419231ebec83b9ced356bb47a74a4009ea/src%2Ftransformers%2Fquantizers%2Fquantizer_hqq.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fquantizers%2Fquantizer_hqq.py?ref=cb0f60419231ebec83b9ced356bb47a74a4009ea",
+            "patch": "@@ -202,6 +202,15 @@ def create_quantized_param(\n         if is_hqq_available():\n             from hqq.core.quantize import HQQLinear\n \n+            # TODO: This is a compatibility hack. HQQ-quantized linear layers do not have a `weight` attribute,\n+            # but some models attempt to access `weight.dtype` during the forward pass. To prevent runtime errors,\n+            # we patch HQQLinear with a dummy `weight` property that returns an empty tensor with the correct dtype and device.\n+            @property\n+            def weight(_self: HQQLinear):\n+                return torch.empty(0, dtype=_self.compute_dtype, device=_self.device)\n+\n+            HQQLinear.weight = weight\n+\n         module, tensor_name = get_module_from_name(model, param_name)\n         layer_name = \".\".join(param_name.split(\".\")[:-1])\n         parent_module = find_parent(model, layer_name)"
+        },
+        {
+            "sha": "37d91e9a259f0030882e097bcc12c22c9e9aa323",
+            "filename": "tests/quantization/hqq/test_hqq.py",
+            "status": "modified",
+            "additions": 37,
+            "deletions": 0,
+            "changes": 37,
+            "blob_url": "https://github.com/huggingface/transformers/blob/cb0f60419231ebec83b9ced356bb47a74a4009ea/tests%2Fquantization%2Fhqq%2Ftest_hqq.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/cb0f60419231ebec83b9ced356bb47a74a4009ea/tests%2Fquantization%2Fhqq%2Ftest_hqq.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fquantization%2Fhqq%2Ftest_hqq.py?ref=cb0f60419231ebec83b9ced356bb47a74a4009ea",
+            "patch": "@@ -15,6 +15,8 @@\n import gc\n import unittest\n \n+import accelerate\n+\n from transformers import AutoModelForCausalLM, AutoTokenizer, HqqConfig\n from transformers.testing_utils import (\n     backend_empty_cache,\n@@ -119,6 +121,41 @@ def test_fp16_quantized_model(self):\n         check_hqqlayer(self, hqq_runner.model.model.layers[0].self_attn.v_proj)\n         check_forward(self, hqq_runner.model)\n \n+    def test_quantized_model_to_new_device_and_new_dtype(self):\n+        \"\"\"\n+        Simple LLM model testing different devices and dtypes\n+        \"\"\"\n+        quant_config = HqqConfig(nbits=8, group_size=64)\n+\n+        hqq_runner = HQQLLMRunner(\n+            model_id=MODEL_ID, quant_config=quant_config, compute_dtype=torch.float16, device=torch_device\n+        )\n+\n+        original_device = hqq_runner.model.model.layers[0].self_attn.v_proj.device\n+        check_hqqlayer(self, hqq_runner.model.model.layers[0].self_attn.v_proj)\n+        check_forward(self, hqq_runner.model)\n+\n+        # Remove `accelerate` hooks to enable move the model to a new device\n+        accelerate.hooks.remove_hook_from_module(hqq_runner.model, recurse=True)\n+\n+        hqq_runner.model.to(\"cpu\", torch.bfloat16)\n+        check_hqqlayer(self, hqq_runner.model.model.layers[0].self_attn.v_proj)\n+        check_forward(self, hqq_runner.model)\n+\n+        hqq_runner.model.cuda(original_device)\n+        check_hqqlayer(self, hqq_runner.model.model.layers[0].self_attn.v_proj)\n+        check_forward(self, hqq_runner.model)\n+\n+    def test_quantized_model_fake_weight_dtype(self):\n+        quant_config = HqqConfig(nbits=8, group_size=64)\n+\n+        hqq_runner = HQQLLMRunner(\n+            model_id=MODEL_ID, quant_config=quant_config, compute_dtype=torch.float16, device=torch_device\n+        )\n+\n+        # We use a hack to inject a fake weight to HQQLinear. Check that it works\n+        self.assertEqual(hqq_runner.model.model.layers[0].self_attn.v_proj.weight.dtype, torch.float16)\n+\n \n @slow\n @require_torch_gpu"
+        }
+    ],
+    "stats": {
+        "total": 89,
+        "additions": 85,
+        "deletions": 4
+    }
+}

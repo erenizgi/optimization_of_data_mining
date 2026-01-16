@@ -1,0 +1,144 @@
+{
+    "author": "zucchini-nlp",
+    "message": "Idefics: fix position ids (#33907)\n\n* fix position ids\r\n\r\n* fix labels also\r\n\r\n* fix copies\r\n\r\n* oops, not that one\r\n\r\n* dont deprecate",
+    "sha": "be9aeba5812cdcf9a47248b4ef05184cab6db200",
+    "files": [
+        {
+            "sha": "02de8d61ae204cbae245a46406e86933701fc816",
+            "filename": "src/transformers/models/idefics/modeling_idefics.py",
+            "status": "modified",
+            "additions": 52,
+            "deletions": 59,
+            "changes": 111,
+            "blob_url": "https://github.com/huggingface/transformers/blob/be9aeba5812cdcf9a47248b4ef05184cab6db200/src%2Ftransformers%2Fmodels%2Fidefics%2Fmodeling_idefics.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/be9aeba5812cdcf9a47248b4ef05184cab6db200/src%2Ftransformers%2Fmodels%2Fidefics%2Fmodeling_idefics.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fidefics%2Fmodeling_idefics.py?ref=be9aeba5812cdcf9a47248b4ef05184cab6db200",
+            "patch": "@@ -183,51 +183,6 @@ def expand_inputs_for_generation(\n     return input_ids, model_kwargs\n \n \n-def prepare_inputs_for_generation(input_ids, past_key_values=None, **kwargs):\n-    token_type_ids = kwargs.get(\"token_type_ids\", None)\n-    cache_position = kwargs.get(\"cache_position\", None)\n-    # If we have cache: let's slice `input_ids` through `cache_position`, to keep only the unprocessed tokens\n-    if past_key_values is not None:\n-        if input_ids.shape[1] != cache_position.shape[0]:\n-            input_ids = input_ids[:, cache_position]\n-        if token_type_ids is not None:\n-            token_type_ids = token_type_ids[:, -input_ids.shape[1] :]\n-\n-    attention_mask = kwargs.get(\"attention_mask\", None)\n-    position_ids = kwargs.get(\"position_ids\", None)\n-\n-    if attention_mask is not None and position_ids is None:\n-        # create position_ids on the fly for batch generation\n-        position_ids = attention_mask.long().cumsum(-1) - 1\n-        position_ids.masked_fill_(attention_mask == 0, 1)\n-        if past_key_values:\n-            position_ids = position_ids[:, -1].unsqueeze(-1)\n-\n-            # This `clone` call is needed to avoid recapturing cuda graphs with `torch.compile`'s  `mode=\"reduce-overhead`, as otherwise the input `position_ids` would have various stride during the decoding. Here, simply using `.contiguous()` is not sufficient as in the batch size = 1 case, `position_ids` is already contiguous but with varying stride which retriggers a capture.\n-            position_ids = position_ids.clone(memory_format=torch.contiguous_format)\n-\n-    pixel_values = kwargs.get(\"pixel_values\", None)\n-    image_encoder_embeddings = kwargs.get(\"image_encoder_embeddings\", None)\n-    perceiver_embeddings = kwargs.get(\"perceiver_embeddings\", None)\n-    image_attention_mask = kwargs.get(\"image_attention_mask\", None)\n-    interpolate_pos_encoding = kwargs.get(\"interpolate_pos_encoding\", False)\n-\n-    return {\n-        \"input_ids\": input_ids,\n-        \"past_key_values\": past_key_values,\n-        \"use_cache\": kwargs.get(\"use_cache\"),\n-        \"cache_position\": cache_position,\n-        \"position_ids\": position_ids,\n-        \"attention_mask\": attention_mask,\n-        \"token_type_ids\": token_type_ids,\n-        \"pixel_values\": pixel_values,\n-        \"image_encoder_embeddings\": image_encoder_embeddings,\n-        \"perceiver_embeddings\": perceiver_embeddings,\n-        \"image_attention_mask\": image_attention_mask,\n-        \"interpolate_pos_encoding\": interpolate_pos_encoding,\n-    }\n-\n-\n def freeze_model(model, module_exceptions=[]):\n     mapping = {\n         \"LayerNorm\": nn.LayerNorm,\n@@ -1210,11 +1165,9 @@ def forward(\n             # create position_ids on the fly for batch generation\n             position_ids = attention_mask.long().cumsum(-1) - 1\n             position_ids.masked_fill_(attention_mask == 0, 1)\n+            position_ids = position_ids[:, -seq_length:]\n         elif position_ids is None:\n-            position_ids = torch.arange(\n-                past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device\n-            )\n-            position_ids = position_ids.unsqueeze(0)\n+            position_ids = cache_position.unsqueeze(0)\n \n         if (pixel_values, image_encoder_embeddings, perceiver_embeddings).count(None) != 2:\n             raise ValueError(\n@@ -1684,7 +1637,9 @@ def forward(\n             labels = labels.to(logits.device)\n             # Shift so that tokens < n predict n\n             if attention_mask is not None:\n-                shift_attention_mask = attention_mask[..., 1:].to(logits.device)\n+                # we use the input attention mask to shift the logits and labels, because it is 2D.\n+                # we also crop attn mask in case it is longer, which happens in PrefixTuning with peft\n+                shift_attention_mask = attention_mask[:, -(logits.shape[1] - 1) :].to(logits.device)\n                 shift_logits = logits[..., :-1, :][shift_attention_mask != 0].contiguous()\n                 shift_labels = labels[..., 1:][shift_attention_mask != 0].contiguous()\n             else:\n@@ -1707,19 +1662,57 @@ def forward(\n             image_hidden_states=outputs.image_hidden_states,\n         )\n \n-    def prepare_inputs_for_generation(self, input_ids, past=None, **kwargs):\n+    def prepare_inputs_for_generation(\n+        self,\n+        input_ids,\n+        past_key_values=None,\n+        attention_mask=None,\n+        position_ids=None,\n+        pixel_values=None,\n+        image_hidden_states=None,\n+        use_cache=None,\n+        cache_position=None,\n+        **kwargs,\n+    ):\n+        # If we have cache: let's slice `input_ids` through `cache_position`, to keep only the unprocessed tokens\n+        if past_key_values is not None:\n+            if input_ids.shape[1] != cache_position.shape[0]:\n+                input_ids = input_ids[:, cache_position]\n+\n+        if attention_mask is not None and position_ids is None:\n+            # create position_ids on the fly for batch generation\n+            position_ids = attention_mask.long().cumsum(-1) - 1\n+            position_ids.masked_fill_(attention_mask == 0, 1)\n+            if past_key_values:\n+                position_ids = position_ids[:, -input_ids.shape[1] :]\n+\n+                # This `clone` call is needed to avoid recapturing cuda graphs with `torch.compile`'s  `mode=\"reduce-overhead`, as otherwise the input `position_ids` would have various stride during the decoding. Here, simply using `.contiguous()` is not sufficient as in the batch size = 1 case, `position_ids` is already contiguous but with varying stride which retriggers a capture.\n+                position_ids = position_ids.clone(memory_format=torch.contiguous_format)\n+\n+        model_inputs = {}\n         image_hidden_states = kwargs.pop(\"image_hidden_states\", None)\n         if image_hidden_states is not None:\n             if self.config.use_resampler:\n-                kwargs[\"perceiver_embeddings\"] = image_hidden_states\n+                model_inputs[\"perceiver_embeddings\"] = image_hidden_states\n             else:\n-                kwargs[\"image_encoder_embeddings\"] = image_hidden_states\n-            kwargs[\"pixel_values\"] = None\n-        inputs = prepare_inputs_for_generation(input_ids, past=past, **kwargs)\n-        unwanted_kwargs = [\"token_type_ids\"]\n-        for kwarg in unwanted_kwargs:\n-            inputs.pop(kwarg, None)\n-        return inputs\n+                model_inputs[\"image_encoder_embeddings\"] = image_hidden_states\n+            pixel_values = None\n+\n+        model_inputs.update(\n+            {\n+                \"input_ids\": input_ids,\n+                \"past_key_values\": past_key_values,\n+                \"use_cache\": use_cache,\n+                \"cache_position\": cache_position,\n+                \"position_ids\": position_ids,\n+                \"attention_mask\": attention_mask,\n+                \"pixel_values\": pixel_values,\n+                \"image_attention_mask\": kwargs.get(\"image_attention_mask\", None),\n+                \"interpolate_pos_encoding\": kwargs.get(\"interpolate_pos_encoding\", False),\n+            }\n+        )\n+\n+        return model_inputs\n \n     @staticmethod\n     def _expand_inputs_for_generation("
+        },
+        {
+            "sha": "b53d0722587d5a0e966841a4c519d526e6915bf8",
+            "filename": "src/transformers/models/idefics2/modeling_idefics2.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 1,
+            "changes": 4,
+            "blob_url": "https://github.com/huggingface/transformers/blob/be9aeba5812cdcf9a47248b4ef05184cab6db200/src%2Ftransformers%2Fmodels%2Fidefics2%2Fmodeling_idefics2.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/be9aeba5812cdcf9a47248b4ef05184cab6db200/src%2Ftransformers%2Fmodels%2Fidefics2%2Fmodeling_idefics2.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fidefics2%2Fmodeling_idefics2.py?ref=be9aeba5812cdcf9a47248b4ef05184cab6db200",
+            "patch": "@@ -1626,7 +1626,9 @@ def forward(\n             labels = labels.to(logits.device)\n             # Shift so that tokens < n predict n\n             if attention_mask is not None:\n-                shift_attention_mask = attention_mask[..., 1:].to(logits.device)\n+                # we use the input attention mask to shift the logits and labels, because it is 2D.\n+                # we also crop attn mask in case it is longer, which happens in PrefixTuning with peft\n+                shift_attention_mask = attention_mask[:, -(logits.shape[1] - 1) :].to(logits.device)\n                 shift_logits = logits[..., :-1, :][shift_attention_mask != 0].contiguous()\n                 shift_labels = labels[..., 1:][shift_attention_mask != 0].contiguous()\n             else:"
+        },
+        {
+            "sha": "757391175ea671248110afc014b342c2b6c8cd8c",
+            "filename": "src/transformers/models/idefics3/modeling_idefics3.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 1,
+            "changes": 4,
+            "blob_url": "https://github.com/huggingface/transformers/blob/be9aeba5812cdcf9a47248b4ef05184cab6db200/src%2Ftransformers%2Fmodels%2Fidefics3%2Fmodeling_idefics3.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/be9aeba5812cdcf9a47248b4ef05184cab6db200/src%2Ftransformers%2Fmodels%2Fidefics3%2Fmodeling_idefics3.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fidefics3%2Fmodeling_idefics3.py?ref=be9aeba5812cdcf9a47248b4ef05184cab6db200",
+            "patch": "@@ -1213,7 +1213,9 @@ def forward(\n             labels = labels.to(logits.device)\n             # Shift so that tokens < n predict n\n             if attention_mask is not None:\n-                shift_attention_mask = attention_mask[..., 1:].to(logits.device)\n+                # we use the input attention mask to shift the logits and labels, because it is 2D.\n+                # we also crop attn mask in case it is longer, which happens in PrefixTuning with peft\n+                shift_attention_mask = attention_mask[:, -(logits.shape[1] - 1) :].to(logits.device)\n                 shift_logits = logits[..., :-1, :][shift_attention_mask != 0].contiguous()\n                 shift_labels = labels[..., 1:][shift_attention_mask != 0].contiguous()\n             else:"
+        },
+        {
+            "sha": "e793ca61c750d75482606eeeb958ed17cb570e1b",
+            "filename": "src/transformers/models/llava/modeling_llava.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 1,
+            "changes": 4,
+            "blob_url": "https://github.com/huggingface/transformers/blob/be9aeba5812cdcf9a47248b4ef05184cab6db200/src%2Ftransformers%2Fmodels%2Fllava%2Fmodeling_llava.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/be9aeba5812cdcf9a47248b4ef05184cab6db200/src%2Ftransformers%2Fmodels%2Fllava%2Fmodeling_llava.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fllava%2Fmodeling_llava.py?ref=be9aeba5812cdcf9a47248b4ef05184cab6db200",
+            "patch": "@@ -546,7 +546,9 @@ def forward(\n         if labels is not None:\n             # Shift so that tokens < n predict n\n             if attention_mask is not None:\n-                shift_attention_mask = attention_mask[..., 1:]\n+                # we use the input attention mask to shift the logits and labels, because it is 2D.\n+                # we also crop attn mask in case it is longer, which happens in PrefixTuning with peft\n+                shift_attention_mask = attention_mask[:, -(logits.shape[1] - 1) :].to(logits.device)\n                 shift_logits = logits[..., :-1, :][shift_attention_mask.to(logits.device) != 0].contiguous()\n                 shift_labels = labels[..., 1:][shift_attention_mask.to(labels.device) != 0].contiguous()\n             else:"
+        },
+        {
+            "sha": "705821c2b713e853fc7f29f5f801d66088b2688e",
+            "filename": "src/transformers/models/llava_next/modeling_llava_next.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 1,
+            "changes": 4,
+            "blob_url": "https://github.com/huggingface/transformers/blob/be9aeba5812cdcf9a47248b4ef05184cab6db200/src%2Ftransformers%2Fmodels%2Fllava_next%2Fmodeling_llava_next.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/be9aeba5812cdcf9a47248b4ef05184cab6db200/src%2Ftransformers%2Fmodels%2Fllava_next%2Fmodeling_llava_next.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fllava_next%2Fmodeling_llava_next.py?ref=be9aeba5812cdcf9a47248b4ef05184cab6db200",
+            "patch": "@@ -923,7 +923,9 @@ def forward(\n         if labels is not None:\n             # Shift so that tokens < n predict n\n             if attention_mask is not None:\n-                shift_attention_mask = attention_mask[..., 1:]\n+                # we use the input attention mask to shift the logits and labels, because it is 2D.\n+                # we also crop attn mask in case it is longer, which happens in PrefixTuning with peft\n+                shift_attention_mask = attention_mask[:, -(logits.shape[1] - 1) :].to(logits.device)\n                 shift_logits = logits[..., :-1, :][shift_attention_mask.to(logits.device) != 0].contiguous()\n                 shift_labels = labels[..., 1:][shift_attention_mask.to(labels.device) != 0].contiguous()\n             else:"
+        },
+        {
+            "sha": "7df4cf20372bb7e7a145d687dff8f28624b09893",
+            "filename": "src/transformers/models/llava_next_video/modeling_llava_next_video.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 1,
+            "changes": 4,
+            "blob_url": "https://github.com/huggingface/transformers/blob/be9aeba5812cdcf9a47248b4ef05184cab6db200/src%2Ftransformers%2Fmodels%2Fllava_next_video%2Fmodeling_llava_next_video.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/be9aeba5812cdcf9a47248b4ef05184cab6db200/src%2Ftransformers%2Fmodels%2Fllava_next_video%2Fmodeling_llava_next_video.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fllava_next_video%2Fmodeling_llava_next_video.py?ref=be9aeba5812cdcf9a47248b4ef05184cab6db200",
+            "patch": "@@ -1004,7 +1004,9 @@ def forward(\n         if labels is not None:\n             # Shift so that tokens < n predict n\n             if attention_mask is not None:\n-                shift_attention_mask = attention_mask[..., 1:]\n+                # we use the input attention mask to shift the logits and labels, because it is 2D.\n+                # we also crop attn mask in case it is longer, which happens in PrefixTuning with peft\n+                shift_attention_mask = attention_mask[:, -(logits.shape[1] - 1) :].to(logits.device)\n                 shift_logits = logits[..., :-1, :][shift_attention_mask.to(logits.device) != 0].contiguous()\n                 shift_labels = labels[..., 1:][shift_attention_mask.to(labels.device) != 0].contiguous()\n             else:"
+        },
+        {
+            "sha": "4b6be407dcab81201cdd70960ec46289b1559421",
+            "filename": "src/transformers/models/llava_next_video/modular_llava_next_video.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 1,
+            "changes": 4,
+            "blob_url": "https://github.com/huggingface/transformers/blob/be9aeba5812cdcf9a47248b4ef05184cab6db200/src%2Ftransformers%2Fmodels%2Fllava_next_video%2Fmodular_llava_next_video.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/be9aeba5812cdcf9a47248b4ef05184cab6db200/src%2Ftransformers%2Fmodels%2Fllava_next_video%2Fmodular_llava_next_video.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fllava_next_video%2Fmodular_llava_next_video.py?ref=be9aeba5812cdcf9a47248b4ef05184cab6db200",
+            "patch": "@@ -519,7 +519,9 @@ def forward(\n         if labels is not None:\n             # Shift so that tokens < n predict n\n             if attention_mask is not None:\n-                shift_attention_mask = attention_mask[..., 1:]\n+                # we use the input attention mask to shift the logits and labels, because it is 2D.\n+                # we also crop attn mask in case it is longer, which happens in PrefixTuning with peft\n+                shift_attention_mask = attention_mask[:, -(logits.shape[1] - 1) :].to(logits.device)\n                 shift_logits = logits[..., :-1, :][shift_attention_mask.to(logits.device) != 0].contiguous()\n                 shift_labels = labels[..., 1:][shift_attention_mask.to(labels.device) != 0].contiguous()\n             else:"
+        },
+        {
+            "sha": "f65c0fe7cfb3e5c8482f4bbdc905d30c1217b114",
+            "filename": "src/transformers/models/llava_onevision/modeling_llava_onevision.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 1,
+            "changes": 4,
+            "blob_url": "https://github.com/huggingface/transformers/blob/be9aeba5812cdcf9a47248b4ef05184cab6db200/src%2Ftransformers%2Fmodels%2Fllava_onevision%2Fmodeling_llava_onevision.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/be9aeba5812cdcf9a47248b4ef05184cab6db200/src%2Ftransformers%2Fmodels%2Fllava_onevision%2Fmodeling_llava_onevision.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fllava_onevision%2Fmodeling_llava_onevision.py?ref=be9aeba5812cdcf9a47248b4ef05184cab6db200",
+            "patch": "@@ -676,7 +676,9 @@ def forward(\n         if labels is not None:\n             # Shift so that tokens < n predict n\n             if attention_mask is not None:\n-                shift_attention_mask = attention_mask[..., 1:]\n+                # we use the input attention mask to shift the logits and labels, because it is 2D.\n+                # we also crop attn mask in case it is longer, which happens in PrefixTuning with peft\n+                shift_attention_mask = attention_mask[:, -(logits.shape[1] - 1) :].to(logits.device)\n                 shift_logits = logits[..., :-1, :][shift_attention_mask.to(logits.device) != 0].contiguous()\n                 shift_labels = labels[..., 1:][shift_attention_mask.to(labels.device) != 0].contiguous()\n             else:"
+        },
+        {
+            "sha": "d75a05bda0e1ec36c03b083f57a7434253e5a316",
+            "filename": "src/transformers/models/paligemma/modeling_paligemma.py",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/huggingface/transformers/blob/be9aeba5812cdcf9a47248b4ef05184cab6db200/src%2Ftransformers%2Fmodels%2Fpaligemma%2Fmodeling_paligemma.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/be9aeba5812cdcf9a47248b4ef05184cab6db200/src%2Ftransformers%2Fmodels%2Fpaligemma%2Fmodeling_paligemma.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fpaligemma%2Fmodeling_paligemma.py?ref=be9aeba5812cdcf9a47248b4ef05184cab6db200",
+            "patch": "@@ -532,7 +532,8 @@ def forward(\n             shift_labels = labels[..., 1:]\n             if attention_mask is not None:\n                 # we use the input attention mask to shift the logits and labels, because it is 2D.\n-                shift_attention_mask = attention_mask[..., 1:]\n+                # we also crop attn mask in case it is longer, which happens in PrefixTuning with peft\n+                shift_attention_mask = attention_mask[:, -shift_logits.shape[1] :].to(logits.device)\n                 shift_logits = shift_logits[shift_attention_mask.to(logits.device) != 0].contiguous()\n                 shift_labels = shift_labels[shift_attention_mask.to(shift_labels.device) != 0].contiguous()\n             else:"
+        },
+        {
+            "sha": "5711433c368d5e4a68b6e532256c3acc43b64399",
+            "filename": "src/transformers/models/video_llava/modeling_video_llava.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 1,
+            "changes": 4,
+            "blob_url": "https://github.com/huggingface/transformers/blob/be9aeba5812cdcf9a47248b4ef05184cab6db200/src%2Ftransformers%2Fmodels%2Fvideo_llava%2Fmodeling_video_llava.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/be9aeba5812cdcf9a47248b4ef05184cab6db200/src%2Ftransformers%2Fmodels%2Fvideo_llava%2Fmodeling_video_llava.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fvideo_llava%2Fmodeling_video_llava.py?ref=be9aeba5812cdcf9a47248b4ef05184cab6db200",
+            "patch": "@@ -656,7 +656,9 @@ def forward(\n         if labels is not None:\n             # Shift so that tokens < n predict n\n             if attention_mask is not None:\n-                shift_attention_mask = attention_mask[..., 1:]\n+                # we use the input attention mask to shift the logits and labels, because it is 2D.\n+                # we also crop attn mask in case it is longer, which happens in PrefixTuning with peft\n+                shift_attention_mask = attention_mask[:, -(logits.shape[1] - 1) :].to(logits.device)\n                 shift_logits = logits[..., :-1, :][shift_attention_mask.to(logits.device) != 0].contiguous()\n                 shift_labels = labels[..., 1:][shift_attention_mask.to(labels.device) != 0].contiguous()\n             else:"
+        },
+        {
+            "sha": "26d92b9ac3dca404e6d3eaa44f1d98760d236c3e",
+            "filename": "src/transformers/models/vipllava/modeling_vipllava.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/huggingface/transformers/blob/be9aeba5812cdcf9a47248b4ef05184cab6db200/src%2Ftransformers%2Fmodels%2Fvipllava%2Fmodeling_vipllava.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/be9aeba5812cdcf9a47248b4ef05184cab6db200/src%2Ftransformers%2Fmodels%2Fvipllava%2Fmodeling_vipllava.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fvipllava%2Fmodeling_vipllava.py?ref=be9aeba5812cdcf9a47248b4ef05184cab6db200",
+            "patch": "@@ -539,7 +539,7 @@ def forward(\n         if labels is not None:\n             # Shift so that tokens < n predict n\n             if attention_mask is not None:\n-                shift_attention_mask = attention_mask[..., 1:]\n+                shift_attention_mask = attention_mask[:, -(logits.shape[1] - 1) :].to(logits.device)\n                 shift_logits = logits[..., :-1, :][shift_attention_mask.to(logits.device) != 0].contiguous()\n                 shift_labels = labels[..., 1:][shift_attention_mask.to(labels.device) != 0].contiguous()\n             else:"
+        }
+    ],
+    "stats": {
+        "total": 148,
+        "additions": 79,
+        "deletions": 69
+    }
+}

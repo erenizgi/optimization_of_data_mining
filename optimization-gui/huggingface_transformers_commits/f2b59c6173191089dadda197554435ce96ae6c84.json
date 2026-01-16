@@ -1,0 +1,36 @@
+{
+    "author": "gante",
+    "message": "[caches] Raise exception on offloaded static caches + multi device (#37974)\n\n* skip tests on >1 gpu\n\n* add todo",
+    "sha": "f2b59c6173191089dadda197554435ce96ae6c84",
+    "files": [
+        {
+            "sha": "005612e82f7cf20bfca6ede60c0554c274f795c9",
+            "filename": "src/transformers/cache_utils.py",
+            "status": "modified",
+            "additions": 14,
+            "deletions": 0,
+            "changes": 14,
+            "blob_url": "https://github.com/huggingface/transformers/blob/f2b59c6173191089dadda197554435ce96ae6c84/src%2Ftransformers%2Fcache_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/f2b59c6173191089dadda197554435ce96ae6c84/src%2Ftransformers%2Fcache_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fcache_utils.py?ref=f2b59c6173191089dadda197554435ce96ae6c84",
+            "patch": "@@ -2028,6 +2028,13 @@ def __init__(\n         layer_device_map: Optional[Dict[int, Union[str, torch.device, int]]] = None,\n     ):\n         super().__init__(config, max_batch_size, max_cache_len, device, dtype, layer_device_map)\n+\n+        # TODO (joao): to enable this cache on multiple devicesuse the pattern from `OffloadedCache`, which keeps\n+        # track of the original device of each layer\n+        unique_devices = set(layer_device_map.values())\n+        if len(unique_devices) > 1:\n+            raise ValueError(f\"OffloadedHybridCache does not support multiple devices. Got devices: {unique_devices}\")\n+\n         self.offload_device = torch.device(offload_device)\n         # Create new CUDA stream for parallel prefetching.\n         self._prefetch_stream = torch.cuda.Stream() if torch._C._get_accelerator().type == \"cuda\" else None\n@@ -2280,6 +2287,13 @@ def __init__(\n         layer_device_map: Optional[Dict[int, Union[str, torch.device, int]]] = None,\n     ) -> None:\n         super(Cache, self).__init__()\n+\n+        # TODO (joao): to enable this cache on multiple devicesuse the pattern from `OffloadedCache`, which keeps\n+        # track of the original device of each layer\n+        unique_devices = set(layer_device_map.values())\n+        if len(unique_devices) > 1:\n+            raise ValueError(f\"OffloadedStaticCache does not support multiple devices. Got devices: {unique_devices}\")\n+\n         self.max_batch_size = max_batch_size\n         self.max_cache_len = config.max_position_embeddings if max_cache_len is None else max_cache_len\n         self.device = torch.device(device) if layer_device_map is None else torch.device(layer_device_map[0])"
+        },
+        {
+            "sha": "48cecb52dcbc50a3cdd24287cb11215b7ce1cc66",
+            "filename": "tests/utils/test_cache_utils.py",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 5,
+            "changes": 15,
+            "blob_url": "https://github.com/huggingface/transformers/blob/f2b59c6173191089dadda197554435ce96ae6c84/tests%2Futils%2Ftest_cache_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/f2b59c6173191089dadda197554435ce96ae6c84/tests%2Futils%2Ftest_cache_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Futils%2Ftest_cache_utils.py?ref=f2b59c6173191089dadda197554435ce96ae6c84",
+            "patch": "@@ -198,19 +198,24 @@ def setUpClass(cls):\n         )\n         cls.model.config.sliding_window = 256  # hack to enable the use of caches with sliding windows\n \n-    def _skip_on_uninstalled_cache_dependencies(self, cache_implementation):\n-        \"\"\"Function to skip tests on missing cache dependencies, given a cache implementation\"\"\"\n+    def _skip_on_failed_cache_prerequisites(self, cache_implementation):\n+        \"\"\"Function to skip tests on failed cache prerequisites, given a cache implementation\"\"\"\n+        # Installed dependencies\n         if cache_implementation == \"quantized\" and not is_optimum_quanto_available():\n             self.skipTest(\"Quanto is not available\")\n+        # Devices\n         if \"offloaded\" in cache_implementation:\n             has_accelerator = torch_device is not None and torch_device != \"cpu\"\n             if not has_accelerator:\n                 self.skipTest(\"Offloaded caches require an accelerator\")\n+            if cache_implementation in [\"offloaded_static\", \"offloaded_hybrid_chunked\"]:\n+                if torch.cuda.device_count() != 1:\n+                    self.skipTest(\"Offloaded static caches require exactly 1 GPU\")\n \n     @parameterized.expand(TEST_CACHE_IMPLEMENTATIONS)\n     def test_cache_batched(self, cache_implementation):\n         \"\"\"Sanity check: caches' `.update` function expects batched inputs\"\"\"\n-        self._skip_on_uninstalled_cache_dependencies(cache_implementation)\n+        self._skip_on_failed_cache_prerequisites(cache_implementation)\n \n         EXPECTED_GENERATION = [\"A sequence: 1, 2, 3, 4, 5, 6, 7, 8,\", \"A sequence: A, B, C, D, E, F, G, H\"]\n \n@@ -239,7 +244,7 @@ def test_cache_beam_search(self, cache_implementation):\n         Sanity check: caches' `reorder_cache` is operational. We can confirm this by looking at the beam indices\n         (an output sequence contains multiple beam indices).\n         \"\"\"\n-        self._skip_on_uninstalled_cache_dependencies(cache_implementation)\n+        self._skip_on_failed_cache_prerequisites(cache_implementation)\n         if cache_implementation == \"offloaded_hybrid_chunked\":\n             # TODO (joao, cyril): something is off with `offloaded_hybrid_chunked` aka `OffloadedHybridCache`: the\n             # output sequence (and the corresponding beam scores, if we add `output_scores=True`) are significantly\n@@ -273,7 +278,7 @@ def test_cache_beam_search(self, cache_implementation):\n     @parameterized.expand(TEST_CACHE_IMPLEMENTATIONS)\n     def test_cache_extra_left_padding(self, cache_implementation):\n         \"\"\"Tests that adding extra left-padding does not affect the generation with the cache\"\"\"\n-        self._skip_on_uninstalled_cache_dependencies(cache_implementation)\n+        self._skip_on_failed_cache_prerequisites(cache_implementation)\n \n         EXPECTED_GENERATION = [\"The cat's whiskers are also a sign of anxiety.\"]\n "
+        }
+    ],
+    "stats": {
+        "total": 29,
+        "additions": 24,
+        "deletions": 5
+    }
+}

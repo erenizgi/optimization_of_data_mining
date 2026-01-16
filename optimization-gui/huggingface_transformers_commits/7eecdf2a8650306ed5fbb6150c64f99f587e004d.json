@@ -1,0 +1,36 @@
+{
+    "author": "ArthurZucker",
+    "message": "Update-tp test (#35844)\n\n* update test for now\n\n* up\n\n* cleanup\n\n* update todo",
+    "sha": "7eecdf2a8650306ed5fbb6150c64f99f587e004d",
+    "files": [
+        {
+            "sha": "e058b639f781cc5be9a2d2a656b8d09b4347e774",
+            "filename": "src/transformers/pytorch_utils.py",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/huggingface/transformers/blob/7eecdf2a8650306ed5fbb6150c64f99f587e004d/src%2Ftransformers%2Fpytorch_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/7eecdf2a8650306ed5fbb6150c64f99f587e004d/src%2Ftransformers%2Fpytorch_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fpytorch_utils.py?ref=7eecdf2a8650306ed5fbb6150c64f99f587e004d",
+            "patch": "@@ -343,6 +343,8 @@ def isin_mps_friendly(elements: torch.Tensor, test_elements: torch.Tensor | int)\n         return torch.isin(elements, test_elements)\n \n \n+# TODO need to add the __repr__ that shows that it is a colwise parallel\n+# See https://github.com/pytorch/pytorch/issues/145726\n def translate_to_torch_parallel_style(style: str):\n     \"\"\"\n     In model configurations, we use a neutral type (string) to specify parallel"
+        },
+        {
+            "sha": "7b9bff5f166618399e2c98407401f0ae79f28ae3",
+            "filename": "tests/tp/test_tp.py",
+            "status": "modified",
+            "additions": 34,
+            "deletions": 12,
+            "changes": 46,
+            "blob_url": "https://github.com/huggingface/transformers/blob/7eecdf2a8650306ed5fbb6150c64f99f587e004d/tests%2Ftp%2Ftest_tp.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/7eecdf2a8650306ed5fbb6150c64f99f587e004d/tests%2Ftp%2Ftest_tp.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Ftp%2Ftest_tp.py?ref=7eecdf2a8650306ed5fbb6150c64f99f587e004d",
+            "patch": "@@ -17,6 +17,7 @@\n import tempfile\n import textwrap\n \n+#  TORCH_LOGS=+dtensor CUDA_LAUNCH_BLOCKING=1 TORCH_USE_CUDA_DSA=1 PYTHONPATH=\"src\" python -m torch.distributed.run --nproc_per_node 2 ./tests/tp/test_tp.py\n from transformers import is_torch_available\n from transformers.models.llama.configuration_llama import LlamaConfig\n from transformers.models.llama.modeling_llama import LlamaModel\n@@ -110,9 +111,8 @@ def test_loading_memory_consumption(self):\n \n     # Test settings\n     model_id = \"meta-llama/Meta-Llama-3-8B-Instruct\"\n-    bs = 4\n-    seqlen = 64\n-\n+    bs = 1\n+    seqlen = 4096\n     # Get distributed settings\n     rank = int(os.environ[\"RANK\"])\n     world_size = int(os.environ[\"WORLD_SIZE\"])\n@@ -124,23 +124,45 @@ def test_loading_memory_consumption(self):\n \n     # Get model config\n     config = LlamaConfig.from_pretrained(model_id)\n-    # Shrink model size\n-    config.num_hidden_layers //= 8\n-    config.vocab_size //= 8\n-\n+    config.hidden_size = 2048\n+    config.attention_bias = False\n     # Instantiate model\n     with device:\n-        model = LlamaModel(config)\n+        model = LlamaModel(config).to(dtype=torch.float16)\n \n     model.eval()\n-\n     # Tensor Parallel\n     if world_size > 1:\n         model.tensor_parallel(device_mesh)\n-\n     # Run model\n+\n     inputs = torch.randint(config.vocab_size, (bs, seqlen), device=device)\n-    with torch.no_grad():\n-        out = model(inputs)\n+\n+    # Test cuda graphing explicitly\n+    with torch.cuda.device(device):\n+        print(\"Cuda graphing\")\n+        with torch.no_grad():\n+            inputs = torch.randint(config.vocab_size, (bs, seqlen), device=device)\n+            # CUDA Graph setup\n+            s = torch.cuda.Stream(device=device)\n+            s.wait_stream(torch.cuda.current_stream())\n+            with torch.cuda.stream(s):\n+                for i in range(3):\n+                    out = model(inputs)\n+            torch.cuda.current_stream().wait_stream(s)\n+            g = torch.cuda.CUDAGraph()\n+            with torch.cuda.graph(g):\n+                out = model(inputs)\n+\n+            for _ in range(2):\n+                g.replay()\n+            s.synchronize()\n \n     assert out.last_hidden_state.shape == torch.Size([bs, seqlen, config.hidden_size])\n+\n+    # Test compile\n+    with torch.no_grad():\n+        out = model(inputs)\n+        model.forward = torch.compile(model.forward, mode=\"reduce-overhead\")\n+        out = model(inputs)\n+        out = model(inputs)"
+        }
+    ],
+    "stats": {
+        "total": 48,
+        "additions": 36,
+        "deletions": 12
+    }
+}

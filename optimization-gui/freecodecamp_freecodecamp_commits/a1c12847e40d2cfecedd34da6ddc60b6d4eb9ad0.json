@@ -1,0 +1,72 @@
+{
+    "author": "ahmaxed",
+    "message": "feat(api): add update-stripe-card endpoint (#55548)\n\nCo-authored-by: Oliver Eyton-Williams <ojeytonwilliams@gmail.com>",
+    "sha": "a1c12847e40d2cfecedd34da6ddc60b6d4eb9ad0",
+    "files": [
+        {
+            "sha": "6efe35529f5b98780abf5cc7c06c1d81ee7c9528",
+            "filename": "api/src/routes/donate.test.ts",
+            "status": "modified",
+            "additions": 65,
+            "deletions": 5,
+            "changes": 70,
+            "blob_url": "https://github.com/freeCodeCamp/freeCodeCamp/blob/a1c12847e40d2cfecedd34da6ddc60b6d4eb9ad0/api%2Fsrc%2Froutes%2Fdonate.test.ts",
+            "raw_url": "https://github.com/freeCodeCamp/freeCodeCamp/raw/a1c12847e40d2cfecedd34da6ddc60b6d4eb9ad0/api%2Fsrc%2Froutes%2Fdonate.test.ts",
+            "contents_url": "https://api.github.com/repos/freeCodeCamp/freeCodeCamp/contents/api%2Fsrc%2Froutes%2Fdonate.test.ts?ref=a1c12847e40d2cfecedd34da6ddc60b6d4eb9ad0",
+            "patch": "@@ -4,7 +4,8 @@ import {\n   devLogin,\n   setupServer,\n   superRequest,\n-  defaultUserEmail\n+  defaultUserEmail,\n+  defaultUserId\n } from '../../jest.utils';\n import { createUserInput } from '../utils/create-user';\n \n@@ -42,6 +43,21 @@ const userWithProgress: Prisma.userCreateInput = {\n     }\n   ]\n };\n+const donationMock = {\n+  endDate: null,\n+  startDate: {\n+    date: '2024-07-17T10:20:56.076Z',\n+    when: '2024-07-17T10:20:56.076+00:00'\n+  },\n+  id: '66979a414748aa2f3ba36d41',\n+  amount: 500,\n+  customerId: 'cust_test_id',\n+  duration: 'month',\n+  email: 'foo@bar.com',\n+  provider: 'stripe',\n+  subscriptionId: 'sub_test_id',\n+  userId: defaultUserId\n+};\n const sharedDonationReqBody = {\n   amount: 500,\n   duration: 'month'\n@@ -93,6 +109,9 @@ const mockSubRetrieveObj = {\n   status: 'active'\n };\n const mockSubRetrieve = jest.fn(() => Promise.resolve(mockSubRetrieveObj));\n+const mockCheckoutSessionCreate = jest.fn(() =>\n+  Promise.resolve({ id: 'checkout_session_id' })\n+);\n const mockCustomerUpdate = jest.fn();\n const generateMockSubCreate = (status: string) => () =>\n   Promise.resolve({\n@@ -120,15 +139,22 @@ jest.mock('stripe', () => {\n       subscriptions: {\n         create: mockSubCreate,\n         retrieve: mockSubRetrieve\n+      },\n+      checkout: {\n+        sessions: {\n+          create: mockCheckoutSessionCreate\n+        }\n       }\n     };\n   });\n });\n \n describe('Donate', () => {\n+  let setCookies: string[];\n   setupServer();\n   describe('Authenticated User', () => {\n     let superPost: ReturnType<typeof createSuperRequest>;\n+    let superPut: ReturnType<typeof createSuperRequest>;\n     const verifyUpdatedUserAndNewDonation = async (email: string) => {\n       const user = await fastifyTestInstance.prisma.user.findFirst({\n         where: { email }\n@@ -162,8 +188,9 @@ describe('Donate', () => {\n     };\n \n     beforeEach(async () => {\n-      const setCookies = await devLogin();\n+      setCookies = await devLogin();\n       superPost = createSuperRequest({ method: 'POST', setCookies });\n+      superPut = createSuperRequest({ method: 'PUT', setCookies });\n       await fastifyTestInstance.prisma.user.updateMany({\n         where: { email: userWithProgress.email },\n         data: userWithProgress\n@@ -302,6 +329,39 @@ describe('Donate', () => {\n       });\n     });\n \n+    describe('PUT /donate/update-stripe-card', () => {\n+      it('should return 200 and return session id', async () => {\n+        await fastifyTestInstance.prisma.donation.create({\n+          data: donationMock\n+        });\n+        const response = await superPut('/donate/update-stripe-card').send({});\n+        expect(mockCheckoutSessionCreate).toHaveBeenCalledWith({\n+          cancel_url: 'http://localhost:8000/update-stripe-card',\n+          customer: 'cust_test_id',\n+          mode: 'setup',\n+          payment_method_types: ['card'],\n+          setup_intent_data: {\n+            metadata: {\n+              customer_id: 'cust_test_id',\n+              subscription_id: 'sub_test_id'\n+            }\n+          },\n+          success_url:\n+            'http://localhost:8000/update-stripe-card?session_id={CHECKOUT_SESSION_ID}'\n+        });\n+        expect(response.body).toEqual({ sessionId: 'checkout_session_id' });\n+        expect(response.status).toBe(200);\n+      });\n+      it('should return 500 if there is no donation record', async () => {\n+        const response = await superPut('/donate/update-stripe-card').send({});\n+        expect(response.body).toEqual({\n+          message: 'flash.generic-error',\n+          type: 'danger'\n+        });\n+        expect(response.status).toBe(500);\n+      });\n+    });\n+\n     describe('POST /donate/create-stripe-payment-intent', () => {\n       it('should return 200 and call stripe api properly', async () => {\n         mockSubCreate.mockImplementationOnce(\n@@ -432,16 +492,16 @@ describe('Donate', () => {\n   });\n \n   describe('Unauthenticated User', () => {\n-    let setCookies: string[];\n     // Get the CSRF cookies from an unprotected route\n     beforeAll(async () => {\n       const res = await superRequest('/status/ping', { method: 'GET' });\n       setCookies = res.get('Set-Cookie');\n     });\n \n-    const endpoints: { path: string; method: 'POST' }[] = [\n+    const endpoints: { path: string; method: 'POST' | 'PUT' }[] = [\n       { path: '/donate/add-donation', method: 'POST' },\n-      { path: '/donate/charge-stripe-card', method: 'POST' }\n+      { path: '/donate/charge-stripe-card', method: 'POST' },\n+      { path: '/donate/update-stripe-card', method: 'PUT' }\n     ];\n \n     endpoints.forEach(({ path, method }) => {"
+        },
+        {
+            "sha": "a62b74e689ac1094e3eb7b5e9b5dab42746831ab",
+            "filename": "api/src/routes/donate.ts",
+            "status": "modified",
+            "additions": 30,
+            "deletions": 1,
+            "changes": 31,
+            "blob_url": "https://github.com/freeCodeCamp/freeCodeCamp/blob/a1c12847e40d2cfecedd34da6ddc60b6d4eb9ad0/api%2Fsrc%2Froutes%2Fdonate.ts",
+            "raw_url": "https://github.com/freeCodeCamp/freeCodeCamp/raw/a1c12847e40d2cfecedd34da6ddc60b6d4eb9ad0/api%2Fsrc%2Froutes%2Fdonate.ts",
+            "contents_url": "https://api.github.com/repos/freeCodeCamp/freeCodeCamp/contents/api%2Fsrc%2Froutes%2Fdonate.ts?ref=a1c12847e40d2cfecedd34da6ddc60b6d4eb9ad0",
+            "patch": "@@ -8,7 +8,7 @@ import {\n   allStripeProductIdsArray\n } from '../../../shared/config/donation-settings';\n import * as schemas from '../schemas';\n-import { STRIPE_SECRET_KEY } from '../utils/env';\n+import { STRIPE_SECRET_KEY, HOME_LOCATION } from '../utils/env';\n import { inLastFiveMinutes } from '../utils/validate-donation';\n import { findOrCreateUser } from './helpers/auth-helpers';\n \n@@ -30,6 +30,35 @@ export const donateRoutes: FastifyPluginCallbackTypebox = (\n     typescript: true\n   });\n \n+  fastify.put(\n+    '/donate/update-stripe-card',\n+    {\n+      schema: schemas.updateStripeCard\n+    },\n+    async req => {\n+      const donation = await fastify.prisma.donation.findFirst({\n+        where: { userId: req.user?.id, provider: 'stripe' }\n+      });\n+      if (!donation)\n+        throw Error(`Stripe donation record not found: ${req.user?.id}`);\n+      const { customerId, subscriptionId } = donation;\n+      const session = await stripe.checkout.sessions.create({\n+        payment_method_types: ['card'],\n+        mode: 'setup',\n+        customer: customerId,\n+        setup_intent_data: {\n+          metadata: {\n+            customer_id: customerId,\n+            subscription_id: subscriptionId\n+          }\n+        },\n+        success_url: `${HOME_LOCATION}/update-stripe-card?session_id={CHECKOUT_SESSION_ID}`,\n+        cancel_url: `${HOME_LOCATION}/update-stripe-card`\n+      });\n+      return { sessionId: session.id } as const;\n+    }\n+  );\n+\n   fastify.post(\n     '/donate/add-donation',\n     {"
+        },
+        {
+            "sha": "c841ca03bf07b1f2f09e2cdc1d163442dfc0a03f",
+            "filename": "api/src/schemas.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/freeCodeCamp/freeCodeCamp/blob/a1c12847e40d2cfecedd34da6ddc60b6d4eb9ad0/api%2Fsrc%2Fschemas.ts",
+            "raw_url": "https://github.com/freeCodeCamp/freeCodeCamp/raw/a1c12847e40d2cfecedd34da6ddc60b6d4eb9ad0/api%2Fsrc%2Fschemas.ts",
+            "contents_url": "https://api.github.com/repos/freeCodeCamp/freeCodeCamp/contents/api%2Fsrc%2Fschemas.ts?ref=a1c12847e40d2cfecedd34da6ddc60b6d4eb9ad0",
+            "patch": "@@ -14,6 +14,7 @@ export { deprecatedEndpoints } from './schemas/deprecated';\n export { chargeStripeCard } from './schemas/donate/charge-stripe-card';\n export { chargeStripe } from './schemas/donate/charge-stripe';\n export { createStripePaymentIntent } from './schemas/donate/create-stripe-payment-intent';\n+export { updateStripeCard } from './schemas/donate/update-stripe-card';\n export { resubscribe } from './schemas/email-subscription/resubscribe';\n export { unsubscribe } from './schemas/email-subscription/unsubscribe';\n export { updateMyAbout } from './schemas/settings/update-my-about';"
+        },
+        {
+            "sha": "ac3eabf11918e09539d99fd0098e8100fe16c507",
+            "filename": "api/src/schemas/donate/update-stripe-card.ts",
+            "status": "added",
+            "additions": 12,
+            "deletions": 0,
+            "changes": 12,
+            "blob_url": "https://github.com/freeCodeCamp/freeCodeCamp/blob/a1c12847e40d2cfecedd34da6ddc60b6d4eb9ad0/api%2Fsrc%2Fschemas%2Fdonate%2Fupdate-stripe-card.ts",
+            "raw_url": "https://github.com/freeCodeCamp/freeCodeCamp/raw/a1c12847e40d2cfecedd34da6ddc60b6d4eb9ad0/api%2Fsrc%2Fschemas%2Fdonate%2Fupdate-stripe-card.ts",
+            "contents_url": "https://api.github.com/repos/freeCodeCamp/freeCodeCamp/contents/api%2Fsrc%2Fschemas%2Fdonate%2Fupdate-stripe-card.ts?ref=a1c12847e40d2cfecedd34da6ddc60b6d4eb9ad0",
+            "patch": "@@ -0,0 +1,12 @@\n+import { Type } from '@fastify/type-provider-typebox';\n+import { genericError } from '../types';\n+\n+export const updateStripeCard = {\n+  body: Type.Object({}),\n+  response: {\n+    200: Type.Object({\n+      sessionId: Type.String()\n+    }),\n+    default: genericError\n+  }\n+};"
+        },
+        {
+            "sha": "b634b4462effdcbf789920dbd9c3dd590b37a3da",
+            "filename": "client/src/utils/ajax.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/freeCodeCamp/freeCodeCamp/blob/a1c12847e40d2cfecedd34da6ddc60b6d4eb9ad0/client%2Fsrc%2Futils%2Fajax.ts",
+            "raw_url": "https://github.com/freeCodeCamp/freeCodeCamp/raw/a1c12847e40d2cfecedd34da6ddc60b6d4eb9ad0/client%2Fsrc%2Futils%2Fajax.ts",
+            "contents_url": "https://api.github.com/repos/freeCodeCamp/freeCodeCamp/contents/client%2Fsrc%2Futils%2Fajax.ts?ref=a1c12847e40d2cfecedd34da6ddc60b6d4eb9ad0",
+            "patch": "@@ -243,7 +243,7 @@ export function addDonation(body: Donation): Promise<ResponseWithData<void>> {\n }\n \n export function updateStripeCard() {\n-  return put('/donate/update-stripe-card');\n+  return put('/donate/update-stripe-card', {});\n }\n \n export function postChargeStripe("
+        }
+    ],
+    "stats": {
+        "total": 116,
+        "additions": 109,
+        "deletions": 7
+    }
+}

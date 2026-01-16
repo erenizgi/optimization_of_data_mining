@@ -1,0 +1,72 @@
+{
+    "author": "lubieowoce",
+    "message": "[CC] Fix hanging dynamic promise when abandoning render (#86690)\n\nFixes #86662\n\nThe bug was introduced in #85747, where we added\n`RenderStage.Abandoned`. We forgot to update the logic that rejects\npromises on abort, so if a render was abandoned (i.e. restarted due to a\ncache miss), then promises waiting for the dynamic stage would hang\nforever.\n\nThis is not generally observable unless the promise is persisted/cached\nin userspace. Userspace caches are problematic in Cache Components and\nwe discourage their usage, but the test app included here should still\nwork as expected (i.e. without hanging forever while rendering).",
+    "sha": "1660d3966a99371a57b3d832522caa55b42bc189",
+    "files": [
+        {
+            "sha": "6b5b0da763490f4a985734e8f4741182a6f0b9c8",
+            "filename": "packages/next/src/server/app-render/staged-rendering.ts",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 1,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/1660d3966a99371a57b3d832522caa55b42bc189/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fstaged-rendering.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/1660d3966a99371a57b3d832522caa55b42bc189/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fstaged-rendering.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fstaged-rendering.ts?ref=1660d3966a99371a57b3d832522caa55b42bc189",
+            "patch": "@@ -40,7 +40,10 @@ export class StagedRenderingController {\n             this.runtimeStagePromise.promise.catch(ignoreReject) // avoid unhandled rejections\n             this.runtimeStagePromise.reject(reason)\n           }\n-          if (this.currentStage < RenderStage.Dynamic) {\n+          if (\n+            this.currentStage < RenderStage.Dynamic ||\n+            this.currentStage === RenderStage.Abandoned\n+          ) {\n             this.dynamicStagePromise.promise.catch(ignoreReject) // avoid unhandled rejections\n             this.dynamicStagePromise.reject(reason)\n           }"
+        },
+        {
+            "sha": "153268847e55a9c95a9ff12bbd5a12942a5a87b6",
+            "filename": "test/development/app-dir/cache-components-reused-promise/app/layout.tsx",
+            "status": "added",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/vercel/next.js/blob/1660d3966a99371a57b3d832522caa55b42bc189/test%2Fdevelopment%2Fapp-dir%2Fcache-components-reused-promise%2Fapp%2Flayout.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/1660d3966a99371a57b3d832522caa55b42bc189/test%2Fdevelopment%2Fapp-dir%2Fcache-components-reused-promise%2Fapp%2Flayout.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fdevelopment%2Fapp-dir%2Fcache-components-reused-promise%2Fapp%2Flayout.tsx?ref=1660d3966a99371a57b3d832522caa55b42bc189",
+            "patch": "@@ -0,0 +1,7 @@\n+export default async function Layout({ children }) {\n+  return (\n+    <html>\n+      <body>{children}</body>\n+    </html>\n+  )\n+}"
+        },
+        {
+            "sha": "3ccb03732a27152a453f9e393c39a95d04cbfb54",
+            "filename": "test/development/app-dir/cache-components-reused-promise/app/page.tsx",
+            "status": "added",
+            "additions": 71,
+            "deletions": 0,
+            "changes": 71,
+            "blob_url": "https://github.com/vercel/next.js/blob/1660d3966a99371a57b3d832522caa55b42bc189/test%2Fdevelopment%2Fapp-dir%2Fcache-components-reused-promise%2Fapp%2Fpage.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/1660d3966a99371a57b3d832522caa55b42bc189/test%2Fdevelopment%2Fapp-dir%2Fcache-components-reused-promise%2Fapp%2Fpage.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fdevelopment%2Fapp-dir%2Fcache-components-reused-promise%2Fapp%2Fpage.tsx?ref=1660d3966a99371a57b3d832522caa55b42bc189",
+            "patch": "@@ -0,0 +1,71 @@\n+// This repros a bug from https://github.com/vercel/next.js/issues/86662.\n+// The bug from occurs if we have:\n+// - a cache (which requires warming = a restart in dev)\n+// - a dynamic function (blocked until the dynamic stage, like an uncached fetch)\n+//   that dedupes concurrent calls. note that that's not quite the same as caching it,\n+//   because it gets dropped after finishing.\n+\n+import { Suspense } from 'react'\n+\n+export default async function Page() {\n+  return (\n+    <main>\n+      <Suspense fallback={<div>Loading...</div>}>\n+        <div id=\"random\">\n+          <DynamicRandom />\n+        </div>\n+      </Suspense>\n+    </main>\n+  )\n+}\n+\n+async function DynamicRandom() {\n+  const [, random] = await Promise.all([\n+    // ensure that there's a restart to warm this cache.\n+    cached(),\n+    // This fetch going to be blocked on the dynamic stage.\n+    // That promise should be rejected when restarting.\n+    // If it's not rejected (like it wasn't before the fix),\n+    // it'll remain hanging, and we'll never render anything.\n+    fetchDynamicRandomDeduped(),\n+  ])\n+  return random\n+}\n+\n+function dedupeConcurrent<T>(func: () => Promise<T>): () => Promise<T> {\n+  let pending: Promise<T> | null = null\n+  return () => {\n+    if (pending !== null) {\n+      console.log('dedupe :: re-using pending promise')\n+      return pending\n+    }\n+\n+    console.log('dedupe :: starting')\n+    const promise = func()\n+    pending = promise\n+\n+    const clearPending = () => {\n+      console.log('dedupe :: finished')\n+      pending = null\n+    }\n+    promise.then(clearPending, clearPending)\n+\n+    return promise\n+  }\n+}\n+\n+const fetchDynamicRandomDeduped = dedupeConcurrent(async () => {\n+  const res = await fetch(\n+    'https://next-data-api-endpoint.vercel.app/api/random'\n+  )\n+  if (!res.ok) {\n+    throw new Error(`request failed with status ${res.status}`)\n+  }\n+  const text = await res.text()\n+  return text\n+})\n+\n+async function cached() {\n+  'use cache'\n+  await new Promise((resolve) => setTimeout(resolve))\n+}"
+        },
+        {
+            "sha": "b1ec296a05c2dc9002b1d4a46bdfef1044c725c9",
+            "filename": "test/development/app-dir/cache-components-reused-promise/cache-components-reused-promise.test.ts",
+            "status": "added",
+            "additions": 12,
+            "deletions": 0,
+            "changes": 12,
+            "blob_url": "https://github.com/vercel/next.js/blob/1660d3966a99371a57b3d832522caa55b42bc189/test%2Fdevelopment%2Fapp-dir%2Fcache-components-reused-promise%2Fcache-components-reused-promise.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/1660d3966a99371a57b3d832522caa55b42bc189/test%2Fdevelopment%2Fapp-dir%2Fcache-components-reused-promise%2Fcache-components-reused-promise.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fdevelopment%2Fapp-dir%2Fcache-components-reused-promise%2Fcache-components-reused-promise.test.ts?ref=1660d3966a99371a57b3d832522caa55b42bc189",
+            "patch": "@@ -0,0 +1,12 @@\n+import { nextTestSetup } from 'e2e-utils'\n+\n+describe('cache-components-dev-warmup - reused promise', () => {\n+  const { next } = nextTestSetup({\n+    files: __dirname,\n+  })\n+\n+  it('aborts dynamic promises when restarting the render', async () => {\n+    const browser = await next.browser('/')\n+    expect(await browser.elementByCss('#random').text()).toMatch(/\\d+\\.\\d+/)\n+  })\n+})"
+        },
+        {
+            "sha": "fa33c7c54f24cc9c85addd95f17ab7b6ebc6d751",
+            "filename": "test/development/app-dir/cache-components-reused-promise/next.config.ts",
+            "status": "added",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/vercel/next.js/blob/1660d3966a99371a57b3d832522caa55b42bc189/test%2Fdevelopment%2Fapp-dir%2Fcache-components-reused-promise%2Fnext.config.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/1660d3966a99371a57b3d832522caa55b42bc189/test%2Fdevelopment%2Fapp-dir%2Fcache-components-reused-promise%2Fnext.config.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fdevelopment%2Fapp-dir%2Fcache-components-reused-promise%2Fnext.config.ts?ref=1660d3966a99371a57b3d832522caa55b42bc189",
+            "patch": "@@ -0,0 +1,7 @@\n+import type { NextConfig } from 'next'\n+\n+const nextConfig: NextConfig = {\n+  cacheComponents: true,\n+}\n+\n+export default nextConfig"
+        }
+    ],
+    "stats": {
+        "total": 102,
+        "additions": 101,
+        "deletions": 1
+    }
+}

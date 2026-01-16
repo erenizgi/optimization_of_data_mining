@@ -1,0 +1,24 @@
+{
+    "author": "bgw",
+    "message": "fix(turbopack-bench): Limit `copy_dir` concurrency to avoid running out of file descriptors (#77468)\n\nWhen running\n\n```\nRUST_BACKTRACE=1 cargo test --benches --release -p turbopack-bench 'bench_startup'\n```\n\nI was seeing\n\n```\nroutine failed: Too many open files (os error 24)\n```\n\nFix this by adding a semaphore.",
+    "sha": "8f68d0382ebd58c7565c9e064c26c5d6727ce6dc",
+    "files": [
+        {
+            "sha": "3d45254d6b8028e6f76f33dea165c3a310f68afe",
+            "filename": "turbopack/crates/turbopack-bench/src/util/prepared_app.rs",
+            "status": "modified",
+            "additions": 44,
+            "deletions": 24,
+            "changes": 68,
+            "blob_url": "https://github.com/vercel/next.js/blob/8f68d0382ebd58c7565c9e064c26c5d6727ce6dc/turbopack%2Fcrates%2Fturbopack-bench%2Fsrc%2Futil%2Fprepared_app.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/8f68d0382ebd58c7565c9e064c26c5d6727ce6dc/turbopack%2Fcrates%2Fturbopack-bench%2Fsrc%2Futil%2Fprepared_app.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-bench%2Fsrc%2Futil%2Fprepared_app.rs?ref=8f68d0382ebd58c7565c9e064c26c5d6727ce6dc",
+            "patch": "@@ -2,6 +2,7 @@ use std::{\n     future::Future,\n     path::{Path, PathBuf},\n     process::Child,\n+    sync::Arc,\n };\n \n use anyhow::{anyhow, Context, Result};\n@@ -13,42 +14,61 @@ use chromiumoxide::{\n     Browser, Page,\n };\n use futures::{FutureExt, StreamExt};\n-use tokio::task::spawn_blocking;\n+use tokio::{sync::Semaphore, task::spawn_blocking};\n use url::Url;\n \n use crate::{bundlers::Bundler, util::PageGuard, BINDING_NAME};\n \n+async fn copy_dir(from: PathBuf, to: PathBuf) -> anyhow::Result<()> {\n+    copy_dir_inner(from, to, Arc::new(Semaphore::new(64))).await\n+}\n+\n // HACK: Needed so that `copy_dir`'s `Future` can be inferred as `Send`:\n // https://github.com/rust-lang/rust/issues/123072\n-fn copy_dir_send(from: PathBuf, to: PathBuf) -> impl Future<Output = anyhow::Result<()>> + Send {\n-    copy_dir(from, to)\n+fn copy_dir_inner_send(\n+    from: PathBuf,\n+    to: PathBuf,\n+    semaphore: Arc<Semaphore>,\n+) -> impl Future<Output = anyhow::Result<()>> + Send {\n+    copy_dir_inner(from, to, semaphore)\n }\n \n-async fn copy_dir(from: PathBuf, to: PathBuf) -> anyhow::Result<()> {\n-    let dir = spawn_blocking(|| std::fs::read_dir(from)).await??;\n+async fn copy_dir_inner(\n+    from: PathBuf,\n+    to: PathBuf,\n+    semaphore: Arc<Semaphore>,\n+) -> anyhow::Result<()> {\n     let mut jobs = Vec::new();\n-    let mut file_futures = Vec::new();\n-    for entry in dir {\n-        let entry = entry?;\n-        let ty = entry.file_type()?;\n-        let to = to.join(entry.file_name());\n-        if ty.is_dir() {\n-            jobs.push(tokio::spawn(async move {\n-                tokio::fs::create_dir(&to).await?;\n-                copy_dir_send(entry.path(), to).await\n-            }));\n-        } else if ty.is_file() {\n-            file_futures.push(async move {\n-                tokio::fs::copy(entry.path(), to).await?;\n-                Ok::<_, anyhow::Error>(())\n-            });\n+    {\n+        let _permit = semaphore\n+            .acquire()\n+            .await\n+            .expect(\"semaphore is never closed\");\n+        let mut dir = spawn_blocking(|| std::fs::read_dir(from)).await??;\n+        for entry in &mut dir {\n+            let entry = entry?;\n+            let ty = entry.file_type()?;\n+            let to = to.join(entry.file_name());\n+            if ty.is_dir() {\n+                let semaphore = semaphore.clone();\n+                jobs.push(tokio::spawn(async move {\n+                    tokio::fs::create_dir(&to).await?;\n+                    copy_dir_inner_send(entry.path(), to, semaphore).await\n+                }));\n+            } else if ty.is_file() {\n+                let semaphore = semaphore.clone();\n+                jobs.push(tokio::spawn(async move {\n+                    let _permit = semaphore\n+                        .acquire()\n+                        .await\n+                        .expect(\"semaphore is never closed\");\n+                    tokio::fs::copy(entry.path(), to).await?;\n+                    Ok::<_, anyhow::Error>(())\n+                }));\n+            }\n         }\n     }\n \n-    for future in file_futures {\n-        jobs.push(tokio::spawn(future));\n-    }\n-\n     for job in jobs {\n         job.await??;\n     }"
+        }
+    ],
+    "stats": {
+        "total": 68,
+        "additions": 44,
+        "deletions": 24
+    }
+}

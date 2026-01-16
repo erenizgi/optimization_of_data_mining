@@ -1,0 +1,108 @@
+{
+    "author": "lubieowoce",
+    "message": "[Segment Cache] use `loading` from dynamic response for unprefetched navigations (#83305)\n\nIf we're navigating to a page without a prefetch, we obviously can't\nshow an instant loading state. However, if the page has a `loading.tsx`,\nthen the loading component will still stream in as part of the dynamic\nresponse, and we should use it to render a loading boundary around the\npage content. If we don't, then the navigation will block until the\ncontent resolves into something renderable (either finishes or manages\nto render a suspense boundary of its own).\n\nThis wasn't being done because `createPendingCacheNode` (used for\nunprefetched navigations) was always setting `loading` to `null`, and\nthen was never updated with the `loading` received from the dynamic\nresponse. With this PR, if we don't already have a prefetched loading\nstate, we'll now handle `loading` the same as we do `rsc` (the segment's\ncontent) -- we'll create a deferred promise for `loading` and resolve it\nwhen the relevant segment streams in.\n\nNote that before the deferred promise is resolved, the relevant\n`LoadingBoundary` itself will suspend on it, but since it sits right\nabove `rsc` (and is in a new subtree) we won't hide any more contents\nthan we would when suspending on the `rsc` promise -- we don't have a\nprefetch, so we won't have an existing loading state to display there\nanyway.\n\nAlso I had to do some typescript tweaks to `createDeferredRsc` to allow\nit to contain a more specific type than `ReactNode`. it's a bit noisy,\nso that's pulled out into a separate commit for ease of review.",
+    "sha": "b2c7ad53e4a8233afcd3ece155b41819e083e711",
+    "files": [
+        {
+            "sha": "e20f545bf106ea096a682392c7ee75b058a3ae32",
+            "filename": "packages/next/src/client/components/router-reducer/ppr-navigations.ts",
+            "status": "modified",
+            "additions": 44,
+            "deletions": 24,
+            "changes": 68,
+            "blob_url": "https://github.com/vercel/next.js/blob/b2c7ad53e4a8233afcd3ece155b41819e083e711/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Frouter-reducer%2Fppr-navigations.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/b2c7ad53e4a8233afcd3ece155b41819e083e711/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Frouter-reducer%2Fppr-navigations.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Frouter-reducer%2Fppr-navigations.ts?ref=b2c7ad53e4a8233afcd3ece155b41819e083e711",
+            "patch": "@@ -973,24 +973,28 @@ function createPendingCacheNode(\n   }\n \n   const maybePrefetchRsc = prefetchData !== null ? prefetchData[1] : null\n-  const maybePrefetchLoading = prefetchData !== null ? prefetchData[3] : null\n   return {\n     lazyData: null,\n     parallelRoutes: parallelRoutes,\n \n     prefetchRsc: maybePrefetchRsc !== undefined ? maybePrefetchRsc : null,\n     prefetchHead: isLeafSegment ? prefetchHead : [null, null],\n \n-    // TODO: Technically, a loading boundary could contain dynamic data. We must\n-    // have separate `loading` and `prefetchLoading` fields to handle this, like\n-    // we do for the segment data and head.\n-    loading: maybePrefetchLoading !== undefined ? maybePrefetchLoading : null,\n-\n     // Create a deferred promise. This will be fulfilled once the dynamic\n     // response is received from the server.\n     rsc: createDeferredRsc() as React.ReactNode,\n     head: isLeafSegment ? (createDeferredRsc() as React.ReactNode) : null,\n \n+    // TODO: Technically, a loading boundary could contain dynamic data. We must\n+    // have separate `loading` and `prefetchLoading` fields to handle this, like\n+    // we do for the segment data and head.\n+    loading:\n+      prefetchData !== null\n+        ? (prefetchData[3] ?? null)\n+        : // If we don't have a prefetch, then we don't know if there's a loading component.\n+          // We'll fulfill it based on the dynamic response, just like `rsc` and `head`.\n+          createDeferredRsc<LoadingModuleData>(),\n+\n     navigatedAt,\n   }\n }\n@@ -1089,6 +1093,14 @@ function finishPendingCacheNode(\n     // been populated by a different navigation. We must not overwrite it.\n   }\n \n+  // If we navigated without a prefetch, then `loading` will be a deferred promise too.\n+  // Fulfill it using the dynamic response so that we can display the loading boundary.\n+  const loading = cacheNode.loading\n+  if (isDeferredRsc(loading)) {\n+    const dynamicLoading = dynamicData[3]\n+    loading.resolve(dynamicLoading)\n+  }\n+\n   // Check if this is a leaf segment. If so, it will have a `head` property with\n   // a pending promise that needs to be resolved with the dynamic head from\n   // the server.\n@@ -1153,6 +1165,7 @@ function abortPendingCacheNode(\n       // used to construct the cache nodes in the first place.\n     }\n   }\n+\n   const rsc = cacheNode.rsc\n   if (isDeferredRsc(rsc)) {\n     if (error === null) {\n@@ -1164,6 +1177,11 @@ function abortPendingCacheNode(\n     }\n   }\n \n+  const loading = cacheNode.loading\n+  if (isDeferredRsc(loading)) {\n+    loading.resolve(null)\n+  }\n+\n   // Check if this is a leaf segment. If so, it will have a `head` property with\n   // a pending promise that needs to be resolved. If an error was provided, we\n   // will not resolve it with an error, since this is rendered at the root of\n@@ -1240,61 +1258,63 @@ export function updateCacheNodeOnPopstateRestoration(\n \n const DEFERRED = Symbol()\n \n-type PendingDeferredRsc = Promise<React.ReactNode> & {\n+type PendingDeferredRsc<T> = Promise<T> & {\n   status: 'pending'\n-  resolve: (value: React.ReactNode) => void\n+  resolve: (value: T) => void\n   reject: (error: any) => void\n   tag: Symbol\n }\n \n-type FulfilledDeferredRsc = Promise<React.ReactNode> & {\n+type FulfilledDeferredRsc<T> = Promise<T> & {\n   status: 'fulfilled'\n-  value: React.ReactNode\n-  resolve: (value: React.ReactNode) => void\n+  value: T\n+  resolve: (value: T) => void\n   reject: (error: any) => void\n   tag: Symbol\n }\n \n-type RejectedDeferredRsc = Promise<React.ReactNode> & {\n+type RejectedDeferredRsc<T> = Promise<T> & {\n   status: 'rejected'\n   reason: any\n-  resolve: (value: React.ReactNode) => void\n+  resolve: (value: T) => void\n   reject: (error: any) => void\n   tag: Symbol\n }\n \n-type DeferredRsc =\n-  | PendingDeferredRsc\n-  | FulfilledDeferredRsc\n-  | RejectedDeferredRsc\n+type DeferredRsc<T extends React.ReactNode = React.ReactNode> =\n+  | PendingDeferredRsc<T>\n+  | FulfilledDeferredRsc<T>\n+  | RejectedDeferredRsc<T>\n \n // This type exists to distinguish a DeferredRsc from a Flight promise. It's a\n // compromise to avoid adding an extra field on every Cache Node, which would be\n // awkward because the pre-PPR parts of codebase would need to account for it,\n // too. We can remove it once type Cache Node type is more settled.\n function isDeferredRsc(value: any): value is DeferredRsc {\n-  return value && value.tag === DEFERRED\n+  return value && typeof value === 'object' && value.tag === DEFERRED\n }\n \n-function createDeferredRsc(): PendingDeferredRsc {\n+function createDeferredRsc<\n+  T extends React.ReactNode = React.ReactNode,\n+>(): PendingDeferredRsc<T> {\n   let resolve: any\n   let reject: any\n-  const pendingRsc = new Promise<React.ReactNode>((res, rej) => {\n+  const pendingRsc = new Promise<T>((res, rej) => {\n     resolve = res\n     reject = rej\n-  }) as PendingDeferredRsc\n+  }) as PendingDeferredRsc<T>\n   pendingRsc.status = 'pending'\n-  pendingRsc.resolve = (value: React.ReactNode) => {\n+  pendingRsc.resolve = (value: T) => {\n     if (pendingRsc.status === 'pending') {\n-      const fulfilledRsc: FulfilledDeferredRsc = pendingRsc as any\n+      const fulfilledRsc: FulfilledDeferredRsc<T> = pendingRsc as any\n       fulfilledRsc.status = 'fulfilled'\n       fulfilledRsc.value = value\n       resolve(value)\n     }\n   }\n   pendingRsc.reject = (error: any) => {\n     if (pendingRsc.status === 'pending') {\n-      const rejectedRsc: RejectedDeferredRsc = pendingRsc as any\n+      const rejectedRsc: RejectedDeferredRsc<T> = pendingRsc as any\n       rejectedRsc.status = 'rejected'\n       rejectedRsc.reason = error\n       reject(error)"
+        },
+        {
+            "sha": "228b8d190dcb9d295c0afed41fddc9e3f48c6658",
+            "filename": "test/e2e/app-dir/segment-cache/no-prefetch/app/layout.tsx",
+            "status": "added",
+            "additions": 8,
+            "deletions": 0,
+            "changes": 8,
+            "blob_url": "https://github.com/vercel/next.js/blob/b2c7ad53e4a8233afcd3ece155b41819e083e711/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Fno-prefetch%2Fapp%2Flayout.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/b2c7ad53e4a8233afcd3ece155b41819e083e711/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Fno-prefetch%2Fapp%2Flayout.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Fno-prefetch%2Fapp%2Flayout.tsx?ref=b2c7ad53e4a8233afcd3ece155b41819e083e711",
+            "patch": "@@ -0,0 +1,8 @@\n+export default function RootLayout({ children }: LayoutProps<'/'>) {\n+  return (\n+    <html>\n+      <head></head>\n+      <body>{children}</body>\n+    </html>\n+  )\n+}"
+        },
+        {
+            "sha": "f294cf41844c10fa73dfb4b2ca32f27d6312ca2f",
+            "filename": "test/e2e/app-dir/segment-cache/no-prefetch/app/page.tsx",
+            "status": "added",
+            "additions": 12,
+            "deletions": 0,
+            "changes": 12,
+            "blob_url": "https://github.com/vercel/next.js/blob/b2c7ad53e4a8233afcd3ece155b41819e083e711/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Fno-prefetch%2Fapp%2Fpage.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/b2c7ad53e4a8233afcd3ece155b41819e083e711/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Fno-prefetch%2Fapp%2Fpage.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Fno-prefetch%2Fapp%2Fpage.tsx?ref=b2c7ad53e4a8233afcd3ece155b41819e083e711",
+            "patch": "@@ -0,0 +1,12 @@\n+import Link from 'next/link'\n+\n+export default function Page() {\n+  return (\n+    <main>\n+      <h1>Home</h1>\n+      <Link href=\"/with-loading\" prefetch={false}>\n+        Go to /with-loading (no prefetch)\n+      </Link>\n+    </main>\n+  )\n+}"
+        },
+        {
+            "sha": "fa67c72daa3571719301b8af38800a97ab5c18fb",
+            "filename": "test/e2e/app-dir/segment-cache/no-prefetch/app/with-loading/client.tsx",
+            "status": "added",
+            "additions": 10,
+            "deletions": 0,
+            "changes": 10,
+            "blob_url": "https://github.com/vercel/next.js/blob/b2c7ad53e4a8233afcd3ece155b41819e083e711/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Fno-prefetch%2Fapp%2Fwith-loading%2Fclient.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/b2c7ad53e4a8233afcd3ece155b41819e083e711/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Fno-prefetch%2Fapp%2Fwith-loading%2Fclient.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Fno-prefetch%2Fapp%2Fwith-loading%2Fclient.tsx?ref=b2c7ad53e4a8233afcd3ece155b41819e083e711",
+            "patch": "@@ -0,0 +1,10 @@\n+'use client'\n+\n+import { use } from 'react'\n+\n+const infinitePromise = new Promise<never>(() => {})\n+\n+export function SuspendForeverOnClient() {\n+  use(infinitePromise)\n+  return null\n+}"
+        },
+        {
+            "sha": "f08dd42c28f8df53c0eba825aebbf4d336a452db",
+            "filename": "test/e2e/app-dir/segment-cache/no-prefetch/app/with-loading/loading.tsx",
+            "status": "added",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/b2c7ad53e4a8233afcd3ece155b41819e083e711/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Fno-prefetch%2Fapp%2Fwith-loading%2Floading.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/b2c7ad53e4a8233afcd3ece155b41819e083e711/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Fno-prefetch%2Fapp%2Fwith-loading%2Floading.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Fno-prefetch%2Fapp%2Fwith-loading%2Floading.tsx?ref=b2c7ad53e4a8233afcd3ece155b41819e083e711",
+            "patch": "@@ -0,0 +1,3 @@\n+export default function Loading() {\n+  return <div id=\"loading-component\">Loading...</div>\n+}"
+        },
+        {
+            "sha": "044874a46804ac8b1ca3f3cdd9fdc53b28a59561",
+            "filename": "test/e2e/app-dir/segment-cache/no-prefetch/app/with-loading/page.tsx",
+            "status": "added",
+            "additions": 12,
+            "deletions": 0,
+            "changes": 12,
+            "blob_url": "https://github.com/vercel/next.js/blob/b2c7ad53e4a8233afcd3ece155b41819e083e711/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Fno-prefetch%2Fapp%2Fwith-loading%2Fpage.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/b2c7ad53e4a8233afcd3ece155b41819e083e711/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Fno-prefetch%2Fapp%2Fwith-loading%2Fpage.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Fno-prefetch%2Fapp%2Fwith-loading%2Fpage.tsx?ref=b2c7ad53e4a8233afcd3ece155b41819e083e711",
+            "patch": "@@ -0,0 +1,12 @@\n+import { connection } from 'next/server'\n+import { SuspendForeverOnClient } from './client'\n+\n+export default async function Page() {\n+  await connection()\n+  return (\n+    <main>\n+      {/* Block on the client to make sure that the loading boundary works correctly. */}\n+      <SuspendForeverOnClient />\n+    </main>\n+  )\n+}"
+        },
+        {
+            "sha": "2dcda1f3c0f692388f6bc12114e05e8d37faea01",
+            "filename": "test/e2e/app-dir/segment-cache/no-prefetch/next.config.js",
+            "status": "added",
+            "additions": 8,
+            "deletions": 0,
+            "changes": 8,
+            "blob_url": "https://github.com/vercel/next.js/blob/b2c7ad53e4a8233afcd3ece155b41819e083e711/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Fno-prefetch%2Fnext.config.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/b2c7ad53e4a8233afcd3ece155b41819e083e711/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Fno-prefetch%2Fnext.config.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Fno-prefetch%2Fnext.config.js?ref=b2c7ad53e4a8233afcd3ece155b41819e083e711",
+            "patch": "@@ -0,0 +1,8 @@\n+/** @type {import('next').NextConfig} */\n+module.exports = {\n+  experimental: {\n+    clientSegmentCache: true,\n+    clientParamParsing: true,\n+  },\n+  productionBrowserSourceMaps: true,\n+}"
+        },
+        {
+            "sha": "438372ab38a6a16c7ea1682fecbe112f900a61bd",
+            "filename": "test/e2e/app-dir/segment-cache/no-prefetch/no-prefetch.test.ts",
+            "status": "added",
+            "additions": 29,
+            "deletions": 0,
+            "changes": 29,
+            "blob_url": "https://github.com/vercel/next.js/blob/b2c7ad53e4a8233afcd3ece155b41819e083e711/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Fno-prefetch%2Fno-prefetch.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/b2c7ad53e4a8233afcd3ece155b41819e083e711/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Fno-prefetch%2Fno-prefetch.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fsegment-cache%2Fno-prefetch%2Fno-prefetch.test.ts?ref=b2c7ad53e4a8233afcd3ece155b41819e083e711",
+            "patch": "@@ -0,0 +1,29 @@\n+import { nextTestSetup } from 'e2e-utils'\n+import { createRouterAct } from '../router-act'\n+\n+describe('navigating without a prefetch', () => {\n+  const { next } = nextTestSetup({\n+    files: __dirname,\n+  })\n+\n+  it('can show a loading boundary from the dynamic response', async () => {\n+    let act: ReturnType<typeof createRouterAct>\n+    const browser = await next.browser('/', {\n+      beforePageLoad(page) {\n+        act = createRouterAct(page)\n+      },\n+    })\n+\n+    // Navigate to a dynamic page with a `loading.tsx` without a prefetch.\n+    await act(async () => {\n+      await browser.elementByCss('a[href=\"/with-loading\"]').click()\n+    })\n+\n+    // The page suspends on the client, so we should display the `loading` that we got from the dynamic response.\n+    expect(\n+      await browser\n+        .elementByCss('#loading-component', { state: 'visible' })\n+        .text()\n+    ).toContain('Loading...')\n+  })\n+})"
+        }
+    ],
+    "stats": {
+        "total": 150,
+        "additions": 126,
+        "deletions": 24
+    }
+}

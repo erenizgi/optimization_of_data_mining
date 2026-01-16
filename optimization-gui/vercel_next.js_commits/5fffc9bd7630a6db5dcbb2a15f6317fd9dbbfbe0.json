@@ -1,0 +1,96 @@
+{
+    "author": "huozhi",
+    "message": "[metadata] always serve streaming metadata in build (#77437)\n\n### What\r\n\r\nDuring the export phase in next build, we always enable the streaming metadata since if there's any dynamic access in metadata we can determine it in the build phase. If it's static, then it won't affect anything. If it's dynamic, then it can be handled when request hits the route.\r\n\r\n### Why\r\n\r\nWe want it enabled even during build b/c this is how we will enforce DIO rules without making any dynamic metadata automatically a build failure",
+    "sha": "5fffc9bd7630a6db5dcbb2a15f6317fd9dbbfbe0",
+    "files": [
+        {
+            "sha": "77bdfb4cd5d5d6e16d0c2634da98dfbae64770c5",
+            "filename": "packages/next/src/export/worker.ts",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 6,
+            "changes": 11,
+            "blob_url": "https://github.com/vercel/next.js/blob/5fffc9bd7630a6db5dcbb2a15f6317fd9dbbfbe0/packages%2Fnext%2Fsrc%2Fexport%2Fworker.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/5fffc9bd7630a6db5dcbb2a15f6317fd9dbbfbe0/packages%2Fnext%2Fsrc%2Fexport%2Fworker.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fexport%2Fworker.ts?ref=5fffc9bd7630a6db5dcbb2a15f6317fd9dbbfbe0",
+            "patch": "@@ -253,11 +253,6 @@ async function exportPageImpl(\n     )\n   }\n \n-  // During the export phase in next build, if it's using PPR we can serve streaming metadata\n-  // when it's available. When we're building the PPR rendering result, we don't need to rely\n-  // on the user agent. The result can be determined to serve streaming on infrastructure level.\n-  const serveStreamingMetadata = !!isRoutePPREnabled\n-\n   const renderOpts: WorkerRenderOpts = {\n     ...components,\n     ...input.renderOpts,\n@@ -267,7 +262,11 @@ async function exportPageImpl(\n     disableOptimizedLoading,\n     locale,\n     supportsDynamicResponse: false,\n-    serveStreamingMetadata,\n+    // During the export phase in next build, we always enable the streaming metadata since if there's\n+    // any dynamic access in metadata we can determine it in the build phase.\n+    // If it's static, then it won't affect anything.\n+    // If it's dynamic, then it can be handled when request hits the route.\n+    serveStreamingMetadata: true,\n     experimental: {\n       ...input.renderOpts.experimental,\n       isRoutePPREnabled,"
+        },
+        {
+            "sha": "add2d8eb09ee0823115b6dbc7b4ae143a59ab54f",
+            "filename": "packages/next/src/server/app-render/app-render.tsx",
+            "status": "modified",
+            "additions": 25,
+            "deletions": 9,
+            "changes": 34,
+            "blob_url": "https://github.com/vercel/next.js/blob/5fffc9bd7630a6db5dcbb2a15f6317fd9dbbfbe0/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fapp-render.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/5fffc9bd7630a6db5dcbb2a15f6317fd9dbbfbe0/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fapp-render.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Fapp-render.tsx?ref=5fffc9bd7630a6db5dcbb2a15f6317fd9dbbfbe0",
+            "patch": "@@ -972,6 +972,7 @@ async function getErrorRSCPayload(\n       {process.env.NODE_ENV === 'development' && (\n         <meta name=\"next-error\" content=\"not-found\" />\n       )}\n+      {StreamingMetadata ? <StreamingMetadata /> : null}\n       <StaticMetadata />\n     </React.Fragment>\n   )\n@@ -992,7 +993,10 @@ async function getErrorRSCPayload(\n   const seedData: CacheNodeSeedData = [\n     initialTree[0],\n     <html id=\"__next_error__\">\n-      <head>{StreamingMetadata ? <StreamingMetadata /> : null}</head>\n+      <head>\n+        {StreamingMetadata ? <StreamingMetadata /> : null}\n+        <StaticMetadata />\n+      </head>\n       <body>\n         {process.env.NODE_ENV !== 'production' && err ? (\n           <template\n@@ -1099,15 +1103,19 @@ function App<T>({\n // @TODO our error stream should be probably just use the same root component. But it was previously\n // different I don't want to figure out if that is meaningful at this time so just keeping the behavior\n // consistent for now.\n-function AppWithoutContext<T>({\n+function ErrorApp<T>({\n   reactServerStream,\n   preinitScripts,\n   clientReferenceManifest,\n+  ServerInsertedMetadataProvider,\n+  ServerInsertedHTMLProvider,\n   nonce,\n }: {\n   reactServerStream: BinaryStreamOf<T>\n   preinitScripts: () => void\n   clientReferenceManifest: NonNullable<RenderOpts['clientReferenceManifest']>\n+  ServerInsertedMetadataProvider: React.ComponentType<{ children: JSX.Element }>\n+  ServerInsertedHTMLProvider: React.ComponentType<{ children: JSX.Element }>\n   nonce?: string\n }): JSX.Element {\n   preinitScripts()\n@@ -1134,11 +1142,15 @@ function AppWithoutContext<T>({\n   const actionQueue = createMutableActionQueue(initialState)\n \n   return (\n-    <AppRouter\n-      actionQueue={actionQueue}\n-      globalErrorComponentAndStyles={response.G}\n-      assetPrefix={response.p}\n-    />\n+    <ServerInsertedMetadataProvider>\n+      <ServerInsertedHTMLProvider>\n+        <AppRouter\n+          actionQueue={actionQueue}\n+          globalErrorComponentAndStyles={response.G}\n+          assetPrefix={response.p}\n+        />\n+      </ServerInsertedHTMLProvider>\n+    </ServerInsertedMetadataProvider>\n   )\n }\n \n@@ -2106,8 +2118,10 @@ async function renderToStream(\n         {\n           ReactDOMServer: require('react-dom/server.edge'),\n           element: (\n-            <AppWithoutContext\n+            <ErrorApp\n               reactServerStream={errorServerStream}\n+              ServerInsertedMetadataProvider={ServerInsertedMetadataProvider}\n+              ServerInsertedHTMLProvider={ServerInsertedHTMLProvider}\n               preinitScripts={errorPreinitScripts}\n               clientReferenceManifest={clientReferenceManifest}\n               nonce={ctx.nonce}\n@@ -4019,8 +4033,10 @@ async function prerenderToStream(\n       const fizzStream = await renderToInitialFizzStream({\n         ReactDOMServer: require('react-dom/server.edge'),\n         element: (\n-          <AppWithoutContext\n+          <ErrorApp\n             reactServerStream={errorServerStream}\n+            ServerInsertedMetadataProvider={ServerInsertedMetadataProvider}\n+            ServerInsertedHTMLProvider={ServerInsertedHTMLProvider}\n             preinitScripts={errorPreinitScripts}\n             clientReferenceManifest={clientReferenceManifest}\n             nonce={ctx.nonce}"
+        },
+        {
+            "sha": "4902d12e6d0606653eade70e2ce6cd73aba165e8",
+            "filename": "test/e2e/app-dir/metadata-streaming/app/static/full/page.tsx",
+            "status": "added",
+            "additions": 10,
+            "deletions": 0,
+            "changes": 10,
+            "blob_url": "https://github.com/vercel/next.js/blob/5fffc9bd7630a6db5dcbb2a15f6317fd9dbbfbe0/test%2Fe2e%2Fapp-dir%2Fmetadata-streaming%2Fapp%2Fstatic%2Ffull%2Fpage.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/5fffc9bd7630a6db5dcbb2a15f6317fd9dbbfbe0/test%2Fe2e%2Fapp-dir%2Fmetadata-streaming%2Fapp%2Fstatic%2Ffull%2Fpage.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fmetadata-streaming%2Fapp%2Fstatic%2Ffull%2Fpage.tsx?ref=5fffc9bd7630a6db5dcbb2a15f6317fd9dbbfbe0",
+            "patch": "@@ -0,0 +1,10 @@\n+export default function Page() {\n+  return <div>static page</div>\n+}\n+\n+export async function generateMetadata() {\n+  return {\n+    title: 'static page',\n+    description: 'static page description',\n+  }\n+}"
+        },
+        {
+            "sha": "41b44c1cb5d9692132ed933681735aaf2a888630",
+            "filename": "test/e2e/app-dir/metadata-streaming/app/static/partial/layout.tsx",
+            "status": "added",
+            "additions": 18,
+            "deletions": 0,
+            "changes": 18,
+            "blob_url": "https://github.com/vercel/next.js/blob/5fffc9bd7630a6db5dcbb2a15f6317fd9dbbfbe0/test%2Fe2e%2Fapp-dir%2Fmetadata-streaming%2Fapp%2Fstatic%2Fpartial%2Flayout.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/5fffc9bd7630a6db5dcbb2a15f6317fd9dbbfbe0/test%2Fe2e%2Fapp-dir%2Fmetadata-streaming%2Fapp%2Fstatic%2Fpartial%2Flayout.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fmetadata-streaming%2Fapp%2Fstatic%2Fpartial%2Flayout.tsx?ref=5fffc9bd7630a6db5dcbb2a15f6317fd9dbbfbe0",
+            "patch": "@@ -0,0 +1,18 @@\n+import React, { Suspense } from 'react'\n+\n+async function Inner({ children }) {\n+  await new Promise((resolve) => setTimeout(resolve, 1 * 1000))\n+  return (\n+    <div className=\"inner\">\n+      <Suspense>{children}</Suspense>\n+    </div>\n+  )\n+}\n+\n+export default function Layout({ children }: { children: React.ReactNode }) {\n+  return (\n+    <Suspense>\n+      <Inner>{children}</Inner>\n+    </Suspense>\n+  )\n+}"
+        },
+        {
+            "sha": "658725036a84f7cde4cf251248b4b07e860ed8d8",
+            "filename": "test/e2e/app-dir/metadata-streaming/app/static/partial/page.tsx",
+            "status": "added",
+            "additions": 27,
+            "deletions": 0,
+            "changes": 27,
+            "blob_url": "https://github.com/vercel/next.js/blob/5fffc9bd7630a6db5dcbb2a15f6317fd9dbbfbe0/test%2Fe2e%2Fapp-dir%2Fmetadata-streaming%2Fapp%2Fstatic%2Fpartial%2Fpage.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/5fffc9bd7630a6db5dcbb2a15f6317fd9dbbfbe0/test%2Fe2e%2Fapp-dir%2Fmetadata-streaming%2Fapp%2Fstatic%2Fpartial%2Fpage.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fmetadata-streaming%2Fapp%2Fstatic%2Fpartial%2Fpage.tsx?ref=5fffc9bd7630a6db5dcbb2a15f6317fd9dbbfbe0",
+            "patch": "@@ -0,0 +1,27 @@\n+import { Suspense } from 'react'\n+import { connection } from 'next/server'\n+\n+export default function Page() {\n+  return (\n+    <div>\n+      inner static page\n+      <Suspense>\n+        <Inner />\n+      </Suspense>\n+    </div>\n+  )\n+}\n+\n+async function Inner() {\n+  await new Promise((resolve) => setTimeout(resolve, 500))\n+  return <div>inner</div>\n+}\n+\n+export async function generateMetadata() {\n+  await new Promise((resolve) => setTimeout(resolve, 1 * 1000))\n+  await connection()\n+  return {\n+    title: 'partial static page',\n+    description: 'partial static page description',\n+  }\n+}"
+        },
+        {
+            "sha": "b761c235c80f28eab6aa1bbcada8e29dc80dcc83",
+            "filename": "test/e2e/app-dir/metadata-streaming/metadata-streaming.test.ts",
+            "status": "modified",
+            "additions": 28,
+            "deletions": 0,
+            "changes": 28,
+            "blob_url": "https://github.com/vercel/next.js/blob/5fffc9bd7630a6db5dcbb2a15f6317fd9dbbfbe0/test%2Fe2e%2Fapp-dir%2Fmetadata-streaming%2Fmetadata-streaming.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/5fffc9bd7630a6db5dcbb2a15f6317fd9dbbfbe0/test%2Fe2e%2Fapp-dir%2Fmetadata-streaming%2Fmetadata-streaming.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fmetadata-streaming%2Fmetadata-streaming.test.ts?ref=5fffc9bd7630a6db5dcbb2a15f6317fd9dbbfbe0",
+            "patch": "@@ -205,4 +205,32 @@ describe('app-dir - metadata-streaming', () => {\n       expect(status).toBe(307)\n     })\n   })\n+\n+  describe('static', () => {\n+    it('should render static metadata in the head', async () => {\n+      const $ = await next.render$('/static/full')\n+      expect($('title').length).toBe(1)\n+      expect($('head title').text()).toBe('static page')\n+    })\n+\n+    it('should determine dynamic metadata in build and render in the body', async () => {\n+      const $ = await next.render$('/static/partial')\n+      expect($('title').length).toBe(1)\n+      expect($('body title').text()).toBe('partial static page')\n+    })\n+\n+    it('should still render dynamic metadata in the head for html bots', async () => {\n+      const $ = await next.render$(\n+        '/static/partial',\n+        {},\n+        {\n+          headers: {\n+            'user-agent': 'Twitterbot',\n+          },\n+        }\n+      )\n+      expect($('title').length).toBe(1)\n+      expect($('head title').text()).toBe('partial static page')\n+    })\n+  })\n })"
+        },
+        {
+            "sha": "1df0fab01451ab8a3ebc3efbc14a93c368b05ccf",
+            "filename": "test/e2e/app-dir/parallel-routes-not-found/parallel-routes-not-found.test.ts",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 18,
+            "changes": 22,
+            "blob_url": "https://github.com/vercel/next.js/blob/5fffc9bd7630a6db5dcbb2a15f6317fd9dbbfbe0/test%2Fe2e%2Fapp-dir%2Fparallel-routes-not-found%2Fparallel-routes-not-found.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/5fffc9bd7630a6db5dcbb2a15f6317fd9dbbfbe0/test%2Fe2e%2Fapp-dir%2Fparallel-routes-not-found%2Fparallel-routes-not-found.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fparallel-routes-not-found%2Fparallel-routes-not-found.test.ts?ref=5fffc9bd7630a6db5dcbb2a15f6317fd9dbbfbe0",
+            "patch": "@@ -1,9 +1,7 @@\n import { nextTestSetup } from 'e2e-utils'\n \n-const isPPR = process.env.__NEXT_EXPERIMENTAL_PPR === 'true'\n-\n describe('parallel-routes-and-interception', () => {\n-  const { next, isNextDev, skipped } = nextTestSetup({\n+  const { next, skipped } = nextTestSetup({\n     files: __dirname,\n     // TODO: remove after deployment handling is updated\n     skipDeployment: true,\n@@ -23,21 +21,9 @@ describe('parallel-routes-and-interception', () => {\n \n     // we also check that the #children-slot id is not present\n     expect(await browser.hasElementByCssSelector('#children-slot')).toBe(false)\n-\n-    if (isPPR && !isNextDev) {\n-      let $ = await next.render$('/')\n-      expect($('title').text()).toBe('')\n-\n-      $ = await next.render$('/', null, {\n-        headers: {\n-          'User-Agent': 'Discordbot',\n-        },\n-      })\n-      expect($('title').text()).toBe('layout title')\n-    } else {\n-      const $ = await next.render$('/')\n-      expect($('title').text()).toBe('layout title')\n-    }\n+    const $ = await next.render$('/')\n+    expect($('title').length).toBe(1)\n+    expect($('title').text()).toBe('layout title')\n   })\n \n   it('should render the title once for the non-existed route', async () => {"
+        }
+    ],
+    "stats": {
+        "total": 150,
+        "additions": 117,
+        "deletions": 33
+    }
+}

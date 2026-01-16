@@ -1,0 +1,24 @@
+{
+    "author": "xenova",
+    "message": "Fix torch.onnx.export of Qwen2-VL vision encoder (#34852)\n\n* Fix torch.onnx.export of Qwen2-VL vision encoder\r\n\r\nThis PR fixes onnx export support for the vision encoder of Qwen2-VL, which converts the `cu_seqlens` to `torch.int32`, leading to errors later on when using the values for slicing.\r\n\r\nhttps://github.com/huggingface/transformers/blob/c57eafdaa119eecae8557be4c626629bc1adc0fd/src/transformers/models/qwen2_vl/modeling_qwen2_vl.py#L1044-L1046\r\n\r\n## Error:\r\n```\r\nonnx.onnx_cpp2py_export.shape_inference.InferenceError: [ShapeInferenceError] (op_type:Slice, node name: /blocks.0/attn/Slice_4): axes has inconsistent type tensor(int64)\r\n```\r\n\r\n## Code to reproduce issue:\r\n```py\r\n\r\nimport requests\r\nfrom PIL import Image\r\nimport torch\r\nfrom transformers import (\r\n    AutoProcessor,\r\n    Qwen2VLForConditionalGeneration,\r\n)\r\n\r\n# Constants\r\nVISION_MODEL_NAME = \"vision_encoder.onnx\"\r\n\r\n# Load model and processor\r\nmodel_id = \"hf-internal-testing/tiny-random-Qwen2VLForConditionalGeneration\"\r\nmodel = Qwen2VLForConditionalGeneration.from_pretrained(model_id).eval()\r\nprocessor = AutoProcessor.from_pretrained(model_id)\r\n\r\n# Prepare inputs\r\nurl = \"https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg\"\r\nimage = Image.open(requests.get(url, stream=True).raw)\r\nconversation = [\r\n    {\r\n        \"role\": \"user\",\r\n        \"content\": [\r\n            { \"type\": \"image\" },\r\n            { \"type\": \"text\", \"text\": \"Describe this image.\"},\r\n        ],\r\n    },\r\n]\r\nimages = [image]\r\ntext_prompt = processor.apply_chat_template(conversation, add_generation_prompt=True)\r\ninputs = processor(text=[text_prompt], images=images, padding=True, return_tensors=\"pt\")\r\n\r\n## Vision model\r\nvision_inputs = dict(\r\n    pixel_values=inputs[\"pixel_values\"],\r\n    grid_thw=inputs[\"image_grid_thw\"],\r\n)\r\nvision_inputs_positional = tuple(vision_inputs.values())\r\nvision_outputs = model.visual.forward(*vision_inputs_positional)  # Test forward pass\r\ntorch.onnx.export(\r\n    model.visual,\r\n    args=vision_inputs_positional,\r\n    f=VISION_MODEL_NAME,\r\n    export_params=True,\r\n    opset_version=14,\r\n    do_constant_folding=True,\r\n    input_names=list(vision_inputs.keys()),\r\n    output_names=[\"image_features\"],\r\n    dynamic_axes={\r\n        \"pixel_values\": {\r\n            0: \"batch_size * grid_t * grid_h * grid_w\",\r\n            1: \"channel * temporal_patch_size * patch_size * patch_size\",\r\n        },\r\n        \"grid_thw\": {0: \"batch_size\"},\r\n        \"image_features\": {0: \"batch_size * grid_t * grid_h * grid_w\"},\r\n    },\r\n)\r\n\r\n# Load and check the exported model model\r\nimport onnx\r\nmodel = onnx.load(VISION_MODEL_NAME)\r\nonnx.checker.check_model(model, full_check=True)\r\ninferred = onnx.shape_inference.infer_shapes(model, check_type=True)\r\n```\r\n\r\n* Formatting\r\n\r\n* [run-slow] qwen2_vl",
+    "sha": "1f6b423f0ce0c6e7afd300b59e5fd1a816e4896c",
+    "files": [
+        {
+            "sha": "5455fcdf3c51d69a30dfc5ec00194483b6402b2a",
+            "filename": "src/transformers/models/qwen2_vl/modeling_qwen2_vl.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/huggingface/transformers/blob/1f6b423f0ce0c6e7afd300b59e5fd1a816e4896c/src%2Ftransformers%2Fmodels%2Fqwen2_vl%2Fmodeling_qwen2_vl.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/1f6b423f0ce0c6e7afd300b59e5fd1a816e4896c/src%2Ftransformers%2Fmodels%2Fqwen2_vl%2Fmodeling_qwen2_vl.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fqwen2_vl%2Fmodeling_qwen2_vl.py?ref=1f6b423f0ce0c6e7afd300b59e5fd1a816e4896c",
+            "patch": "@@ -1025,7 +1025,7 @@ def forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor) -> torch.\n         rotary_pos_emb = self.rot_pos_emb(grid_thw)\n \n         cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(\n-            dim=0, dtype=torch.int32\n+            dim=0, dtype=grid_thw.dtype\n         )\n         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)\n "
+        }
+    ],
+    "stats": {
+        "total": 2,
+        "additions": 1,
+        "deletions": 1
+    }
+}

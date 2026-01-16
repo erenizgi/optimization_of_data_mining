@@ -1,0 +1,36 @@
+{
+    "author": "mobicham",
+    "message": "Fix hqq skipped modules and dynamic quant (#36821)\n\n* Fix hqq skip_modules and dynamic_quant\n\n* fix skipped modules loading\n\n* add dynamic/skip HqqConfig test",
+    "sha": "3e8f0fbf44f8223a50ce05864a7cea223085fb9a",
+    "files": [
+        {
+            "sha": "8524e7dcec161c279b1779f2683c6180afba5aeb",
+            "filename": "src/transformers/quantizers/quantizer_hqq.py",
+            "status": "modified",
+            "additions": 24,
+            "deletions": 3,
+            "changes": 27,
+            "blob_url": "https://github.com/huggingface/transformers/blob/3e8f0fbf44f8223a50ce05864a7cea223085fb9a/src%2Ftransformers%2Fquantizers%2Fquantizer_hqq.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/3e8f0fbf44f8223a50ce05864a7cea223085fb9a/src%2Ftransformers%2Fquantizers%2Fquantizer_hqq.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fquantizers%2Fquantizer_hqq.py?ref=3e8f0fbf44f8223a50ce05864a7cea223085fb9a",
+            "patch": "@@ -124,7 +124,14 @@ def _find_hqq_quantizable_layers(model, layers):\n             # valid modules are Linear layers that have HQQLinear state_dict. We ignore skip_modules and any layers with Linear state_dict() params\n             _valid_modules = set()\n             _find_hqq_quantizable_layers(model, _valid_modules)\n-            _valid_modules -= set(model.config.quantization_config[\"skip_modules\"])\n+\n+            # Remove skipped modules\n+            _skipped_modules = set()\n+            for _module in _valid_modules:\n+                for _skip_module in model.config.quantization_config[\"skip_modules\"]:\n+                    if _skip_module in _module:\n+                        _skipped_modules.add(_module)\n+            _valid_modules -= _skipped_modules\n \n             # Append new expected layers based on _ref_keys\n             _ref_keys = HQQLinear(\n@@ -243,10 +250,24 @@ def create_quantized_param(\n \n         # Step 2: Replace module with either HQQLinear or move it to device. We do this via setattr on the parent as doing on it on the module\n         # directly doesn't work.\n-        if hasattr(module, \"quant_config\"):\n+        quant_config = model.config.quantization_config[\"quant_config\"]\n+        skip_modules = model.config.quantization_config[\"skip_modules\"]\n+        module_tag = \".\".join(module.name.split(\".\")[-2:])\n+        module_quant_config = None\n+        if \"weight_quant_params\" in quant_config:\n+            module_quant_config = quant_config\n+        elif module_tag in quant_config:\n+            module_quant_config = quant_config[module_tag]\n+\n+        for skip_module in skip_modules:\n+            if skip_module in module.name:\n+                module_quant_config = None\n+                break\n+\n+        if module_quant_config is not None:\n             hqq_layer = HQQLinear(\n                 module,\n-                module.quant_config,\n+                quant_config=module_quant_config,\n                 compute_dtype=self.torch_dtype,\n                 device=target_device,\n                 del_orig=True,"
+        },
+        {
+            "sha": "031b3fefa5be568d3bf97c7c1ee567fa2f5cba49",
+            "filename": "tests/quantization/hqq/test_hqq.py",
+            "status": "modified",
+            "additions": 33,
+            "deletions": 0,
+            "changes": 33,
+            "blob_url": "https://github.com/huggingface/transformers/blob/3e8f0fbf44f8223a50ce05864a7cea223085fb9a/tests%2Fquantization%2Fhqq%2Ftest_hqq.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/3e8f0fbf44f8223a50ce05864a7cea223085fb9a/tests%2Fquantization%2Fhqq%2Ftest_hqq.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fquantization%2Fhqq%2Ftest_hqq.py?ref=3e8f0fbf44f8223a50ce05864a7cea223085fb9a",
+            "patch": "@@ -207,3 +207,36 @@ def test_model_serialization(self):\n             logits_loaded = model_loaded.forward(input_tensor).logits\n \n         self.assertEqual((logits_loaded - logits_ref).abs().mean().item(), 0)\n+\n+    def test_model_serialization_dynamic_quant_with_skip(self):\n+        \"\"\"\n+        Simple HQQ LLM save/load test with dynamic quant\n+        \"\"\"\n+        q4_config = {\"nbits\": 4, \"group_size\": 64}\n+        q3_config = {\"nbits\": 3, \"group_size\": 64}\n+\n+        quant_config = HqqConfig(\n+            dynamic_config={\n+                \"self_attn.q_proj\": q4_config,\n+                \"self_attn.k_proj\": q4_config,\n+                \"self_attn.v_proj\": q4_config,\n+                \"self_attn.o_proj\": q4_config,\n+                \"mlp.gate_proj\": q3_config,\n+                \"mlp.up_proj\": q3_config,\n+            },\n+            skip_modules=[\"lm_head\", \"down_proj\"],\n+        )\n+\n+        hqq_runner = HQQLLMRunner(\n+            model_id=MODEL_ID, quant_config=quant_config, compute_dtype=torch.float16, device=torch_device\n+        )\n+\n+        model = hqq_runner.model\n+\n+        input_tensor = torch.zeros((1, 8), dtype=torch.int32, device=torch_device)\n+        with torch.no_grad():\n+            model.forward(input_tensor).logits\n+\n+        self.assertEqual(isinstance(model.model.layers[1].mlp.down_proj, torch.nn.Linear), True)\n+        self.assertEqual(model.model.layers[1].self_attn.v_proj.quant_config[\"weight_quant_params\"][\"nbits\"], 4)\n+        self.assertEqual(model.model.layers[1].mlp.gate_proj.quant_config[\"weight_quant_params\"][\"nbits\"], 3)"
+        }
+    ],
+    "stats": {
+        "total": 60,
+        "additions": 57,
+        "deletions": 3
+    }
+}

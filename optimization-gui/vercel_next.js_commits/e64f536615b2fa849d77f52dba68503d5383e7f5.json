@@ -1,0 +1,24 @@
+{
+    "author": "sokra",
+    "message": "Turbopack: Try to avoid block_in_place in scope (#84172)\n\n### What?\n\n`block_in_place` is relatively expensive. So we want to avoid it as long as possible and only use it when really needing to wait for a longer time.",
+    "sha": "e64f536615b2fa849d77f52dba68503d5383e7f5",
+    "files": [
+        {
+            "sha": "23d150fe4fd6667046c6f33c9dda7087ac6e7f16",
+            "filename": "turbopack/crates/turbo-tasks/src/scope.rs",
+            "status": "modified",
+            "additions": 50,
+            "deletions": 22,
+            "changes": 72,
+            "blob_url": "https://github.com/vercel/next.js/blob/e64f536615b2fa849d77f52dba68503d5383e7f5/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fscope.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/e64f536615b2fa849d77f52dba68503d5383e7f5/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fscope.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fscope.rs?ref=e64f536615b2fa849d77f52dba68503d5383e7f5",
+            "patch": "@@ -10,6 +10,7 @@ use std::{\n         atomic::{AtomicUsize, Ordering},\n     },\n     thread::{self, Thread},\n+    time::{Duration, Instant},\n };\n \n use futures::FutureExt;\n@@ -44,10 +45,39 @@ impl ScopeInner {\n     }\n \n     fn wait(&self) {\n+        if self.remaining_tasks.load(Ordering::Acquire) == 0 {\n+            return;\n+        }\n+\n         let _span = info_span!(\"blocking\").entered();\n-        while self.remaining_tasks.load(Ordering::Acquire) != 0 {\n-            thread::park();\n+\n+        // Park up to 1ms without block_in_place to avoid the overhead.\n+        const TIMEOUT: Duration = Duration::from_millis(1);\n+        let beginning_park = Instant::now();\n+\n+        let mut timeout_remaining = TIMEOUT;\n+        loop {\n+            thread::park_timeout(timeout_remaining);\n+            if self.remaining_tasks.load(Ordering::Acquire) == 0 {\n+                return;\n+            }\n+            let elapsed = beginning_park.elapsed();\n+            if elapsed >= TIMEOUT {\n+                break;\n+            }\n+            timeout_remaining = TIMEOUT - elapsed;\n         }\n+\n+        // Park with block_in_place to allow to continue other work\n+        block_in_place(|| {\n+            while self.remaining_tasks.load(Ordering::Acquire) != 0 {\n+                thread::park();\n+            }\n+        });\n+    }\n+\n+    fn wait_and_rethrow_panic(&self) {\n+        self.wait();\n         if let Some((err, _)) = self.panic.lock().take() {\n             panic::resume_unwind(err);\n         }\n@@ -147,7 +177,7 @@ impl<'scope, 'env: 'scope, R: Send + 'env> Scope<'scope, 'env, R> {\n \n impl<'scope, 'env: 'scope, R: Send + 'env> Drop for Scope<'scope, 'env, R> {\n     fn drop(&mut self) {\n-        self.inner.wait();\n+        self.inner.wait_and_rethrow_panic();\n     }\n }\n \n@@ -163,25 +193,23 @@ where\n     R: Send + 'env,\n     F: for<'scope> FnOnce(&'scope Scope<'scope, 'env, R>) + 'env,\n {\n-    block_in_place(|| {\n-        let mut results = Vec::with_capacity(number_of_tasks);\n-        for _ in 0..number_of_tasks {\n-            results.push(Mutex::new(None));\n-        }\n-        let results = results.into_boxed_slice();\n-        let result = {\n-            // SAFETY: We drop the Scope later.\n-            let scope = unsafe { Scope::new(&results) };\n-            catch_unwind(AssertUnwindSafe(|| f(&scope)))\n-        };\n-        if let Err(panic) = result {\n-            panic::resume_unwind(panic);\n-        }\n-        results.into_iter().map(|mutex| {\n-            mutex\n-                .into_inner()\n-                .expect(\"All values are set when the scope returns without panic\")\n-        })\n+    let mut results = Vec::with_capacity(number_of_tasks);\n+    for _ in 0..number_of_tasks {\n+        results.push(Mutex::new(None));\n+    }\n+    let results = results.into_boxed_slice();\n+    let result = {\n+        // SAFETY: We drop the Scope later.\n+        let scope = unsafe { Scope::new(&results) };\n+        catch_unwind(AssertUnwindSafe(|| f(&scope)))\n+    };\n+    if let Err(panic) = result {\n+        panic::resume_unwind(panic);\n+    }\n+    results.into_iter().map(|mutex| {\n+        mutex\n+            .into_inner()\n+            .expect(\"All values are set when the scope returns without panic\")\n     })\n }\n "
+        }
+    ],
+    "stats": {
+        "total": 72,
+        "additions": 50,
+        "deletions": 22
+    }
+}

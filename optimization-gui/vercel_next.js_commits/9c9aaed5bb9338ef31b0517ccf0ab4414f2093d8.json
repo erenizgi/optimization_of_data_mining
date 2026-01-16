@@ -1,0 +1,48 @@
+{
+    "author": "ztanner",
+    "message": "fix router handling when setting a location response header (#82588)\n\nWhen middleware sets a `Location` header on the response, we should not\nassume that the target URL is the one we want to handle the request. We\nonly want to route to the underlying location header when a rewrite is\nexplicitly triggered rather than relying on the presence of the response\nheader.\n\n---------\n\nCo-authored-by: JJ Kasper <jj@jjsweb.site>",
+    "sha": "9c9aaed5bb9338ef31b0517ccf0ab4414f2093d8",
+    "files": [
+        {
+            "sha": "c74f0968ff3890e637119008e7924911a968f9e7",
+            "filename": "packages/next/src/server/lib/router-utils/resolve-routes.ts",
+            "status": "modified",
+            "additions": 33,
+            "deletions": 9,
+            "changes": 42,
+            "blob_url": "https://github.com/vercel/next.js/blob/9c9aaed5bb9338ef31b0517ccf0ab4414f2093d8/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Frouter-utils%2Fresolve-routes.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/9c9aaed5bb9338ef31b0517ccf0ab4414f2093d8/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Frouter-utils%2Fresolve-routes.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Frouter-utils%2Fresolve-routes.ts?ref=9c9aaed5bb9338ef31b0517ccf0ab4414f2093d8",
+            "patch": "@@ -18,7 +18,10 @@ import { formatHostname } from '../format-hostname'\n import { toNodeOutgoingHttpHeaders } from '../../web/utils'\n import { isAbortError } from '../../pipe-readable'\n import { getHostname } from '../../../shared/lib/get-hostname'\n-import { getRedirectStatus } from '../../../lib/redirect-status'\n+import {\n+  getRedirectStatus,\n+  allowedStatusCodes,\n+} from '../../../lib/redirect-status'\n import { normalizeRepeatedSlashes } from '../../../shared/lib/utils'\n import { getRelativeURL } from '../../../shared/lib/router/utils/relativize-url'\n import { addPathPrefix } from '../../../shared/lib/router/utils/add-path-prefix'\n@@ -659,15 +662,36 @@ export function getResolveRoutes(\n \n             if (middlewareHeaders['location']) {\n               const value = middlewareHeaders['location'] as string\n-              const rel = getRelativeURL(value, initUrl)\n-              resHeaders['location'] = rel\n-              parsedUrl = url.parse(rel, true)\n \n-              return {\n-                parsedUrl,\n-                resHeaders,\n-                finished: true,\n-                statusCode: middlewareRes.status,\n+              // Only process Location header as a redirect if it has a proper redirect status\n+              // This prevents a Location header with non-redirect status from being treated as a redirect\n+              const isRedirectStatus = allowedStatusCodes.has(\n+                middlewareRes.status\n+              )\n+\n+              if (isRedirectStatus) {\n+                // Process as redirect: update parsedUrl and convert to relative URL\n+                const rel = getRelativeURL(value, initUrl)\n+                resHeaders['location'] = rel\n+                parsedUrl = url.parse(rel, true)\n+\n+                return {\n+                  parsedUrl,\n+                  resHeaders,\n+                  finished: true,\n+                  statusCode: middlewareRes.status,\n+                }\n+              } else {\n+                // Not a redirect: just pass through the Location header\n+                resHeaders['location'] = value\n+\n+                return {\n+                  parsedUrl,\n+                  resHeaders,\n+                  finished: true,\n+                  bodyStream,\n+                  statusCode: middlewareRes.status,\n+                }\n               }\n             }\n "
+        },
+        {
+            "sha": "e5a113e593ec18473db5a5406c2f7ef0790d16e6",
+            "filename": "test/e2e/app-dir/app-middleware/app-middleware.test.ts",
+            "status": "modified",
+            "additions": 24,
+            "deletions": 1,
+            "changes": 25,
+            "blob_url": "https://github.com/vercel/next.js/blob/9c9aaed5bb9338ef31b0517ccf0ab4414f2093d8/test%2Fe2e%2Fapp-dir%2Fapp-middleware%2Fapp-middleware.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/9c9aaed5bb9338ef31b0517ccf0ab4414f2093d8/test%2Fe2e%2Fapp-dir%2Fapp-middleware%2Fapp-middleware.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fapp-middleware%2Fapp-middleware.test.ts?ref=9c9aaed5bb9338ef31b0517ccf0ab4414f2093d8",
+            "patch": "@@ -6,7 +6,7 @@ import { nextTestSetup, FileRef } from 'e2e-utils'\n import type { Response } from 'node-fetch'\n \n describe('app-dir with middleware', () => {\n-  const { next } = nextTestSetup({\n+  const { next, isNextDeploy } = nextTestSetup({\n     files: __dirname,\n   })\n \n@@ -248,6 +248,29 @@ describe('app-dir with middleware', () => {\n \n     await browser.deleteCookies()\n   })\n+\n+  // TODO: This consistently 404s on Vercel deployments. It technically\n+  // doesn't repro the bug we're trying to fix but we need to figure out\n+  // why the handling is different.\n+  if (!isNextDeploy) {\n+    it('should not incorrectly treat a Location header as a rewrite', async () => {\n+      const res = await next.fetch('/test-location-header')\n+\n+      // Should get status 200 (not a redirect status)\n+      expect(res.status).toBe(200)\n+\n+      // Should get the JSON response associated with the route,\n+      // and not follow the redirect\n+      const json = await res.json()\n+      expect(json).toEqual({ foo: 'bar' })\n+\n+      // Ensure the provided location is still on the response\n+      const locationHeader = res.headers.get('location')\n+      expect(locationHeader).toBe(\n+        'https://next-data-api-endpoint.vercel.app/api/random'\n+      )\n+    })\n+  }\n })\n \n describe('app dir - middleware without pages dir', () => {"
+        },
+        {
+            "sha": "e341734febb4bb2737a2732d411314a025b7fc47",
+            "filename": "test/e2e/app-dir/app-middleware/middleware.js",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 0,
+            "changes": 11,
+            "blob_url": "https://github.com/vercel/next.js/blob/9c9aaed5bb9338ef31b0517ccf0ab4414f2093d8/test%2Fe2e%2Fapp-dir%2Fapp-middleware%2Fmiddleware.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/9c9aaed5bb9338ef31b0517ccf0ab4414f2093d8/test%2Fe2e%2Fapp-dir%2Fapp-middleware%2Fmiddleware.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fapp-middleware%2Fmiddleware.js?ref=9c9aaed5bb9338ef31b0517ccf0ab4414f2093d8",
+            "patch": "@@ -78,6 +78,17 @@ export async function middleware(request) {\n     return res\n   }\n \n+  if (request.nextUrl.pathname === '/test-location-header') {\n+    return NextResponse.json(\n+      { foo: 'bar' },\n+      {\n+        headers: {\n+          location: 'https://next-data-api-endpoint.vercel.app/api/random',\n+        },\n+      }\n+    )\n+  }\n+\n   return NextResponse.next({\n     request: {\n       headers: headersFromRequest,"
+        }
+    ],
+    "stats": {
+        "total": 78,
+        "additions": 68,
+        "deletions": 10
+    }
+}

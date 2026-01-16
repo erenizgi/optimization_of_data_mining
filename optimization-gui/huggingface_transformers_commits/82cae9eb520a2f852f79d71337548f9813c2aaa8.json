@@ -1,0 +1,48 @@
+{
+    "author": "remi-or",
+    "message": "Add __iter__ to DynamicCache (#41569)\n\n* Add __iter__ to DynamicCache\n\n* Fix tests that use ddp init",
+    "sha": "82cae9eb520a2f852f79d71337548f9813c2aaa8",
+    "files": [
+        {
+            "sha": "bd0014c663069b8ca781d7b223adfcf45fff3278",
+            "filename": "src/transformers/cache_utils.py",
+            "status": "modified",
+            "additions": 18,
+            "deletions": 4,
+            "changes": 22,
+            "blob_url": "https://github.com/huggingface/transformers/blob/82cae9eb520a2f852f79d71337548f9813c2aaa8/src%2Ftransformers%2Fcache_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/82cae9eb520a2f852f79d71337548f9813c2aaa8/src%2Ftransformers%2Fcache_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fcache_utils.py?ref=82cae9eb520a2f852f79d71337548f9813c2aaa8",
+            "patch": "@@ -176,6 +176,11 @@ def __init__(self, sliding_window: int):\n         super().__init__()\n         self.sliding_window = sliding_window\n         self.cumulative_length = 0\n+        self._sliding_window_tensor = torch.tensor(self.sliding_window, dtype=torch.long)\n+\n+    def lazy_initialization(self, key_states: torch.Tensor) -> None:\n+        super().lazy_initialization(key_states)\n+        self._sliding_window_tensor = self._sliding_window_tensor.to(self.device)\n \n     def update(\n         self,\n@@ -932,7 +937,7 @@ class DynamicCache(Cache):\n \n     def __init__(\n         self,\n-        ddp_cache_data: Optional[Iterable[tuple[torch.Tensor, torch.Tensor]]] = None,\n+        ddp_cache_data: Optional[Iterable[tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor]]] = None,\n         config: Optional[PreTrainedConfig] = None,\n         offloading: bool = False,\n         offload_only_non_sliding: bool = False,\n@@ -965,10 +970,15 @@ def __init__(\n         # In this case, use the passed data to already fill in the Cache\n         if ddp_cache_data is not None:\n             # Init all the layers with the data\n-            for layer_idx, (key_states, value_states) in enumerate(ddp_cache_data):\n-                # If the config was not passed above, initialize a DynamicLayer for each entry of the ddp_data\n+            for layer_idx, (sliding_window_tensor, key_states, value_states) in enumerate(ddp_cache_data):\n+                # If the config was not passed above, initialize a new cache layer for each entry of the ddp_data\n                 if config is None:\n-                    layers.append(DynamicLayer())\n+                    if sliding_window_tensor is not None:\n+                        # Since the same layer is dispatched across replicas, sliding_window is the same for all\n+                        sliding_window = sliding_window_tensor[0].item()\n+                        layers.append(DynamicSlidingWindowLayer(sliding_window=sliding_window))\n+                    else:\n+                        layers.append(DynamicLayer())\n                 # Update the layer with the data\n                 _, _ = layers[layer_idx].update(key_states, value_states)\n \n@@ -982,6 +992,10 @@ def __init__(\n         else:\n             super().__init__(layers=layers, offloading=offloading, offload_only_non_sliding=offload_only_non_sliding)\n \n+    def __iter__(self):\n+        for layer in self.layers:\n+            yield getattr(layer, \"_sliding_window_tensor\", None), layer.keys, layer.values\n+\n \n class StaticCache(Cache):\n     \"\"\""
+        },
+        {
+            "sha": "828f0e4290f7047f4cf64ecbb0cb0bec61f1dd3b",
+            "filename": "tests/test_modeling_common.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/huggingface/transformers/blob/82cae9eb520a2f852f79d71337548f9813c2aaa8/tests%2Ftest_modeling_common.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/82cae9eb520a2f852f79d71337548f9813c2aaa8/tests%2Ftest_modeling_common.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Ftest_modeling_common.py?ref=82cae9eb520a2f852f79d71337548f9813c2aaa8",
+            "patch": "@@ -1598,6 +1598,7 @@ def _create_and_check_torch_fx_tracing(self, config, inputs_dict, output_loss=Fa\n                         cache_shape = (batch_size, num_heads, cache_length, head_dim)\n                         non_empty_pkv = tuple(\n                             (\n+                                None,\n                                 torch.rand(cache_shape, dtype=torch.float, device=torch_device),\n                                 torch.rand(cache_shape, dtype=torch.float, device=torch_device),\n                             )"
+        },
+        {
+            "sha": "0d42c4ba0e15ba01130292cbc311f184d816f5da",
+            "filename": "tests/utils/test_modeling_utils.py",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 1,
+            "changes": 5,
+            "blob_url": "https://github.com/huggingface/transformers/blob/82cae9eb520a2f852f79d71337548f9813c2aaa8/tests%2Futils%2Ftest_modeling_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/82cae9eb520a2f852f79d71337548f9813c2aaa8/tests%2Futils%2Ftest_modeling_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Futils%2Ftest_modeling_utils.py?ref=82cae9eb520a2f852f79d71337548f9813c2aaa8",
+            "patch": "@@ -1806,7 +1806,10 @@ def test_cache_when_needed_at_train_time(self):\n \n         # simulate injecting virtual tokens like in prefix tuning\n         num_virtual_tokens = 3\n-        past_key_values = [torch.randn(2, 1, 2, num_virtual_tokens, 8)] * 2\n+        past_key_values = [\n+            (None, torch.randn(1, 2, num_virtual_tokens, 8), torch.randn(1, 2, num_virtual_tokens, 8)),\n+            (None, torch.randn(1, 2, num_virtual_tokens, 8), torch.randn(1, 2, num_virtual_tokens, 8)),\n+        ]\n         past_key_values = DynamicCache(past_key_values)\n         model_inputs[\"attention_mask\"] = torch.cat(\n             ("
+        }
+    ],
+    "stats": {
+        "total": 28,
+        "additions": 23,
+        "deletions": 5
+    }
+}

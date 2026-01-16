@@ -1,0 +1,108 @@
+{
+    "author": "devjiwonchoi",
+    "message": "Remove bailed out SSG routes from the list of SSG (#83861)\n\n### Why?\n\nWhen SSG, the pages can bail out when detected a dynamic usage. However,\nthe routes that bailed out were still marked as SSG, which can confuse\nthe users.\n\n### How?\n\nRemove the bailed-out routes from the SSG routes list. If there are no\nmore SSG routes for the dynamic route, mark it as dynamic in Build CLI.\n\n#### Before - Has 1, 2, 3, even though they bailed.\n\n```\nRoute (app)                         Size  First Load JS    \n┌ ○ /_not-found                      0 B         114 kB\n└ ● /[id]                            0 B         114 kB\n    ├ /1\n    ├ /2\n    └ /3\n+ First Load JS shared by all     114 kB\n  ├ chunks/29c57ad6b43f6070.js   75.8 kB\n  ├ chunks/df142624801412ea.js   24.3 kB\n  └ other shared chunks (total)  13.5 kB\n\n\n○  (Static)  prerendered as static content\n●  (SSG)     prerendered as static HTML (uses generateStaticParams)\n```\n\n#### After - No longer has 1, 2, 3, and the route is marked as dynamic.\n\n```\nRoute (app)                         Size  First Load JS    \n┌ ○ /_not-found                      0 B         114 kB\n└ ƒ /[id]                            0 B         114 kB\n+ First Load JS shared by all     114 kB\n  ├ chunks/4963d796c068bb13.js   24.3 kB\n  ├ chunks/f59bbf014aa0eff6.js   75.8 kB\n  └ other shared chunks (total)  13.5 kB\n\n\n○  (Static)   prerendered as static content\nƒ  (Dynamic)  server-rendered on demand\n```\n\nFixes https://github.com/vercel/next.js/issues/76507\nCloses NAR-194\n\n---------\n\nCo-authored-by: Wyatt Johnson <accounts+github@wyattjoh.ca>",
+    "sha": "396fed36a28dafd0ebdd326c743fe8bcb12f1853",
+    "files": [
+        {
+            "sha": "4efb93ce0ef3080366910fb3a6ab2a7086e1cfb0",
+            "filename": "packages/next/src/build/index.ts",
+            "status": "modified",
+            "additions": 34,
+            "deletions": 7,
+            "changes": 41,
+            "blob_url": "https://github.com/vercel/next.js/blob/396fed36a28dafd0ebdd326c743fe8bcb12f1853/packages%2Fnext%2Fsrc%2Fbuild%2Findex.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/396fed36a28dafd0ebdd326c743fe8bcb12f1853/packages%2Fnext%2Fsrc%2Fbuild%2Findex.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Findex.ts?ref=396fed36a28dafd0ebdd326c743fe8bcb12f1853",
+            "patch": "@@ -2811,6 +2811,8 @@ export default async function build(\n         buildStage: 'static-generation',\n       })\n \n+      const hasGSPAndRevalidateZero = new Set<string>()\n+\n       // we need to trigger automatic exporting when we have\n       // - static 404/500\n       // - getStaticProps paths\n@@ -3087,6 +3089,8 @@ export default async function build(\n             const appConfig = appDefaultConfigs.get(originalAppPath)\n             if (!appConfig) throw new InvariantError('App config not found')\n \n+            const ssgPageRoutesSet = new Set(pageInfos.get(page)?.ssgPageRoutes)\n+\n             let hasRevalidateZero =\n               appConfig.revalidate === 0 ||\n               getCacheControl(page).revalidate === 0\n@@ -3282,13 +3286,35 @@ export default async function build(\n                 }\n               } else {\n                 hasRevalidateZero = true\n-                // we might have determined during prerendering that this page\n-                // used dynamic data\n-                pageInfos.set(route.pathname, {\n-                  ...(pageInfos.get(route.pathname) as PageInfo),\n-                  isSSG: false,\n-                  isStatic: false,\n-                })\n+\n+                if (ssgPageRoutesSet.has(route.pathname)) {\n+                  const pageInfo = pageInfos.get(page) as PageInfo\n+                  // Remove the route from the SSG page routes if it bailed out\n+                  // during prerendering.\n+                  ssgPageRoutesSet.delete(route.pathname)\n+\n+                  // Mark the route as having a GSP and revalidate zero.\n+                  if (ssgPageRoutesSet.size === 0) {\n+                    hasGSPAndRevalidateZero.delete(page)\n+                  } else {\n+                    hasGSPAndRevalidateZero.add(page)\n+                  }\n+\n+                  pageInfos.set(page, {\n+                    ...pageInfo,\n+                    ssgPageRoutes: Array.from(ssgPageRoutesSet),\n+                    // If there are no SSG page routes left, then the page is not SSG.\n+                    isSSG: ssgPageRoutesSet.size === 0 ? false : pageInfo.isSSG,\n+                  })\n+                } else {\n+                  // we might have determined during prerendering that this page\n+                  // used dynamic data\n+                  pageInfos.set(route.pathname, {\n+                    ...(pageInfos.get(route.pathname) as PageInfo),\n+                    isSSG: false,\n+                    isStatic: false,\n+                  })\n+                }\n               }\n             }\n \n@@ -4167,6 +4193,7 @@ export default async function build(\n           pageExtensions: config.pageExtensions,\n           buildManifest,\n           middlewareManifest,\n+          hasGSPAndRevalidateZero,\n         })\n       )\n "
+        },
+        {
+            "sha": "9fb8987ca78e36dfbb7105bb58d8299f3ff43ca7",
+            "filename": "packages/next/src/build/utils.ts",
+            "status": "modified",
+            "additions": 21,
+            "deletions": 0,
+            "changes": 21,
+            "blob_url": "https://github.com/vercel/next.js/blob/396fed36a28dafd0ebdd326c743fe8bcb12f1853/packages%2Fnext%2Fsrc%2Fbuild%2Futils.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/396fed36a28dafd0ebdd326c743fe8bcb12f1853/packages%2Fnext%2Fsrc%2Fbuild%2Futils.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Futils.ts?ref=396fed36a28dafd0ebdd326c743fe8bcb12f1853",
+            "patch": "@@ -255,12 +255,14 @@ export async function printTreeView(\n     pageExtensions,\n     middlewareManifest,\n     useStaticPages404,\n+    hasGSPAndRevalidateZero,\n   }: {\n     pagesDir?: string\n     pageExtensions: PageExtensions\n     buildManifest: BuildManifest\n     middlewareManifest: MiddlewareManifest\n     useStaticPages404: boolean\n+    hasGSPAndRevalidateZero: Set<string>\n   }\n ) {\n   // Can be overridden for test purposes to omit the build duration output.\n@@ -373,6 +375,23 @@ export async function printTreeView(\n         symbol = 'ƒ'\n       }\n \n+      if (hasGSPAndRevalidateZero.has(item)) {\n+        usedSymbols.add('ƒ')\n+        messages.push([\n+          `${border} ƒ ${item}${\n+            totalDuration > MIN_DURATION\n+              ? ` (${getPrettyDuration(totalDuration)})`\n+              : ''\n+          }`,\n+          showRevalidate && pageInfo?.initialCacheControl\n+            ? formatRevalidate(pageInfo.initialCacheControl)\n+            : '',\n+          showExpire && pageInfo?.initialCacheControl\n+            ? formatExpire(pageInfo.initialCacheControl)\n+            : '',\n+        ])\n+      }\n+\n       usedSymbols.add(symbol)\n \n       messages.push([\n@@ -393,6 +412,8 @@ export async function printTreeView(\n         const totalRoutes = pageInfo.ssgPageRoutes.length\n         const contSymbol = i === arr.length - 1 ? ' ' : '├'\n \n+        // HERE\n+\n         let routes: { route: string; duration: number; avgDuration?: number }[]\n         if (pageInfo.ssgPageDurations?.some((d) => d > MIN_DURATION)) {\n           const previewPages = totalRoutes === 8 ? 8 : Math.min(totalRoutes, 7)"
+        },
+        {
+            "sha": "888614deda3ba5d744d1a7e5dac131038dba2b12",
+            "filename": "test/production/app-dir/build-output-ssg-bailout/app/layout.tsx",
+            "status": "added",
+            "additions": 8,
+            "deletions": 0,
+            "changes": 8,
+            "blob_url": "https://github.com/vercel/next.js/blob/396fed36a28dafd0ebdd326c743fe8bcb12f1853/test%2Fproduction%2Fapp-dir%2Fbuild-output-ssg-bailout%2Fapp%2Flayout.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/396fed36a28dafd0ebdd326c743fe8bcb12f1853/test%2Fproduction%2Fapp-dir%2Fbuild-output-ssg-bailout%2Fapp%2Flayout.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fproduction%2Fapp-dir%2Fbuild-output-ssg-bailout%2Fapp%2Flayout.tsx?ref=396fed36a28dafd0ebdd326c743fe8bcb12f1853",
+            "patch": "@@ -0,0 +1,8 @@\n+import { ReactNode } from 'react'\n+export default function Root({ children }: { children: ReactNode }) {\n+  return (\n+    <html>\n+      <body>{children}</body>\n+    </html>\n+  )\n+}"
+        },
+        {
+            "sha": "74ee49552527f021174124c48af23d9d43f3a79b",
+            "filename": "test/production/app-dir/build-output-ssg-bailout/app/ssg-bailout-partial/[id]/page.tsx",
+            "status": "added",
+            "additions": 20,
+            "deletions": 0,
+            "changes": 20,
+            "blob_url": "https://github.com/vercel/next.js/blob/396fed36a28dafd0ebdd326c743fe8bcb12f1853/test%2Fproduction%2Fapp-dir%2Fbuild-output-ssg-bailout%2Fapp%2Fssg-bailout-partial%2F%5Bid%5D%2Fpage.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/396fed36a28dafd0ebdd326c743fe8bcb12f1853/test%2Fproduction%2Fapp-dir%2Fbuild-output-ssg-bailout%2Fapp%2Fssg-bailout-partial%2F%5Bid%5D%2Fpage.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fproduction%2Fapp-dir%2Fbuild-output-ssg-bailout%2Fapp%2Fssg-bailout-partial%2F%5Bid%5D%2Fpage.tsx?ref=396fed36a28dafd0ebdd326c743fe8bcb12f1853",
+            "patch": "@@ -0,0 +1,20 @@\n+export default async function Page({\n+  params,\n+  searchParams,\n+}: {\n+  params: Promise<{ id: string }>\n+  searchParams: Promise<{ id: string }>\n+}) {\n+  const { id } = await params\n+  // Bail out for /ssg-bailout-partial/1 only.\n+  if (id === '1') {\n+    const { id } = await searchParams\n+    return <p>hello world {id}</p>\n+  }\n+\n+  return <p>hello world</p>\n+}\n+\n+export async function generateStaticParams() {\n+  return [{ id: '1' }, { id: '2' }, { id: '3' }]\n+}"
+        },
+        {
+            "sha": "03e66260553960a8bf07a41f0ce05fc207bfc8e9",
+            "filename": "test/production/app-dir/build-output-ssg-bailout/app/ssg-bailout/[id]/page.tsx",
+            "status": "added",
+            "additions": 12,
+            "deletions": 0,
+            "changes": 12,
+            "blob_url": "https://github.com/vercel/next.js/blob/396fed36a28dafd0ebdd326c743fe8bcb12f1853/test%2Fproduction%2Fapp-dir%2Fbuild-output-ssg-bailout%2Fapp%2Fssg-bailout%2F%5Bid%5D%2Fpage.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/396fed36a28dafd0ebdd326c743fe8bcb12f1853/test%2Fproduction%2Fapp-dir%2Fbuild-output-ssg-bailout%2Fapp%2Fssg-bailout%2F%5Bid%5D%2Fpage.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fproduction%2Fapp-dir%2Fbuild-output-ssg-bailout%2Fapp%2Fssg-bailout%2F%5Bid%5D%2Fpage.tsx?ref=396fed36a28dafd0ebdd326c743fe8bcb12f1853",
+            "patch": "@@ -0,0 +1,12 @@\n+export default async function Page({\n+  searchParams,\n+}: {\n+  searchParams: Promise<{ id: string }>\n+}) {\n+  const { id } = await searchParams\n+  return <p>hello world {id}</p>\n+}\n+\n+export async function generateStaticParams() {\n+  return [{ id: '1' }, { id: '2' }, { id: '3' }]\n+}"
+        },
+        {
+            "sha": "3138065c89fe6d608bfec1493a0aa4e1fad7b743",
+            "filename": "test/production/app-dir/build-output-ssg-bailout/app/ssg/[id]/page.tsx",
+            "status": "added",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/vercel/next.js/blob/396fed36a28dafd0ebdd326c743fe8bcb12f1853/test%2Fproduction%2Fapp-dir%2Fbuild-output-ssg-bailout%2Fapp%2Fssg%2F%5Bid%5D%2Fpage.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/396fed36a28dafd0ebdd326c743fe8bcb12f1853/test%2Fproduction%2Fapp-dir%2Fbuild-output-ssg-bailout%2Fapp%2Fssg%2F%5Bid%5D%2Fpage.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fproduction%2Fapp-dir%2Fbuild-output-ssg-bailout%2Fapp%2Fssg%2F%5Bid%5D%2Fpage.tsx?ref=396fed36a28dafd0ebdd326c743fe8bcb12f1853",
+            "patch": "@@ -0,0 +1,7 @@\n+export default function Page() {\n+  return <p>hello world</p>\n+}\n+\n+export function generateStaticParams() {\n+  return [{ id: '1' }, { id: '2' }, { id: '3' }]\n+}"
+        },
+        {
+            "sha": "7d4c613459cf35af387d3de1774b51dc5c317e48",
+            "filename": "test/production/app-dir/build-output-ssg-bailout/build-output-ssg-bailout.test.ts",
+            "status": "added",
+            "additions": 76,
+            "deletions": 0,
+            "changes": 76,
+            "blob_url": "https://github.com/vercel/next.js/blob/396fed36a28dafd0ebdd326c743fe8bcb12f1853/test%2Fproduction%2Fapp-dir%2Fbuild-output-ssg-bailout%2Fbuild-output-ssg-bailout.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/396fed36a28dafd0ebdd326c743fe8bcb12f1853/test%2Fproduction%2Fapp-dir%2Fbuild-output-ssg-bailout%2Fbuild-output-ssg-bailout.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fproduction%2Fapp-dir%2Fbuild-output-ssg-bailout%2Fbuild-output-ssg-bailout.test.ts?ref=396fed36a28dafd0ebdd326c743fe8bcb12f1853",
+            "patch": "@@ -0,0 +1,76 @@\n+import { nextTestSetup } from 'e2e-utils'\n+\n+describe('build-output-ssg-bailout', () => {\n+  if (process.env.__NEXT_EXPERIMENTAL_CACHE_COMPONENTS === 'true') {\n+    it.skip('PPR is enabled, will throw instead of bailing out', () => {})\n+    return\n+  }\n+\n+  const { next } = nextTestSetup({\n+    files: __dirname,\n+    skipStart: true,\n+    env: {\n+      __NEXT_PRIVATE_DETERMINISTIC_BUILD_OUTPUT: '1',\n+      NEXT_DEBUG_BUILD: '1',\n+    },\n+  })\n+\n+  beforeAll(() => next.build())\n+\n+  // This is available when NEXT_DEBUG_BUILD is set (or --debug flag is used).\n+  it('should show error messages for SSG bailout', async () => {\n+    expect(next.cliOutput).toContain(\n+      'Error: Static generation failed due to dynamic usage on /ssg-bailout/1, reason: `await searchParams`, `searchParams.then`, or similar'\n+    )\n+    expect(next.cliOutput).toContain(\n+      'Error: Static generation failed due to dynamic usage on /ssg-bailout/2, reason: `await searchParams`, `searchParams.then`, or similar'\n+    )\n+    expect(next.cliOutput).toContain(\n+      'Error: Static generation failed due to dynamic usage on /ssg-bailout/3, reason: `await searchParams`, `searchParams.then`, or similar'\n+    )\n+\n+    // Bailed out for /ssg-bailout-partial/1 only.\n+    expect(next.cliOutput).toContain(\n+      'Error: Static generation failed due to dynamic usage on /ssg-bailout-partial/1, reason: `await searchParams`, `searchParams.then`, or similar'\n+    )\n+  })\n+\n+  it('should list SSG pages for pages that did not bail out', async () => {\n+    // - /ssg/[id] is marked (SSG) and has 1,2,3 listed.\n+    // - /ssg-bailout-partial/[id] is marked (SSG) and has 2,3 listed.\n+    // - /ssg-bailout/[id] is marked (Dynamic) and has nothing listed.\n+    expect(getTreeView(next.cliOutput)).toMatchInlineSnapshot(`\n+     \"Route (app)\n+     ┌ ○ /_not-found\n+     ├ ƒ /ssg-bailout-partial/[id]\n+     ├ ● /ssg-bailout-partial/[id]\n+     ├   ├ /ssg-bailout-partial/2\n+     ├   └ /ssg-bailout-partial/3\n+     ├ ƒ /ssg-bailout/[id]\n+     └ ● /ssg/[id]\n+         ├ /ssg/1\n+         ├ /ssg/2\n+         └ /ssg/3\n+\n+\n+     ○  (Static)   prerendered as static content\n+     ●  (SSG)      prerendered as static HTML (uses generateStaticParams)\n+     ƒ  (Dynamic)  server-rendered on demand\"\n+    `)\n+  })\n+})\n+\n+function getTreeView(cliOutput: string): string {\n+  let foundStart = false\n+  const lines: string[] = []\n+\n+  for (const line of cliOutput.split('\\n')) {\n+    foundStart ||= line.startsWith('Route ')\n+\n+    if (foundStart) {\n+      lines.push(line)\n+    }\n+  }\n+\n+  return lines.join('\\n').trim()\n+}"
+        },
+        {
+            "sha": "807126e4cf0bf5b1c8c917e6e0148a27331587d1",
+            "filename": "test/production/app-dir/build-output-ssg-bailout/next.config.js",
+            "status": "added",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/vercel/next.js/blob/396fed36a28dafd0ebdd326c743fe8bcb12f1853/test%2Fproduction%2Fapp-dir%2Fbuild-output-ssg-bailout%2Fnext.config.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/396fed36a28dafd0ebdd326c743fe8bcb12f1853/test%2Fproduction%2Fapp-dir%2Fbuild-output-ssg-bailout%2Fnext.config.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fproduction%2Fapp-dir%2Fbuild-output-ssg-bailout%2Fnext.config.js?ref=396fed36a28dafd0ebdd326c743fe8bcb12f1853",
+            "patch": "@@ -0,0 +1,6 @@\n+/**\n+ * @type {import('next').NextConfig}\n+ */\n+const nextConfig = {}\n+\n+module.exports = nextConfig"
+        }
+    ],
+    "stats": {
+        "total": 191,
+        "additions": 184,
+        "deletions": 7
+    }
+}

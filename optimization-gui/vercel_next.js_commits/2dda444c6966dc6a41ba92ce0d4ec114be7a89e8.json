@@ -1,0 +1,180 @@
+{
+    "author": "mischnic",
+    "message": "Turbopack: don't read binding_usage in dev (#86722)\n\nI'm debating whether this should be `Option<BindingUsage>` instead, so that we can detect if you built the graph without the binding_usage but then still try to enable `remove_unused_exports` (which would now silently noop and never tree shaking anything).",
+    "sha": "2dda444c6966dc6a41ba92ce0d4ec114be7a89e8",
+    "files": [
+        {
+            "sha": "a53171e2cc8e5001f8e88be7774f03d76e7e47c2",
+            "filename": "crates/next-api/src/app.rs",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 3,
+            "changes": 18,
+            "blob_url": "https://github.com/vercel/next.js/blob/2dda444c6966dc6a41ba92ce0d4ec114be7a89e8/crates%2Fnext-api%2Fsrc%2Fapp.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/2dda444c6966dc6a41ba92ce0d4ec114be7a89e8/crates%2Fnext-api%2Fsrc%2Fapp.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/crates%2Fnext-api%2Fsrc%2Fapp.rs?ref=2dda444c6966dc6a41ba92ce0d4ec114be7a89e8",
+            "patch": "@@ -858,7 +858,10 @@ impl AppProject {\n     ) -> Result<Vc<BaseAndFullModuleGraph>> {\n         if *self.project.per_page_module_graph().await? {\n             let next_mode = self.project.next_mode();\n-            let should_trace = next_mode.await?.is_production();\n+            let next_mode_ref = next_mode.await?;\n+            let should_trace = next_mode_ref.is_production();\n+            let should_read_binding_usage = next_mode_ref.is_production();\n+\n             let client_shared_entries = client_shared_entries\n                 .await?\n                 .into_iter()\n@@ -874,7 +877,8 @@ impl AppProject {\n                     let ServerEntries {\n                         server_utils,\n                         server_component_entries,\n-                    } = &*find_server_entries(*rsc_entry, should_trace).await?;\n+                    } = &*find_server_entries(*rsc_entry, should_trace, should_read_binding_usage)\n+                        .await?;\n \n                     let graph = SingleModuleGraph::new_with_entries_visited_intern(\n                         vec![\n@@ -891,6 +895,7 @@ impl AppProject {\n                         ],\n                         VisitedModules::empty(),\n                         should_trace,\n+                        should_read_binding_usage,\n                     );\n                     graphs.push(graph);\n                     let mut visited_modules = VisitedModules::from_graph(graph);\n@@ -908,6 +913,7 @@ impl AppProject {\n                             vec![ChunkGroupEntry::Entry(vec![ResolvedVc::upcast(*module)])],\n                             visited_modules,\n                             should_trace,\n+                            should_read_binding_usage,\n                         );\n                         graphs.push(graph);\n                         let is_layout = module.server_path().await?.file_stem() == Some(\"layout\");\n@@ -929,6 +935,7 @@ impl AppProject {\n                         vec![ChunkGroupEntry::Entry(client_shared_entries)],\n                         VisitedModules::empty(),\n                         should_trace,\n+                        should_read_binding_usage,\n                     );\n                     graphs.push(graph);\n                     VisitedModules::from_graph(graph)\n@@ -938,6 +945,7 @@ impl AppProject {\n                     vec![rsc_entry_chunk_group],\n                     visited_modules,\n                     should_trace,\n+                    should_read_binding_usage,\n                 );\n                 graphs.push(graph);\n                 visited_modules = visited_modules.concatenate(graph);\n@@ -948,6 +956,7 @@ impl AppProject {\n                     additional_entries.owned().await?,\n                     visited_modules,\n                     should_trace,\n+                    should_read_binding_usage,\n                 );\n                 graphs.push(additional_module_graph);\n \n@@ -1282,12 +1291,15 @@ impl AppEndpoint {\n                 .get_next_dynamic_imports_for_endpoint(*rsc_entry)\n                 .await?;\n \n+        let is_production = project.next_mode().await?.is_production();\n+\n         let client_references =\n             ClientReferencesGraphs::new(*module_graphs.base, per_page_module_graph)\n                 .get_client_references_for_endpoint(\n                     *rsc_entry,\n                     matches!(this.ty, AppEndpointType::Page { .. }),\n-                    project.next_mode().await?.is_production(),\n+                    is_production,\n+                    is_production,\n                 )\n                 .to_resolved()\n                 .await?;"
+        },
+        {
+            "sha": "00dbb887c5886119adf8f55b9e06f3704980c64e",
+            "filename": "crates/next-api/src/module_graph.rs",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 1,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/2dda444c6966dc6a41ba92ce0d4ec114be7a89e8/crates%2Fnext-api%2Fsrc%2Fmodule_graph.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/2dda444c6966dc6a41ba92ce0d4ec114be7a89e8/crates%2Fnext-api%2Fsrc%2Fmodule_graph.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/crates%2Fnext-api%2Fsrc%2Fmodule_graph.rs?ref=2dda444c6966dc6a41ba92ce0d4ec114be7a89e8",
+            "patch": "@@ -460,6 +460,7 @@ impl ClientReferencesGraphs {\n         entry: Vc<Box<dyn Module>>,\n         has_layout_segments: bool,\n         include_traced: bool,\n+        include_binding_usage: bool,\n     ) -> Result<Vc<ClientReferenceGraphResult>> {\n         let span = tracing::info_span!(\"collect all client references for endpoint\");\n         async move {\n@@ -477,7 +478,9 @@ impl ClientReferencesGraphs {\n                 // messes up the order of the server_component_entries.\n                 let server_entries = async {\n                     if has_layout_segments {\n-                        let server_entries = find_server_entries(entry, include_traced).await?;\n+                        let server_entries =\n+                            find_server_entries(entry, include_traced, include_binding_usage)\n+                                .await?;\n                         Ok(Some(server_entries))\n                     } else {\n                         Ok(None)"
+        },
+        {
+            "sha": "ad5f1122597d666b6a72531abfea67902948a975",
+            "filename": "crates/next-api/src/pages.rs",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 1,
+            "changes": 7,
+            "blob_url": "https://github.com/vercel/next.js/blob/2dda444c6966dc6a41ba92ce0d4ec114be7a89e8/crates%2Fnext-api%2Fsrc%2Fpages.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/2dda444c6966dc6a41ba92ce0d4ec114be7a89e8/crates%2Fnext-api%2Fsrc%2Fpages.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/crates%2Fnext-api%2Fsrc%2Fpages.rs?ref=2dda444c6966dc6a41ba92ce0d4ec114be7a89e8",
+            "patch": "@@ -728,7 +728,10 @@ impl PageEndpoint {\n \n         if *project.per_page_module_graph().await? {\n             let next_mode = project.next_mode();\n-            let should_trace = next_mode.await?.is_production();\n+            let next_mode_ref = next_mode.await?;\n+            let should_trace = next_mode_ref.is_production();\n+            let should_read_binding_usage = next_mode_ref.is_production();\n+\n             let ssr_chunk_module = self.internal_ssr_chunk_module().await?;\n             // Implements layout segment optimization to compute a graph \"chain\" for document, app,\n             // page\n@@ -745,6 +748,7 @@ impl PageEndpoint {\n                     vec![ChunkGroupEntry::Shared(module)],\n                     visited_modules,\n                     should_trace,\n+                    should_read_binding_usage,\n                 );\n                 graphs.push(graph);\n                 visited_modules = visited_modules.concatenate(graph);\n@@ -754,6 +758,7 @@ impl PageEndpoint {\n                 vec![ChunkGroupEntry::Entry(vec![ssr_chunk_module.ssr_module])],\n                 visited_modules,\n                 should_trace,\n+                should_read_binding_usage,\n             );\n             graphs.push(graph);\n "
+        },
+        {
+            "sha": "0b02184f8451092ae30c0864663b8c94425aaf0b",
+            "filename": "crates/next-api/src/project.rs",
+            "status": "modified",
+            "additions": 14,
+            "deletions": 5,
+            "changes": 19,
+            "blob_url": "https://github.com/vercel/next.js/blob/2dda444c6966dc6a41ba92ce0d4ec114be7a89e8/crates%2Fnext-api%2Fsrc%2Fproject.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/2dda444c6966dc6a41ba92ce0d4ec114be7a89e8/crates%2Fnext-api%2Fsrc%2Fproject.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/crates%2Fnext-api%2Fsrc%2Fproject.rs?ref=2dda444c6966dc6a41ba92ce0d4ec114be7a89e8",
+            "patch": "@@ -1065,7 +1065,8 @@ impl Project {\n         entry: ResolvedVc<Box<dyn Module>>,\n     ) -> Result<Vc<ModuleGraph>> {\n         Ok(if *self.per_page_module_graph().await? {\n-            ModuleGraph::from_entry_module(*entry, self.next_mode().await?.is_production())\n+            let is_production = self.next_mode().await?.is_production();\n+            ModuleGraph::from_entry_module(*entry, is_production, is_production)\n         } else {\n             *self.whole_app_module_graphs().await?.full\n         })\n@@ -1077,6 +1078,7 @@ impl Project {\n         evaluatable_assets: Vc<EvaluatableAssets>,\n     ) -> Result<Vc<ModuleGraph>> {\n         Ok(if *self.per_page_module_graph().await? {\n+            let is_production = self.next_mode().await?.is_production();\n             let entries = evaluatable_assets\n                 .await?\n                 .iter()\n@@ -1085,7 +1087,8 @@ impl Project {\n                 .collect();\n             ModuleGraph::from_modules(\n                 Vc::cell(vec![ChunkGroupEntry::Entry(entries)]),\n-                self.next_mode().await?.is_production(),\n+                is_production,\n+                is_production,\n             )\n         } else {\n             *self.whole_app_module_graphs().await?.full\n@@ -2000,9 +2003,14 @@ async fn whole_app_module_graph_operation(\n     mark_root();\n \n     let next_mode = project.next_mode();\n-    let should_trace = next_mode.await?.is_production();\n-    let base_single_module_graph =\n-        SingleModuleGraph::new_with_entries(project.get_all_entries(), should_trace);\n+    let next_mode_ref = next_mode.await?;\n+    let should_trace = next_mode_ref.is_production();\n+    let should_read_binding_usage = next_mode_ref.is_production();\n+    let base_single_module_graph = SingleModuleGraph::new_with_entries(\n+        project.get_all_entries(),\n+        should_trace,\n+        should_read_binding_usage,\n+    );\n     let base_visited_modules = VisitedModules::from_graph(base_single_module_graph);\n \n     let base = ModuleGraph::from_single_graph(base_single_module_graph);\n@@ -2030,6 +2038,7 @@ async fn whole_app_module_graph_operation(\n         additional_entries,\n         base_visited_modules,\n         should_trace,\n+        should_read_binding_usage,\n     );\n \n     let full_with_unused_references ="
+        },
+        {
+            "sha": "48cf77b540a3cba1182213bd8e1f500afbea8336",
+            "filename": "crates/next-core/src/next_client_reference/visit_client_reference.rs",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 6,
+            "changes": 22,
+            "blob_url": "https://github.com/vercel/next.js/blob/2dda444c6966dc6a41ba92ce0d4ec114be7a89e8/crates%2Fnext-core%2Fsrc%2Fnext_client_reference%2Fvisit_client_reference.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/2dda444c6966dc6a41ba92ce0d4ec114be7a89e8/crates%2Fnext-core%2Fsrc%2Fnext_client_reference%2Fvisit_client_reference.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/crates%2Fnext-core%2Fsrc%2Fnext_client_reference%2Fvisit_client_reference.rs?ref=2dda444c6966dc6a41ba92ce0d4ec114be7a89e8",
+            "patch": "@@ -81,6 +81,7 @@ pub struct ServerEntries {\n pub async fn find_server_entries(\n     entry: ResolvedVc<Box<dyn Module>>,\n     include_traced: bool,\n+    include_binding_usage: bool,\n ) -> Result<Vc<ServerEntries>> {\n     async move {\n         let emit_spans = tracing::enabled!(Level::INFO);\n@@ -97,8 +98,9 @@ pub async fn find_server_entries(\n                     },\n                 )],\n                 FindServerEntries {\n-                    include_traced,\n                     emit_spans,\n+                    include_traced,\n+                    include_binding_usage,\n                 },\n             )\n             .await\n@@ -130,9 +132,11 @@ pub async fn find_server_entries(\n }\n \n struct FindServerEntries {\n+    emit_spans: bool,\n     /// Whether to walk ChunkingType::Traced references\n     include_traced: bool,\n-    emit_spans: bool,\n+    /// Whether to read the binding usage information from modules\n+    include_binding_usage: bool,\n }\n \n #[derive(\n@@ -173,6 +177,7 @@ impl Visit<FindServerEntriesNode> for FindServerEntries {\n \n     fn edges(&mut self, node: &FindServerEntriesNode) -> Self::EdgesFuture {\n         let include_traced = self.include_traced;\n+        let include_binding_usage = self.include_binding_usage;\n         let parent_module = match node {\n             // This should never occur since we always skip visiting these\n             // nodes' edges.\n@@ -185,10 +190,15 @@ impl Visit<FindServerEntriesNode> for FindServerEntries {\n         };\n         let emit_spans = self.emit_spans;\n         async move {\n-            // Pass include_traced to reuse the same cached `primary_chunkable_referenced_modules`\n-            // task result, but the traced references will be filtered out again afterwards.\n-            let referenced_modules =\n-                primary_chunkable_referenced_modules(parent_module, include_traced).await?;\n+            // Pass include_traced and include_binding_usage to reuse the same cached\n+            // `primary_chunkable_referenced_modules` task result, but the traced references will be\n+            // filtered out again afterwards.\n+            let referenced_modules = primary_chunkable_referenced_modules(\n+                parent_module,\n+                include_traced,\n+                include_binding_usage,\n+            )\n+            .await?;\n \n             let referenced_modules = referenced_modules\n                 .iter()"
+        },
+        {
+            "sha": "0d8156e2126d5c53918880d7e19d23038f9996d8",
+            "filename": "crates/next-core/src/next_font/google/mod.rs",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/2dda444c6966dc6a41ba92ce0d4ec114be7a89e8/crates%2Fnext-core%2Fsrc%2Fnext_font%2Fgoogle%2Fmod.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/2dda444c6966dc6a41ba92ce0d4ec114be7a89e8/crates%2Fnext-core%2Fsrc%2Fnext_font%2Fgoogle%2Fmod.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/crates%2Fnext-core%2Fsrc%2Fnext_font%2Fgoogle%2Fmod.rs?ref=2dda444c6966dc6a41ba92ce0d4ec114be7a89e8",
+            "patch": "@@ -756,7 +756,7 @@ async fn get_mock_stylesheet(\n         .module();\n \n     let entries = get_evaluate_entries(mocked_response_asset, asset_context, None);\n-    let module_graph = ModuleGraph::from_modules(entries.graph_entries(), false);\n+    let module_graph = ModuleGraph::from_modules(entries.graph_entries(), false, false);\n \n     let root = mock_fs.root().owned().await?;\n     let val = evaluate("
+        },
+        {
+            "sha": "0eb3c02917b1de0e27918cdd7c7a814f1d2ce16d",
+            "filename": "turbopack/crates/turbopack-cli/src/build/mod.rs",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/2dda444c6966dc6a41ba92ce0d4ec114be7a89e8/turbopack%2Fcrates%2Fturbopack-cli%2Fsrc%2Fbuild%2Fmod.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/2dda444c6966dc6a41ba92ce0d4ec114be7a89e8/turbopack%2Fcrates%2Fturbopack-cli%2Fsrc%2Fbuild%2Fmod.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-cli%2Fsrc%2Fbuild%2Fmod.rs?ref=2dda444c6966dc6a41ba92ce0d4ec114be7a89e8",
+            "patch": "@@ -308,6 +308,7 @@ async fn build_internal(\n     let mut module_graph = ModuleGraph::from_modules(\n         Vc::cell(vec![ChunkGroupEntry::Entry(entries.clone())]),\n         false,\n+        true,\n     );\n     let module_id_strategy = ResolvedVc::upcast(\n         get_global_module_id_strategy(module_graph)"
+        },
+        {
+            "sha": "2d64e40e59b8762732dae669a18e1bfa04a7727f",
+            "filename": "turbopack/crates/turbopack-cli/src/dev/web_entry_source.rs",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 4,
+            "changes": 11,
+            "blob_url": "https://github.com/vercel/next.js/blob/2dda444c6966dc6a41ba92ce0d4ec114be7a89e8/turbopack%2Fcrates%2Fturbopack-cli%2Fsrc%2Fdev%2Fweb_entry_source.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/2dda444c6966dc6a41ba92ce0d4ec114be7a89e8/turbopack%2Fcrates%2Fturbopack-cli%2Fsrc%2Fdev%2Fweb_entry_source.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-cli%2Fsrc%2Fdev%2Fweb_entry_source.rs?ref=2dda444c6966dc6a41ba92ce0d4ec114be7a89e8",
+            "patch": "@@ -161,10 +161,13 @@ pub async fn create_web_entry_source(\n                 .map(|&entry| ResolvedVc::upcast(entry)),\n         )\n         .collect::<Vec<ResolvedVc<Box<dyn Module>>>>();\n-    let module_graph =\n-        ModuleGraph::from_modules(Vc::cell(vec![ChunkGroupEntry::Entry(all_modules)]), false)\n-            .to_resolved()\n-            .await?;\n+    let module_graph = ModuleGraph::from_modules(\n+        Vc::cell(vec![ChunkGroupEntry::Entry(all_modules)]),\n+        false,\n+        false,\n+    )\n+    .to_resolved()\n+    .await?;\n \n     let entries: Vec<_> = entries\n         .into_iter()"
+        },
+        {
+            "sha": "8e105bf642b3d07e05fd5931813dcb2124fb5e93",
+            "filename": "turbopack/crates/turbopack-core/src/module_graph/mod.rs",
+            "status": "modified",
+            "additions": 44,
+            "deletions": 6,
+            "changes": 50,
+            "blob_url": "https://github.com/vercel/next.js/blob/2dda444c6966dc6a41ba92ce0d4ec114be7a89e8/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fmodule_graph%2Fmod.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/2dda444c6966dc6a41ba92ce0d4ec114be7a89e8/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fmodule_graph%2Fmod.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fmodule_graph%2Fmod.rs?ref=2dda444c6966dc6a41ba92ce0d4ec114be7a89e8",
+            "patch": "@@ -240,6 +240,7 @@ impl SingleModuleGraph {\n         entries: &GraphEntriesT,\n         visited_modules: &FxIndexMap<ResolvedVc<Box<dyn Module>>, GraphNodeIndex>,\n         include_traced: bool,\n+        include_binding_usage: bool,\n     ) -> Result<Vc<Self>> {\n         let emit_spans = tracing::enabled!(Level::INFO);\n         let root_edges = entries\n@@ -263,6 +264,7 @@ impl SingleModuleGraph {\n                     visited_modules,\n                     emit_spans,\n                     include_traced,\n+                    include_binding_usage,\n                 },\n             )\n             .await\n@@ -783,16 +785,26 @@ impl ModuleGraph {\n     pub fn from_entry_module(\n         module: ResolvedVc<Box<dyn Module>>,\n         include_traced: bool,\n+        include_binding_usage: bool,\n     ) -> Vc<Self> {\n         Self::from_single_graph(SingleModuleGraph::new_with_entries(\n             Vc::cell(vec![ChunkGroupEntry::Entry(vec![module])]),\n             include_traced,\n+            include_binding_usage,\n         ))\n     }\n \n     #[turbo_tasks::function]\n-    pub fn from_modules(modules: Vc<GraphEntries>, include_traced: bool) -> Vc<Self> {\n-        Self::from_single_graph(SingleModuleGraph::new_with_entries(modules, include_traced))\n+    pub fn from_modules(\n+        modules: Vc<GraphEntries>,\n+        include_traced: bool,\n+        include_binding_usage: bool,\n+    ) -> Vc<Self> {\n+        Self::from_single_graph(SingleModuleGraph::new_with_entries(\n+            modules,\n+            include_traced,\n+            include_binding_usage,\n+        ))\n     }\n \n     #[turbo_tasks::function]\n@@ -1534,20 +1546,29 @@ impl SingleModuleGraph {\n     pub async fn new_with_entries(\n         entries: Vc<GraphEntries>,\n         include_traced: bool,\n+        include_binding_usage: bool,\n     ) -> Result<Vc<Self>> {\n-        SingleModuleGraph::new_inner(&*entries.await?, &Default::default(), include_traced).await\n+        SingleModuleGraph::new_inner(\n+            &*entries.await?,\n+            &Default::default(),\n+            include_traced,\n+            include_binding_usage,\n+        )\n+        .await\n     }\n \n     #[turbo_tasks::function]\n     pub async fn new_with_entries_visited(\n         entries: Vc<GraphEntries>,\n         visited_modules: Vc<VisitedModules>,\n         include_traced: bool,\n+        include_binding_usage: bool,\n     ) -> Result<Vc<Self>> {\n         SingleModuleGraph::new_inner(\n             &*entries.await?,\n             &visited_modules.await?.modules,\n             include_traced,\n+            include_binding_usage,\n         )\n         .await\n     }\n@@ -1558,9 +1579,15 @@ impl SingleModuleGraph {\n         entries: GraphEntriesT,\n         visited_modules: Vc<VisitedModules>,\n         include_traced: bool,\n+        include_binding_usage: bool,\n     ) -> Result<Vc<Self>> {\n-        SingleModuleGraph::new_inner(&entries, &visited_modules.await?.modules, include_traced)\n-            .await\n+        SingleModuleGraph::new_inner(\n+            &entries,\n+            &visited_modules.await?.modules,\n+            include_traced,\n+            include_binding_usage,\n+        )\n+        .await\n     }\n }\n \n@@ -1689,6 +1716,9 @@ struct SingleModuleGraphBuilder<'a> {\n \n     /// Whether to walk ChunkingType::Traced references\n     include_traced: bool,\n+\n+    /// Whether to read ChunkableModuleReference::binding_usage()\n+    include_binding_usage: bool,\n }\n impl\n     Visit<(\n@@ -1753,10 +1783,15 @@ impl\n         let visited_modules = self.visited_modules;\n         let emit_spans = self.emit_spans;\n         let include_traced = self.include_traced;\n+        let include_binding_usage = self.include_binding_usage;\n         async move {\n             Ok(match (module, chunkable_ref_target) {\n                 (Some(module), None) => {\n-                    let refs_cell = primary_chunkable_referenced_modules(*module, include_traced);\n+                    let refs_cell = primary_chunkable_referenced_modules(\n+                        *module,\n+                        include_traced,\n+                        include_binding_usage,\n+                    );\n                     let refs = match refs_cell.await {\n                         Ok(refs) => refs,\n                         Err(e) => {\n@@ -2107,6 +2142,7 @@ pub mod tests {\n             let parent_graph = SingleModuleGraph::new_with_entries(\n                 GraphEntries::cell(GraphEntries(vec![ChunkGroupEntry::Entry(vec![b_module])])),\n                 false,\n+                false,\n             );\n \n             let module_graph = ModuleGraph::from_graphs(vec![\n@@ -2115,6 +2151,7 @@ pub mod tests {\n                     GraphEntries::cell(GraphEntries(vec![ChunkGroupEntry::Entry(vec![a_module])])),\n                     VisitedModules::from_graph(parent_graph),\n                     false,\n+                    false,\n                 ),\n             ])\n             .await?;\n@@ -2340,6 +2377,7 @@ pub mod tests {\n                     entry_modules.clone(),\n                 )])),\n                 false,\n+                false,\n             );\n \n             // Create a simple name mapping to make analyzing the visitors easier."
+        },
+        {
+            "sha": "ba99354e50c4a2fd7f4443e2ff64758fefdd9594",
+            "filename": "turbopack/crates/turbopack-core/src/reference/mod.rs",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 1,
+            "changes": 7,
+            "blob_url": "https://github.com/vercel/next.js/blob/2dda444c6966dc6a41ba92ce0d4ec114be7a89e8/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Freference%2Fmod.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/2dda444c6966dc6a41ba92ce0d4ec114be7a89e8/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Freference%2Fmod.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Freference%2Fmod.rs?ref=2dda444c6966dc6a41ba92ce0d4ec114be7a89e8",
+            "patch": "@@ -314,6 +314,7 @@ pub struct ModulesWithRefData(Vec<(ResolvedVc<Box<dyn ModuleReference>>, Resolve\n pub async fn primary_chunkable_referenced_modules(\n     module: ResolvedVc<Box<dyn Module>>,\n     include_traced: bool,\n+    include_binding_usage: bool,\n ) -> Result<Vc<ModulesWithRefData>> {\n     let modules = module\n         .references()\n@@ -333,7 +334,11 @@ pub async fn primary_chunkable_referenced_modules(\n                     .await?\n                     .primary_modules_ref()\n                     .await?;\n-                let binding_usage = reference.binding_usage().owned().await?;\n+                let binding_usage = if include_binding_usage {\n+                    reference.binding_usage().owned().await?\n+                } else {\n+                    BindingUsage::default()\n+                };\n \n                 return Ok(Some((\n                     ResolvedVc::upcast(reference),"
+        },
+        {
+            "sha": "acc194a89afdec37409655868f7097b10e3c9c6b",
+            "filename": "turbopack/crates/turbopack-node/src/transforms/postcss.rs",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/2dda444c6966dc6a41ba92ce0d4ec114be7a89e8/turbopack%2Fcrates%2Fturbopack-node%2Fsrc%2Ftransforms%2Fpostcss.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/2dda444c6966dc6a41ba92ce0d4ec114be7a89e8/turbopack%2Fcrates%2Fturbopack-node%2Fsrc%2Ftransforms%2Fpostcss.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-node%2Fsrc%2Ftransforms%2Fpostcss.rs?ref=2dda444c6966dc6a41ba92ce0d4ec114be7a89e8",
+            "patch": "@@ -499,7 +499,7 @@ impl PostCssTransformedAsset {\n             .to_resolved()\n             .await?;\n \n-        let module_graph = ModuleGraph::from_modules(entries.graph_entries(), false)\n+        let module_graph = ModuleGraph::from_modules(entries.graph_entries(), false, false)\n             .to_resolved()\n             .await?;\n "
+        },
+        {
+            "sha": "5a5781f371ce50653ef3d01937df56e565a93bb0",
+            "filename": "turbopack/crates/turbopack-node/src/transforms/webpack.rs",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/2dda444c6966dc6a41ba92ce0d4ec114be7a89e8/turbopack%2Fcrates%2Fturbopack-node%2Fsrc%2Ftransforms%2Fwebpack.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/2dda444c6966dc6a41ba92ce0d4ec114be7a89e8/turbopack%2Fcrates%2Fturbopack-node%2Fsrc%2Ftransforms%2Fwebpack.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-node%2Fsrc%2Ftransforms%2Fwebpack.rs?ref=2dda444c6966dc6a41ba92ce0d4ec114be7a89e8",
+            "patch": "@@ -245,7 +245,7 @@ impl WebpackLoadersProcessedAsset {\n             .to_resolved()\n             .await?;\n \n-        let module_graph = ModuleGraph::from_modules(entries.graph_entries(), false)\n+        let module_graph = ModuleGraph::from_modules(entries.graph_entries(), false, false)\n             .to_resolved()\n             .await?;\n "
+        },
+        {
+            "sha": "450ad13c37e43ac5c837834e4b7c6ee3d1ca02b0",
+            "filename": "turbopack/crates/turbopack-tests/tests/execution.rs",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/2dda444c6966dc6a41ba92ce0d4ec114be7a89e8/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/2dda444c6966dc6a41ba92ce0d4ec114be7a89e8/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution.rs?ref=2dda444c6966dc6a41ba92ce0d4ec114be7a89e8",
+            "patch": "@@ -476,7 +476,7 @@ async fn run_test_operation(prepared_test: ResolvedVc<PreparedTest>) -> Result<V\n \n     let entries = get_evaluate_entries(jest_entry_asset, asset_context, None);\n \n-    let mut module_graph = ModuleGraph::from_modules(entries.graph_entries(), false);\n+    let mut module_graph = ModuleGraph::from_modules(entries.graph_entries(), false, true);\n \n     let binding_usage = if options.remove_unused_imports || options.remove_unused_exports {\n         Some("
+        },
+        {
+            "sha": "7044fe56061b575efa9607d38e7e8df86c561faf",
+            "filename": "turbopack/crates/turbopack-tests/tests/snapshot.rs",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/2dda444c6966dc6a41ba92ce0d4ec114be7a89e8/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/2dda444c6966dc6a41ba92ce0d4ec114be7a89e8/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot.rs?ref=2dda444c6966dc6a41ba92ce0d4ec114be7a89e8",
+            "patch": "@@ -432,6 +432,7 @@ async fn run_test_operation(resource: RcStr) -> Result<Vc<FileSystemPath>> {\n     let mut module_graph = ModuleGraph::from_modules(\n         Vc::cell(vec![ChunkGroupEntry::Entry(entry_modules.clone())]),\n         false,\n+        true,\n     );\n \n     let binding_usage = if options.remove_unused_imports || options.remove_unused_exports {"
+        }
+    ],
+    "stats": {
+        "total": 149,
+        "additions": 118,
+        "deletions": 31
+    }
+}

@@ -1,0 +1,72 @@
+{
+    "author": "mischnic",
+    "message": "Turbopack: don't recompute empty parse results (#83883)\n\nDon't use the recomputation mechanism for this, just make it an optional.",
+    "sha": "a32aed998a1c2d9700ead862d3bd896b25600d5b",
+    "files": [
+        {
+            "sha": "1361eeb660d2d8b9d4b2ed1133219ca169b63c32",
+            "filename": "turbopack/crates/turbopack-ecmascript/src/lib.rs",
+            "status": "modified",
+            "additions": 27,
+            "deletions": 6,
+            "changes": 33,
+            "blob_url": "https://github.com/vercel/next.js/blob/a32aed998a1c2d9700ead862d3bd896b25600d5b/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Flib.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/a32aed998a1c2d9700ead862d3bd896b25600d5b/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Flib.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Flib.rs?ref=a32aed998a1c2d9700ead862d3bd896b25600d5b",
+            "patch": "@@ -516,7 +516,7 @@ impl EcmascriptAnalyzable for EcmascriptModuleAsset {\n             .await?;\n \n         Ok(EcmascriptModuleContentOptions {\n-            parsed,\n+            parsed: Some(parsed),\n             module: ResolvedVc::upcast(self),\n             specified_module_type: module_type_result.module_type,\n             chunking_context,\n@@ -885,7 +885,7 @@ pub struct EcmascriptModuleContent {\n #[derive(Clone, Debug, Hash, TaskInput)]\n pub struct EcmascriptModuleContentOptions {\n     module: ResolvedVc<Box<dyn EcmascriptChunkPlaceable>>,\n-    parsed: ResolvedVc<ParseResult>,\n+    parsed: Option<ResolvedVc<ParseResult>>,\n     specified_module_type: SpecifiedModuleType,\n     chunking_context: ResolvedVc<Box<dyn ChunkingContext>>,\n     references: ResolvedVc<ModuleReferences>,\n@@ -1030,7 +1030,7 @@ impl EcmascriptModuleContent {\n         generate_source_map: bool,\n     ) -> Result<Vc<Self>> {\n         let content = process_parse_result(\n-            parsed.to_resolved().await?,\n+            Some(parsed.to_resolved().await?),\n             ident,\n             specified_module_type,\n             generate_source_map,\n@@ -1655,9 +1655,8 @@ struct ScopeHoistingOptions<'a> {\n     modules: &'a FxIndexMap<ResolvedVc<Box<dyn EcmascriptChunkPlaceable>>, MergeableModuleExposure>,\n }\n \n-#[instrument(level = Level::TRACE, skip_all, name = \"process module\")]\n async fn process_parse_result(\n-    parsed: ResolvedVc<ParseResult>,\n+    parsed: Option<ResolvedVc<ParseResult>>,\n     ident: Vc<AssetIdent>,\n     specified_module_type: SpecifiedModuleType,\n     generate_source_map: bool,\n@@ -1914,12 +1913,16 @@ async fn process_parse_result(\n             })\n         },\n     )\n+    .instrument(tracing::trace_span!(\n+        \"process parse result\",\n+        ident = display(ident.to_string().await?),\n+    ))\n     .await\n }\n \n /// Try to avoid cloning the AST and Globals by unwrapping the ReadRef (and cloning otherwise).\n async fn with_consumed_parse_result<T>(\n-    parsed: ResolvedVc<ParseResult>,\n+    parsed: Option<ResolvedVc<ParseResult>>,\n     success: impl AsyncFnOnce(\n         Program,\n         &Arc<SourceMap>,\n@@ -1929,6 +1932,24 @@ async fn with_consumed_parse_result<T>(\n     ) -> Result<T>,\n     error: impl AsyncFnOnce(&ParseResult) -> Result<T>,\n ) -> Result<T> {\n+    let Some(parsed) = parsed else {\n+        let globals = Globals::new();\n+        let eval_context = GLOBALS.set(&globals, || EvalContext {\n+            unresolved_mark: Mark::new(),\n+            top_level_mark: Mark::new(),\n+            imports: Default::default(),\n+            force_free_values: Default::default(),\n+        });\n+        return success(\n+            Program::Module(swc_core::ecma::ast::Module::dummy()),\n+            &Default::default(),\n+            &Default::default(),\n+            Either::Left(eval_context),\n+            Either::Left(Default::default()),\n+        )\n+        .await;\n+    };\n+\n     let parsed = parsed.final_read_hint().await?;\n     match &*parsed {\n         ParseResult::Ok { .. } => {"
+        },
+        {
+            "sha": "c6c2d4ae1652a4deafbd1d2dbfe1d9d7f7b8a19b",
+            "filename": "turbopack/crates/turbopack-ecmascript/src/parse.rs",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 24,
+            "changes": 25,
+            "blob_url": "https://github.com/vercel/next.js/blob/a32aed998a1c2d9700ead862d3bd896b25600d5b/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Fparse.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/a32aed998a1c2d9700ead862d3bd896b25600d5b/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Fparse.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Fparse.rs?ref=a32aed998a1c2d9700ead862d3bd896b25600d5b",
+            "patch": "@@ -10,7 +10,6 @@ use swc_core::{\n         errors::{HANDLER, Handler},\n         input::StringInput,\n         source_map::{Files, SourceMapGenConfig, build_source_map},\n-        util::take::Take,\n     },\n     ecma::{\n         ast::{EsVersion, Id, ObjectPatProp, Pat, Program, VarDecl},\n@@ -44,7 +43,7 @@ use turbopack_swc_utils::emitter::IssueEmitter;\n use super::EcmascriptModuleAssetType;\n use crate::{\n     EcmascriptInputTransform,\n-    analyzer::{ImportMap, graph::EvalContext},\n+    analyzer::graph::EvalContext,\n     swc_comments::ImmutableComments,\n     transform::{EcmascriptInputTransforms, TransformContext},\n };\n@@ -80,28 +79,6 @@ impl PartialEq for ParseResult {\n     }\n }\n \n-#[turbo_tasks::value_impl]\n-impl ParseResult {\n-    #[turbo_tasks::function]\n-    pub fn empty() -> Vc<ParseResult> {\n-        let globals = Globals::new();\n-        let eval_context = GLOBALS.set(&globals, || EvalContext {\n-            unresolved_mark: Mark::new(),\n-            top_level_mark: Mark::new(),\n-            imports: ImportMap::default(),\n-            force_free_values: Default::default(),\n-        });\n-        ParseResult::Ok {\n-            program: Program::Module(swc_core::ecma::ast::Module::dummy()),\n-            comments: Default::default(),\n-            eval_context,\n-            globals: Arc::new(globals),\n-            source_map: Default::default(),\n-        }\n-        .cell()\n-    }\n-}\n-\n /// `original_source_maps_complete` indicates whether the `original_source_maps` cover the whole\n /// map, i.e. whether every module that ended up in `mappings` had an original sourcemap.\n #[instrument(level = Level::INFO, skip_all)]"
+        },
+        {
+            "sha": "3e8256bf1e1029840e1651f426f87a5c90a7406b",
+            "filename": "turbopack/crates/turbopack-ecmascript/src/side_effect_optimization/facade/module.rs",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/a32aed998a1c2d9700ead862d3bd896b25600d5b/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Fside_effect_optimization%2Ffacade%2Fmodule.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/a32aed998a1c2d9700ead862d3bd896b25600d5b/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Fside_effect_optimization%2Ffacade%2Fmodule.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Fside_effect_optimization%2Ffacade%2Fmodule.rs?ref=a32aed998a1c2d9700ead862d3bd896b25600d5b",
+            "patch": "@@ -23,7 +23,6 @@ use crate::{\n     chunk::{EcmascriptChunkPlaceable, EcmascriptExports},\n     code_gen::CodeGens,\n     export::Liveness,\n-    parse::ParseResult,\n     references::{\n         async_module::{AsyncModule, OptionAsyncModule},\n         esm::{EsmExport, EsmExports, base::EsmAssetReferences},\n@@ -212,7 +211,7 @@ impl EcmascriptAnalyzable for EcmascriptModuleFacadeModule {\n         let (part_references, esm_references) = self.await?.specific_references().await?;\n \n         Ok(EcmascriptModuleContentOptions {\n-            parsed: ParseResult::empty().to_resolved().await?,\n+            parsed: None,\n             module: ResolvedVc::upcast(self),\n             specified_module_type: SpecifiedModuleType::EcmaScript,\n             chunking_context,"
+        },
+        {
+            "sha": "0836407120917aaa3df14f656f4f95a8e0982425",
+            "filename": "turbopack/crates/turbopack-ecmascript/src/side_effect_optimization/locals/module.rs",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/a32aed998a1c2d9700ead862d3bd896b25600d5b/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Fside_effect_optimization%2Flocals%2Fmodule.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/a32aed998a1c2d9700ead862d3bd896b25600d5b/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Fside_effect_optimization%2Flocals%2Fmodule.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Fside_effect_optimization%2Flocals%2Fmodule.rs?ref=a32aed998a1c2d9700ead862d3bd896b25600d5b",
+            "patch": "@@ -111,7 +111,7 @@ impl EcmascriptAnalyzable for EcmascriptModuleLocalsModule {\n             .await?;\n \n         Ok(EcmascriptModuleContentOptions {\n-            parsed,\n+            parsed: Some(parsed),\n             module: ResolvedVc::upcast(self),\n             specified_module_type: module_type_result.module_type,\n             chunking_context,"
+        },
+        {
+            "sha": "dcf3dd9e199b5370c83decc8857a8c8bdbc0fb05",
+            "filename": "turbopack/crates/turbopack-ecmascript/src/tree_shake/asset.rs",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/a32aed998a1c2d9700ead862d3bd896b25600d5b/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Ftree_shake%2Fasset.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/a32aed998a1c2d9700ead862d3bd896b25600d5b/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Ftree_shake%2Fasset.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Ftree_shake%2Fasset.rs?ref=a32aed998a1c2d9700ead862d3bd896b25600d5b",
+            "patch": "@@ -94,7 +94,7 @@ impl EcmascriptAnalyzable for EcmascriptModulePartAsset {\n             .reference_module_source_maps(Vc::upcast(*self))\n             .await?;\n         Ok(EcmascriptModuleContentOptions {\n-            parsed,\n+            parsed: Some(parsed),\n             module: ResolvedVc::upcast(self),\n             specified_module_type: module_type_result.module_type,\n             chunking_context,"
+        }
+    ],
+    "stats": {
+        "total": 65,
+        "additions": 31,
+        "deletions": 34
+    }
+}

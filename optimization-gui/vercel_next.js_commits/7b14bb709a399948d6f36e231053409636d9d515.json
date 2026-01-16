@@ -1,0 +1,36 @@
+{
+    "author": "mischnic",
+    "message": "Turbopack: fix double codegen of some merged modules (#83886)\n\nThis fixes double-codegen and re-parse (due to recomputation).\r\n\r\nPreviously, `get_batch_group` could return some of the original JS modules, while `chunkable_items` was correctly getting the replaced `MergedEcmascriptModule`s. This cause modules to be codegened twice.\r\nInstead, replace `ModuleBatch`es in both of the lists.\r\n\r\nBefore:\r\n<img width=\"1069\" height=\"975\" alt=\"Bildschirmfoto 2025-09-17 um 11 59 21\" src=\"https://github.com/user-attachments/assets/74e0258b-9651-4e6d-b433-f2d81f0b96ce\" />\r\n\r\n\r\nAfter:\r\n<img width=\"1591\" height=\"1044\" alt=\"Bildschirmfoto 2025-09-17 um 12 15 24\" src=\"https://github.com/user-attachments/assets/170b36ca-5b64-4b0f-851e-06305baf86a7\" />",
+    "sha": "7b14bb709a399948d6f36e231053409636d9d515",
+    "files": [
+        {
+            "sha": "50e8e51287720bcedccdeaa3d605040f2e85e371",
+            "filename": "turbopack/crates/turbopack-core/src/chunk/chunk_group.rs",
+            "status": "modified",
+            "additions": 64,
+            "deletions": 2,
+            "changes": 66,
+            "blob_url": "https://github.com/vercel/next.js/blob/7b14bb709a399948d6f36e231053409636d9d515/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fchunk%2Fchunk_group.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/7b14bb709a399948d6f36e231053409636d9d515/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fchunk%2Fchunk_group.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fchunk%2Fchunk_group.rs?ref=7b14bb709a399948d6f36e231053409636d9d515",
+            "patch": "@@ -1,4 +1,4 @@\n-use std::{cell::RefCell, collections::HashSet};\n+use std::{cell::RefCell, collections::HashSet, sync::atomic::AtomicBool};\n \n use anyhow::{Context, Result};\n use rustc_hash::FxHashMap;\n@@ -20,7 +20,8 @@ use crate::{\n         GraphTraversalAction, ModuleGraph,\n         merged_modules::MergedModuleInfo,\n         module_batch::{\n-            ChunkableModuleBatchGroup, ChunkableModuleOrBatch, ModuleBatch, ModuleOrBatch,\n+            ChunkableModuleBatchGroup, ChunkableModuleOrBatch, ModuleBatch, ModuleBatchGroup,\n+            ModuleOrBatch,\n         },\n         module_batches::{BatchingConfig, ModuleBatchesGraphEdge},\n     },\n@@ -373,6 +374,16 @@ pub async fn chunk_group_content(\n         }\n     }\n \n+    let batch_groups = if let Some((merged_modules, _)) = &should_merge_modules {\n+        batch_groups\n+            .into_iter()\n+            .map(|group| map_module_batch_group(*merged_modules, *group).to_resolved())\n+            .try_join()\n+            .await?\n+    } else {\n+        batch_groups.into_iter().collect()\n+    };\n+\n     Ok(ChunkGroupContent {\n         chunkable_items,\n         batch_groups,\n@@ -422,3 +433,54 @@ async fn map_module_batch(\n         Ok(batch)\n     }\n }\n+\n+#[turbo_tasks::function]\n+async fn map_module_batch_group(\n+    merged_modules: Vc<MergedModuleInfo>,\n+    group: Vc<ModuleBatchGroup>,\n+) -> Result<Vc<ModuleBatchGroup>> {\n+    let merged_modules_ref = merged_modules.await?;\n+    let group_ref = group.await?;\n+\n+    let modified = AtomicBool::new(false);\n+    let items = group_ref\n+        .items\n+        .iter()\n+        .copied()\n+        .map(async |chunkable_module| match chunkable_module {\n+            ModuleOrBatch::Module(module) => {\n+                if !merged_modules_ref.should_create_chunk_item_for(module) {\n+                    modified.store(true, std::sync::atomic::Ordering::Relaxed);\n+                    return Ok(None);\n+                }\n+\n+                let module =\n+                    if let Some(replacement) = merged_modules_ref.should_replace_module(module) {\n+                        modified.store(true, std::sync::atomic::Ordering::Relaxed);\n+                        ResolvedVc::upcast(replacement)\n+                    } else {\n+                        module\n+                    };\n+\n+                Ok(Some(ModuleOrBatch::Module(module)))\n+            }\n+            ModuleOrBatch::Batch(batch) => {\n+                let replacement = map_module_batch(merged_modules, *batch)\n+                    .to_resolved()\n+                    .await?;\n+                if replacement != batch {\n+                    modified.store(true, std::sync::atomic::Ordering::Relaxed);\n+                }\n+                Ok(Some(ModuleOrBatch::Batch(replacement)))\n+            }\n+            ModuleOrBatch::None(i) => Ok(Some(ModuleOrBatch::None(i))),\n+        })\n+        .try_flat_join()\n+        .await?;\n+\n+    if modified.into_inner() {\n+        Ok(ModuleBatchGroup::new(items, group_ref.chunk_groups.clone()))\n+    } else {\n+        Ok(group)\n+    }\n+}"
+        },
+        {
+            "sha": "4660f7b64e44ebad8bd435871bb22b4e06ba63c5",
+            "filename": "turbopack/crates/turbopack-core/src/chunk/mod.rs",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/7b14bb709a399948d6f36e231053409636d9d515/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fchunk%2Fmod.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/7b14bb709a399948d6f36e231053409636d9d515/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fchunk%2Fmod.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fchunk%2Fmod.rs?ref=7b14bb709a399948d6f36e231053409636d9d515",
+            "patch": "@@ -428,7 +428,7 @@ pub trait ChunkableModuleReference: ModuleReference + ValueToString {\n \n pub struct ChunkGroupContent {\n     pub chunkable_items: Vec<ChunkableModuleOrBatch>,\n-    pub batch_groups: FxIndexSet<ResolvedVc<ModuleBatchGroup>>,\n+    pub batch_groups: Vec<ResolvedVc<ModuleBatchGroup>>,\n     pub async_modules: FxIndexSet<ResolvedVc<Box<dyn ChunkableModule>>>,\n     pub traced_modules: FxIndexSet<ResolvedVc<Box<dyn Module>>>,\n     pub availability_info: AvailabilityInfo,"
+        }
+    ],
+    "stats": {
+        "total": 68,
+        "additions": 65,
+        "deletions": 3
+    }
+}

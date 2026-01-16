@@ -1,0 +1,48 @@
+{
+    "author": "feedthejim",
+    "message": "fix: revalidateTag with profile should not trigger client cache invalidation (#88069)\n\n## Summary\n\nFixes a bug where calling `revalidateTag(tag, profile)` incorrectly\ntriggers client-side cache invalidation, causing read-your-own-writes\nbehavior that violates stale-while-revalidate semantics.\n\n### The Problem\n\nWhen `revalidateTag('tag', 'max')` is called in a server action:\n1. The tag is correctly marked for stale-while-revalidate\n2. BUT the `x-action-revalidated` header is incorrectly set to `1`\n3. This triggers client-side cache invalidation via\n`revalidateEntireCache()`\n4. The client navigates and may display stale data from background\nrevalidation\n\nThis caused the confusing behavior where:\n- Click 1: Nothing happens (correct)\n- Click 2: Nothing happens (correct) \n- Click 3: Data changes to a stale value from click 1 (incorrect!)\n\n### The Fix\n\nIn `addRevalidationHeader`, change the `isTagRevalidated` calculation to\nonly count tags **without** a profile (from `updateTag`). Tags with a\nprofile (from `revalidateTag`) should follow stale-while-revalidate\nsemantics and not trigger immediate client-side cache invalidation.\n\n```typescript\n// Before:\nconst isTagRevalidated = workStore.pendingRevalidatedTags?.length ? 1 : 0\n\n// After:\nconst isTagRevalidated = workStore.pendingRevalidatedTags?.some(\n  (item) => item.profile === undefined\n) ? 1 : 0\n```\n\n### Expected Behavior After Fix\n\n| API | Profile | Header Set | Client Behavior |\n|-----|---------|------------|-----------------|\n| `updateTag(tag)` | `undefined` | ✅ Yes | Immediate refresh\n(read-your-own-writes) |\n| `revalidateTag(tag, 'max')` | `'max'` | ❌ No | Keep stale data (SWR) |\n| `revalidateTag(tag, { expire: 0 })` | `{ expire: 0 }` | ✅ Yes* |\nImmediate refresh |\n\n*For immediate expiration via `pathWasRevalidated` which is already\nhandled correctly.\n\n## Test Plan\n\n- [x] Added new test page at\n`test/e2e/app-dir/use-cache/app/(partially-static)/revalidate-tag-no-refresh/page.tsx`\n- [x] Added test case that verifies 3 clicks of `revalidateTag` with\nprofile don't change the displayed value\n- [x] Verified existing `updateTag` test (`should update after\nrevalidateTag correctly`) still passes\n- [x] Verified both tests pass with `pnpm test-start`\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-authored-by: Claude Opus 4.5 <noreply@anthropic.com>",
+    "sha": "fa56f2c1fa02fcaeca08358725a9565a7a5997ac",
+    "files": [
+        {
+            "sha": "6614f855a91054b2af56a7427e61b7a757d3e34e",
+            "filename": "packages/next/src/server/app-render/action-handler.ts",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 1,
+            "changes": 9,
+            "blob_url": "https://github.com/vercel/next.js/blob/fa56f2c1fa02fcaeca08358725a9565a7a5997ac/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Faction-handler.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/fa56f2c1fa02fcaeca08358725a9565a7a5997ac/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Faction-handler.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Faction-handler.ts?ref=fa56f2c1fa02fcaeca08358725a9565a7a5997ac",
+            "patch": "@@ -160,7 +160,14 @@ function addRevalidationHeader(\n   // TODO-APP: Currently paths are treated as tags, so the second element of the tuple\n   // is always empty.\n \n-  const isTagRevalidated = workStore.pendingRevalidatedTags?.length ? 1 : 0\n+  // Only count tags without a profile (updateTag) as requiring client cache invalidation\n+  // Tags with a profile (revalidateTag) use stale-while-revalidate and shouldn't\n+  // trigger immediate client-side cache invalidation\n+  const isTagRevalidated = workStore.pendingRevalidatedTags?.some(\n+    (item) => item.profile === undefined\n+  )\n+    ? 1\n+    : 0\n   const isCookieRevalidated = getModifiedCookieValues(\n     requestStore.mutableCookies\n   ).length"
+        },
+        {
+            "sha": "56dfbe96a814d6e99bcbf08c69243639969af277",
+            "filename": "test/e2e/app-dir/use-cache/app/(partially-static)/revalidate-tag-no-refresh/page.tsx",
+            "status": "added",
+            "additions": 34,
+            "deletions": 0,
+            "changes": 34,
+            "blob_url": "https://github.com/vercel/next.js/blob/fa56f2c1fa02fcaeca08358725a9565a7a5997ac/test%2Fe2e%2Fapp-dir%2Fuse-cache%2Fapp%2F(partially-static)%2Frevalidate-tag-no-refresh%2Fpage.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/fa56f2c1fa02fcaeca08358725a9565a7a5997ac/test%2Fe2e%2Fapp-dir%2Fuse-cache%2Fapp%2F(partially-static)%2Frevalidate-tag-no-refresh%2Fpage.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fuse-cache%2Fapp%2F(partially-static)%2Frevalidate-tag-no-refresh%2Fpage.tsx?ref=fa56f2c1fa02fcaeca08358725a9565a7a5997ac",
+            "patch": "@@ -0,0 +1,34 @@\n+import { revalidateTag, cacheTag, cacheLife } from 'next/cache'\n+\n+async function getCachedRandomNumber() {\n+  'use cache'\n+  cacheTag('revalidate-tag-test')\n+  cacheLife('max')\n+\n+  // This should change on each cache refresh\n+  return Math.random().toString()\n+}\n+\n+export default async function Page() {\n+  const randomNumber = await getCachedRandomNumber()\n+\n+  return (\n+    <div>\n+      <p id=\"random\">{randomNumber}</p>\n+      <form>\n+        <button\n+          id=\"revalidate-tag-with-profile\"\n+          formAction={async () => {\n+            'use server'\n+            // This should NOT cause immediate client refresh\n+            // The client should continue showing stale data\n+            // Fresh data should only appear on next navigation/refresh\n+            revalidateTag('revalidate-tag-test', 'max')\n+          }}\n+        >\n+          Revalidate Tag (background)\n+        </button>\n+      </form>\n+    </div>\n+  )\n+}"
+        },
+        {
+            "sha": "7071bea24c198206ed323ed27db3fe5eccdf3bf7",
+            "filename": "test/e2e/app-dir/use-cache/use-cache.test.ts",
+            "status": "modified",
+            "additions": 36,
+            "deletions": 0,
+            "changes": 36,
+            "blob_url": "https://github.com/vercel/next.js/blob/fa56f2c1fa02fcaeca08358725a9565a7a5997ac/test%2Fe2e%2Fapp-dir%2Fuse-cache%2Fuse-cache.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/fa56f2c1fa02fcaeca08358725a9565a7a5997ac/test%2Fe2e%2Fapp-dir%2Fuse-cache%2Fuse-cache.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fuse-cache%2Fuse-cache.test.ts?ref=fa56f2c1fa02fcaeca08358725a9565a7a5997ac",
+            "patch": "@@ -495,6 +495,7 @@ describe('use-cache', () => {\n           '/react-cache',\n           '/referential-equality',\n           '/revalidate-and-redirect/redirect',\n+          '/revalidate-tag-no-refresh',\n           '/rsc-payload',\n           '/static-class-method',\n           withCacheComponents && '/unhandled-promise-regression',\n@@ -679,6 +680,41 @@ describe('use-cache', () => {\n         'cache-handler set fetch cache https://next-data-api-endpoint.vercel.app/api/random?no-store'\n       )\n     })\n+\n+    // Test for revalidateTag with profile (stale-while-revalidate)\n+    // This should NOT cause immediate client refresh - only updateTag should do that\n+    it('should NOT update immediately after revalidateTag with profile (stale-while-revalidate)', async () => {\n+      const browser = await next.browser('/revalidate-tag-no-refresh')\n+      const initial = await browser.elementByCss('#random').text()\n+\n+      console.log('[Test] Initial value:', initial)\n+\n+      // Click 1: revalidateTag with profile - should NOT cause immediate refresh\n+      await browser.elementByCss('#revalidate-tag-with-profile').click()\n+      // Wait for the action to complete\n+      await new Promise((r) => setTimeout(r, 1000))\n+      const afterClick1 = await browser.elementByCss('#random').text()\n+      console.log('[Test] After click 1:', afterClick1)\n+      expect(afterClick1).toBe(initial) // No change - stale-while-revalidate\n+\n+      // Click 2: Same as click 1 - should still show stale data\n+      await browser.elementByCss('#revalidate-tag-with-profile').click()\n+      await new Promise((r) => setTimeout(r, 1000))\n+      const afterClick2 = await browser.elementByCss('#random').text()\n+      console.log('[Test] After click 2:', afterClick2)\n+      expect(afterClick2).toBe(initial) // Still no change\n+\n+      // Click 3: Same as before - should still show stale data (not data from click 1)\n+      await browser.elementByCss('#revalidate-tag-with-profile').click()\n+      await new Promise((r) => setTimeout(r, 1000))\n+      const afterClick3 = await browser.elementByCss('#random').text()\n+      console.log('[Test] After click 3:', afterClick3)\n+      expect(afterClick3).toBe(initial) // Still no change - no read-your-own-writes\n+\n+      // The key assertion: after 3 clicks, the value should still be the same\n+      // This proves revalidateTag with profile does NOT cause read-your-own-writes\n+      // (Unlike the bug where click 3 would show a different stale value)\n+    })\n   }\n \n   it('should override fetch with cookies/auth in use cache properly', async () => {"
+        }
+    ],
+    "stats": {
+        "total": 79,
+        "additions": 78,
+        "deletions": 1
+    }
+}

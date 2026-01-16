@@ -1,0 +1,157 @@
+{
+    "author": "huozhi",
+    "message": "improve next config schema validation errors (#84847)",
+    "sha": "27821674a6d239b5159bdb285d4633c8435c3568",
+    "files": [
+        {
+            "sha": "617a7b44e8b2e399dff64fb91222503c7155d2dd",
+            "filename": "packages/next/src/server/config.ts",
+            "status": "modified",
+            "additions": 94,
+            "deletions": 54,
+            "changes": 148,
+            "blob_url": "https://github.com/vercel/next.js/blob/27821674a6d239b5159bdb285d4633c8435c3568/packages%2Fnext%2Fsrc%2Fserver%2Fconfig.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/27821674a6d239b5159bdb285d4633c8435c3568/packages%2Fnext%2Fsrc%2Fserver%2Fconfig.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fconfig.ts?ref=27821674a6d239b5159bdb285d4633c8435c3568",
+            "patch": "@@ -22,7 +22,7 @@ import { loadWebpackHook } from './config-utils'\n import { imageConfigDefault } from '../shared/lib/image-config'\n import type { ImageConfig } from '../shared/lib/image-config'\n import { loadEnvConfig, updateInitialEnv } from '@next/env'\n-import { flushAndExit } from '../telemetry/flush-and-exit'\n+import { flushTelemetry } from '../telemetry/flush-telemetry'\n import {\n   findRootDirAndLockFiles,\n   warnDuplicatedLockFiles,\n@@ -53,40 +53,48 @@ export type { DomainLocale, NextConfig } from './config-shared'\n \n function normalizeNextConfigZodErrors(\n   error: ZodError<NextConfig>\n-): [errorMessages: string[], shouldExit: boolean] {\n-  let shouldExit = false\n+): [warnings: string[], fatalErrors: string[]] {\n+  const warnings: string[] = []\n+  const fatalErrors: string[] = []\n   const issues = normalizeZodErrors(error)\n-  return [\n-    issues.flatMap(({ issue, message }) => {\n-      if (issue.path[0] === 'images') {\n-        // We exit the build when encountering an error in the images config\n+\n+  for (const { issue, message: originalMessage } of issues) {\n+    let message = originalMessage\n+    let shouldExit = false\n+\n+    if (issue.path[0] === 'images') {\n+      // We exit the build when encountering an error in the images config\n+      shouldExit = true\n+    }\n+    if (\n+      issue.code === 'unrecognized_keys' &&\n+      issue.path[0] === 'experimental'\n+    ) {\n+      if (message.includes('turbopackPersistentCachingForBuild')) {\n+        // We exit the build when encountering an error in the turbopackPersistentCaching config\n         shouldExit = true\n+        message +=\n+          \"\\nUse 'experimental.turbopackFileSystemCacheForBuild' instead.\"\n+        message +=\n+          '\\nLearn more: https://nextjs.org/docs/app/api-reference/config/next-config-js/turbopackFileSystemCache'\n+      } else if (message.includes('turbopackPersistentCaching')) {\n+        // We exit the build when encountering an error in the turbopackPersistentCaching config\n+        shouldExit = true\n+        message +=\n+          \"\\nUse 'experimental.turbopackFileSystemCacheForDev' instead.\"\n+        message +=\n+          '\\nLearn more: https://nextjs.org/docs/app/api-reference/config/next-config-js/turbopackFileSystemCache'\n       }\n-      if (\n-        issue.code === 'unrecognized_keys' &&\n-        issue.path[0] === 'experimental'\n-      ) {\n-        if (message.includes('turbopackPersistentCachingForBuild')) {\n-          // We exit the build when encountering an error in the turbopackPersistentCaching config\n-          shouldExit = true\n-          message +=\n-            \"\\nUse 'experimental.turbopackFileSystemCacheForBuild' instead.\"\n-          message +=\n-            '\\nLearn more: https://nextjs.org/docs/app/api-reference/config/next-config-js/turbopackFileSystemCache'\n-        } else if (message.includes('turbopackPersistentCaching')) {\n-          // We exit the build when encountering an error in the turbopackPersistentCaching config\n-          shouldExit = true\n-          message +=\n-            \"\\nUse 'experimental.turbopackFileSystemCacheForDev' instead.\"\n-          message +=\n-            '\\nLearn more: https://nextjs.org/docs/app/api-reference/config/next-config-js/turbopackFileSystemCache'\n-        }\n-      }\n+    }\n \n-      return message\n-    }),\n-    shouldExit,\n-  ]\n+    if (shouldExit) {\n+      fatalErrors.push(message)\n+    } else {\n+      warnings.push(message)\n+    }\n+  }\n+\n+  return [warnings, fatalErrors]\n }\n \n export function warnOptionHasBeenDeprecated(\n@@ -1938,36 +1946,68 @@ async function validateConfigSchema(\n   const state = configSchema.safeParse(userConfig)\n \n   if (!state.success) {\n-    // error message header\n-    const messages = [`Invalid ${configFileName} options detected: `]\n+    const [warnings, fatalErrors] = normalizeNextConfigZodErrors(state.error)\n+    const hasFatalErrors = fatalErrors.length > 0\n \n-    const [errorMessages, shouldExit] = normalizeNextConfigZodErrors(\n-      state.error\n-    )\n-    // ident list item\n-    for (const error of errorMessages) {\n-      messages.push(`    ${error.split('\\n').join('\\n    ')}`)\n-    }\n+    // Group warnings first\n+    if (warnings.length > 0) {\n+      const warningMessages = [`Invalid ${configFileName} options detected: `]\n \n-    // error message footer\n-    messages.push(\n-      'See more info here: https://nextjs.org/docs/messages/invalid-next-config'\n-    )\n+      for (const error of warnings) {\n+        warningMessages.push(`    ${error.split('\\n').join('\\n    ')}`)\n+      }\n \n-    // Call the callback with validation messages if provided\n-    if (onValidationMessages) {\n-      onValidationMessages(messages)\n-    }\n+      warningMessages.push(\n+        'See more info here: https://nextjs.org/docs/messages/invalid-next-config'\n+      )\n \n-    if (shouldExit) {\n-      for (const message of messages) {\n-        console.error(message)\n+      // Call the callback with validation messages if provided\n+      if (onValidationMessages) {\n+        onValidationMessages(warningMessages)\n       }\n-      await flushAndExit(1)\n-    } else {\n-      for (const message of messages) {\n+\n+      for (const message of warningMessages) {\n         warn(message)\n       }\n     }\n+\n+    // Then throw hard errors\n+    if (hasFatalErrors) {\n+      await flushTelemetry()\n+\n+      const errorMessages = [\n+        `Fatal next config errors found in ${configFileName} that must be fixed:`,\n+      ]\n+\n+      for (const error of fatalErrors) {\n+        errorMessages.push(`    ${error.split('\\n').join('\\n    ')}`)\n+      }\n+\n+      errorMessages.push(\n+        'These configuration options are required or have been migrated. Please update your configuration.'\n+      )\n+      errorMessages.push(\n+        'See more info here: https://nextjs.org/docs/messages/invalid-next-config'\n+      )\n+\n+      // Call the callback with validation messages if provided\n+      if (onValidationMessages) {\n+        onValidationMessages(errorMessages)\n+      }\n+\n+      const fullErrorMessage = errorMessages.join('\\n')\n+\n+      let err: Error\n+      // Hide the stack trace for this error as the trace is not useful here.\n+      const stackTraceLimit = Error.stackTraceLimit\n+      Error.stackTraceLimit = 0\n+      try {\n+        err = new Error(fullErrorMessage)\n+      } finally {\n+        Error.stackTraceLimit = stackTraceLimit\n+      }\n+\n+      throw err\n+    }\n   }\n }"
+        },
+        {
+            "sha": "69e3475c6285ff22f33a9098af97584846dcefd1",
+            "filename": "packages/next/src/telemetry/flush-telemetry.ts",
+            "status": "renamed",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/27821674a6d239b5159bdb285d4633c8435c3568/packages%2Fnext%2Fsrc%2Ftelemetry%2Fflush-telemetry.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/27821674a6d239b5159bdb285d4633c8435c3568/packages%2Fnext%2Fsrc%2Ftelemetry%2Fflush-telemetry.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Ftelemetry%2Fflush-telemetry.ts?ref=27821674a6d239b5159bdb285d4633c8435c3568",
+            "patch": "@@ -1,11 +1,10 @@\n import { traceGlobals } from '../trace/shared'\n \n-export async function flushAndExit(code: number) {\n+export async function flushTelemetry() {\n   let telemetry = traceGlobals.get('telemetry') as\n     | InstanceType<typeof import('./storage').Telemetry>\n     | undefined\n   if (telemetry) {\n     await telemetry.flush()\n   }\n-  process.exit(code)\n }",
+            "previous_filename": "packages/next/src/telemetry/flush-and-exit.ts"
+        },
+        {
+            "sha": "6eef625cb3b951a4723d6e79f35f9f2ee6480e67",
+            "filename": "test-config-errors/app/page.js",
+            "status": "added",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/27821674a6d239b5159bdb285d4633c8435c3568/test-config-errors%2Fapp%2Fpage.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/27821674a6d239b5159bdb285d4633c8435c3568/test-config-errors%2Fapp%2Fpage.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test-config-errors%2Fapp%2Fpage.js?ref=27821674a6d239b5159bdb285d4633c8435c3568",
+            "patch": "@@ -0,0 +1,3 @@\n+export default function Page() {\n+  return <div>Test Page</div>\n+}"
+        },
+        {
+            "sha": "c64561851d5f1fcadfc813d88e164a5df7027701",
+            "filename": "test-config-errors/next.config.js",
+            "status": "added",
+            "additions": 13,
+            "deletions": 0,
+            "changes": 13,
+            "blob_url": "https://github.com/vercel/next.js/blob/27821674a6d239b5159bdb285d4633c8435c3568/test-config-errors%2Fnext.config.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/27821674a6d239b5159bdb285d4633c8435c3568/test-config-errors%2Fnext.config.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test-config-errors%2Fnext.config.js?ref=27821674a6d239b5159bdb285d4633c8435c3568",
+            "patch": "@@ -0,0 +1,13 @@\n+// Test config with both warnings (unknown keys) and hard errors (images config error)\n+module.exports = {\n+  // This should be a warning - unknown experimental key\n+  experimental: {\n+    unknownExperimentalOption: true,\n+    anotherUnknownOption: 'test',\n+  },\n+\n+  // This should be a hard error - invalid images config\n+  images: {\n+    invalidOption: 'bad value',\n+  },\n+}"
+        },
+        {
+            "sha": "803f17d863c8ad887c14588aab3487e473367b41",
+            "filename": "test/production/config-validation-fatal-errors/app/layout.js",
+            "status": "added",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/vercel/next.js/blob/27821674a6d239b5159bdb285d4633c8435c3568/test%2Fproduction%2Fconfig-validation-fatal-errors%2Fapp%2Flayout.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/27821674a6d239b5159bdb285d4633c8435c3568/test%2Fproduction%2Fconfig-validation-fatal-errors%2Fapp%2Flayout.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fproduction%2Fconfig-validation-fatal-errors%2Fapp%2Flayout.js?ref=27821674a6d239b5159bdb285d4633c8435c3568",
+            "patch": "@@ -0,0 +1,7 @@\n+export default function RootLayout({ children }) {\n+  return (\n+    <html>\n+      <body>{children}</body>\n+    </html>\n+  )\n+}"
+        },
+        {
+            "sha": "6eef625cb3b951a4723d6e79f35f9f2ee6480e67",
+            "filename": "test/production/config-validation-fatal-errors/app/page.js",
+            "status": "added",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/27821674a6d239b5159bdb285d4633c8435c3568/test%2Fproduction%2Fconfig-validation-fatal-errors%2Fapp%2Fpage.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/27821674a6d239b5159bdb285d4633c8435c3568/test%2Fproduction%2Fconfig-validation-fatal-errors%2Fapp%2Fpage.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fproduction%2Fconfig-validation-fatal-errors%2Fapp%2Fpage.js?ref=27821674a6d239b5159bdb285d4633c8435c3568",
+            "patch": "@@ -0,0 +1,3 @@\n+export default function Page() {\n+  return <div>Test Page</div>\n+}"
+        },
+        {
+            "sha": "f659f219abc4901c2c990bceed38206b72e54151",
+            "filename": "test/production/config-validation-fatal-errors/index.test.ts",
+            "status": "added",
+            "additions": 35,
+            "deletions": 0,
+            "changes": 35,
+            "blob_url": "https://github.com/vercel/next.js/blob/27821674a6d239b5159bdb285d4633c8435c3568/test%2Fproduction%2Fconfig-validation-fatal-errors%2Findex.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/27821674a6d239b5159bdb285d4633c8435c3568/test%2Fproduction%2Fconfig-validation-fatal-errors%2Findex.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fproduction%2Fconfig-validation-fatal-errors%2Findex.test.ts?ref=27821674a6d239b5159bdb285d4633c8435c3568",
+            "patch": "@@ -0,0 +1,35 @@\n+import { nextTestSetup } from 'e2e-utils'\n+\n+describe('config validation - fatal errors', () => {\n+  const { next } = nextTestSetup({\n+    skipStart: true,\n+    skipDeployment: true,\n+    files: __dirname,\n+  })\n+\n+  it('should show warnings first, then throw fatal error', async () => {\n+    const { exitCode, cliOutput } = await next.build()\n+\n+    // Build should fail\n+    expect(exitCode).toBe(1)\n+\n+    // Should show warnings first\n+    expect(cliOutput).toContain('Invalid next.config.js options detected')\n+    expect(cliOutput).toContain(\n+      \"Unrecognized key(s) in object: 'unknownExperimentalOption', 'anotherUnknownOption'\"\n+    )\n+    expect(cliOutput).toContain('at \"experimental\"')\n+\n+    // Should show fatal error\n+    expect(cliOutput).toContain(\n+      'Fatal next config errors found in next.config.js that must be fixed'\n+    )\n+    expect(cliOutput).toContain(\n+      \"Unrecognized key(s) in object: 'invalidOption'\"\n+    )\n+    expect(cliOutput).toContain('at \"images\"')\n+    expect(cliOutput).toContain(\n+      'These configuration options are required or have been migrated'\n+    )\n+  })\n+})"
+        },
+        {
+            "sha": "c473beb704d34642afdcd535c29439225ec41031",
+            "filename": "test/production/config-validation-fatal-errors/next.config.js",
+            "status": "added",
+            "additions": 12,
+            "deletions": 0,
+            "changes": 12,
+            "blob_url": "https://github.com/vercel/next.js/blob/27821674a6d239b5159bdb285d4633c8435c3568/test%2Fproduction%2Fconfig-validation-fatal-errors%2Fnext.config.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/27821674a6d239b5159bdb285d4633c8435c3568/test%2Fproduction%2Fconfig-validation-fatal-errors%2Fnext.config.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fproduction%2Fconfig-validation-fatal-errors%2Fnext.config.js?ref=27821674a6d239b5159bdb285d4633c8435c3568",
+            "patch": "@@ -0,0 +1,12 @@\n+module.exports = {\n+  // This should be a warning - unknown experimental key\n+  experimental: {\n+    unknownExperimentalOption: true,\n+    anotherUnknownOption: 'test',\n+  },\n+\n+  // This should be a fatal error - invalid images config\n+  images: {\n+    invalidOption: 'bad value',\n+  },\n+}"
+        },
+        {
+            "sha": "803f17d863c8ad887c14588aab3487e473367b41",
+            "filename": "test/production/config-validation-warnings/app/layout.js",
+            "status": "added",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/vercel/next.js/blob/27821674a6d239b5159bdb285d4633c8435c3568/test%2Fproduction%2Fconfig-validation-warnings%2Fapp%2Flayout.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/27821674a6d239b5159bdb285d4633c8435c3568/test%2Fproduction%2Fconfig-validation-warnings%2Fapp%2Flayout.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fproduction%2Fconfig-validation-warnings%2Fapp%2Flayout.js?ref=27821674a6d239b5159bdb285d4633c8435c3568",
+            "patch": "@@ -0,0 +1,7 @@\n+export default function RootLayout({ children }) {\n+  return (\n+    <html>\n+      <body>{children}</body>\n+    </html>\n+  )\n+}"
+        },
+        {
+            "sha": "6eef625cb3b951a4723d6e79f35f9f2ee6480e67",
+            "filename": "test/production/config-validation-warnings/app/page.js",
+            "status": "added",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/27821674a6d239b5159bdb285d4633c8435c3568/test%2Fproduction%2Fconfig-validation-warnings%2Fapp%2Fpage.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/27821674a6d239b5159bdb285d4633c8435c3568/test%2Fproduction%2Fconfig-validation-warnings%2Fapp%2Fpage.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fproduction%2Fconfig-validation-warnings%2Fapp%2Fpage.js?ref=27821674a6d239b5159bdb285d4633c8435c3568",
+            "patch": "@@ -0,0 +1,3 @@\n+export default function Page() {\n+  return <div>Test Page</div>\n+}"
+        },
+        {
+            "sha": "e9750e3384647ed63fb09dbd5b6715d31683ef9c",
+            "filename": "test/production/config-validation-warnings/index.test.ts",
+            "status": "added",
+            "additions": 29,
+            "deletions": 0,
+            "changes": 29,
+            "blob_url": "https://github.com/vercel/next.js/blob/27821674a6d239b5159bdb285d4633c8435c3568/test%2Fproduction%2Fconfig-validation-warnings%2Findex.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/27821674a6d239b5159bdb285d4633c8435c3568/test%2Fproduction%2Fconfig-validation-warnings%2Findex.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fproduction%2Fconfig-validation-warnings%2Findex.test.ts?ref=27821674a6d239b5159bdb285d4633c8435c3568",
+            "patch": "@@ -0,0 +1,29 @@\n+import { nextTestSetup } from 'e2e-utils'\n+\n+describe('config validation - warnings only', () => {\n+  const { next } = nextTestSetup({\n+    skipStart: true,\n+    skipDeployment: true,\n+    files: __dirname,\n+  })\n+\n+  it('should show warnings but not block the build', async () => {\n+    const { exitCode, cliOutput } = await next.build()\n+\n+    // Build should succeed\n+    expect(exitCode).toBe(0)\n+\n+    // Should show warnings\n+    expect(cliOutput).toContain('Invalid next.config.js options detected')\n+    expect(cliOutput).toContain(\n+      \"Unrecognized key(s) in object: 'unknownExperimentalOption', 'anotherUnknownOption'\"\n+    )\n+    expect(cliOutput).toContain('at \"experimental\"')\n+\n+    // Should NOT show fatal error message\n+    expect(cliOutput).not.toContain('Fatal next config errors')\n+\n+    // Build should complete successfully\n+    expect(cliOutput).toContain('Compiled successfully')\n+  })\n+})"
+        },
+        {
+            "sha": "eedc6eccd7a8991802244e27519687d7753afd5f",
+            "filename": "test/production/config-validation-warnings/next.config.js",
+            "status": "added",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/vercel/next.js/blob/27821674a6d239b5159bdb285d4633c8435c3568/test%2Fproduction%2Fconfig-validation-warnings%2Fnext.config.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/27821674a6d239b5159bdb285d4633c8435c3568/test%2Fproduction%2Fconfig-validation-warnings%2Fnext.config.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fproduction%2Fconfig-validation-warnings%2Fnext.config.js?ref=27821674a6d239b5159bdb285d4633c8435c3568",
+            "patch": "@@ -0,0 +1,7 @@\n+module.exports = {\n+  // This should be a warning - unknown experimental key\n+  experimental: {\n+    unknownExperimentalOption: true,\n+    anotherUnknownOption: 'test',\n+  },\n+}"
+        }
+    ],
+    "stats": {
+        "total": 270,
+        "additions": 214,
+        "deletions": 56
+    }
+}

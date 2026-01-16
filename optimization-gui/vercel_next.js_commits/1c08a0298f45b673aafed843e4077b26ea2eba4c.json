@@ -1,0 +1,96 @@
+{
+    "author": "mischnic",
+    "message": "Turbopack: add benchmark for JS analysis (#83042)\n\n```\r\nfull/full/packages/next/dist/compiled/babel-packages/packages-bundle.js\r\n                        time:   [176.60 ms 177.59 ms 178.86 ms]\r\nFound 5 outliers among 100 measurements (5.00%)\r\n  2 (2.00%) high mild\r\n  3 (3.00%) high severe\r\nfull/full/node_modules/.pnpm/react-dom@19.2.0-canary-03fda05d-20250820_react@19.2.0-canary-03fda05d-...\r\n                        time:   [65.679 ms 66.265 ms 67.000 ms]\r\n                        Performance has improved.\r\nFound 5 outliers among 100 measurements (5.00%)\r\n  2 (2.00%) high mild\r\n  3 (3.00%) high severe\r\n```",
+    "sha": "1c08a0298f45b673aafed843e4077b26ea2eba4c",
+    "files": [
+        {
+            "sha": "f5dc3869d1118e75aef8bd4e9f369749d0e0f40f",
+            "filename": "Cargo.lock",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/1c08a0298f45b673aafed843e4077b26ea2eba4c/Cargo.lock",
+            "raw_url": "https://github.com/vercel/next.js/raw/1c08a0298f45b673aafed843e4077b26ea2eba4c/Cargo.lock",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/Cargo.lock?ref=1c08a0298f45b673aafed843e4077b26ea2eba4c",
+            "patch": "@@ -9768,6 +9768,7 @@ dependencies = [\n  \"turbo-esregex\",\n  \"turbo-rcstr\",\n  \"turbo-tasks\",\n+ \"turbo-tasks-backend\",\n  \"turbo-tasks-build\",\n  \"turbo-tasks-fs\",\n  \"turbo-tasks-hash\",\n@@ -9776,6 +9777,7 @@ dependencies = [\n  \"turbopack-core\",\n  \"turbopack-resolve\",\n  \"turbopack-swc-utils\",\n+ \"turbopack-test-utils\",\n  \"url\",\n ]\n "
+        },
+        {
+            "sha": "cfa60bc079d91dd622b4b55a14602d067819caca",
+            "filename": "turbopack/crates/turbopack-ecmascript/Cargo.toml",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/1c08a0298f45b673aafed843e4077b26ea2eba4c/turbopack%2Fcrates%2Fturbopack-ecmascript%2FCargo.toml",
+            "raw_url": "https://github.com/vercel/next.js/raw/1c08a0298f45b673aafed843e4077b26ea2eba4c/turbopack%2Fcrates%2Fturbopack-ecmascript%2FCargo.toml",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-ecmascript%2FCargo.toml?ref=1c08a0298f45b673aafed843e4077b26ea2eba4c",
+            "patch": "@@ -76,8 +76,10 @@ swc_core = { workspace = true, features = [\n \n [dev-dependencies]\n criterion = { workspace = true, features = [\"async_tokio\"] }\n+turbo-tasks-backend = { workspace = true }\n turbo-tasks-malloc = { workspace = true }\n turbo-tasks-testing = { workspace = true }\n+turbopack-test-utils = { workspace = true }\n \n [build-dependencies]\n turbo-tasks-build = { workspace = true }"
+        },
+        {
+            "sha": "34871dcddb4fcb02ccde565061bc987af9f7d199",
+            "filename": "turbopack/crates/turbopack-ecmascript/benches/full.rs",
+            "status": "added",
+            "additions": 122,
+            "deletions": 0,
+            "changes": 122,
+            "blob_url": "https://github.com/vercel/next.js/blob/1c08a0298f45b673aafed843e4077b26ea2eba4c/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fbenches%2Ffull.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/1c08a0298f45b673aafed843e4077b26ea2eba4c/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fbenches%2Ffull.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fbenches%2Ffull.rs?ref=1c08a0298f45b673aafed843e4077b26ea2eba4c",
+            "patch": "@@ -0,0 +1,122 @@\n+use std::{path::PathBuf, sync::Arc, time::Duration};\n+\n+use criterion::{Bencher, BenchmarkId, Criterion};\n+use turbo_rcstr::rcstr;\n+use turbo_tasks::{ResolvedVc, TurboTasks};\n+use turbo_tasks_backend::{\n+    BackendOptions, BackingStorage, TurboTasksBackend, noop_backing_storage,\n+};\n+use turbo_tasks_fs::{DiskFileSystem, FileSystem};\n+use turbopack_core::{\n+    compile_time_info::CompileTimeInfo,\n+    environment::{Environment, ExecutionEnvironment, NodeJsEnvironment},\n+    file_source::FileSource,\n+    ident::Layer,\n+};\n+use turbopack_ecmascript::{\n+    EcmascriptInputTransforms, EcmascriptModuleAsset, EcmascriptOptions, TreeShakingMode,\n+    references::analyse_ecmascript_module_internal,\n+};\n+use turbopack_test_utils::noop_asset_context::NoopAssetContext;\n+\n+pub fn benchmark(c: &mut Criterion) {\n+    turbopack_ecmascript::register();\n+    turbopack_test_utils::register();\n+\n+    let rt = tokio::runtime::Builder::new_current_thread()\n+        .build()\n+        .unwrap();\n+\n+    let tt = TurboTasks::new(TurboTasksBackend::new(\n+        BackendOptions {\n+            dependency_tracking: false,\n+            storage_mode: None,\n+            ..Default::default()\n+        },\n+        noop_backing_storage(),\n+    ));\n+\n+    let cases = rt\n+        .block_on(tt.run_once(async {\n+            let root_dir = PathBuf::from(env!(\"CARGO_MANIFEST_DIR\")).join(\"../../../\");\n+            let fs = DiskFileSystem::new(rcstr!(\"project\"), root_dir.to_str().unwrap().into());\n+\n+            let environment = Environment::new(ExecutionEnvironment::NodeJsLambda(\n+                NodeJsEnvironment::default().resolved_cell(),\n+            ));\n+            let compile_time_info = CompileTimeInfo::new(environment).to_resolved().await?;\n+            let layer = Layer::new(rcstr!(\"test\"));\n+            let module_asset_context = NoopAssetContext {\n+                compile_time_info,\n+                layer,\n+            }\n+            .resolved_cell();\n+\n+            let mut cases = vec![];\n+            for file in [\n+                r#\"packages/next/dist/compiled/babel-packages/packages-bundle.js\"#,\n+                r#\"node_modules/.pnpm/react-dom@19.2.0-canary-03fda05d-20250820_react@19.2.0-canary-03fda05d-20250820/node_modules/react-dom/cjs/react-dom-client.development.js\"#,\n+            ] {\n+                let module = EcmascriptModuleAsset::builder(\n+                    ResolvedVc::upcast(\n+                        FileSource::new(fs.root().await?.join(file).unwrap())\n+                            .to_resolved()\n+                            .await?,\n+                    ),\n+                    ResolvedVc::upcast(module_asset_context),\n+                    EcmascriptInputTransforms::empty().to_resolved().await?,\n+                    EcmascriptOptions {\n+                        tree_shaking_mode: Some(TreeShakingMode::ReexportsOnly),\n+                        ..Default::default()\n+                    }\n+                    .resolved_cell(),\n+                    compile_time_info,\n+                )\n+                .build()\n+                .to_resolved()\n+                .await?;\n+\n+                cases.push((file, module));\n+            }\n+            anyhow::Ok(cases)\n+        }))\n+        .unwrap();\n+\n+    let mut group = c.benchmark_group(\"full\");\n+    group.warm_up_time(Duration::from_secs(1));\n+    group.measurement_time(Duration::from_secs(20));\n+\n+    for case in cases {\n+        group.bench_with_input(\n+            BenchmarkId::new(\"full\", case.0),\n+            &BenchInput {\n+                module: case.1,\n+                storage: tt.clone(),\n+            },\n+            bench_full,\n+        );\n+    }\n+}\n+\n+struct BenchInput<B>\n+where\n+    B: BackingStorage,\n+{\n+    storage: Arc<TurboTasks<TurboTasksBackend<B>>>,\n+    module: ResolvedVc<EcmascriptModuleAsset>,\n+}\n+\n+fn bench_full<B>(b: &mut Bencher, input: &BenchInput<B>)\n+where\n+    B: BackingStorage,\n+{\n+    let rt = tokio::runtime::Builder::new_current_thread()\n+        .build()\n+        .unwrap();\n+\n+    b.to_async(rt).iter(|| {\n+        input\n+            .storage\n+            .run_once(analyse_ecmascript_module_internal(input.module, None))\n+    });\n+}"
+        },
+        {
+            "sha": "7167dd52a6277076092b930c44afdbd6427f9589",
+            "filename": "turbopack/crates/turbopack-ecmascript/benches/mod.rs",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 1,
+            "changes": 4,
+            "blob_url": "https://github.com/vercel/next.js/blob/1c08a0298f45b673aafed843e4077b26ea2eba4c/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fbenches%2Fmod.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/1c08a0298f45b673aafed843e4077b26ea2eba4c/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fbenches%2Fmod.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fbenches%2Fmod.rs?ref=1c08a0298f45b673aafed843e4077b26ea2eba4c",
+            "patch": "@@ -3,6 +3,8 @@ extern crate turbo_tasks_malloc;\n use criterion::{criterion_group, criterion_main};\n \n mod analyzer;\n+mod full;\n \n criterion_group!(analyzer_benches, analyzer::benchmark);\n-criterion_main!(analyzer_benches);\n+criterion_group!(full_benches, full::benchmark);\n+criterion_main!(analyzer_benches, full_benches);"
+        },
+        {
+            "sha": "0effbc37d63a8a555e15cee4340e673a7f78ba7b",
+            "filename": "turbopack/crates/turbopack-ecmascript/src/references/mod.rs",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/1c08a0298f45b673aafed843e4077b26ea2eba4c/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Freferences%2Fmod.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/1c08a0298f45b673aafed843e4077b26ea2eba4c/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Freferences%2Fmod.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Freferences%2Fmod.rs?ref=1c08a0298f45b673aafed843e4077b26ea2eba4c",
+            "patch": "@@ -499,7 +499,7 @@ pub(crate) async fn analyse_ecmascript_module(\n     }\n }\n \n-pub(crate) async fn analyse_ecmascript_module_internal(\n+pub async fn analyse_ecmascript_module_internal(\n     module: ResolvedVc<EcmascriptModuleAsset>,\n     part: Option<ModulePart>,\n ) -> Result<Vc<AnalyzeEcmascriptModuleResult>> {"
+        },
+        {
+            "sha": "11e1cb13070f548e04a92d29ac7199c7984be2ed",
+            "filename": "turbopack/crates/turbopack-test-utils/src/lib.rs",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/vercel/next.js/blob/1c08a0298f45b673aafed843e4077b26ea2eba4c/turbopack%2Fcrates%2Fturbopack-test-utils%2Fsrc%2Flib.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/1c08a0298f45b673aafed843e4077b26ea2eba4c/turbopack%2Fcrates%2Fturbopack-test-utils%2Fsrc%2Flib.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-test-utils%2Fsrc%2Flib.rs?ref=1c08a0298f45b673aafed843e4077b26ea2eba4c",
+            "patch": "@@ -3,4 +3,13 @@\n #![feature(arbitrary_self_types_pointers)]\n \n pub mod jest;\n+pub mod noop_asset_context;\n pub mod snapshot;\n+\n+pub fn register() {\n+    turbo_tasks::register();\n+    turbo_tasks_fs::register();\n+    turbopack_core::register();\n+    turbopack_cli_utils::register();\n+    include!(concat!(env!(\"OUT_DIR\"), \"/register.rs\"));\n+}"
+        },
+        {
+            "sha": "1602c0df8c213c9f6ae7cea9769134b7c0255ddc",
+            "filename": "turbopack/crates/turbopack-test-utils/src/noop_asset_context.rs",
+            "status": "added",
+            "additions": 81,
+            "deletions": 0,
+            "changes": 81,
+            "blob_url": "https://github.com/vercel/next.js/blob/1c08a0298f45b673aafed843e4077b26ea2eba4c/turbopack%2Fcrates%2Fturbopack-test-utils%2Fsrc%2Fnoop_asset_context.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/1c08a0298f45b673aafed843e4077b26ea2eba4c/turbopack%2Fcrates%2Fturbopack-test-utils%2Fsrc%2Fnoop_asset_context.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-test-utils%2Fsrc%2Fnoop_asset_context.rs?ref=1c08a0298f45b673aafed843e4077b26ea2eba4c",
+            "patch": "@@ -0,0 +1,81 @@\n+use anyhow::Result;\n+use turbo_rcstr::{RcStr, rcstr};\n+use turbo_tasks::{ResolvedVc, Vc};\n+use turbo_tasks_fs::{FileSystemPath, glob::Glob};\n+use turbopack_core::{\n+    compile_time_info::CompileTimeInfo,\n+    context::{AssetContext, ProcessResult},\n+    ident::Layer,\n+    reference_type::ReferenceType,\n+    resolve::{ModuleResolveResult, ResolveResult, options::ResolveOptions, parse::Request},\n+    source::Source,\n+};\n+\n+#[turbo_tasks::value(shared)]\n+pub struct NoopAssetContext {\n+    pub compile_time_info: ResolvedVc<CompileTimeInfo>,\n+    pub layer: Layer,\n+}\n+\n+#[turbo_tasks::value_impl]\n+impl AssetContext for NoopAssetContext {\n+    #[turbo_tasks::function]\n+    fn compile_time_info(&self) -> Vc<CompileTimeInfo> {\n+        *self.compile_time_info\n+    }\n+\n+    fn layer(&self) -> Layer {\n+        self.layer.clone()\n+    }\n+\n+    #[turbo_tasks::function]\n+    async fn resolve_options(\n+        self: Vc<Self>,\n+        _origin_path: FileSystemPath,\n+        _reference_type: ReferenceType,\n+    ) -> Result<Vc<ResolveOptions>> {\n+        Ok(ResolveOptions::default().cell())\n+    }\n+\n+    #[turbo_tasks::function]\n+    async fn resolve_asset(\n+        self: Vc<Self>,\n+        _origin_path: FileSystemPath,\n+        _request: Vc<Request>,\n+        _resolve_options: Vc<ResolveOptions>,\n+        _reference_type: ReferenceType,\n+    ) -> Result<Vc<ModuleResolveResult>> {\n+        Ok(*ModuleResolveResult::unresolvable())\n+    }\n+\n+    #[turbo_tasks::function]\n+    async fn process_resolve_result(\n+        self: Vc<Self>,\n+        _result: Vc<ResolveResult>,\n+        _reference_type: ReferenceType,\n+    ) -> Result<Vc<ModuleResolveResult>> {\n+        Ok(*ModuleResolveResult::unresolvable())\n+    }\n+\n+    #[turbo_tasks::function]\n+    async fn process(\n+        self: Vc<Self>,\n+        _asset: ResolvedVc<Box<dyn Source>>,\n+        _reference_type: ReferenceType,\n+    ) -> Result<Vc<ProcessResult>> {\n+        Ok(ProcessResult::Ignore.cell())\n+    }\n+\n+    #[turbo_tasks::function]\n+    async fn with_transition(\n+        self: Vc<Self>,\n+        _transition: RcStr,\n+    ) -> Result<Vc<Box<dyn AssetContext>>> {\n+        Ok(Vc::upcast(self))\n+    }\n+\n+    #[turbo_tasks::function]\n+    async fn side_effect_free_packages(&self) -> Result<Vc<Glob>> {\n+        Ok(Glob::new(rcstr!(\"\"), Default::default()))\n+    }\n+}"
+        }
+    ],
+    "stats": {
+        "total": 222,
+        "additions": 220,
+        "deletions": 2
+    }
+}

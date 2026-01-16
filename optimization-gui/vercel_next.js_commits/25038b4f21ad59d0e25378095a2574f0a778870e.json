@@ -1,0 +1,144 @@
+{
+    "author": "sokra",
+    "message": "[Turbopack] remove ChunkingType::Passthrough (#76217)\n\n### What?\n\nThe feature can be removed since it's no longer used.",
+    "sha": "25038b4f21ad59d0e25378095a2574f0a778870e",
+    "files": [
+        {
+            "sha": "2970479464152092ed0c26d976d5e2610ef29e11",
+            "filename": "turbopack/crates/turbopack-browser/src/ecmascript/content_entry.rs",
+            "status": "modified",
+            "additions": 20,
+            "deletions": 34,
+            "changes": 54,
+            "blob_url": "https://github.com/vercel/next.js/blob/25038b4f21ad59d0e25378095a2574f0a778870e/turbopack%2Fcrates%2Fturbopack-browser%2Fsrc%2Fecmascript%2Fcontent_entry.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/25038b4f21ad59d0e25378095a2574f0a778870e/turbopack%2Fcrates%2Fturbopack-browser%2Fsrc%2Fecmascript%2Fcontent_entry.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-browser%2Fsrc%2Fecmascript%2Fcontent_entry.rs?ref=25038b4f21ad59d0e25378095a2574f0a778870e",
+            "patch": "@@ -2,7 +2,7 @@ use anyhow::Result;\n use tracing::{info_span, Instrument};\n use turbo_tasks::{FxIndexMap, ReadRef, ResolvedVc, TryJoinIterExt, ValueToString, Vc};\n use turbopack_core::{\n-    chunk::{AsyncModuleInfo, ChunkItem, ChunkItemExt, ChunkItemTy, ModuleId},\n+    chunk::{AsyncModuleInfo, ChunkItem, ChunkItemExt, ModuleId},\n     code_builder::Code,\n };\n use turbopack_ecmascript::chunk::{\n@@ -49,48 +49,34 @@ impl EcmascriptDevChunkContentEntries {\n     ) -> Result<Vc<EcmascriptDevChunkContentEntries>> {\n         let chunk_content = chunk_content.await?;\n \n-        let included_chunk_items = chunk_content\n+        let entries: FxIndexMap<_, _> = chunk_content\n             .chunk_items\n             .iter()\n             .map(\n-                async |EcmascriptChunkItemWithAsyncInfo {\n-                           ty,\n-                           chunk_item,\n-                           async_info,\n-                       }| {\n-                    if matches!(ty, ChunkItemTy::Included) {\n-                        Ok(Some((chunk_item, async_info)))\n-                    } else {\n-                        Ok(None)\n+                |&EcmascriptChunkItemWithAsyncInfo {\n+                     chunk_item,\n+                     async_info,\n+                 }| async move {\n+                    async move {\n+                        Ok((\n+                            chunk_item.id().await?,\n+                            EcmascriptDevChunkContentEntry::new(\n+                                chunk_item,\n+                                async_info.map(|info| *info),\n+                            )\n+                            .await?,\n+                        ))\n                     }\n+                    .instrument(info_span!(\n+                        \"chunk item\",\n+                        name = display(chunk_item.asset_ident().to_string().await?)\n+                    ))\n+                    .await\n                 },\n             )\n             .try_join()\n             .await?\n             .into_iter()\n-            .flatten();\n-\n-        let entries: FxIndexMap<_, _> = included_chunk_items\n-            .map(|(&chunk_item, &async_module_info)| async move {\n-                async move {\n-                    Ok((\n-                        chunk_item.id().await?,\n-                        EcmascriptDevChunkContentEntry::new(\n-                            chunk_item,\n-                            async_module_info.map(|info| *info),\n-                        )\n-                        .await?,\n-                    ))\n-                }\n-                .instrument(info_span!(\n-                    \"chunk item\",\n-                    name = display(chunk_item.asset_ident().to_string().await?)\n-                ))\n-                .await\n-            })\n-            .try_join()\n-            .await?\n-            .into_iter()\n             .collect();\n \n         Ok(Vc::cell(entries))"
+        },
+        {
+            "sha": "007e97ba7c1a6c06fccf356de86ce7012335f86f",
+            "filename": "turbopack/crates/turbopack-core/src/chunk/chunk_group.rs",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 35,
+            "changes": 50,
+            "blob_url": "https://github.com/vercel/next.js/blob/25038b4f21ad59d0e25378095a2574f0a778870e/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fchunk%2Fchunk_group.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/25038b4f21ad59d0e25378095a2574f0a778870e/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fchunk%2Fchunk_group.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fchunk%2Fchunk_group.rs?ref=25038b4f21ad59d0e25378095a2574f0a778870e",
+            "patch": "@@ -1,14 +1,12 @@\n use std::collections::HashSet;\n \n use anyhow::Result;\n-use futures::future::Either;\n use rustc_hash::FxHashMap;\n use turbo_tasks::{FxIndexMap, FxIndexSet, ResolvedVc, TryJoinIterExt, Value, Vc};\n \n use super::{\n     availability_info::AvailabilityInfo, chunking::make_chunks, AsyncModuleInfo, Chunk,\n-    ChunkGroupContent, ChunkItem, ChunkItemTy, ChunkItemWithAsyncModuleInfo, ChunkableModule,\n-    ChunkingContext,\n+    ChunkGroupContent, ChunkItem, ChunkItemWithAsyncModuleInfo, ChunkableModule, ChunkingContext,\n };\n use crate::{\n     chunk::ChunkingType,\n@@ -42,7 +40,6 @@ pub async fn make_chunk_group(\n         chunkable_modules,\n         async_modules,\n         traced_modules,\n-        passthrough_modules,\n     } = chunk_group_content(\n         &*module_graph.await?,\n         chunk_group_entries,\n@@ -98,7 +95,6 @@ pub async fn make_chunk_group(\n         async_loaders\n             .iter()\n             .map(|&chunk_item| ChunkItemWithAsyncModuleInfo {\n-                ty: ChunkItemTy::Included,\n                 chunk_item,\n                 module: None,\n                 async_info: None,\n@@ -123,37 +119,26 @@ pub async fn make_chunk_group(\n \n     let mut chunk_items = all_modules\n         .iter()\n-        .map(|(module, async_info)| {\n-            Either::Left(async move {\n-                Ok(ChunkItemWithAsyncModuleInfo {\n-                    ty: ChunkItemTy::Included,\n-                    chunk_item: module\n-                        .as_chunk_item(module_graph, *chunking_context)\n-                        .to_resolved()\n-                        .await?,\n-                    module: Some(*module),\n-                    async_info: *async_info,\n-                })\n+        .map(|(module, async_info)| async move {\n+            Ok(ChunkItemWithAsyncModuleInfo {\n+                chunk_item: module\n+                    .as_chunk_item(module_graph, *chunking_context)\n+                    .to_resolved()\n+                    .await?,\n+                module: Some(*module),\n+                async_info: *async_info,\n             })\n         })\n-        .chain(passthrough_modules.into_iter().map(|module| {\n-            Either::Right(async move {\n-                Ok(ChunkItemWithAsyncModuleInfo {\n-                    ty: ChunkItemTy::Passthrough,\n-                    chunk_item: module\n-                        .as_chunk_item(module_graph, *chunking_context)\n-                        .to_resolved()\n-                        .await?,\n-                    module: Some(module),\n-                    async_info: None,\n-                })\n-            })\n-        }))\n         .try_join()\n         .await?;\n \n     chunk_items.extend(async_loader_chunk_items);\n-    referenced_output_assets.reserve(async_loader_references.iter().map(|r| r.len()).sum());\n+    referenced_output_assets.reserve(\n+        async_loader_references\n+            .iter()\n+            .map(|r| r.len())\n+            .sum::<usize>(),\n+    );\n     referenced_output_assets.extend(async_loader_references.into_iter().flatten());\n \n     // Pass chunk items to chunking algorithm\n@@ -212,7 +197,6 @@ pub async fn chunk_group_content(\n             chunkable_modules: FxIndexSet::default(),\n             async_modules: FxIndexSet::default(),\n             traced_modules: FxIndexSet::default(),\n-            passthrough_modules: FxIndexSet::default(),\n         },\n     };\n \n@@ -258,10 +242,6 @@ pub async fn chunk_group_content(\n                 };\n \n                 Ok(match edge {\n-                    ChunkingType::Passthrough => {\n-                        result.passthrough_modules.insert(chunkable_module);\n-                        GraphTraversalAction::Continue\n-                    }\n                     ChunkingType::Parallel | ChunkingType::ParallelInheritAsync => {\n                         if is_available {\n                             GraphTraversalAction::Skip"
+        },
+        {
+            "sha": "aa73c7610f5cf71ed44586cf4d733f244eb77f29",
+            "filename": "turbopack/crates/turbopack-core/src/chunk/chunking/mod.rs",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 7,
+            "changes": 8,
+            "blob_url": "https://github.com/vercel/next.js/blob/25038b4f21ad59d0e25378095a2574f0a778870e/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fchunk%2Fchunking%2Fmod.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/25038b4f21ad59d0e25378095a2574f0a778870e/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fchunk%2Fchunking%2Fmod.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fchunk%2Fchunking%2Fmod.rs?ref=25038b4f21ad59d0e25378095a2574f0a778870e",
+            "patch": "@@ -9,8 +9,7 @@ use turbo_rcstr::RcStr;\n use turbo_tasks::{FxIndexMap, ReadRef, ResolvedVc, TryJoinIterExt, ValueToString, Vc};\n \n use super::{\n-    AsyncModuleInfo, Chunk, ChunkItem, ChunkItemTy, ChunkItemWithAsyncModuleInfo, ChunkType,\n-    ChunkingContext,\n+    AsyncModuleInfo, Chunk, ChunkItem, ChunkItemWithAsyncModuleInfo, ChunkType, ChunkingContext,\n };\n use crate::{\n     chunk::{\n@@ -88,15 +87,13 @@ pub async fn make_chunks(\n                 .map(\n                     async |(\n                         ChunkItemWithAsyncModuleInfo {\n-                            ty,\n                             chunk_item,\n                             module,\n                             async_info,\n                         },\n                         chunk_item_info,\n                     )| {\n                         Ok(ChunkItemWithInfo {\n-                            ty: *ty,\n                             chunk_item: *chunk_item,\n                             module: *module,\n                             async_info: *async_info,\n@@ -156,7 +153,6 @@ pub async fn make_chunks(\n }\n \n struct ChunkItemWithInfo {\n-    ty: ChunkItemTy,\n     chunk_item: ResolvedVc<Box<dyn ChunkItem>>,\n     module: Option<ResolvedVc<Box<dyn ChunkableModule>>>,\n     async_info: Option<ResolvedVc<AsyncModuleInfo>>,\n@@ -186,13 +182,11 @@ async fn make_chunk(\n                 .into_iter()\n                 .map(\n                     |ChunkItemWithInfo {\n-                         ty,\n                          chunk_item,\n                          module,\n                          async_info,\n                          ..\n                      }| ChunkItemWithAsyncModuleInfo {\n-                        ty,\n                         chunk_item,\n                         module,\n                         async_info,"
+        },
+        {
+            "sha": "7ef4669a139daef49d787fbbbda2aff0dd537ac2",
+            "filename": "turbopack/crates/turbopack-core/src/chunk/mod.rs",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 25,
+            "changes": 25,
+            "blob_url": "https://github.com/vercel/next.js/blob/25038b4f21ad59d0e25378095a2574f0a778870e/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fchunk%2Fmod.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/25038b4f21ad59d0e25378095a2574f0a778870e/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fchunk%2Fmod.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fchunk%2Fmod.rs?ref=25038b4f21ad59d0e25378095a2574f0a778870e",
+            "patch": "@@ -179,9 +179,6 @@ pub enum ChunkingType {\n         _ty: ChunkGroupType,\n         merge_tag: Option<RcStr>,\n     },\n-    /// Module not placed in chunk group, but its references are still followed and placed into the\n-    /// chunk group.\n-    Passthrough,\n     // Module not placed in chunk group, but its references are still followed.\n     Traced,\n }\n@@ -207,7 +204,6 @@ pub struct ChunkGroupContent {\n     pub chunkable_modules: FxIndexSet<ResolvedVc<Box<dyn ChunkableModule>>>,\n     pub async_modules: FxIndexSet<ResolvedVc<Box<dyn ChunkableModule>>>,\n     pub traced_modules: FxIndexSet<ResolvedVc<Box<dyn Module>>>,\n-    pub passthrough_modules: FxIndexSet<ResolvedVc<Box<dyn ChunkableModule>>>,\n }\n \n #[turbo_tasks::value_trait]\n@@ -285,32 +281,11 @@ impl AsyncModuleInfo {\n     }\n }\n \n-#[derive(\n-    Copy,\n-    Debug,\n-    Clone,\n-    Serialize,\n-    Deserialize,\n-    PartialEq,\n-    Eq,\n-    Hash,\n-    TraceRawVcs,\n-    TaskInput,\n-    NonLocalValue,\n-)]\n-pub enum ChunkItemTy {\n-    /// The ChunkItem should be included as content in the chunk.\n-    Included,\n-    /// The ChunkItem should be used to trace references but should not included in the chunk.\n-    Passthrough,\n-}\n-\n #[derive(\n     Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, TraceRawVcs, TaskInput, NonLocalValue,\n )]\n // #[turbo_tasks::value]\n pub struct ChunkItemWithAsyncModuleInfo {\n-    pub ty: ChunkItemTy,\n     pub chunk_item: ResolvedVc<Box<dyn ChunkItem>>,\n     pub module: Option<ResolvedVc<Box<dyn ChunkableModule>>>,\n     pub async_info: Option<ResolvedVc<AsyncModuleInfo>>,"
+        },
+        {
+            "sha": "bb98790caa542a30fbfab418c076bd4b3e2f396e",
+            "filename": "turbopack/crates/turbopack-core/src/introspect/utils.rs",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 6,
+            "changes": 6,
+            "blob_url": "https://github.com/vercel/next.js/blob/25038b4f21ad59d0e25378095a2574f0a778870e/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fintrospect%2Futils.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/25038b4f21ad59d0e25378095a2574f0a778870e/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fintrospect%2Futils.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fintrospect%2Futils.rs?ref=25038b4f21ad59d0e25378095a2574f0a778870e",
+            "patch": "@@ -33,11 +33,6 @@ fn async_reference_ty() -> Vc<RcStr> {\n     Vc::cell(\"async reference\".into())\n }\n \n-#[turbo_tasks::function]\n-fn passthrough_reference_ty() -> Vc<RcStr> {\n-    Vc::cell(\"passthrough reference\".into())\n-}\n-\n #[turbo_tasks::function]\n fn isolated_reference_ty() -> Vc<RcStr> {\n     Vc::cell(\"isolated reference\".into())\n@@ -87,7 +82,6 @@ pub async fn children_from_module_references(\n                 }\n                 Some(ChunkingType::Async) => key = async_reference_ty(),\n                 Some(ChunkingType::Isolated { .. }) => key = isolated_reference_ty(),\n-                Some(ChunkingType::Passthrough) => key = passthrough_reference_ty(),\n                 Some(ChunkingType::Traced) => key = traced_reference_ty(),\n             }\n         }"
+        },
+        {
+            "sha": "72074435ae8b4a4f3cedd6af75bbb72bc4cb3cbb",
+            "filename": "turbopack/crates/turbopack-core/src/module_graph/async_module_info.rs",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 1,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/25038b4f21ad59d0e25378095a2574f0a778870e/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fmodule_graph%2Fasync_module_info.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/25038b4f21ad59d0e25378095a2574f0a778870e/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fmodule_graph%2Fasync_module_info.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fmodule_graph%2Fasync_module_info.rs?ref=25038b4f21ad59d0e25378095a2574f0a778870e",
+            "patch": "@@ -96,7 +96,6 @@ async fn compute_async_module_info_single(\n                 ChunkingType::Parallel\n                 | ChunkingType::Async\n                 | ChunkingType::Isolated { .. }\n-                | ChunkingType::Passthrough\n                 | ChunkingType::Traced => {\n                     // Nothing to propagate\n                 }"
+        },
+        {
+            "sha": "9437acdcfcca204161e9c9da053a8c10faea2b86",
+            "filename": "turbopack/crates/turbopack-core/src/module_graph/chunk_group_info.rs",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 3,
+            "changes": 4,
+            "blob_url": "https://github.com/vercel/next.js/blob/25038b4f21ad59d0e25378095a2574f0a778870e/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fmodule_graph%2Fchunk_group_info.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/25038b4f21ad59d0e25378095a2574f0a778870e/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fmodule_graph%2Fchunk_group_info.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fmodule_graph%2Fchunk_group_info.rs?ref=25038b4f21ad59d0e25378095a2574f0a778870e",
+            "patch": "@@ -193,9 +193,7 @@ pub async fn compute_chunk_group_info(graph: &ModuleGraph) -> Result<Vc<ChunkGro\n                 let chunk_groups =\n                     if let Some((parent, chunking_type)) = parent_info {\n                         match chunking_type {\n-                            ChunkingType::Parallel\n-                            | ChunkingType::ParallelInheritAsync\n-                            | ChunkingType::Passthrough => {\n+                            ChunkingType::Parallel | ChunkingType::ParallelInheritAsync => {\n                                 ChunkGroupInheritance::Inherit(parent.module)\n                             }\n                             ChunkingType::Async => ChunkGroupInheritance::ChunkGroup(Either::Left("
+        },
+        {
+            "sha": "31fda33141bc2f9dbb34fa200a9ff401a1bda463",
+            "filename": "turbopack/crates/turbopack-ecmascript/src/chunk/chunk_type.rs",
+            "status": "modified",
+            "additions": 24,
+            "deletions": 25,
+            "changes": 49,
+            "blob_url": "https://github.com/vercel/next.js/blob/25038b4f21ad59d0e25378095a2574f0a778870e/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Fchunk%2Fchunk_type.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/25038b4f21ad59d0e25378095a2574f0a778870e/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Fchunk%2Fchunk_type.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Fchunk%2Fchunk_type.rs?ref=25038b4f21ad59d0e25378095a2574f0a778870e",
+            "patch": "@@ -1,6 +1,6 @@\n use anyhow::{bail, Result};\n use turbo_rcstr::RcStr;\n-use turbo_tasks::{ResolvedVc, TryJoinIterExt, ValueDefault, ValueToString, Vc};\n+use turbo_tasks::{ResolvedVc, ValueDefault, ValueToString, Vc};\n use turbopack_core::{\n     chunk::{\n         round_chunk_item_size, AsyncModuleInfo, Chunk, ChunkItem, ChunkItemWithAsyncModuleInfo,\n@@ -45,33 +45,32 @@ impl ChunkType for EcmascriptChunkType {\n         else {\n             bail!(\"Ecmascript chunking context not found\");\n         };\n+        fn to_ecmascript_chunk_item(\n+            chunk_item: &ChunkItemWithAsyncModuleInfo,\n+        ) -> Result<EcmascriptChunkItemWithAsyncInfo> {\n+            let ChunkItemWithAsyncModuleInfo {\n+                chunk_item,\n+                module: _,\n+                async_info,\n+            } = chunk_item;\n+            let Some(chunk_item) =\n+                ResolvedVc::try_downcast::<Box<dyn EcmascriptChunkItem>>(*chunk_item)\n+            else {\n+                bail!(\n+                    \"Chunk item is not an ecmascript chunk item but reporting chunk type \\\n+                     ecmascript\"\n+                );\n+            };\n+            Ok(EcmascriptChunkItemWithAsyncInfo {\n+                chunk_item,\n+                async_info: *async_info,\n+            })\n+        }\n         let content = EcmascriptChunkContent {\n             chunk_items: chunk_items\n                 .iter()\n-                .map(\n-                    async |ChunkItemWithAsyncModuleInfo {\n-                               ty,\n-                               chunk_item,\n-                               module: _,\n-                               async_info,\n-                           }| {\n-                        let Some(chunk_item) =\n-                            ResolvedVc::try_downcast::<Box<dyn EcmascriptChunkItem>>(*chunk_item)\n-                        else {\n-                            bail!(\n-                                \"Chunk item is not an ecmascript chunk item but reporting chunk \\\n-                                 type ecmascript\"\n-                            );\n-                        };\n-                        Ok(EcmascriptChunkItemWithAsyncInfo {\n-                            ty: *ty,\n-                            chunk_item,\n-                            async_info: *async_info,\n-                        })\n-                    },\n-                )\n-                .try_join()\n-                .await?,\n+                .map(to_ecmascript_chunk_item)\n+                .collect::<Result<Vec<_>>>()?,\n             referenced_output_assets: referenced_output_assets.owned().await?,\n         }\n         .cell();"
+        },
+        {
+            "sha": "c0ece253a471a972f939612366303823377a5525",
+            "filename": "turbopack/crates/turbopack-ecmascript/src/chunk/content.rs",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 8,
+            "changes": 10,
+            "blob_url": "https://github.com/vercel/next.js/blob/25038b4f21ad59d0e25378095a2574f0a778870e/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Fchunk%2Fcontent.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/25038b4f21ad59d0e25378095a2574f0a778870e/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Fchunk%2Fcontent.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Fchunk%2Fcontent.rs?ref=25038b4f21ad59d0e25378095a2574f0a778870e",
+            "patch": "@@ -1,7 +1,7 @@\n use anyhow::Result;\n use turbo_tasks::{ResolvedVc, Vc};\n use turbopack_core::{\n-    chunk::{ChunkItem, ChunkItemTy, ChunkItems},\n+    chunk::{ChunkItem, ChunkItems},\n     output::OutputAsset,\n };\n \n@@ -20,13 +20,7 @@ impl EcmascriptChunkContent {\n         Ok(ChunkItems(\n             self.chunk_items\n                 .iter()\n-                .filter_map(|EcmascriptChunkItemWithAsyncInfo { ty, chunk_item, .. }| {\n-                    if matches!(ty, ChunkItemTy::Included) {\n-                        Some(chunk_item)\n-                    } else {\n-                        None\n-                    }\n-                })\n+                .map(|EcmascriptChunkItemWithAsyncInfo { chunk_item, .. }| chunk_item)\n                 .map(|item| ResolvedVc::upcast::<Box<dyn ChunkItem>>(*item))\n                 .collect(),\n         )"
+        },
+        {
+            "sha": "7f98ae2520240e6176d7fbae697da0e6ac622dba",
+            "filename": "turbopack/crates/turbopack-ecmascript/src/chunk/item.rs",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/25038b4f21ad59d0e25378095a2574f0a778870e/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Fchunk%2Fitem.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/25038b4f21ad59d0e25378095a2574f0a778870e/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Fchunk%2Fitem.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Fchunk%2Fitem.rs?ref=25038b4f21ad59d0e25378095a2574f0a778870e",
+            "patch": "@@ -7,7 +7,7 @@ use turbo_tasks::{\n };\n use turbo_tasks_fs::{rope::Rope, FileSystemPath};\n use turbopack_core::{\n-    chunk::{AsyncModuleInfo, ChunkItem, ChunkItemTy, ChunkingContext},\n+    chunk::{AsyncModuleInfo, ChunkItem, ChunkingContext},\n     code_builder::{Code, CodeBuilder},\n     error::PrettyPrintError,\n     issue::{code_gen::CodeGenerationIssue, IssueExt, IssueSeverity, StyledString},\n@@ -188,7 +188,6 @@ pub struct EcmascriptChunkItemOptions {\n     Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, TraceRawVcs, TaskInput, NonLocalValue,\n )]\n pub struct EcmascriptChunkItemWithAsyncInfo {\n-    pub ty: ChunkItemTy,\n     pub chunk_item: ResolvedVc<Box<dyn EcmascriptChunkItem>>,\n     pub async_info: Option<ResolvedVc<AsyncModuleInfo>>,\n }"
+        },
+        {
+            "sha": "fd16593d0ff5fd4c6877a55346b80577e17a00e9",
+            "filename": "turbopack/crates/turbopack-ecmascript/src/chunk/mod.rs",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 5,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/25038b4f21ad59d0e25378095a2574f0a778870e/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Fchunk%2Fmod.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/25038b4f21ad59d0e25378095a2574f0a778870e/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Fchunk%2Fmod.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Fchunk%2Fmod.rs?ref=25038b4f21ad59d0e25378095a2574f0a778870e",
+            "patch": "@@ -173,11 +173,6 @@ impl EcmascriptChunk {\n     pub fn chunk_content(&self) -> Vc<EcmascriptChunkContent> {\n         *self.content\n     }\n-\n-    #[turbo_tasks::function]\n-    pub async fn chunk_items_count(&self) -> Result<Vc<usize>> {\n-        Ok(Vc::cell(self.content.await?.chunk_items.len()))\n-    }\n }\n \n #[turbo_tasks::function]"
+        }
+    ],
+    "stats": {
+        "total": 215,
+        "additions": 64,
+        "deletions": 151
+    }
+}

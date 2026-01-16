@@ -1,0 +1,36 @@
+{
+    "author": "Cyrilvallez",
+    "message": "[loading] Fix device when source and target are different (#42246)\n\n* fix device\n\n* fix\n\n* CI\n\n* simplify a bit",
+    "sha": "1742d1198ddce1eb3e34c7e86330b708fb9fd496",
+    "files": [
+        {
+            "sha": "aeca68b934a216735a494ef44b9ba717b590f789",
+            "filename": "src/transformers/core_model_loading.py",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 7,
+            "changes": 19,
+            "blob_url": "https://github.com/huggingface/transformers/blob/1742d1198ddce1eb3e34c7e86330b708fb9fd496/src%2Ftransformers%2Fcore_model_loading.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/1742d1198ddce1eb3e34c7e86330b708fb9fd496/src%2Ftransformers%2Fcore_model_loading.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fcore_model_loading.py?ref=1742d1198ddce1eb3e34c7e86330b708fb9fd496",
+            "patch": "@@ -312,16 +312,16 @@ class ConversionEntry:\n GLOBAL_WORKERS = min(16, (os.cpu_count() or 8) * 2)  # NVMe: 8-16; HDD/NFS: 2-4\n \n \n-def _materialize_copy(tensor, dtype=None):\n+def _materialize_copy(tensor, device=None, dtype=None):\n     tensor = tensor[...]\n-    if dtype is not None:\n-        tensor = tensor.to(dtype)\n+    if dtype is not None or device is not None:\n+        tensor = tensor.to(device=device, dtype=dtype)\n     return tensor\n \n \n-def spawn_materialize(thread_pool, tensor, dtype=None) -> Future:\n+def spawn_materialize(thread_pool, tensor, device=None, dtype=None) -> Future:\n     def _job():\n-        return _materialize_copy(tensor, dtype)\n+        return _materialize_copy(tensor, device, dtype)\n \n     return thread_pool.submit(_job)\n \n@@ -447,7 +447,10 @@ def convert_and_load_state_dict_in_model(\n \n     prefix = model.base_model_prefix\n     tp_plan = tp_plan or {}  # {glob_pattern: plan_obj_or_key}\n-    device_map = device_map or {}  # {exact_target_key: device}\n+    device_map = device_map or {\"\": \"cpu\"}  # {exact_target_key: device}\n+    device_map_regex = re.compile(\n+        \"|\".join(rf\"({k})\" for k in sorted(device_map.keys(), key=lambda x: x.count(\".\"), reverse=True))\n+    )\n     dtype_plan = dtype_plan or {}  # {glob_pattern: dtype}\n     weight_mapping = weight_mapping or {}  # {glob_pattern: WeightConverter}\n     meta_model_state_dict = model.state_dict()\n@@ -534,7 +537,9 @@ def convert_and_load_state_dict_in_model(\n                 )\n \n         if future is None:  # If not TP, async materialize the tensors. TODO handle disk offload?\n-            future = spawn_materialize(thread_pool, tensor, _dtype)\n+            device_match = device_map_regex.match(first_target_key)\n+            param_device = device_map[device_match.group()] if device_match else device_map.get(\"\", \"cpu\")\n+            future = spawn_materialize(thread_pool, tensor, param_device, _dtype)\n         entry.collected_tensors[target_key].setdefault(converter_key, []).append(future)\n \n     # 2. Actually convert the ckpt"
+        },
+        {
+            "sha": "0d936319e92674dd845612e5d4eaf9254ec6ced1",
+            "filename": "src/transformers/modeling_utils.py",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 25,
+            "changes": 32,
+            "blob_url": "https://github.com/huggingface/transformers/blob/1742d1198ddce1eb3e34c7e86330b708fb9fd496/src%2Ftransformers%2Fmodeling_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/1742d1198ddce1eb3e34c7e86330b708fb9fd496/src%2Ftransformers%2Fmodeling_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodeling_utils.py?ref=1742d1198ddce1eb3e34c7e86330b708fb9fd496",
+            "patch": "@@ -4186,9 +4186,6 @@ def _load_pretrained_model(\n             expanded_device_map = expand_device_map(device_map, expected_keys)\n             caching_allocator_warmup(model, expanded_device_map, hf_quantizer)\n \n-        if device_map is None:\n-            device_map = {\"\": \"cpu\"}\n-        keys = sorted(device_map.keys(), key=len, reverse=True)\n         tp_plan = getattr(model, \"_tp_plan\", None)\n         error_msgs = []\n \n@@ -4211,33 +4208,18 @@ def _load_pretrained_model(\n             missing_keys, unexpected_keys, mismatched_keys, misc = set(), set(), set(), set()\n         else:\n             all_pointer = set()\n+            # Checkpoints are safetensors\n             if checkpoint_files is not None and checkpoint_files[0].endswith(\".safetensors\"):\n-                pattern = re.compile(r\"(\" + \"|\".join(map(re.escape, keys)) + r\")\")\n-                if sharded_metadata is None:\n-                    k_v_iterator = dict.fromkeys(\n-                        safe_open(checkpoint_files[0], framework=\"pt\").keys(), checkpoint_files[0].rsplit(\"/\", 1)[1]\n-                    ).items()\n-                else:\n-                    k_v_iterator = sharded_metadata[\"weight_map\"].items()\n-\n                 merged_state_dict = {}\n-                for k, v in k_v_iterator:\n-                    match = pattern.match(k)\n-                    if match and match.group(1) != \"\":\n-                        device = device_map[match.group(1)]\n-                    else:\n-                        device = device_map.get(\"\", \"cpu\")\n-                        if isinstance(device, torch.device):\n-                            device = device.index  # safetensors only\n-                    if device == \"disk\":\n-                        device = \"cpu\"  # we read to cpu to then write to disk\n-                    file_pointer = safe_open(\n-                        os.path.join(checkpoint_files[0].rsplit(\"/\", 1)[0], v), framework=\"pt\", device=device\n-                    )\n+                for file in checkpoint_files:\n+                    file_pointer = safe_open(file, framework=\"pt\", device=\"cpu\")\n                     all_pointer.add(file_pointer)\n-                    merged_state_dict[k] = file_pointer.get_slice(k)  # don't materialize yet\n+                    for k in file_pointer.keys():\n+                        merged_state_dict[k] = file_pointer.get_slice(k)  # don't materialize yet\n+            # User passed an explicit state_dict\n             elif state_dict is not None:\n                 merged_state_dict = state_dict\n+            # Checkpoints are .bin\n             elif checkpoint_files is not None:\n                 merged_state_dict = {}\n                 for ckpt_file in checkpoint_files:"
+        }
+    ],
+    "stats": {
+        "total": 51,
+        "additions": 19,
+        "deletions": 32
+    }
+}

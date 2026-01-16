@@ -1,0 +1,96 @@
+{
+    "author": "mischnic",
+    "message": "Turbopack: side effect directive (#76876)\n\nAny suggestions regarding the exact naming?\n\n```\n\"use turbopack no side effects\"\n\nexport const bar = 123;\n```",
+    "sha": "37554159117255789ad9565d540b96f9da83049d",
+    "files": [
+        {
+            "sha": "6778836e027a48937ac6e88ebc597f2217c134d0",
+            "filename": "turbopack/crates/turbopack-ecmascript/src/lib.rs",
+            "status": "modified",
+            "additions": 17,
+            "deletions": 2,
+            "changes": 19,
+            "blob_url": "https://github.com/vercel/next.js/blob/37554159117255789ad9565d540b96f9da83049d/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Flib.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/37554159117255789ad9565d540b96f9da83049d/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Flib.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Flib.rs?ref=37554159117255789ad9565d540b96f9da83049d",
+            "patch": "@@ -67,7 +67,7 @@ use turbo_tasks::{\n     trace::TraceRawVcs, FxIndexMap, NonLocalValue, ReadRef, ResolvedVc, TaskInput, TryJoinIterExt,\n     Value, ValueToString, Vc,\n };\n-use turbo_tasks_fs::{rope::Rope, FileJsonContent, FileSystemPath};\n+use turbo_tasks_fs::{glob::Glob, rope::Rope, FileJsonContent, FileSystemPath};\n use turbopack_core::{\n     asset::{Asset, AssetContent},\n     chunk::{\n@@ -92,7 +92,7 @@ pub use turbopack_resolve::ecmascript as resolve;\n \n use self::chunk::{EcmascriptChunkItemContent, EcmascriptChunkType, EcmascriptExports};\n use crate::{\n-    chunk::EcmascriptChunkPlaceable,\n+    chunk::{placeable::is_marked_as_side_effect_free, EcmascriptChunkPlaceable},\n     code_gen::CodeGens,\n     parse::generate_js_source_map,\n     references::{\n@@ -646,6 +646,21 @@ impl EcmascriptChunkPlaceable for EcmascriptModuleAsset {\n     async fn get_async_module(self: Vc<Self>) -> Result<Vc<OptionAsyncModule>> {\n         Ok(*self.analyze().await?.async_module)\n     }\n+\n+    #[turbo_tasks::function]\n+    async fn is_marked_as_side_effect_free(\n+        self: Vc<Self>,\n+        side_effect_free_packages: Vc<Glob>,\n+    ) -> Result<Vc<bool>> {\n+        // Check package.json first, so that we can skip parsing the module if it's marked that way.\n+        let pkg_side_effect_free =\n+            is_marked_as_side_effect_free(self.ident().path(), side_effect_free_packages);\n+        Ok(if *pkg_side_effect_free.await? {\n+            pkg_side_effect_free\n+        } else {\n+            Vc::cell(self.analyze().await?.has_side_effect_free_directive)\n+        })\n+    }\n }\n \n #[turbo_tasks::value_impl]"
+        },
+        {
+            "sha": "6225cad26f650e30851f9c952b2d1703a75c66e8",
+            "filename": "turbopack/crates/turbopack-ecmascript/src/references/mod.rs",
+            "status": "modified",
+            "additions": 38,
+            "deletions": 0,
+            "changes": 38,
+            "blob_url": "https://github.com/vercel/next.js/blob/37554159117255789ad9565d540b96f9da83049d/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Freferences%2Fmod.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/37554159117255789ad9565d540b96f9da83049d/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Freferences%2Fmod.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Freferences%2Fmod.rs?ref=37554159117255789ad9565d540b96f9da83049d",
+            "patch": "@@ -23,6 +23,7 @@ use std::{borrow::Cow, collections::BTreeMap, future::Future, mem::take, ops::De\n use anyhow::{bail, Result};\n use constant_condition::{ConstantConditionCodeGen, ConstantConditionValue};\n use constant_value::ConstantValueCodeGen;\n+use either::Either;\n use indexmap::map::Entry;\n use lazy_static::lazy_static;\n use num_traits::Zero;\n@@ -42,6 +43,7 @@ use swc_core::{\n     },\n     ecma::{\n         ast::*,\n+        utils::IsDirective,\n         visit::{\n             fields::{AssignExprField, AssignTargetField, SimpleAssignTargetField},\n             AstParentKind, AstParentNodeRef, VisitAstPath, VisitWithAstPath,\n@@ -169,6 +171,7 @@ pub struct AnalyzeEcmascriptModuleResult {\n     pub code_generation: ResolvedVc<CodeGens>,\n     pub exports: ResolvedVc<EcmascriptExports>,\n     pub async_module: ResolvedVc<OptionAsyncModule>,\n+    pub has_side_effect_free_directive: bool,\n     /// `true` when the analysis was successful.\n     pub successful: bool,\n     pub source_map: ResolvedVc<OptionStringifiedSourceMap>,\n@@ -221,6 +224,7 @@ pub struct AnalyzeEcmascriptModuleResultBuilder {\n     async_module: ResolvedVc<OptionAsyncModule>,\n     successful: bool,\n     source_map: Option<ResolvedVc<OptionStringifiedSourceMap>>,\n+    has_side_effect_free_directive: bool,\n }\n \n impl AnalyzeEcmascriptModuleResultBuilder {\n@@ -238,6 +242,7 @@ impl AnalyzeEcmascriptModuleResultBuilder {\n             async_module: ResolvedVc::cell(None),\n             successful: false,\n             source_map: None,\n+            has_side_effect_free_directive: false,\n         }\n     }\n \n@@ -297,6 +302,11 @@ impl AnalyzeEcmascriptModuleResultBuilder {\n         self.async_module = ResolvedVc::cell(Some(async_module));\n     }\n \n+    /// Set whether this module is side-efffect free according to a user-provided directive.\n+    pub fn set_has_side_effect_free_directive(&mut self, value: bool) {\n+        self.has_side_effect_free_directive = value;\n+    }\n+\n     /// Sets whether the analysis was successful.\n     pub fn set_successful(&mut self, successful: bool) {\n         self.successful = successful;\n@@ -411,6 +421,7 @@ impl AnalyzeEcmascriptModuleResultBuilder {\n                 code_generation: ResolvedVc::cell(self.code_gens),\n                 exports: self.exports.resolved_cell(),\n                 async_module: self.async_module,\n+                has_side_effect_free_directive: self.has_side_effect_free_directive,\n                 successful: self.successful,\n                 source_map,\n             },\n@@ -586,6 +597,33 @@ pub(crate) async fn analyse_ecmascript_module_internal(\n         return analysis.build(Default::default(), false).await;\n     };\n \n+    let has_side_effect_free_directive = match program {\n+        Program::Module(module) => Either::Left(\n+            module\n+                .body\n+                .iter()\n+                .take_while(|i| match i {\n+                    ModuleItem::Stmt(stmt) => stmt.directive_continue(),\n+                    ModuleItem::ModuleDecl(_) => false,\n+                })\n+                .filter_map(|i| i.as_stmt()),\n+        ),\n+        Program::Script(script) => Either::Right(\n+            script\n+                .body\n+                .iter()\n+                .take_while(|stmt| stmt.directive_continue()),\n+        ),\n+    }\n+    .any(|f| match f {\n+        Stmt::Expr(ExprStmt { expr, .. }) => match &**expr {\n+            Expr::Lit(Lit::Str(Str { value, .. })) => value == \"use turbopack no side effects\",\n+            _ => false,\n+        },\n+        _ => false,\n+    });\n+    analysis.set_has_side_effect_free_directive(has_side_effect_free_directive);\n+\n     let compile_time_info = compile_time_info_for_module_type(\n         *raw_module.compile_time_info,\n         eval_context.is_esm(specified_type),"
+        },
+        {
+            "sha": "bd3bdaa0249e6542fde5b5e41359c0488f2d8f05",
+            "filename": "turbopack/crates/turbopack-tests/tests/execution/turbopack/side-effects-optimization/directive/input/index.js",
+            "status": "added",
+            "additions": 10,
+            "deletions": 0,
+            "changes": 10,
+            "blob_url": "https://github.com/vercel/next.js/blob/37554159117255789ad9565d540b96f9da83049d/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fdirective%2Finput%2Findex.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/37554159117255789ad9565d540b96f9da83049d/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fdirective%2Finput%2Findex.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fdirective%2Finput%2Findex.js?ref=37554159117255789ad9565d540b96f9da83049d",
+            "patch": "@@ -0,0 +1,10 @@\n+import { foo } from './lib/index.js'\n+\n+it('should respect side effects directive', () => {\n+  expect(foo).toBe(789)\n+\n+  const modules = Object.keys(__turbopack_modules__)\n+  expect(modules).toContainEqual(expect.stringContaining('input/lib/foo'))\n+  expect(modules).not.toContainEqual(expect.stringContaining('input/lib/index'))\n+  expect(modules).not.toContainEqual(expect.stringContaining('input/lib/bar'))\n+})"
+        },
+        {
+            "sha": "b3a0ae6cb0215e0006bcecb116e1de5573380419",
+            "filename": "turbopack/crates/turbopack-tests/tests/execution/turbopack/side-effects-optimization/directive/input/lib/bar.js",
+            "status": "added",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/37554159117255789ad9565d540b96f9da83049d/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fdirective%2Finput%2Flib%2Fbar.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/37554159117255789ad9565d540b96f9da83049d/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fdirective%2Finput%2Flib%2Fbar.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fdirective%2Finput%2Flib%2Fbar.js?ref=37554159117255789ad9565d540b96f9da83049d",
+            "patch": "@@ -0,0 +1,3 @@\n+\"use turbopack no side effects\"\n+\n+export const bar = 123;"
+        },
+        {
+            "sha": "fe91f7e0bec28495f467cf2ce2955aa08fbd165b",
+            "filename": "turbopack/crates/turbopack-tests/tests/execution/turbopack/side-effects-optimization/directive/input/lib/foo.js",
+            "status": "added",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/37554159117255789ad9565d540b96f9da83049d/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fdirective%2Finput%2Flib%2Ffoo.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/37554159117255789ad9565d540b96f9da83049d/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fdirective%2Finput%2Flib%2Ffoo.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fdirective%2Finput%2Flib%2Ffoo.js?ref=37554159117255789ad9565d540b96f9da83049d",
+            "patch": "@@ -0,0 +1,3 @@\n+\"use turbopack no side effects\"\n+\n+export const foo = 789;"
+        },
+        {
+            "sha": "efbeb86e27df62767dbc334883d7e58e6e370cd3",
+            "filename": "turbopack/crates/turbopack-tests/tests/execution/turbopack/side-effects-optimization/directive/input/lib/index.js",
+            "status": "added",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/vercel/next.js/blob/37554159117255789ad9565d540b96f9da83049d/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fdirective%2Finput%2Flib%2Findex.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/37554159117255789ad9565d540b96f9da83049d/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fdirective%2Finput%2Flib%2Findex.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fdirective%2Finput%2Flib%2Findex.js?ref=37554159117255789ad9565d540b96f9da83049d",
+            "patch": "@@ -0,0 +1,4 @@\n+\"use turbopack no side effects\"\n+\n+export {foo} from \"./foo\";\n+export {bar} from \"./bar\";"
+        },
+        {
+            "sha": "af13697f09f935e9c18c212c95296a9187fde3eb",
+            "filename": "turbopack/crates/turbopack-tests/tests/execution/turbopack/side-effects-optimization/directive/options.json",
+            "status": "added",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/37554159117255789ad9565d540b96f9da83049d/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fdirective%2Foptions.json",
+            "raw_url": "https://github.com/vercel/next.js/raw/37554159117255789ad9565d540b96f9da83049d/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fdirective%2Foptions.json",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fdirective%2Foptions.json?ref=37554159117255789ad9565d540b96f9da83049d",
+            "patch": "@@ -0,0 +1,3 @@\n+{\n+  \"treeShakingMode\": \"reexports-only\"\n+}"
+        }
+    ],
+    "stats": {
+        "total": 80,
+        "additions": 78,
+        "deletions": 2
+    }
+}

@@ -1,0 +1,36 @@
+{
+    "author": "sambhavnoobcoder",
+    "message": "Fix PaliGemma Pad Token Masking During Training #35855 (#35859)\n\n* change order of unmasking of tokens\n\n* library import\n\n* class setup\n\n* test function\n\n* refactor\n\n* add commit message\n\n* test modified\n\n* explict initiliasation of weights + made model smaller\n\n* removed sepete testing file\n\n* fixup\n\n* fixup core\n\n* test attention mask with token types\n\n* tests fixup\n\n* removed PaliGemmaAttentionMaskTest class\n\n---------\n\nCo-authored-by: sambhavnoobcoder <indosambahv@gmail.com>",
+    "sha": "950cfb0b4f6f79dbeb658100d25b5f3e3d8be04b",
+    "files": [
+        {
+            "sha": "9172b98c069e18b0ba5b08c2f4b9d696e7d1fb5e",
+            "filename": "src/transformers/models/paligemma/modeling_paligemma.py",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 5,
+            "changes": 14,
+            "blob_url": "https://github.com/huggingface/transformers/blob/950cfb0b4f6f79dbeb658100d25b5f3e3d8be04b/src%2Ftransformers%2Fmodels%2Fpaligemma%2Fmodeling_paligemma.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/950cfb0b4f6f79dbeb658100d25b5f3e3d8be04b/src%2Ftransformers%2Fmodels%2Fpaligemma%2Fmodeling_paligemma.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fpaligemma%2Fmodeling_paligemma.py?ref=950cfb0b4f6f79dbeb658100d25b5f3e3d8be04b",
+            "patch": "@@ -383,16 +383,20 @@ def _update_causal_mask(\n         if attention_mask is not None:\n             causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit\n             mask_length = attention_mask.shape[-1]\n+\n+            # First unmask prefix tokens during training\n+            if is_training:\n+                causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(\n+                    token_type_ids[:, None, None, :].to(causal_mask.device) == 0, 0\n+                )\n+\n+            # Then apply padding mask (will mask pad tokens)\n             padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :].to(causal_mask.device)\n             padding_mask = padding_mask == 0\n             causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(\n                 padding_mask, min_dtype\n             )\n-            # we are training thus we need to create a full mask on the image + prefix but causal on suffix\n-            if is_training:\n-                causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(\n-                    token_type_ids[:, None, None, :].to(causal_mask.device) == 0, 0\n-                )\n+\n         return causal_mask\n \n     def get_image_features(self, pixel_values: torch.FloatTensor):"
+        },
+        {
+            "sha": "7d686576bd83193ccda93bc98993974124d9fb5e",
+            "filename": "tests/models/paligemma/test_modeling_paligemma.py",
+            "status": "modified",
+            "additions": 41,
+            "deletions": 0,
+            "changes": 41,
+            "blob_url": "https://github.com/huggingface/transformers/blob/950cfb0b4f6f79dbeb658100d25b5f3e3d8be04b/tests%2Fmodels%2Fpaligemma%2Ftest_modeling_paligemma.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/950cfb0b4f6f79dbeb658100d25b5f3e3d8be04b/tests%2Fmodels%2Fpaligemma%2Ftest_modeling_paligemma.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fpaligemma%2Ftest_modeling_paligemma.py?ref=950cfb0b4f6f79dbeb658100d25b5f3e3d8be04b",
+            "patch": "@@ -351,6 +351,47 @@ def test_flash_attention_2_padding_matches_padding_free_with_position_ids(self):\n     def test_generate_compile_model_forward(self):\n         pass\n \n+    def test_attention_mask_with_token_types(self):\n+        \"\"\"Test that attention masking works correctly both with and without token type IDs.\"\"\"\n+        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()\n+\n+        for model_class in self.all_model_classes:\n+            model = model_class(config)\n+            model.to(torch_device)\n+            model.eval()\n+\n+            # Case 1: With token_type_ids\n+            outputs_with_types = model(\n+                **inputs_dict,\n+                output_attentions=True,\n+            )\n+\n+            # Case 2: Without token_type_ids\n+            inputs_no_types = {k: v for k, v in inputs_dict.items() if k != \"token_type_ids\"}\n+            outputs_no_types = model(\n+                **inputs_no_types,\n+                output_attentions=True,\n+            )\n+\n+            attention_outputs_with_types = outputs_with_types.attentions\n+            attention_outputs_no_types = outputs_no_types.attentions\n+\n+            # Verify pad tokens remain masked in both cases\n+            attention_mask = inputs_dict[\"attention_mask\"]\n+            pad_positions = attention_mask == 0\n+\n+            for layer_attentions in [attention_outputs_with_types, attention_outputs_no_types]:\n+                for layer_attn in layer_attentions:\n+                    # Check if pad tokens are properly masked\n+                    for batch_idx in range(layer_attn.shape[0]):\n+                        for seq_idx in range(layer_attn.shape[-1]):\n+                            if pad_positions[batch_idx, seq_idx]:\n+                                # Verify attention weights for pad tokens are zero\n+                                self.assertTrue(\n+                                    torch.all(layer_attn[batch_idx, :, :, seq_idx] == 0),\n+                                    f\"Found non-zero attention weights for padding token at batch {batch_idx}, sequence position {seq_idx}\",\n+                                )\n+\n \n @slow\n @require_torch"
+        }
+    ],
+    "stats": {
+        "total": 55,
+        "additions": 50,
+        "deletions": 5
+    }
+}

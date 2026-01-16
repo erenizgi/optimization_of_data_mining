@@ -1,0 +1,84 @@
+{
+    "author": "ojeytonwilliams",
+    "message": "feat(api): redirect auth requests if already signed in (#55829)",
+    "sha": "609cdb0c4a84989c1cacbf83c7a4259d19c8fc2e",
+    "files": [
+        {
+            "sha": "feb6dcd5c738cab641f77d536bd8213c7c612ecd",
+            "filename": "api/src/app.ts",
+            "status": "modified",
+            "additions": 14,
+            "deletions": 9,
+            "changes": 23,
+            "blob_url": "https://github.com/freeCodeCamp/freeCodeCamp/blob/609cdb0c4a84989c1cacbf83c7a4259d19c8fc2e/api%2Fsrc%2Fapp.ts",
+            "raw_url": "https://github.com/freeCodeCamp/freeCodeCamp/raw/609cdb0c4a84989c1cacbf83c7a4259d19c8fc2e/api%2Fsrc%2Fapp.ts",
+            "contents_url": "https://api.github.com/repos/freeCodeCamp/freeCodeCamp/contents/api%2Fsrc%2Fapp.ts?ref=609cdb0c4a84989c1cacbf83c7a4259d19c8fc2e",
+            "patch": "@@ -186,10 +186,10 @@ export const build = async (\n   void fastify.register(auth);\n   void fastify.register(notFound);\n   void fastify.register(prismaPlugin);\n+  void fastify.register(bouncer);\n \n   // Routes requiring authentication:\n   void fastify.register(async function (fastify, _opts) {\n-    await fastify.register(bouncer);\n     fastify.addHook('onRequest', fastify.authorize);\n     // CSRF protection enabled:\n     await fastify.register(async function (fastify, _opts) {\n@@ -222,14 +222,19 @@ export const build = async (\n       await fastify.register(settingRedirectRoutes);\n     });\n   });\n-  // Routes not requiring authentication:\n-  void fastify.register(mobileAuth0Routes);\n-  // TODO: consolidate with LOCAL_MOCK_AUTH\n-  if (FCC_ENABLE_DEV_LOGIN_MODE) {\n-    void fastify.register(devAuthRoutes);\n-  } else {\n-    void fastify.register(authRoutes);\n-  }\n+  // Routes for signed out users:\n+  void fastify.register(async function (fastify) {\n+    fastify.addHook('onRequest', fastify.authorize);\n+    // TODO(Post-MVP): add the redirectIfSignedIn hook here, rather than in the\n+    // mobileAuth0Routes and authRoutes plugins.\n+    await fastify.register(mobileAuth0Routes);\n+    // TODO: consolidate with LOCAL_MOCK_AUTH\n+    if (FCC_ENABLE_DEV_LOGIN_MODE) {\n+      await fastify.register(devAuthRoutes);\n+    } else {\n+      await fastify.register(authRoutes);\n+    }\n+  });\n   void fastify.register(chargeStripeRoute);\n   void fastify.register(signoutRoute);\n   void fastify.register(emailSubscribtionRoutes);"
+        },
+        {
+            "sha": "a58bc4c05345e6d18a04113c819b79cd6184b545",
+            "filename": "api/src/plugins/auth0.test.ts",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/freeCodeCamp/freeCodeCamp/blob/609cdb0c4a84989c1cacbf83c7a4259d19c8fc2e/api%2Fsrc%2Fplugins%2Fauth0.test.ts",
+            "raw_url": "https://github.com/freeCodeCamp/freeCodeCamp/raw/609cdb0c4a84989c1cacbf83c7a4259d19c8fc2e/api%2Fsrc%2Fplugins%2Fauth0.test.ts",
+            "contents_url": "https://api.github.com/repos/freeCodeCamp/freeCodeCamp/contents/api%2Fsrc%2Fplugins%2Fauth0.test.ts?ref=609cdb0c4a84989c1cacbf83c7a4259d19c8fc2e",
+            "patch": "@@ -8,6 +8,7 @@ import cookies, { sign, unsign } from './cookies';\n import { auth0Client } from './auth0';\n import redirectWithMessage, { formatMessage } from './redirect-with-message';\n import auth from './auth';\n+import bouncer from './bouncer';\n \n // eslint-disable-next-line @typescript-eslint/no-unsafe-return\n jest.mock('../utils/env', () => ({\n@@ -24,6 +25,7 @@ describe('auth0 plugin', () => {\n     await fastify.register(cookies);\n     await fastify.register(redirectWithMessage);\n     await fastify.register(auth);\n+    await fastify.register(bouncer);\n     await fastify.register(auth0Client);\n     await fastify.register(prismaPlugin);\n   });"
+        },
+        {
+            "sha": "82e1b5e5b97cc5f9cfc213e4273d7a8c876b5bd9",
+            "filename": "api/src/plugins/auth0.ts",
+            "status": "modified",
+            "additions": 24,
+            "deletions": 15,
+            "changes": 39,
+            "blob_url": "https://github.com/freeCodeCamp/freeCodeCamp/blob/609cdb0c4a84989c1cacbf83c7a4259d19c8fc2e/api%2Fsrc%2Fplugins%2Fauth0.ts",
+            "raw_url": "https://github.com/freeCodeCamp/freeCodeCamp/raw/609cdb0c4a84989c1cacbf83c7a4259d19c8fc2e/api%2Fsrc%2Fplugins%2Fauth0.ts",
+            "contents_url": "https://api.github.com/repos/freeCodeCamp/freeCodeCamp/contents/api%2Fsrc%2Fplugins%2Fauth0.ts?ref=609cdb0c4a84989c1cacbf83c7a4259d19c8fc2e",
+            "patch": "@@ -53,21 +53,28 @@ export const auth0Client: FastifyPluginCallbackTypebox = fp(\n       }\n     });\n \n-    fastify.get('/signin', async function (request, reply) {\n-      const returnTo = request.headers.referer ?? `${HOME_LOCATION}/learn`;\n-      void reply.setCookie('login-returnto', returnTo, {\n-        domain: COOKIE_DOMAIN,\n-        httpOnly: true,\n-        secure: true,\n-        signed: true,\n-        sameSite: 'lax'\n-      });\n+    void fastify.register(function (fastify, _options, done) {\n+      // TODO(Post-MVP): move this into the app, so that we add this hook once for\n+      // all auth routes.\n+      fastify.addHook('onRequest', fastify.redirectIfSignedIn);\n \n-      const redirectUrl = await this.auth0OAuth.generateAuthorizationUri(\n-        request,\n-        reply\n-      );\n-      void reply.redirect(redirectUrl);\n+      fastify.get('/signin', async function (request, reply) {\n+        const returnTo = request.headers.referer ?? `${HOME_LOCATION}/learn`;\n+        void reply.setCookie('login-returnto', returnTo, {\n+          domain: COOKIE_DOMAIN,\n+          httpOnly: true,\n+          secure: true,\n+          signed: true,\n+          sameSite: 'lax'\n+        });\n+\n+        const redirectUrl = await this.auth0OAuth.generateAuthorizationUri(\n+          request,\n+          reply\n+        );\n+        void reply.redirect(redirectUrl);\n+      });\n+      done();\n     });\n \n     // TODO: use a schema to validate the query params.\n@@ -151,5 +158,7 @@ export const auth0Client: FastifyPluginCallbackTypebox = fp(\n \n     done();\n   },\n-  { dependencies: ['redirect-with-message'] }\n+  // TODO(Post-MVP): remove bouncer dependency when moving redirectIfSignedIn\n+  // out of this plugin.\n+  { dependencies: ['redirect-with-message', 'bouncer'] }\n );"
+        },
+        {
+            "sha": "6f9d6a363b7905951ae236249c43a94486f9ce93",
+            "filename": "api/src/plugins/bouncer.test.ts",
+            "status": "modified",
+            "additions": 24,
+            "deletions": 22,
+            "changes": 46,
+            "blob_url": "https://github.com/freeCodeCamp/freeCodeCamp/blob/609cdb0c4a84989c1cacbf83c7a4259d19c8fc2e/api%2Fsrc%2Fplugins%2Fbouncer.test.ts",
+            "raw_url": "https://github.com/freeCodeCamp/freeCodeCamp/raw/609cdb0c4a84989c1cacbf83c7a4259d19c8fc2e/api%2Fsrc%2Fplugins%2Fbouncer.test.ts",
+            "contents_url": "https://api.github.com/repos/freeCodeCamp/freeCodeCamp/contents/api%2Fsrc%2Fplugins%2Fbouncer.test.ts?ref=609cdb0c4a84989c1cacbf83c7a4259d19c8fc2e",
+            "patch": "@@ -40,7 +40,7 @@ describe('bouncer', () => {\n       fastify.addHook('onRequest', fastify.send401IfNoUser);\n     });\n \n-    it('should return 401 if no user is present', async () => {\n+    it('should return 401 if NO user is present', async () => {\n       const message = {\n         type: 'danger',\n         content: 'Something undesirable occurred'\n@@ -83,7 +83,10 @@ describe('bouncer', () => {\n     });\n     const redirectLocation = `${HOME_LOCATION}?${formatMessage({ type: 'info', content: 'Only authenticated users can access this route. Please sign in and try again.' })}`;\n \n-    it('should redirect to HOME_LOCATION if no user is present', async () => {\n+    // TODO(Post-MVP): make the redirects consistent between redirectIfNoUser\n+    // and redirectIfSignedIn. Either both should redirect to the referer or\n+    // both should redirect to HOME_LOCATION.\n+    it('should redirect to HOME_LOCATION if NO user is present', async () => {\n       const message = {\n         type: 'danger',\n         content: 'At the moment, content is ignored'\n@@ -117,36 +120,35 @@ describe('bouncer', () => {\n     });\n   });\n \n-  describe('fallback hook', () => {\n-    it('should reject unauthed requests when no other reject hooks are added', async () => {\n-      const message = {\n-        type: 'danger',\n-        content: 'Something undesirable occurred'\n-      };\n+  describe('redirectIfSignedIn', () => {\n+    beforeEach(() => {\n+      fastify.addHook('onRequest', fastify.redirectIfSignedIn);\n+    });\n+\n+    it('should redirect to the referer if a user is present', async () => {\n       authorizeSpy.mockImplementationOnce((req, _reply, done) => {\n-        req.accessDeniedMessage = message;\n+        req.user = { id: '123' };\n         done();\n       });\n       const res = await fastify.inject({\n         method: 'GET',\n-        url: '/'\n+        url: '/',\n+        headers: {\n+          referer: 'https://www.freecodecamp.org/some/other/path'\n+        }\n       });\n \n-      expect(res.json()).toStrictEqual({\n-        type: message.type,\n-        message: message.content\n-      });\n+      expect(res.headers.location).toBe(\n+        'https://www.freecodecamp.org/some/other/path'\n+      );\n+      expect(res.statusCode).toEqual(302);\n     });\n \n-    it('should not be called if another reject hook is added', async () => {\n-      const redirectLocation = `${HOME_LOCATION}?${formatMessage({ type: 'info', content: 'Only authenticated users can access this route. Please sign in and try again.' })}`;\n+    it('should not alter the response if NO user is present', async () => {\n       const message = {\n         type: 'danger',\n-        content: 'Something undesirable occurred'\n+        content: 'At the moment, content is ignored'\n       };\n-      // using redirectIfNoUser as the reject hook since then it's obvious that\n-      // the fallback hook is not called.\n-      fastify.addHook('onRequest', fastify.redirectIfNoUser);\n       authorizeSpy.mockImplementationOnce((req, _reply, done) => {\n         req.accessDeniedMessage = message;\n         done();\n@@ -156,8 +158,8 @@ describe('bouncer', () => {\n         url: '/'\n       });\n \n-      expect(res.headers.location).toBe(redirectLocation);\n-      expect(res.statusCode).toEqual(302);\n+      expect(res.json()).toEqual({ foo: 'bar' });\n+      expect(res.statusCode).toEqual(200);\n     });\n   });\n });"
+        },
+        {
+            "sha": "e7181e28edec668667b42ac508795e1d0f10b6c8",
+            "filename": "api/src/plugins/bouncer.ts",
+            "status": "modified",
+            "additions": 14,
+            "deletions": 2,
+            "changes": 16,
+            "blob_url": "https://github.com/freeCodeCamp/freeCodeCamp/blob/609cdb0c4a84989c1cacbf83c7a4259d19c8fc2e/api%2Fsrc%2Fplugins%2Fbouncer.ts",
+            "raw_url": "https://github.com/freeCodeCamp/freeCodeCamp/raw/609cdb0c4a84989c1cacbf83c7a4259d19c8fc2e/api%2Fsrc%2Fplugins%2Fbouncer.ts",
+            "contents_url": "https://api.github.com/repos/freeCodeCamp/freeCodeCamp/contents/api%2Fsrc%2Fplugins%2Fbouncer.ts?ref=609cdb0c4a84989c1cacbf83c7a4259d19c8fc2e",
+            "patch": "@@ -10,6 +10,7 @@ declare module 'fastify' {\n   interface FastifyInstance {\n     send401IfNoUser: (req: FastifyRequest, reply: FastifyReply) => void;\n     redirectIfNoUser: (req: FastifyRequest, reply: FastifyReply) => void;\n+    redirectIfSignedIn: (req: FastifyRequest, reply: FastifyReply) => void;\n   }\n }\n \n@@ -40,9 +41,20 @@ const plugin: FastifyPluginCallback = (fastify, _options, done) => {\n     }\n   );\n \n-  fastify.addHook('preParsing', fastify.send401IfNoUser);\n+  fastify.decorate(\n+    'redirectIfSignedIn',\n+    async function (req: FastifyRequest, reply: FastifyReply) {\n+      if (req.user) {\n+        const { returnTo } = getRedirectParams(req);\n+        await reply.redirect(returnTo);\n+      }\n+    }\n+  );\n \n   done();\n };\n \n-export default fp(plugin, { dependencies: ['auth', 'redirect-with-message'] });\n+export default fp(plugin, {\n+  dependencies: ['auth', 'redirect-with-message'],\n+  name: 'bouncer'\n+});"
+        },
+        {
+            "sha": "2fcb4a5315350c678c7660a2f38e699f549f2f20",
+            "filename": "api/src/routes/auth.ts",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/freeCodeCamp/freeCodeCamp/blob/609cdb0c4a84989c1cacbf83c7a4259d19c8fc2e/api%2Fsrc%2Froutes%2Fauth.ts",
+            "raw_url": "https://github.com/freeCodeCamp/freeCodeCamp/raw/609cdb0c4a84989c1cacbf83c7a4259d19c8fc2e/api%2Fsrc%2Froutes%2Fauth.ts",
+            "contents_url": "https://api.github.com/repos/freeCodeCamp/freeCodeCamp/contents/api%2Fsrc%2Froutes%2Fauth.ts?ref=609cdb0c4a84989c1cacbf83c7a4259d19c8fc2e",
+            "patch": "@@ -56,6 +56,10 @@ export const mobileAuth0Routes: FastifyPluginCallback = (\n     })\n   );\n \n+  // TODO(Post-MVP): move this into the app, so that we add this hook once for\n+  // all auth routes.\n+  fastify.addHook('onRequest', fastify.redirectIfSignedIn);\n+\n   fastify.get('/mobile-login', async req => {\n     const email = await getEmailFromAuth0(req);\n "
+        }
+    ],
+    "stats": {
+        "total": 130,
+        "additions": 82,
+        "deletions": 48
+    }
+}

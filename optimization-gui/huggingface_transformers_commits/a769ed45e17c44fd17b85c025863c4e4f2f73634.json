@@ -1,0 +1,48 @@
+{
+    "author": "alex-bene",
+    "message": "Add `post_process_depth_estimation` for GLPN (#34413)\n\n* add depth postprocessing for GLPN\r\n\r\n* remove previous temp fix for glpn tests\r\n\r\n* Style changes for GLPN's `post_process_depth_estimation`\r\n\r\nCo-authored-by: Arthur <48595927+ArthurZucker@users.noreply.github.com>\r\n\r\n* additional style fix\r\n\r\n---------\r\n\r\nCo-authored-by: Arthur <48595927+ArthurZucker@users.noreply.github.com>",
+    "sha": "a769ed45e17c44fd17b85c025863c4e4f2f73634",
+    "files": [
+        {
+            "sha": "115cefc86beec38bde7049c235a4892cab9bc7ec",
+            "filename": "src/transformers/models/glpn/image_processing_glpn.py",
+            "status": "modified",
+            "additions": 52,
+            "deletions": 2,
+            "changes": 54,
+            "blob_url": "https://github.com/huggingface/transformers/blob/a769ed45e17c44fd17b85c025863c4e4f2f73634/src%2Ftransformers%2Fmodels%2Fglpn%2Fimage_processing_glpn.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/a769ed45e17c44fd17b85c025863c4e4f2f73634/src%2Ftransformers%2Fmodels%2Fglpn%2Fimage_processing_glpn.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fglpn%2Fimage_processing_glpn.py?ref=a769ed45e17c44fd17b85c025863c4e4f2f73634",
+            "patch": "@@ -14,7 +14,11 @@\n # limitations under the License.\n \"\"\"Image processor class for GLPN.\"\"\"\n \n-from typing import List, Optional, Union\n+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union\n+\n+\n+if TYPE_CHECKING:\n+    from ...modeling_outputs import DepthEstimatorOutput\n \n import numpy as np\n import PIL.Image\n@@ -27,12 +31,17 @@\n     get_image_size,\n     infer_channel_dimension_format,\n     is_scaled_image,\n+    is_torch_available,\n     make_list_of_images,\n     to_numpy_array,\n     valid_images,\n     validate_preprocess_arguments,\n )\n-from ...utils import TensorType, filter_out_non_signature_kwargs, logging\n+from ...utils import TensorType, filter_out_non_signature_kwargs, logging, requires_backends\n+\n+\n+if is_torch_available():\n+    import torch\n \n \n logger = logging.get_logger(__name__)\n@@ -218,3 +227,44 @@ def preprocess(\n \n         data = {\"pixel_values\": images}\n         return BatchFeature(data=data, tensor_type=return_tensors)\n+\n+    def post_process_depth_estimation(\n+        self,\n+        outputs: \"DepthEstimatorOutput\",\n+        target_sizes: Optional[Union[TensorType, List[Tuple[int, int]], None]] = None,\n+    ) -> List[Dict[str, TensorType]]:\n+        \"\"\"\n+        Converts the raw output of [`DepthEstimatorOutput`] into final depth predictions and depth PIL images.\n+        Only supports PyTorch.\n+\n+        Args:\n+            outputs ([`DepthEstimatorOutput`]):\n+                Raw outputs of the model.\n+            target_sizes (`TensorType` or `List[Tuple[int, int]]`, *optional*):\n+                Tensor of shape `(batch_size, 2)` or list of tuples (`Tuple[int, int]`) containing the target size\n+                (height, width) of each image in the batch. If left to None, predictions will not be resized.\n+\n+        Returns:\n+            `List[Dict[str, TensorType]]`: A list of dictionaries of tensors representing the processed depth\n+            predictions.\n+        \"\"\"\n+        requires_backends(self, \"torch\")\n+\n+        predicted_depth = outputs.predicted_depth\n+\n+        if (target_sizes is not None) and (len(predicted_depth) != len(target_sizes)):\n+            raise ValueError(\n+                \"Make sure that you pass in as many target sizes as the batch dimension of the predicted depth\"\n+            )\n+\n+        results = []\n+        target_sizes = [None] * len(predicted_depth) if target_sizes is None else target_sizes\n+        for depth, target_size in zip(predicted_depth, target_sizes):\n+            if target_size is not None:\n+                depth = depth[None, None, ...]\n+                depth = torch.nn.functional.interpolate(depth, size=target_size, mode=\"bicubic\", align_corners=False)\n+                depth = depth.squeeze()\n+\n+            results.append({\"predicted_depth\": depth})\n+\n+        return results"
+        },
+        {
+            "sha": "70f175df8c99731793341ee6c2219e2e7247db76",
+            "filename": "src/transformers/models/glpn/modeling_glpn.py",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 9,
+            "changes": 16,
+            "blob_url": "https://github.com/huggingface/transformers/blob/a769ed45e17c44fd17b85c025863c4e4f2f73634/src%2Ftransformers%2Fmodels%2Fglpn%2Fmodeling_glpn.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/a769ed45e17c44fd17b85c025863c4e4f2f73634/src%2Ftransformers%2Fmodels%2Fglpn%2Fmodeling_glpn.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fglpn%2Fmodeling_glpn.py?ref=a769ed45e17c44fd17b85c025863c4e4f2f73634",
+            "patch": "@@ -723,20 +723,18 @@ def forward(\n \n         >>> with torch.no_grad():\n         ...     outputs = model(**inputs)\n-        ...     predicted_depth = outputs.predicted_depth\n \n         >>> # interpolate to original size\n-        >>> prediction = torch.nn.functional.interpolate(\n-        ...     predicted_depth.unsqueeze(1),\n-        ...     size=image.size[::-1],\n-        ...     mode=\"bicubic\",\n-        ...     align_corners=False,\n+        >>> post_processed_output = image_processor.post_process_depth_estimation(\n+        ...     outputs,\n+        ...     target_sizes=[(image.height, image.width)],\n         ... )\n \n         >>> # visualize the prediction\n-        >>> output = prediction.squeeze().cpu().numpy()\n-        >>> formatted = (output * 255 / np.max(output)).astype(\"uint8\")\n-        >>> depth = Image.fromarray(formatted)\n+        >>> predicted_depth = post_processed_output[0][\"predicted_depth\"]\n+        >>> depth = predicted_depth * 255 / predicted_depth.max()\n+        >>> depth = depth.detach().cpu().numpy()\n+        >>> depth = Image.fromarray(depth.astype(\"uint8\"))\n         ```\"\"\"\n         return_dict = return_dict if return_dict is not None else self.config.use_return_dict\n         output_hidden_states = ("
+        },
+        {
+            "sha": "81e95ab244f9aa542976bb323d12017e64dc6b40",
+            "filename": "tests/models/glpn/test_modeling_glpn.py",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 8,
+            "changes": 8,
+            "blob_url": "https://github.com/huggingface/transformers/blob/a769ed45e17c44fd17b85c025863c4e4f2f73634/tests%2Fmodels%2Fglpn%2Ftest_modeling_glpn.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/a769ed45e17c44fd17b85c025863c4e4f2f73634/tests%2Fmodels%2Fglpn%2Ftest_modeling_glpn.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fglpn%2Ftest_modeling_glpn.py?ref=a769ed45e17c44fd17b85c025863c4e4f2f73634",
+            "patch": "@@ -157,14 +157,6 @@ def setUp(self):\n         self.model_tester = GLPNModelTester(self)\n         self.config_tester = GLPNConfigTester(self, config_class=GLPNConfig)\n \n-    @unittest.skip(reason=\"Failing after #32550\")\n-    def test_pipeline_depth_estimation(self):\n-        pass\n-\n-    @unittest.skip(reason=\"Failing after #32550\")\n-    def test_pipeline_depth_estimation_fp16(self):\n-        pass\n-\n     def test_config(self):\n         self.config_tester.run_common_tests()\n "
+        }
+    ],
+    "stats": {
+        "total": 78,
+        "additions": 59,
+        "deletions": 19
+    }
+}

@@ -1,0 +1,36 @@
+{
+    "author": "muellerzr",
+    "message": "Only disallow DeepSpeed Zero-3 for auto bs finder (#31731)\n\n* Only disallow DeepSpeed\r\n\r\n* Clean\r\n\r\n* DeepSpeed!\r\n\r\n* Add a test for deepspeed",
+    "sha": "6b7d64ac1c5d19ab4b9e99142a08e31741106e4e",
+    "files": [
+        {
+            "sha": "423eaa69fd1fb74ecb366557333a11ba29768014",
+            "filename": "src/transformers/trainer.py",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 4,
+            "changes": 13,
+            "blob_url": "https://github.com/huggingface/transformers/blob/6b7d64ac1c5d19ab4b9e99142a08e31741106e4e/src%2Ftransformers%2Ftrainer.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/6b7d64ac1c5d19ab4b9e99142a08e31741106e4e/src%2Ftransformers%2Ftrainer.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Ftrainer.py?ref=6b7d64ac1c5d19ab4b9e99142a08e31741106e4e",
+            "patch": "@@ -4822,10 +4822,15 @@ def create_accelerator_and_postprocess(self):\n             wrapper = \"DeepSpeed\" if self.is_deepspeed_enabled else \"FSDP\"\n             raise ValueError(f\"{wrapper} can't be used with `save_only_model` along with `load_best_model_at_end`.\")\n \n-        # `auto_find_batch_size` isn't yet supported with DeepSpeed/FSDP\n-        if (self.is_deepspeed_enabled or self.is_fsdp_enabled) and self.args.auto_find_batch_size:\n-            wrapper = \"DeepSpeed\" if self.is_deepspeed_enabled else \"FSDP\"\n-            raise NotImplementedError(f\"`{wrapper}` doesn't support `auto_find_batch_size`.\")\n+        # `auto_find_batch_size` isn't supported yet with DeepSpeed Zero-3\n+        if (\n+            self.is_deepspeed_enabled\n+            and self.accelerator.state.deepspeed_plugin.zero_stage == 3\n+            and self.args.auto_find_batch_size\n+        ):\n+            raise ValueError(\n+                \"`auto_find_batch_size` isn't supported yet with DeepSpeed Zero-3. Please consider using Zero-2, Zero-1, or FSDP\"\n+            )\n \n     def propagate_args_to_deepspeed(self, auto_find_batch_size=False):\n         \"\"\""
+        },
+        {
+            "sha": "49213f19187fe498c010f50753d26567e0e6552b",
+            "filename": "tests/trainer/test_trainer.py",
+            "status": "modified",
+            "additions": 28,
+            "deletions": 25,
+            "changes": 53,
+            "blob_url": "https://github.com/huggingface/transformers/blob/6b7d64ac1c5d19ab4b9e99142a08e31741106e4e/tests%2Ftrainer%2Ftest_trainer.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/6b7d64ac1c5d19ab4b9e99142a08e31741106e4e/tests%2Ftrainer%2Ftest_trainer.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Ftrainer%2Ftest_trainer.py?ref=6b7d64ac1c5d19ab4b9e99142a08e31741106e4e",
+            "patch": "@@ -145,6 +145,21 @@\n PATH_SAMPLE_TEXT = f\"{get_tests_dir()}/fixtures/sample_text.txt\"\n \n \n+class MockCudaOOMCallback(TrainerCallback):\n+    \"\"\"\n+    Simple callback to simulate CUDA OOM error if\n+    the batch size is >= to `batch_size_limit`.\n+    \"\"\"\n+\n+    def __init__(self, batch_size_limit=16):\n+        self.batch_size_limit = batch_size_limit\n+\n+    def on_step_end(self, args, state, control, **kwargs):\n+        # simulate OOM on the first step\n+        if state.train_batch_size >= self.batch_size_limit:\n+            raise RuntimeError(\"CUDA out of memory.\")\n+\n+\n class RegressionDataset:\n     def __init__(self, a=2, b=3, length=64, seed=42, label_names=None):\n         np.random.seed(seed)\n@@ -2504,41 +2519,35 @@ def test_auto_batch_size_finder(self):\n             run_glue.main()\n \n     @require_deepspeed\n-    def test_auto_batch_size_with_resume_from_checkpoint_with_deepspeed(self):\n+    def test_auto_batch_size_with_deepspeed(self):\n         train_dataset = RegressionDataset(length=128)\n \n         config = RegressionModelConfig(a=0, b=2)\n         model = RegressionRandomPreTrainedModel(config)\n \n         tmp_dir = self.get_auto_remove_tmp_dir()\n \n-        class MockCudaOOMCallback(TrainerCallback):\n-            def on_step_end(self, args, state, control, **kwargs):\n-                # simulate OOM on the first step\n-                if state.train_batch_size >= 16:\n-                    raise RuntimeError(\"CUDA out of memory.\")\n-\n-        deepspeed = {\n-            \"zero_optimization\": {\n-                \"stage\": 1,\n-            },\n-            \"train_batch_size\": \"auto\",\n-            \"train_micro_batch_size_per_gpu\": \"auto\",\n-        }\n+        for stage in [1, 2]:\n+            deepspeed = {\n+                \"zero_optimization\": {\n+                    \"stage\": stage,\n+                },\n+                \"train_batch_size\": \"auto\",\n+                \"train_micro_batch_size_per_gpu\": \"auto\",\n+            }\n \n         args = RegressionTrainingArguments(\n             tmp_dir,\n             do_train=True,\n             max_steps=2,\n-            save_steps=1,\n+            save_strategy=\"no\",\n             per_device_train_batch_size=16,\n             auto_find_batch_size=True,\n             deepspeed=deepspeed,\n         )\n-        # Note: This can have issues, for now we don't support this functionality\n-        # ref: https://github.com/huggingface/transformers/pull/29057\n-        with self.assertRaises(NotImplementedError):\n-            _ = Trainer(model, args, train_dataset=train_dataset, callbacks=[MockCudaOOMCallback()])\n+        trainer = Trainer(model, args, train_dataset=train_dataset, callbacks=[MockCudaOOMCallback()])\n+        trainer.train()\n+        self.assertEqual(trainer._train_batch_size, 8)\n \n     def test_auto_batch_size_with_resume_from_checkpoint(self):\n         train_dataset = RegressionDataset(length=128)\n@@ -2548,12 +2557,6 @@ def test_auto_batch_size_with_resume_from_checkpoint(self):\n \n         tmp_dir = self.get_auto_remove_tmp_dir()\n \n-        class MockCudaOOMCallback(TrainerCallback):\n-            def on_step_end(self, args, state, control, **kwargs):\n-                # simulate OOM on the first step\n-                if state.train_batch_size >= 16:\n-                    raise RuntimeError(\"CUDA out of memory.\")\n-\n         args = RegressionTrainingArguments(\n             tmp_dir,\n             do_train=True,"
+        }
+    ],
+    "stats": {
+        "total": 66,
+        "additions": 37,
+        "deletions": 29
+    }
+}

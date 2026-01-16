@@ -1,0 +1,108 @@
+{
+    "author": "sokra",
+    "message": "Turbopack: add task_id_details feature (#84970)\n\n### What?\n\nAdd a bunch of feature flags that help debugging cases where it is loosing invalidations.",
+    "sha": "f6c2d4913233109ea49256e587db9b7ce636a1a5",
+    "files": [
+        {
+            "sha": "e224fc985b779b75c9976b6dcaff34afa1b0a2f4",
+            "filename": "turbopack/crates/turbo-tasks-backend/Cargo.toml",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/f6c2d4913233109ea49256e587db9b7ce636a1a5/turbopack%2Fcrates%2Fturbo-tasks-backend%2FCargo.toml",
+            "raw_url": "https://github.com/vercel/next.js/raw/f6c2d4913233109ea49256e587db9b7ce636a1a5/turbopack%2Fcrates%2Fturbo-tasks-backend%2FCargo.toml",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks-backend%2FCargo.toml?ref=f6c2d4913233109ea49256e587db9b7ce636a1a5",
+            "patch": "@@ -24,6 +24,8 @@ trace_aggregation_update = []\n trace_find_and_schedule = []\n trace_task_completion = []\n trace_task_dirty = []\n+trace_task_output_dependencies = []\n+trace_task_details = []\n lmdb = [\"dep:lmdb-rkv\"]\n \n [dependencies]"
+        },
+        {
+            "sha": "d9dc5cea2894a9ded36f4072a2cef75ccf73190a",
+            "filename": "turbopack/crates/turbo-tasks-backend/src/backend/mod.rs",
+            "status": "modified",
+            "additions": 58,
+            "deletions": 12,
+            "changes": 70,
+            "blob_url": "https://github.com/vercel/next.js/blob/f6c2d4913233109ea49256e587db9b7ce636a1a5/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fbackend%2Fmod.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/f6c2d4913233109ea49256e587db9b7ce636a1a5/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fbackend%2Fmod.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fbackend%2Fmod.rs?ref=f6c2d4913233109ea49256e587db9b7ce636a1a5",
+            "patch": "@@ -24,7 +24,7 @@ use parking_lot::{Condvar, Mutex};\n use rustc_hash::{FxHashMap, FxHashSet, FxHasher};\n use smallvec::{SmallVec, smallvec};\n use tokio::time::{Duration, Instant};\n-use tracing::{Span, field::Empty, info_span, trace_span};\n+use tracing::{Span, info_span, trace_span};\n use turbo_tasks::{\n     CellId, FxDashMap, FxIndexMap, KeyValuePair, RawVc, ReadCellOptions, ReadConsistency,\n     ReadOutputOptions, ReadTracking, SessionId, TRANSIENT_TASK_BIT, TaskExecutionReason, TaskId,\n@@ -722,21 +722,23 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n             let result = match output {\n                 OutputValue::Cell(cell) => Ok(Ok(RawVc::TaskCell(cell.task, cell.cell))),\n                 OutputValue::Output(task) => Ok(Ok(RawVc::TaskOutput(*task))),\n-                OutputValue::Error(error) => {\n-                    let err: anyhow::Error = error.clone().into();\n-                    Err(err.context(format!(\n-                        \"Execution of {} failed\",\n-                        ctx.get_task_description(task_id)\n-                    )))\n-                }\n+                OutputValue::Error(error) => Err(error\n+                    .with_task_context(ctx.get_task_description(task_id), Some(task_id))\n+                    .into()),\n             };\n             if let Some(mut reader_task) = reader_task\n                 && options.tracking.should_track(result.is_err())\n                 && (!task.is_immutable() || cfg!(feature = \"verify_immutable\"))\n             {\n-                let reader = reader.unwrap();\n+                #[cfg(feature = \"trace_task_output_dependencies\")]\n+                let _span = tracing::trace_span!(\n+                    \"add output dependency\",\n+                    task = %task_id,\n+                    dependent_task = ?reader\n+                )\n+                .entered();\n                 let _ = task.add(CachedDataItem::OutputDependent {\n-                    task: reader,\n+                    task: reader.unwrap(),\n                     value: (),\n                 });\n                 drop(task);\n@@ -1763,7 +1765,22 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n         // The task might be invalidated during this process, so we need to check the stale flag\n         // at the start of every step.\n \n-        let span = tracing::trace_span!(\"task execution completed\", immutable = Empty).entered();\n+        #[cfg(not(feature = \"trace_task_details\"))]\n+        let _span = tracing::trace_span!(\"task execution completed\").entered();\n+        #[cfg(feature = \"trace_task_details\")]\n+        let span = tracing::trace_span!(\n+            \"task execution completed\",\n+            task_id = display(task_id),\n+            result = match result.as_ref() {\n+                Ok(value) => display(either::Either::Left(value)),\n+                Err(err) => display(either::Either::Right(err)),\n+            },\n+            immutable = tracing::field::Empty,\n+            new_output = tracing::field::Empty,\n+            output_dependents = tracing::field::Empty,\n+            stale = tracing::field::Empty,\n+        )\n+        .entered();\n         let mut ctx = self.execute_context(turbo_tasks);\n \n         let Some(TaskExecutionCompletePrepareResult {\n@@ -1776,6 +1793,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n             output_dependent_tasks,\n         }) = self.task_execution_completed_prepare(\n             &mut ctx,\n+            #[cfg(feature = \"trace_task_details\")]\n             &span,\n             task_id,\n             result,\n@@ -1785,9 +1803,16 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n         )\n         else {\n             // Task was stale and has been rescheduled\n+            #[cfg(feature = \"trace_task_details\")]\n+            span.record(\"stale\", \"true\");\n             return true;\n         };\n \n+        #[cfg(feature = \"trace_task_details\")]\n+        span.record(\"new_output\", new_output.is_some());\n+        #[cfg(feature = \"trace_task_details\")]\n+        span.record(\"output_dependents\", output_dependent_tasks.len());\n+\n         // When restoring from filesystem cache the following might not be executed (since we can\n         // suspend in `CleanupOldEdgesOperation`), but that's ok as the task is still dirty and\n         // would be executed again.\n@@ -1810,6 +1835,8 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n             && self.task_execution_completed_connect(&mut ctx, task_id, new_children)\n         {\n             // Task was stale and has been rescheduled\n+            #[cfg(feature = \"trace_task_details\")]\n+            span.record(\"stale\", \"true\");\n             return true;\n         }\n \n@@ -1823,6 +1850,8 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n             is_now_immutable,\n         ) {\n             // Task was stale and has been rescheduled\n+            #[cfg(feature = \"trace_task_details\")]\n+            span.record(\"stale\", \"true\");\n             return true;\n         }\n \n@@ -1836,7 +1865,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n     fn task_execution_completed_prepare(\n         &self,\n         ctx: &mut impl ExecuteContext<'_>,\n-        span: &Span,\n+        #[cfg(feature = \"trace_task_details\")] span: &Span,\n         task_id: TaskId,\n         result: Result<RawVc, TurboTasksExecutionError>,\n         cell_counters: &AutoMap<ValueTypeId, u32, BuildHasherDefault<FxHasher>, 8>,\n@@ -2088,6 +2117,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n         {\n             is_now_immutable = true;\n         }\n+        #[cfg(feature = \"trace_task_details\")]\n         span.record(\"immutable\", is_immutable || is_now_immutable);\n \n         if !queue.is_empty() || !old_edges.is_empty() {\n@@ -2120,19 +2150,33 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n \n         let mut queue = AggregationUpdateQueue::new();\n         for dependent_task_id in output_dependent_tasks {\n+            #[cfg(feature = \"trace_task_output_dependencies\")]\n+            let span = tracing::trace_span!(\n+                \"invalidate output dependency\",\n+                task = %task_id,\n+                dependent_task = %dependent_task_id,\n+                result = tracing::field::Empty,\n+            )\n+            .entered();\n             if ctx.is_once_task(dependent_task_id) {\n                 // once tasks are never invalidated\n+                #[cfg(feature = \"trace_task_output_dependencies\")]\n+                span.record(\"result\", \"once task\");\n                 continue;\n             }\n             let dependent = ctx.task(dependent_task_id, TaskDataCategory::All);\n             if dependent.has_key(&CachedDataItemKey::OutdatedOutputDependency { target: task_id }) {\n                 // output dependency is outdated, so it hasn't read the output yet\n                 // and doesn't need to be invalidated\n+                #[cfg(feature = \"trace_task_output_dependencies\")]\n+                span.record(\"result\", \"outdated dependency\");\n                 continue;\n             }\n             if !dependent.has_key(&CachedDataItemKey::OutputDependency { target: task_id }) {\n                 // output dependency has been removed, so the task doesn't depend on the\n                 // output anymore and doesn't need to be invalidated\n+                #[cfg(feature = \"trace_task_output_dependencies\")]\n+                span.record(\"result\", \"no backward dependency\");\n                 continue;\n             }\n             make_task_dirty_internal(\n@@ -2144,6 +2188,8 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n                 &mut queue,\n                 ctx,\n             );\n+            #[cfg(feature = \"trace_task_output_dependencies\")]\n+            span.record(\"result\", \"marked dirty\");\n         }\n \n         queue.execute(ctx);"
+        },
+        {
+            "sha": "e5794f4b12ff8bcf72be3db8d9b0bf5c65a616ac",
+            "filename": "turbopack/crates/turbo-tasks-backend/src/backend/operation/cleanup_old_edges.rs",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/vercel/next.js/blob/f6c2d4913233109ea49256e587db9b7ce636a1a5/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fbackend%2Foperation%2Fcleanup_old_edges.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/f6c2d4913233109ea49256e587db9b7ce636a1a5/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fbackend%2Foperation%2Fcleanup_old_edges.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fbackend%2Foperation%2Fcleanup_old_edges.rs?ref=f6c2d4913233109ea49256e587db9b7ce636a1a5",
+            "patch": "@@ -182,6 +182,13 @@ impl Operation for CleanupOldEdgesOperation {\n                                 }\n                             }\n                             OutdatedEdge::OutputDependency(output_task_id) => {\n+                                #[cfg(feature = \"trace_task_output_dependencies\")]\n+                                let _span = tracing::trace_span!(\n+                                    \"remove output dependency\",\n+                                    task = %output_task_id,\n+                                    dependent_task = %task_id\n+                                )\n+                                .entered();\n                                 {\n                                     let mut task = ctx.task(output_task_id, TaskDataCategory::Data);\n                                     task.remove(&CachedDataItemKey::OutputDependent {"
+        },
+        {
+            "sha": "56f955dd43569108c2c872c98a510ab897f71201",
+            "filename": "turbopack/crates/turbo-tasks-backend/src/backend/operation/invalidate.rs",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/f6c2d4913233109ea49256e587db9b7ce636a1a5/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fbackend%2Foperation%2Finvalidate.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/f6c2d4913233109ea49256e587db9b7ce636a1a5/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fbackend%2Foperation%2Finvalidate.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fbackend%2Foperation%2Finvalidate.rs?ref=f6c2d4913233109ea49256e587db9b7ce636a1a5",
+            "patch": "@@ -224,6 +224,7 @@ pub fn make_task_dirty_internal(\n         #[cfg(feature = \"trace_task_dirty\")]\n         let _span = tracing::trace_span!(\n             \"make task stale\",\n+            task_id = display(task_id),\n             name = ctx.get_task_description(task_id),\n             cause = %TaskDirtyCauseInContext::new(&cause, ctx)\n         )\n@@ -244,6 +245,7 @@ pub fn make_task_dirty_internal(\n             #[cfg(feature = \"trace_task_dirty\")]\n             let _span = tracing::trace_span!(\n                 \"task already dirty\",\n+                task_id = display(task_id),\n                 name = ctx.get_task_description(task_id),\n                 cause = %TaskDirtyCauseInContext::new(&cause, ctx)\n             )\n@@ -275,6 +277,7 @@ pub fn make_task_dirty_internal(\n     #[cfg(feature = \"trace_task_dirty\")]\n     let _span = tracing::trace_span!(\n         \"make task dirty\",\n+        task_id = display(task_id),\n         name = ctx.get_task_description(task_id),\n         cause = %TaskDirtyCauseInContext::new(&cause, ctx)\n     )"
+        },
+        {
+            "sha": "200867e933292c541f61cf3e6d90cbecef3f05a1",
+            "filename": "turbopack/crates/turbo-tasks/Cargo.toml",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/f6c2d4913233109ea49256e587db9b7ce636a1a5/turbopack%2Fcrates%2Fturbo-tasks%2FCargo.toml",
+            "raw_url": "https://github.com/vercel/next.js/raw/f6c2d4913233109ea49256e587db9b7ce636a1a5/turbopack%2Fcrates%2Fturbo-tasks%2FCargo.toml",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks%2FCargo.toml?ref=f6c2d4913233109ea49256e587db9b7ce636a1a5",
+            "patch": "@@ -12,6 +12,7 @@ bench = false\n default = []\n tokio_tracing = [\"tokio/tracing\"]\n hanging_detection = []\n+task_id_details = []\n \n # TODO(bgw): This feature is here to unblock turning on local tasks by default. It's only turned on\n # in unit tests. This will be removed very soon."
+        },
+        {
+            "sha": "e15edf4eb68affdae72c254bd54670bcc9ef23ef",
+            "filename": "turbopack/crates/turbo-tasks/src/backend.rs",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 1,
+            "changes": 14,
+            "blob_url": "https://github.com/vercel/next.js/blob/f6c2d4913233109ea49256e587db9b7ce636a1a5/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fbackend.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/f6c2d4913233109ea49256e587db9b7ce636a1a5/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fbackend.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fbackend.rs?ref=f6c2d4913233109ea49256e587db9b7ce636a1a5",
+            "patch": "@@ -427,6 +427,8 @@ pub struct TurboTasksError {\n #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]\n pub struct TurboTaskContextError {\n     pub task: RcStr,\n+    #[cfg(feature = \"task_id_details\")]\n+    pub task_id: Option<TaskId>,\n     pub source: Option<TurboTasksExecutionError>,\n }\n \n@@ -438,9 +440,11 @@ pub enum TurboTasksExecutionError {\n }\n \n impl TurboTasksExecutionError {\n-    pub fn with_task_context(&self, task: impl Display) -> Self {\n+    pub fn with_task_context(&self, task: impl Display, _task_id: Option<TaskId>) -> Self {\n         TurboTasksExecutionError::TaskContext(Arc::new(TurboTaskContextError {\n             task: RcStr::from(task.to_string()),\n+            #[cfg(feature = \"task_id_details\")]\n+            task_id: _task_id,\n             source: Some(self.clone()),\n         }))\n     }\n@@ -468,6 +472,14 @@ impl Display for TurboTasksExecutionError {\n                 write!(f, \"{}\", error.message)\n             }\n             TurboTasksExecutionError::TaskContext(context_error) => {\n+                #[cfg(feature = \"task_id_details\")]\n+                if let Some(task_id) = context_error.task_id {\n+                    return write!(\n+                        f,\n+                        \"Execution of {} ({}) failed\",\n+                        context_error.task, task_id\n+                    );\n+                }\n                 write!(f, \"Execution of {} failed\", context_error.task)\n             }\n         }"
+        },
+        {
+            "sha": "7c2e58e8e665968e72a12a6f671479e4149dbf9b",
+            "filename": "turbopack/crates/turbo-tasks/src/manager.rs",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 1,
+            "changes": 11,
+            "blob_url": "https://github.com/vercel/next.js/blob/f6c2d4913233109ea49256e587db9b7ce636a1a5/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fmanager.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/f6c2d4913233109ea49256e587db9b7ce636a1a5/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fmanager.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fmanager.rs?ref=f6c2d4913233109ea49256e587db9b7ce636a1a5",
+            "patch": "@@ -281,6 +281,15 @@ pub enum TaskPersistence {\n     Transient,\n }\n \n+impl Display for TaskPersistence {\n+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n+        match self {\n+            TaskPersistence::Persistent => write!(f, \"persistent\"),\n+            TaskPersistence::Transient => write!(f, \"transient\"),\n+        }\n+    }\n+}\n+\n #[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]\n pub enum ReadConsistency {\n     /// The default behavior for most APIs. Reads are faster, but may return stale values, which\n@@ -826,7 +835,7 @@ impl<B: Backend + 'static> TurboTasks<B> {\n                 let output = match result {\n                     Ok(raw_vc) => OutputContent::Link(raw_vc),\n                     Err(err) => OutputContent::Error(\n-                        TurboTasksExecutionError::from(err).with_task_context(task_type),\n+                        TurboTasksExecutionError::from(err).with_task_context(task_type, None),\n                     ),\n                 };\n "
+        },
+        {
+            "sha": "60aaf0a0f86cb586d935383c74a0c2594ba71311",
+            "filename": "turbopack/crates/turbo-tasks/src/raw_vc.rs",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 0,
+            "changes": 16,
+            "blob_url": "https://github.com/vercel/next.js/blob/f6c2d4913233109ea49256e587db9b7ce636a1a5/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fraw_vc.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/f6c2d4913233109ea49256e587db9b7ce636a1a5/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fraw_vc.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks%2Fsrc%2Fraw_vc.rs?ref=f6c2d4913233109ea49256e587db9b7ce636a1a5",
+            "patch": "@@ -103,6 +103,22 @@ impl Debug for RawVc {\n     }\n }\n \n+impl Display for RawVc {\n+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n+        match self {\n+            RawVc::TaskOutput(task_id) => write!(f, \"output of task {}\", **task_id),\n+            RawVc::TaskCell(task_id, cell_id) => {\n+                write!(f, \"{} of task {}\", cell_id, **task_id)\n+            }\n+            RawVc::LocalOutput(execution_id, local_task_id, task_persistence) => write!(\n+                f,\n+                \"output of local task {} ({}, {})\",\n+                **local_task_id, **execution_id, task_persistence\n+            ),\n+        }\n+    }\n+}\n+\n impl RawVc {\n     pub fn is_resolved(&self) -> bool {\n         match self {"
+        }
+    ],
+    "stats": {
+        "total": 124,
+        "additions": 110,
+        "deletions": 14
+    }
+}

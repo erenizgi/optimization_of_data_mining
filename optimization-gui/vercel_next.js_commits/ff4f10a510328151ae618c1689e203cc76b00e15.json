@@ -1,0 +1,84 @@
+{
+    "author": "devjiwonchoi",
+    "message": "[Pages] fix: use `asPath` for query-only navigation with `useRouter` (#82236)\n\n### Why?\n\nThe issue was brought up when the app had rewrites (say `/ -> /foo`),\nand the page used `useRouter.push/replace` to add the search queries; it\nused the destination's pathname (`/foo?query=1`) instead of just adding\nthe query (`/?query=1`).\n\nCurrent Behavior:\nhttps://github.com/vercel/next.js/actions/runs/16647831682/job/47112716254?pr=82236#step:34:156\n\n### How?\n\nTherefore, as we handle the hash (`#`), if the target path only needs a\nquery `?`, we may use `router.asPath` by default for static routes to\nresolve cases with rewrites. However, if it is a dynamic route, it needs\nto be able to interpolate the query (for `/[id]` segment, `/?id=1`\ninterpolates to `/1` route), so use `router.pathname`. Finally, if it is\nsuspected to be a rewritten path, use `router.asPath`.\n\n**Note:**\n\nThere is an edge case where the pathname is dynamic, and also a rewrite\npath to the same segment.\n\nE.g. in `/[slug]` path, rewrite `/foo -> /bar`\n\nIn this case, it will be treated as a non-rewritten path and possibly\ninterpolate the query string.\n\nE.g., `/any?slug=foo` will become the content of `/foo`, not rewritten\nas `/bar`.\n\nThis is currently a trade-off of not resolving rewrite paths on every\nRouter/Link call, but using a lighter route regex pattern check.\n\nFixes https://github.com/vercel/next.js/issues/81476",
+    "sha": "ff4f10a510328151ae618c1689e203cc76b00e15",
+    "files": [
+        {
+            "sha": "2957b942bcdb7ff2a4ebfc0bb4a9116fcbf58ece",
+            "filename": "packages/next/src/client/resolve-href.ts",
+            "status": "modified",
+            "additions": 35,
+            "deletions": 4,
+            "changes": 39,
+            "blob_url": "https://github.com/vercel/next.js/blob/ff4f10a510328151ae618c1689e203cc76b00e15/packages%2Fnext%2Fsrc%2Fclient%2Fresolve-href.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/ff4f10a510328151ae618c1689e203cc76b00e15/packages%2Fnext%2Fsrc%2Fclient%2Fresolve-href.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fclient%2Fresolve-href.ts?ref=ff4f10a510328151ae618c1689e203cc76b00e15",
+            "patch": "@@ -8,6 +8,8 @@ import { normalizePathTrailingSlash } from './normalize-trailing-slash'\n import { isLocalURL } from '../shared/lib/router/utils/is-local-url'\n import { isDynamicRoute } from '../shared/lib/router/utils'\n import { interpolateAs } from '../shared/lib/router/utils/interpolate-as'\n+import { getRouteRegex } from '../shared/lib/router/utils/route-regex'\n+import { getRouteMatcher } from '../shared/lib/router/utils/route-matcher'\n \n /**\n  * Resolves a given hyperlink with a certain router state (basePath not included).\n@@ -56,10 +58,39 @@ export function resolveHref(\n   }\n \n   try {\n-    base = new URL(\n-      urlAsString.startsWith('#') ? router.asPath : router.pathname,\n-      'http://n'\n-    )\n+    let baseBase = urlAsString.startsWith('#') ? router.asPath : router.pathname\n+\n+    // If the provided href is only a query string, it is safer to use the asPath\n+    // considering rewrites.\n+    if (urlAsString.startsWith('?')) {\n+      baseBase = router.asPath\n+\n+      // However, if is a dynamic route, we need to use the pathname to preserve the\n+      // query interpolation and rewrites (router.pathname will look like \"/[slug]\").\n+      if (isDynamicRoute(router.pathname)) {\n+        baseBase = router.pathname\n+\n+        const routeRegex = getRouteRegex(router.pathname)\n+        const match = getRouteMatcher(routeRegex)(router.asPath)\n+\n+        // For dynamic routes, if asPath doesn't match the pathname regex, it is a rewritten path.\n+        // In this case, should use asPath to preserve the current URL.\n+        if (!match) {\n+          baseBase = router.asPath\n+        }\n+\n+        // Note: There is an edge case where the pathname is dynamic, and also a rewrite path to the same segment.\n+        // E.g. in \"/[slug]\" path, rewrite \"/foo\" -> \"/bar\"\n+\n+        // In this case, it will be treated as a non-rewritten path and possibly interpolate the query string.\n+        // E.g., \"/any?slug=foo\" will become the content of \"/foo\", not rewritten as \"/bar\"\n+\n+        // This is currently a trade-off of not resolving rewrite paths on every Router/Link call,\n+        // but using a lighter route regex pattern check.\n+      }\n+    }\n+\n+    base = new URL(baseBase, 'http://n')\n   } catch (_) {\n     // fallback to / for invalid asPath values e.g. //\n     base = new URL('/', 'http://n')"
+        },
+        {
+            "sha": "4ffb23e868c8f8691f1d36eda23fbd1083e1859d",
+            "filename": "test/e2e/use-router-with-rewrites/next.config.js",
+            "status": "added",
+            "additions": 33,
+            "deletions": 0,
+            "changes": 33,
+            "blob_url": "https://github.com/vercel/next.js/blob/ff4f10a510328151ae618c1689e203cc76b00e15/test%2Fe2e%2Fuse-router-with-rewrites%2Fnext.config.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/ff4f10a510328151ae618c1689e203cc76b00e15/test%2Fe2e%2Fuse-router-with-rewrites%2Fnext.config.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fuse-router-with-rewrites%2Fnext.config.js?ref=ff4f10a510328151ae618c1689e203cc76b00e15",
+            "patch": "@@ -0,0 +1,33 @@\n+/** @type {import('next').NextConfig} */\n+const nextConfig = {\n+  reactStrictMode: true,\n+  rewrites: async () => {\n+    return {\n+      beforeFiles: [\n+        {\n+          source: '/',\n+          destination: '/foo',\n+        },\n+        {\n+          source: '/rewrite-to-another-segment/:id',\n+          destination: '/rewrite-to-another-segment/:id/foo',\n+        },\n+        // Even though there's rewrite, below won't work as expected due to trade-off.\n+        {\n+          source: '/rewrite-to-same-segment/1',\n+          destination: '/rewrite-to-same-segment/001',\n+        },\n+        {\n+          source: '/rewrite-to-same-segment/2',\n+          destination: '/rewrite-to-same-segment/002',\n+        },\n+        {\n+          source: '/rewrite-to-same-segment/3',\n+          destination: '/rewrite-to-same-segment/003',\n+        },\n+      ],\n+    }\n+  },\n+}\n+\n+module.exports = nextConfig"
+        },
+        {
+            "sha": "8acc73bcd80de24b31231bd17bcaa3cf0868dc82",
+            "filename": "test/e2e/use-router-with-rewrites/pages/foo.tsx",
+            "status": "added",
+            "additions": 34,
+            "deletions": 0,
+            "changes": 34,
+            "blob_url": "https://github.com/vercel/next.js/blob/ff4f10a510328151ae618c1689e203cc76b00e15/test%2Fe2e%2Fuse-router-with-rewrites%2Fpages%2Ffoo.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/ff4f10a510328151ae618c1689e203cc76b00e15/test%2Fe2e%2Fuse-router-with-rewrites%2Fpages%2Ffoo.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fuse-router-with-rewrites%2Fpages%2Ffoo.tsx?ref=ff4f10a510328151ae618c1689e203cc76b00e15",
+            "patch": "@@ -0,0 +1,34 @@\n+import Link from 'next/link'\n+import { useRouter } from 'next/router'\n+\n+export default function Page() {\n+  const router = useRouter()\n+\n+  function handlePush() {\n+    router.push({\n+      query: {\n+        param: 1,\n+      },\n+    })\n+  }\n+\n+  function handleReplace() {\n+    router.replace({\n+      query: {\n+        param: 1,\n+      },\n+    })\n+  }\n+\n+  return (\n+    <>\n+      <button id=\"router-push\" onClick={handlePush}>\n+        router.push\n+      </button>\n+      <button id=\"router-replace\" onClick={handleReplace}>\n+        router.replace\n+      </button>\n+      <Link href=\"?param=1\">Link</Link>\n+    </>\n+  )\n+}"
+        },
+        {
+            "sha": "1b01ba202bbc4d0e6dbecce80f4cffbecec52974",
+            "filename": "test/e2e/use-router-with-rewrites/pages/rewrite-to-another-segment/[id]/foo.tsx",
+            "status": "added",
+            "additions": 35,
+            "deletions": 0,
+            "changes": 35,
+            "blob_url": "https://github.com/vercel/next.js/blob/ff4f10a510328151ae618c1689e203cc76b00e15/test%2Fe2e%2Fuse-router-with-rewrites%2Fpages%2Frewrite-to-another-segment%2F%5Bid%5D%2Ffoo.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/ff4f10a510328151ae618c1689e203cc76b00e15/test%2Fe2e%2Fuse-router-with-rewrites%2Fpages%2Frewrite-to-another-segment%2F%5Bid%5D%2Ffoo.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fuse-router-with-rewrites%2Fpages%2Frewrite-to-another-segment%2F%5Bid%5D%2Ffoo.tsx?ref=ff4f10a510328151ae618c1689e203cc76b00e15",
+            "patch": "@@ -0,0 +1,35 @@\n+import Link from 'next/link'\n+import { useRouter } from 'next/router'\n+\n+export default function Page() {\n+  const router = useRouter()\n+\n+  function handlePush() {\n+    router.push({\n+      query: {\n+        id: 1,\n+      },\n+    })\n+  }\n+\n+  function handleReplace() {\n+    router.replace({\n+      query: {\n+        id: 2,\n+      },\n+    })\n+  }\n+\n+  return (\n+    <>\n+      <p>{router.query.id}</p>\n+      <button id=\"router-push\" onClick={handlePush}>\n+        router.push\n+      </button>\n+      <button id=\"router-replace\" onClick={handleReplace}>\n+        router.replace\n+      </button>\n+      <Link href=\"?id=3\">Link</Link>\n+    </>\n+  )\n+}"
+        },
+        {
+            "sha": "1b01ba202bbc4d0e6dbecce80f4cffbecec52974",
+            "filename": "test/e2e/use-router-with-rewrites/pages/rewrite-to-same-segment/[id]/index.tsx",
+            "status": "added",
+            "additions": 35,
+            "deletions": 0,
+            "changes": 35,
+            "blob_url": "https://github.com/vercel/next.js/blob/ff4f10a510328151ae618c1689e203cc76b00e15/test%2Fe2e%2Fuse-router-with-rewrites%2Fpages%2Frewrite-to-same-segment%2F%5Bid%5D%2Findex.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/ff4f10a510328151ae618c1689e203cc76b00e15/test%2Fe2e%2Fuse-router-with-rewrites%2Fpages%2Frewrite-to-same-segment%2F%5Bid%5D%2Findex.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fuse-router-with-rewrites%2Fpages%2Frewrite-to-same-segment%2F%5Bid%5D%2Findex.tsx?ref=ff4f10a510328151ae618c1689e203cc76b00e15",
+            "patch": "@@ -0,0 +1,35 @@\n+import Link from 'next/link'\n+import { useRouter } from 'next/router'\n+\n+export default function Page() {\n+  const router = useRouter()\n+\n+  function handlePush() {\n+    router.push({\n+      query: {\n+        id: 1,\n+      },\n+    })\n+  }\n+\n+  function handleReplace() {\n+    router.replace({\n+      query: {\n+        id: 2,\n+      },\n+    })\n+  }\n+\n+  return (\n+    <>\n+      <p>{router.query.id}</p>\n+      <button id=\"router-push\" onClick={handlePush}>\n+        router.push\n+      </button>\n+      <button id=\"router-replace\" onClick={handleReplace}>\n+        router.replace\n+      </button>\n+      <Link href=\"?id=3\">Link</Link>\n+    </>\n+  )\n+}"
+        },
+        {
+            "sha": "62617ac6deb678c60f4638e995ae913bbecd5902",
+            "filename": "test/e2e/use-router-with-rewrites/use-router-with-rewrites.test.ts",
+            "status": "added",
+            "additions": 97,
+            "deletions": 0,
+            "changes": 97,
+            "blob_url": "https://github.com/vercel/next.js/blob/ff4f10a510328151ae618c1689e203cc76b00e15/test%2Fe2e%2Fuse-router-with-rewrites%2Fuse-router-with-rewrites.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/ff4f10a510328151ae618c1689e203cc76b00e15/test%2Fe2e%2Fuse-router-with-rewrites%2Fuse-router-with-rewrites.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fuse-router-with-rewrites%2Fuse-router-with-rewrites.test.ts?ref=ff4f10a510328151ae618c1689e203cc76b00e15",
+            "patch": "@@ -0,0 +1,97 @@\n+import { nextTestSetup } from 'e2e-utils'\n+\n+describe('use-router-with-rewrites', () => {\n+  const { next } = nextTestSetup({\n+    files: __dirname,\n+  })\n+\n+  it('should preserve current pathname when using useRouter.push with rewrites', async () => {\n+    const browser = await next.browser('/')\n+    await browser.elementById('router-push').click()\n+\n+    const url = new URL(await browser.url())\n+    expect(url.pathname + url.search).toBe('/?param=1')\n+  })\n+\n+  it('should preserve current pathname when using useRouter.replace with rewrites', async () => {\n+    const browser = await next.browser('/')\n+    await browser.elementById('router-replace').click()\n+\n+    const url = new URL(await browser.url())\n+    expect(url.pathname + url.search).toBe('/?param=1')\n+  })\n+\n+  it('should preserve current pathname when using Link with rewrites', async () => {\n+    const browser = await next.browser('/')\n+    await browser.elementByCss('a').click()\n+\n+    const url = new URL(await browser.url())\n+    expect(url.pathname + url.search).toBe('/?param=1')\n+  })\n+\n+  describe('rewrite to another segment', () => {\n+    it('should preserve current pathname when using useRouter.push with rewrites on dynamic route', async () => {\n+      const browser = await next.browser('/rewrite-to-another-segment/0')\n+      await browser.elementById('router-push').click()\n+\n+      const url = new URL(await browser.url())\n+      expect(url.pathname + url.search).toBe(\n+        '/rewrite-to-another-segment/0?id=1'\n+      )\n+    })\n+\n+    it('should preserve current pathname when using useRouter.replace with rewrites on dynamic route', async () => {\n+      const browser = await next.browser('/rewrite-to-another-segment/0')\n+      await browser.elementById('router-replace').click()\n+\n+      const url = new URL(await browser.url())\n+      expect(url.pathname + url.search).toBe(\n+        '/rewrite-to-another-segment/0?id=2'\n+      )\n+    })\n+\n+    it('should preserve current pathname when using Link with rewrites on dynamic route', async () => {\n+      const browser = await next.browser('/rewrite-to-another-segment/0')\n+      await browser.elementByCss('a').click()\n+\n+      const url = new URL(await browser.url())\n+      expect(url.pathname + url.search).toBe(\n+        '/rewrite-to-another-segment/0?id=3'\n+      )\n+    })\n+  })\n+\n+  // This is an edge case where rewrite won't work as expected due to trade-off,\n+  // but interpolates the query instead.\n+  describe('rewrite to same segment', () => {\n+    it('should preserve current pathname when using useRouter.push with rewrites on dynamic route', async () => {\n+      const browser = await next.browser('/rewrite-to-same-segment/0')\n+      await browser.elementById('router-push').click()\n+\n+      const url = new URL(await browser.url())\n+      expect(url.pathname + url.search).toBe('/rewrite-to-same-segment/1')\n+\n+      expect(await browser.elementByCss('p').text()).toBe('1')\n+    })\n+\n+    it('should preserve current pathname when using useRouter.replace with rewrites on dynamic route', async () => {\n+      const browser = await next.browser('/rewrite-to-same-segment/0')\n+      await browser.elementById('router-replace').click()\n+\n+      const url = new URL(await browser.url())\n+      expect(url.pathname + url.search).toBe('/rewrite-to-same-segment/2')\n+\n+      expect(await browser.elementByCss('p').text()).toBe('2')\n+    })\n+\n+    it('should preserve current pathname when using Link with rewrites on dynamic route', async () => {\n+      const browser = await next.browser('/rewrite-to-same-segment/0')\n+      await browser.elementByCss('a').click()\n+\n+      const url = new URL(await browser.url())\n+      expect(url.pathname + url.search).toBe('/rewrite-to-same-segment/3')\n+\n+      expect(await browser.elementByCss('p').text()).toBe('3')\n+    })\n+  })\n+})"
+        }
+    ],
+    "stats": {
+        "total": 273,
+        "additions": 269,
+        "deletions": 4
+    }
+}

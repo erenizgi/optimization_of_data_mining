@@ -1,0 +1,72 @@
+{
+    "author": "IlyasMoutawwakil",
+    "message": "Optimize MoEs for decoding using batched_mm (#43126)\n\n* optimize model for decoding\n\n* only optimize when grouped_mm\n\n* fixes\n\n* fix training compile failures\n\n* no need to skip\n\n* style\n\n* fix\n\n* Apply suggestion from @IlyasMoutawwakil\n\n* Apply suggestion from @IlyasMoutawwakil\n\n* info once",
+    "sha": "4520b549f230db350523c4f63677fedd789510f8",
+    "files": [
+        {
+            "sha": "c5aa1db152fdfd6cfc11cedb62ddd8180451a70c",
+            "filename": "src/transformers/generation/utils.py",
+            "status": "modified",
+            "additions": 19,
+            "deletions": 10,
+            "changes": 29,
+            "blob_url": "https://github.com/huggingface/transformers/blob/4520b549f230db350523c4f63677fedd789510f8/src%2Ftransformers%2Fgeneration%2Futils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/4520b549f230db350523c4f63677fedd789510f8/src%2Ftransformers%2Fgeneration%2Futils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fgeneration%2Futils.py?ref=4520b549f230db350523c4f63677fedd789510f8",
+            "patch": "@@ -19,6 +19,7 @@\n import os\n import warnings\n from collections.abc import Callable\n+from contextlib import contextmanager\n from dataclasses import dataclass\n from typing import TYPE_CHECKING, Any, Optional, Union\n \n@@ -2192,17 +2193,24 @@ def _valid_auto_compile_criteria(self, model_kwargs: dict[str, Any], generation_\n                     )\n                     generation_config.compile_config.fullgraph = False\n \n-            # If we use grouped_mm and dtype different than bfloat16, we fallback to batched_mm\n-            if self.config._experts_implementation == \"grouped_mm\":\n-                if self.dtype != torch.bfloat16:\n-                    logger.warning_once(\n-                        \"torch._grouped_mm currently only supports bfloat16 when being compiled with torch.compile. \"\n-                        \"Falling back to batched_mm implementation for compilation.\"\n-                    )\n-                    self.set_experts_implementation(\"batched_mm\")\n-\n         return can_compile\n \n+    @contextmanager\n+    def _optimize_model_for_decode(self):\n+        original_experts_implementation = self.config._experts_implementation\n+        if original_experts_implementation == \"grouped_mm\":\n+            logger.info_once(\n+                \"We will be switching to 'batched_mm' for the decoding stage as it is much more performant than 'grouped_mm' on smaller inputs. \"\n+                \"If you experience any issues with this, please open an issue on the Hugging Face Transformers GitHub repository.\",\n+            )\n+            self.set_experts_implementation(\"batched_mm\")\n+\n+        try:\n+            yield\n+        finally:\n+            if original_experts_implementation == \"grouped_mm\":\n+                self.set_experts_implementation(original_experts_implementation)\n+\n     def _get_deprecated_gen_repo(\n         self,\n         generation_mode: GenerationMode,\n@@ -2860,7 +2868,8 @@ def _sample(\n         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):\n             if prefill_consumed:\n                 model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)\n-                outputs = model_forward(**model_inputs, return_dict=True)\n+                with self._optimize_model_for_decode():\n+                    outputs = model_forward(**model_inputs, return_dict=True)\n             prefill_consumed = True\n             model_kwargs = self._update_model_kwargs_for_generation(\n                 outputs,"
+        },
+        {
+            "sha": "4f1ce3b836569863ced754e08806e6fb96d6c2a3",
+            "filename": "tests/models/deepseek_v2/test_modeling_deepseek_v2.py",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 7,
+            "changes": 7,
+            "blob_url": "https://github.com/huggingface/transformers/blob/4520b549f230db350523c4f63677fedd789510f8/tests%2Fmodels%2Fdeepseek_v2%2Ftest_modeling_deepseek_v2.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/4520b549f230db350523c4f63677fedd789510f8/tests%2Fmodels%2Fdeepseek_v2%2Ftest_modeling_deepseek_v2.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fdeepseek_v2%2Ftest_modeling_deepseek_v2.py?ref=4520b549f230db350523c4f63677fedd789510f8",
+            "patch": "@@ -16,8 +16,6 @@\n \n import unittest\n \n-import pytest\n-\n from transformers import BitsAndBytesConfig, Cache, is_torch_available\n from transformers.testing_utils import require_read_token, require_torch, require_torch_accelerator, slow, torch_device\n \n@@ -135,11 +133,6 @@ def test_model_rope_scaling_frequencies(self):\n         with self.assertRaises(AssertionError):\n             torch.testing.assert_close(yarn_freqs_cis_long, original_freqs_cis_long)\n \n-    @unittest.skip(\"Dynamic control flow in MoE\")\n-    @pytest.mark.torch_compile_test\n-    def test_torch_compile_for_training(self):\n-        pass\n-\n     def test_tp_plan_matches_params(self):\n         \"\"\"Need to overwrite as the plan contains keys that are valid but depend on some configs flags and cannot\n         be valid all at the same time\"\"\""
+        },
+        {
+            "sha": "ac0253ea16c76d267d25ec4ef40095a5ca5a2817",
+            "filename": "tests/models/ernie4_5_moe/test_modeling_ernie4_5_moe.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 4,
+            "changes": 5,
+            "blob_url": "https://github.com/huggingface/transformers/blob/4520b549f230db350523c4f63677fedd789510f8/tests%2Fmodels%2Fernie4_5_moe%2Ftest_modeling_ernie4_5_moe.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/4520b549f230db350523c4f63677fedd789510f8/tests%2Fmodels%2Fernie4_5_moe%2Ftest_modeling_ernie4_5_moe.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fernie4_5_moe%2Ftest_modeling_ernie4_5_moe.py?ref=4520b549f230db350523c4f63677fedd789510f8",
+            "patch": "@@ -161,10 +161,7 @@ def get_large_model(cls):\n     @classmethod\n     def get_small_model(cls):\n         cls.model = Ernie4_5_MoeForCausalLM.from_pretrained(\n-            \"hf-internal-testing/ERNIE-4.5-Small-Moe\",\n-            device_map=\"auto\",\n-            dtype=\"auto\",\n-            experts_implementation=\"eager\",\n+            \"hf-internal-testing/ERNIE-4.5-Small-Moe\", device_map=\"auto\", dtype=\"auto\", experts_implementation=\"eager\"\n         )\n \n         return cls.model"
+        },
+        {
+            "sha": "4df39ee878cce0703d2d8896d3e93c3232f59c06",
+            "filename": "tests/models/flex_olmo/test_modeling_flex_olmo.py",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 7,
+            "changes": 7,
+            "blob_url": "https://github.com/huggingface/transformers/blob/4520b549f230db350523c4f63677fedd789510f8/tests%2Fmodels%2Fflex_olmo%2Ftest_modeling_flex_olmo.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/4520b549f230db350523c4f63677fedd789510f8/tests%2Fmodels%2Fflex_olmo%2Ftest_modeling_flex_olmo.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fflex_olmo%2Ftest_modeling_flex_olmo.py?ref=4520b549f230db350523c4f63677fedd789510f8",
+            "patch": "@@ -16,8 +16,6 @@\n \n import unittest\n \n-import pytest\n-\n from transformers import is_torch_available\n from transformers.models.auto.tokenization_auto import AutoTokenizer\n from transformers.testing_utils import (\n@@ -57,11 +55,6 @@ class FlexOlmoModelTest(CausalLMModelTest, unittest.TestCase):\n     # used in `test_torch_compile_for_training`\n     _torch_compile_train_cls = FlexOlmoForCausalLM if is_torch_available() else None\n \n-    @unittest.skip(\"Dynamic control flow in MoE\")\n-    @pytest.mark.torch_compile_test\n-    def test_torch_compile_for_training(self):\n-        pass\n-\n \n @require_torch\n class FlexOlmoIntegrationTest(unittest.TestCase):"
+        },
+        {
+            "sha": "83a4a226ff83539a4ba256e9ba2b673bbd14c08a",
+            "filename": "tests/models/qwen2_moe/test_modeling_qwen2_moe.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/huggingface/transformers/blob/4520b549f230db350523c4f63677fedd789510f8/tests%2Fmodels%2Fqwen2_moe%2Ftest_modeling_qwen2_moe.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/4520b549f230db350523c4f63677fedd789510f8/tests%2Fmodels%2Fqwen2_moe%2Ftest_modeling_qwen2_moe.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fqwen2_moe%2Ftest_modeling_qwen2_moe.py?ref=4520b549f230db350523c4f63677fedd789510f8",
+            "patch": "@@ -119,7 +119,7 @@ class Qwen2MoeIntegrationTest(unittest.TestCase):\n     def get_model(cls):\n         if cls.model is None:\n             cls.model = Qwen2MoeForCausalLM.from_pretrained(\n-                \"Qwen/Qwen1.5-MoE-A2.7B\", device_map=\"auto\", dtype=torch.float16\n+                \"Qwen/Qwen1.5-MoE-A2.7B\", device_map=\"auto\", dtype=torch.float16, experts_implementation=\"eager\"\n             )\n         return cls.model\n "
+        }
+    ],
+    "stats": {
+        "total": 50,
+        "additions": 21,
+        "deletions": 29
+    }
+}

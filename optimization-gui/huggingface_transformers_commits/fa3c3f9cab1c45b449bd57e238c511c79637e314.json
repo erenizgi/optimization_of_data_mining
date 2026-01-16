@@ -1,0 +1,36 @@
+{
+    "author": "jerryzh168",
+    "message": "Break weight tying when quantizing input embedding (#37905)\n\nSummary:\nCurrently when we try to quantize input_embedding for some models, the output embedding\n(lm_head) will also be quantized the same way, since they are tied, and this may not be what\nwe want. To break the tie, we added the option to allow people to\n1. load unquantized weight\n2. tie weights\n3. quantize\n\nso that the tie will be broken\n\nTest Plan:\n```\nfrom transformers import (\n  AutoModelForCausalLM,\n  AutoProcessor,\n  AutoTokenizer,\n  TorchAoConfig,\n)\nfrom torchao.quantization.quant_api import (\n    IntxWeightOnlyConfig,\n    Int8DynamicActivationIntxWeightConfig,\n    AOPerModuleConfig\n)\nfrom torchao.quantization.granularity import PerGroup, PerAxis\nimport torch\n\nmodel_id = \"microsoft/Phi-4-mini-instruct\"\n\nembedding_config = IntxWeightOnlyConfig(\n    weight_dtype=torch.int8,\n    granularity=PerAxis(0),\n)\nlinear_config = Int8DynamicActivationIntxWeightConfig(\n    weight_dtype=torch.int4,\n    weight_granularity=PerGroup(32),\n    weight_scale_dtype=torch.bfloat16,\n)\nquant_config = AOPerModuleConfig({\"_default\": linear_config, \"model.embed_tokens\": embedding_config})\nquantization_config = TorchAoConfig(quant_type=quant_config, include_embedding=True, untie_embedding_weights=True)\nquantized_model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float32, device_map=\"auto\", quantization_config=quantization_config)\ntokenizer = AutoTokenizer.from_pretrained(model_id)\n\nprint(quantized_model)\nprint(\"embed_tokens.weight:\", quantized_model.model.embed_tokens.weight)\nprint(\"lm head weight:\", quantized_model.lm_head.weight)\nfrom transformers.modeling_utils import find_tied_parameters\nprint(find_tied_parameters(quantized_model))\n```\nReviewers:\n\nSubscribers:\n\nTasks:\n\nTags:\n\nCo-authored-by: Mohamed Mekkouri <93391238+MekkCyber@users.noreply.github.com>",
+    "sha": "fa3c3f9cab1c45b449bd57e238c511c79637e314",
+    "files": [
+        {
+            "sha": "0bd887258559f11f5a0fb130654705baee5cd2ac",
+            "filename": "src/transformers/quantizers/quantizer_torchao.py",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 0,
+            "changes": 10,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fa3c3f9cab1c45b449bd57e238c511c79637e314/src%2Ftransformers%2Fquantizers%2Fquantizer_torchao.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fa3c3f9cab1c45b449bd57e238c511c79637e314/src%2Ftransformers%2Fquantizers%2Fquantizer_torchao.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fquantizers%2Fquantizer_torchao.py?ref=fa3c3f9cab1c45b449bd57e238c511c79637e314",
+            "patch": "@@ -247,6 +247,16 @@ def create_quantized_param(\n             module._parameters[tensor_name] = torch.nn.Parameter(\n                 param_value, requires_grad=param_value.requires_grad\n             ).to(device=target_device)\n+            # if we are quantizing tied parameters, to avoid tying the quantized weights\n+            # the correct order to do it is\n+            # 1. load the weight to model\n+            # 2. run tie_weights to populate the weights\n+            # 3. quantize\n+            input_embed = model.get_input_embeddings()\n+            if self.quantization_config.untie_embedding_weights and id(module) == id(input_embed):\n+                model.tie_weights()\n+                setattr(model.config.get_text_config(decoder=True), \"tie_word_embeddings\", False)\n+\n             # handle AOPerModuleConfig, introduced in torchao 0.11.0+\n             if self.quantization_config._get_ao_version() > version.Version(\"0.10.0\"):\n                 from torchao.quantization import AOPerModuleConfig"
+        },
+        {
+            "sha": "8af225d92b36a255e7c69fe2c36d6ef5ee7111a5",
+            "filename": "src/transformers/utils/quantization_config.py",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fa3c3f9cab1c45b449bd57e238c511c79637e314/src%2Ftransformers%2Futils%2Fquantization_config.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fa3c3f9cab1c45b449bd57e238c511c79637e314/src%2Ftransformers%2Futils%2Fquantization_config.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Futils%2Fquantization_config.py?ref=fa3c3f9cab1c45b449bd57e238c511c79637e314",
+            "patch": "@@ -1555,6 +1555,7 @@ class TorchAoConfig(QuantizationConfigMixin):\n     modules_to_not_convert: Optional[List]\n     quant_type_kwargs: Dict[str, Any]\n     include_embedding: bool\n+    untie_embedding_weights: bool\n \n     \"\"\"This is a config class for torchao quantization/sparsity techniques.\n \n@@ -1569,6 +1570,9 @@ class TorchAoConfig(QuantizationConfigMixin):\n         inlcude_embedding (`bool`, default to `False`):\n             Whether to include embedding in quantization or not, input embedding will be removed from\n             the module_not_to_convert list as well if this flag is set.\n+        untie_embedding_weights (`bool`, default to `False`):\n+            Whether to untie the weights when we are quantizing input embedding weights that is tied\n+            to other weights.\n         kwargs (`Dict[str, Any]`, *optional*):\n             The keyword arguments for the chosen type of quantization, for example, int4_weight_only quantization supports two keyword arguments\n             `group_size` and `inner_k_tiles` currently. More API examples and documentation of arguments can be found in\n@@ -1614,13 +1618,15 @@ def __init__(\n         quant_type: Union[str, \"AOBaseConfig\"],  # noqa: F821\n         modules_to_not_convert: Optional[List] = None,\n         include_embedding: bool = False,\n+        untie_embedding_weights: bool = False,\n         **kwargs,\n     ):\n         self.quant_method = QuantizationMethod.TORCHAO\n         self.quant_type = quant_type\n         self.modules_to_not_convert = modules_to_not_convert\n         self.quant_type_kwargs = kwargs.get(\"quant_type_kwargs\", kwargs)\n         self.include_embedding = include_embedding\n+        self.untie_embedding_weights = untie_embedding_weights\n         self.post_init()\n \n     @staticmethod"
+        }
+    ],
+    "stats": {
+        "total": 16,
+        "additions": 16,
+        "deletions": 0
+    }
+}

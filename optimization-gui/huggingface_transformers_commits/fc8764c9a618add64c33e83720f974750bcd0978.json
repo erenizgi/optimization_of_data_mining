@@ -1,0 +1,144 @@
+{
+    "author": "gante",
+    "message": "[Generation, Gemma 3] When passing a custom `generation_config`, overwrite default values with the model's base `generation_config` (#36684)",
+    "sha": "fc8764c9a618add64c33e83720f974750bcd0978",
+    "files": [
+        {
+            "sha": "9eba1bfc92aa45485977639e7d7aa22024eead1e",
+            "filename": "src/transformers/generation/configuration_utils.py",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 4,
+            "changes": 8,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fc8764c9a618add64c33e83720f974750bcd0978/src%2Ftransformers%2Fgeneration%2Fconfiguration_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fc8764c9a618add64c33e83720f974750bcd0978/src%2Ftransformers%2Fgeneration%2Fconfiguration_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fgeneration%2Fconfiguration_utils.py?ref=fc8764c9a618add64c33e83720f974750bcd0978",
+            "patch": "@@ -73,7 +73,7 @@\n     }\n     QUANT_BACKEND_CLASSES_MAPPING = {\"quanto\": QuantoQuantizedCache, \"HQQ\": HQQQuantizedCache}\n     ALL_CACHE_IMPLEMENTATIONS = (\n-        list(NEED_SETUP_CACHE_CLASSES_MAPPING.keys()) + list(CACHE_CONFIG_MAPPING.keys()) + [\"offloaded\"]\n+        list(NEED_SETUP_CACHE_CLASSES_MAPPING.keys()) + list(CACHE_CONFIG_MAPPING.keys()) + [\"offloaded\", \"dynamic\"]\n     )\n \n \n@@ -175,16 +175,16 @@ class GenerationConfig(PushToHubMixin):\n         cache_implementation (`str`, *optional*, default to `None`):\n             Name of the cache class that will be instantiated in `generate`, for faster decoding. Possible values are:\n \n+            - `\"dynamic\"`: [`DynamicCache`]\n             - `\"static\"`: [`StaticCache`]\n             - `\"offloaded_static\"`: [`OffloadedStaticCache`]\n             - `\"sliding_window\"`: [`SlidingWindowCache`]\n             - `\"hybrid\"`: [`HybridCache`]\n             - `\"mamba\"`: [`MambaCache`]\n             - `\"quantized\"`: [`QuantizedCache`]\n \n-            We support other cache types, but they must be manually instantiated and\n-            passed to `generate` through the `past_key_values` argument. See our\n-            [cache documentation](https://huggingface.co/docs/transformers/en/kv_cache) for further information.\n+            If none is specified, we will use the default cache for the model (which is often [`DynamicCache`]). See\n+            our [cache documentation](https://huggingface.co/docs/transformers/en/kv_cache) for further information.\n         cache_config (`CacheConfig` or `dict`, *optional*, default to `None`):\n             Arguments used in the key-value cache class can be passed in `cache_config`. Can be passed as a `Dict` and\n             it will be converted to its repsective `CacheConfig` internally."
+        },
+        {
+            "sha": "2e73e423ab320b1841f4f1f6d4882d3f09c96e4f",
+            "filename": "src/transformers/generation/utils.py",
+            "status": "modified",
+            "additions": 47,
+            "deletions": 18,
+            "changes": 65,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fc8764c9a618add64c33e83720f974750bcd0978/src%2Ftransformers%2Fgeneration%2Futils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fc8764c9a618add64c33e83720f974750bcd0978/src%2Ftransformers%2Fgeneration%2Futils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fgeneration%2Futils.py?ref=fc8764c9a618add64c33e83720f974750bcd0978",
+            "patch": "@@ -1177,21 +1177,37 @@ def _merge_criteria_processor_list(\n         default_list: Union[LogitsProcessorList, StoppingCriteriaList],\n         custom_list: Union[LogitsProcessorList, StoppingCriteriaList],\n     ) -> Union[LogitsProcessorList, StoppingCriteriaList]:\n+        \"\"\"\n+        Merge user-defined processors/criteria with the ones instantiated inside `generate`. In case the same\n+        processor/criteria is present on both lists, use the user-defined one.\n+\n+        (Note: up to v4.49.0, this funtion threw an exception is the same logit processor was found twice.)\n+        \"\"\"\n         if len(custom_list) == 0:\n             return default_list\n+\n+        final_list = type(default_list)()\n         for default in default_list:\n+            using_custom = False\n             for custom in custom_list:\n                 if type(custom) is type(default):\n                     object_type = \"stopping criteria\" if isinstance(custom, StoppingCriteria) else \"logits processor\"\n-                    raise ValueError(\n-                        f\"A custom {object_type} of type {type(custom)} with values {custom} has been passed to\"\n-                        f\" `.generate()`, but it has already been created with the values {default}. {default} has been\"\n-                        \" created by passing the corresponding arguments to generate or by the model's config default\"\n-                        f\" values. If you just want to change the default values of {object_type} consider passing\"\n-                        f\" them as arguments to `.generate()` instead of using a custom {object_type}.\"\n+                    logger.warning_once(\n+                        f\"A custom {object_type} of type {type(custom)} has been passed to `.generate()`, but it \"\n+                        f\"was also created in `.generate()`, given its parameterization. The custom {type(custom)} \"\n+                        f\"will take precedence. Please check the docstring of {type(custom)} to see related \"\n+                        \"`.generate()` flags.\"\n                     )\n-        default_list.extend(custom_list)\n-        return default_list\n+                    final_list.append(custom)\n+                    using_custom = True\n+                    break\n+            if not using_custom:\n+                final_list.append(default)\n+\n+        for custom in custom_list:\n+            if custom not in final_list:\n+                final_list.append(custom)\n+        return final_list\n \n     def compute_transition_scores(\n         self,\n@@ -1573,17 +1589,28 @@ def _prepare_generation_config(\n         # exception will be raised in `_validate_model_kwargs`\n         if not is_torchdynamo_compiling():\n             generation_config = copy.deepcopy(generation_config)\n-            model_kwargs = generation_config.update(**kwargs)\n-            # If `generation_config` is provided, let's fallback ALL special tokens to the default values for the model\n+\n+            # If `generation_config` is provided, let's fallback ALL default values to the model's generation config\n+            # TODO (joao): per-model generation config classes.\n             if not using_model_generation_config:\n-                if generation_config.bos_token_id is None:\n-                    generation_config.bos_token_id = self.generation_config.bos_token_id\n-                if generation_config.eos_token_id is None:\n-                    generation_config.eos_token_id = self.generation_config.eos_token_id\n-                if generation_config.pad_token_id is None:\n-                    generation_config.pad_token_id = self.generation_config.pad_token_id\n-                if generation_config.decoder_start_token_id is None:\n-                    generation_config.decoder_start_token_id = self.generation_config.decoder_start_token_id\n+                modified_values = {}\n+                default_generation_config = GenerationConfig()\n+                for key, default_value in default_generation_config.__dict__.items():\n+                    if key.startswith(\"_\"):  # metadata\n+                        continue\n+                    custom_gen_config_value = getattr(generation_config, key)\n+                    model_gen_config_value = getattr(self.generation_config, key)\n+                    if custom_gen_config_value == default_value and model_gen_config_value != default_value:\n+                        modified_values[key] = model_gen_config_value\n+                        setattr(generation_config, key, model_gen_config_value)\n+                if len(modified_values) > 0:\n+                    logger.warning_once(\n+                        f\"`generation_config` default values have been modified to match model-specific defaults: \"\n+                        f\"{modified_values}. If this is not desired, please set these values explicitly.\"\n+                    )\n+\n+            # Finally, apply any passed kwargs\n+            model_kwargs = generation_config.update(**kwargs)\n         else:\n             model_kwargs = kwargs\n \n@@ -1837,6 +1864,8 @@ def _prepare_cache_for_generation(\n                 model_kwargs[cache_name] = cache_class(cache_config)\n             elif generation_config.cache_implementation == \"offloaded\":\n                 model_kwargs[cache_name] = OffloadedCache()\n+            elif generation_config.cache_implementation == \"dynamic\":\n+                model_kwargs[cache_name] = DynamicCache()\n \n         # Use DynamicCache() instance by default. This will avoid back and forth from legacy format that\n         # keeps copying the cache thus using much more memory"
+        },
+        {
+            "sha": "e6cbe5267a76de1124e66c3698274b79736c709b",
+            "filename": "tests/generation/test_utils.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fc8764c9a618add64c33e83720f974750bcd0978/tests%2Fgeneration%2Ftest_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fc8764c9a618add64c33e83720f974750bcd0978/tests%2Fgeneration%2Ftest_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fgeneration%2Ftest_utils.py?ref=fc8764c9a618add64c33e83720f974750bcd0978",
+            "patch": "@@ -1162,8 +1162,8 @@ def test_beam_search_low_memory(self):\n             # The two outputs must match and their shape must be as expected\n             self._check_similar_generate_outputs(low_output, high_output)\n \n-    @pytest.mark.generate\n     @parameterized.expand([(\"random\",), (\"same\",)])\n+    @pytest.mark.generate\n     def test_assisted_decoding_matches_greedy_search(self, assistant_type):\n         # This test ensures that the assisted generation does not introduce output changes over greedy search.\n         # See https://github.com/huggingface/transformers/issues/25420#issuecomment-1775317535 for more info."
+        },
+        {
+            "sha": "6d42d4e98ec15c78fd9d07e86dd0e827ce5bc622",
+            "filename": "tests/models/aya_vision/test_modeling_aya_vision.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fc8764c9a618add64c33e83720f974750bcd0978/tests%2Fmodels%2Faya_vision%2Ftest_modeling_aya_vision.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fc8764c9a618add64c33e83720f974750bcd0978/tests%2Fmodels%2Faya_vision%2Ftest_modeling_aya_vision.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Faya_vision%2Ftest_modeling_aya_vision.py?ref=fc8764c9a618add64c33e83720f974750bcd0978",
+            "patch": "@@ -16,6 +16,7 @@\n \n import unittest\n \n+import pytest\n from parameterized import parameterized\n \n from transformers import (\n@@ -261,6 +262,7 @@ def test_eager_matches_sdpa_generate(self):\n         pass\n \n     @parameterized.expand([(\"random\",), (\"same\",)])\n+    @pytest.mark.generate\n     @unittest.skip(\"Cohere2 has HybridCache which is not compatible with assisted decoding\")\n     def test_assisted_decoding_matches_greedy_search(self, assistant_type):\n         pass\n@@ -269,6 +271,7 @@ def test_assisted_decoding_matches_greedy_search(self, assistant_type):\n     def test_prompt_lookup_decoding_matches_greedy_search(self, assistant_type):\n         pass\n \n+    @pytest.mark.generate\n     @unittest.skip(\"Cohere2 has HybridCache which is not compatible with assisted decoding\")\n     def test_assisted_decoding_sample(self):\n         pass"
+        },
+        {
+            "sha": "699eb15ddbade9c539a9da7676e06f345343e9f8",
+            "filename": "tests/models/cohere2/test_modeling_cohere2.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fc8764c9a618add64c33e83720f974750bcd0978/tests%2Fmodels%2Fcohere2%2Ftest_modeling_cohere2.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fc8764c9a618add64c33e83720f974750bcd0978/tests%2Fmodels%2Fcohere2%2Ftest_modeling_cohere2.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fcohere2%2Ftest_modeling_cohere2.py?ref=fc8764c9a618add64c33e83720f974750bcd0978",
+            "patch": "@@ -16,6 +16,7 @@\n \n import unittest\n \n+import pytest\n from packaging import version\n from parameterized import parameterized\n from pytest import mark\n@@ -81,6 +82,7 @@ def test_eager_matches_sdpa_generate(self):\n         pass\n \n     @parameterized.expand([(\"random\",), (\"same\",)])\n+    @pytest.mark.generate\n     @unittest.skip(\"Cohere2 has HybridCache which is not compatible with assisted decoding\")\n     def test_assisted_decoding_matches_greedy_search(self, assistant_type):\n         pass\n@@ -89,6 +91,7 @@ def test_assisted_decoding_matches_greedy_search(self, assistant_type):\n     def test_prompt_lookup_decoding_matches_greedy_search(self, assistant_type):\n         pass\n \n+    @pytest.mark.generate\n     @unittest.skip(\"Cohere2 has HybridCache which is not compatible with assisted decoding\")\n     def test_assisted_decoding_sample(self):\n         pass"
+        },
+        {
+            "sha": "835b208c7d4e5ce56c3ac81e845489d45fe632d2",
+            "filename": "tests/models/fuyu/test_modeling_fuyu.py",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fc8764c9a618add64c33e83720f974750bcd0978/tests%2Fmodels%2Ffuyu%2Ftest_modeling_fuyu.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fc8764c9a618add64c33e83720f974750bcd0978/tests%2Fmodels%2Ffuyu%2Ftest_modeling_fuyu.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Ffuyu%2Ftest_modeling_fuyu.py?ref=fc8764c9a618add64c33e83720f974750bcd0978",
+            "patch": "@@ -299,12 +299,13 @@ def test_training_gradient_checkpointing_use_reentrant(self):\n     def test_training_gradient_checkpointing_use_reentrant_false(self):\n         pass\n \n-    @pytest.mark.generate\n     @parameterized.expand([(\"random\",), (\"same\",)])\n+    @pytest.mark.generate\n     @unittest.skip(\"Fuyu doesn't support assisted generation due to the need to crop/extend image patches indices\")\n     def test_assisted_decoding_matches_greedy_search(self):\n         pass\n \n+    @pytest.mark.generate\n     @unittest.skip(\"Fuyu doesn't support assisted generation due to the need to crop/extend image patches indices\")\n     def test_assisted_decoding_sample(self):\n         pass"
+        },
+        {
+            "sha": "3a51e0bbf78d91c6f6626e3234e39bf18d016f56",
+            "filename": "tests/models/gemma2/test_modeling_gemma2.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fc8764c9a618add64c33e83720f974750bcd0978/tests%2Fmodels%2Fgemma2%2Ftest_modeling_gemma2.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fc8764c9a618add64c33e83720f974750bcd0978/tests%2Fmodels%2Fgemma2%2Ftest_modeling_gemma2.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fgemma2%2Ftest_modeling_gemma2.py?ref=fc8764c9a618add64c33e83720f974750bcd0978",
+            "patch": "@@ -16,6 +16,7 @@\n \n import unittest\n \n+import pytest\n from packaging import version\n from parameterized import parameterized\n from pytest import mark\n@@ -96,6 +97,7 @@ def test_eager_matches_sdpa_generate(self):\n         pass\n \n     @parameterized.expand([(\"random\",), (\"same\",)])\n+    @pytest.mark.generate\n     @unittest.skip(\"Gemma2 has HybridCache which is not compatible with assisted decoding\")\n     def test_assisted_decoding_matches_greedy_search(self, assistant_type):\n         pass\n@@ -104,6 +106,7 @@ def test_assisted_decoding_matches_greedy_search(self, assistant_type):\n     def test_prompt_lookup_decoding_matches_greedy_search(self, assistant_type):\n         pass\n \n+    @pytest.mark.generate\n     @unittest.skip(\"Gemma2 has HybridCache which is not compatible with assisted decoding\")\n     def test_assisted_decoding_sample(self):\n         pass"
+        },
+        {
+            "sha": "3586d35cb3ed56abe2e87700d5032ca83716deb3",
+            "filename": "tests/models/gemma3/test_modeling_gemma3.py",
+            "status": "modified",
+            "additions": 37,
+            "deletions": 0,
+            "changes": 37,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fc8764c9a618add64c33e83720f974750bcd0978/tests%2Fmodels%2Fgemma3%2Ftest_modeling_gemma3.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fc8764c9a618add64c33e83720f974750bcd0978/tests%2Fmodels%2Fgemma3%2Ftest_modeling_gemma3.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fgemma3%2Ftest_modeling_gemma3.py?ref=fc8764c9a618add64c33e83720f974750bcd0978",
+            "patch": "@@ -16,13 +16,15 @@\n \n import unittest\n \n+import pytest\n from parameterized import parameterized\n \n from transformers import (\n     AutoModelForCausalLM,\n     AutoTokenizer,\n     Gemma3Config,\n     Gemma3TextConfig,\n+    GenerationConfig,\n     is_torch_available,\n )\n from transformers.testing_utils import (\n@@ -75,6 +77,7 @@ def test_model_outputs_equivalence(self, **kwargs):\n         pass\n \n     @parameterized.expand([(\"random\",), (\"same\",)])\n+    @pytest.mark.generate\n     @unittest.skip(\"Gemma3 has HybridCache which is not compatible with assisted decoding\")\n     def test_assisted_decoding_matches_greedy_search(self, assistant_type):\n         pass\n@@ -83,6 +86,7 @@ def test_assisted_decoding_matches_greedy_search(self, assistant_type):\n     def test_prompt_lookup_decoding_matches_greedy_search(self, assistant_type):\n         pass\n \n+    @pytest.mark.generate\n     @unittest.skip(\"Gemma3 has HybridCache which is not compatible with assisted decoding\")\n     def test_assisted_decoding_sample(self):\n         pass\n@@ -277,6 +281,7 @@ def test_model_outputs_equivalence(self, **kwargs):\n         pass\n \n     @parameterized.expand([(\"random\",), (\"same\",)])\n+    @pytest.mark.generate\n     @unittest.skip(\"Gemma3 has HybridCache which is not compatible with assisted decoding\")\n     def test_assisted_decoding_matches_greedy_search(self, assistant_type):\n         pass\n@@ -285,6 +290,7 @@ def test_assisted_decoding_matches_greedy_search(self, assistant_type):\n     def test_prompt_lookup_decoding_matches_greedy_search(self, assistant_type):\n         pass\n \n+    @pytest.mark.generate\n     @unittest.skip(\"Gemma3 has HybridCache which is not compatible with assisted decoding\")\n     def test_assisted_decoding_sample(self):\n         pass\n@@ -551,3 +557,34 @@ def test_generation_beyond_sliding_window(self, attn_implementation: str):\n \n         EXPECTED_COMPLETIONS = [\" and I'm going to take a walk.\\n\\nI really enjoy the scenery, and I'\", \", green, yellow, orange, purple, brown, black, white, gray.\\n\\nI'\"]  # fmt: skip\n         self.assertEqual(output_text, EXPECTED_COMPLETIONS)\n+\n+    def test_generation_beyond_sliding_window_with_generation_config(self):\n+        \"\"\"\n+        Same as `test_generation_beyond_sliding_window`, but passing a GenerationConfig. Regression test for #36684 --\n+        ensures `cache_implementation='hybrid'` is correctly inherited from the base `model.generation_config`.\n+        \"\"\"\n+        model_id = \"gg-hf-g/gemma-3-1b-it\"\n+        attn_implementation = \"sdpa\"\n+\n+        input_text = [\n+            \"This is a nice place. \" * 800 + \"I really enjoy the scenery,\",  # This is larger than 4096 tokens\n+            \"A list of colors: red, blue\",  # This will almost all be padding tokens\n+        ]\n+        tokenizer = AutoTokenizer.from_pretrained(model_id, padding=\"left\")\n+        inputs = tokenizer(input_text, padding=True, return_tensors=\"pt\").to(torch_device)\n+\n+        model = AutoModelForCausalLM.from_pretrained(\n+            model_id, attn_implementation=attn_implementation, torch_dtype=torch.float16\n+        ).to(torch_device)\n+\n+        # Make sure prefill is larger than sliding window\n+        input_size = inputs.input_ids.shape[-1]\n+        self.assertTrue(input_size > model.config.sliding_window)\n+\n+        generation_config = GenerationConfig(max_new_tokens=20)\n+\n+        out = model.generate(**inputs, generation_config=generation_config)[:, input_size:]\n+        output_text = tokenizer.batch_decode(out)\n+\n+        EXPECTED_COMPLETIONS = [\" and I'm going to take a walk.\\n\\nI really enjoy the scenery, and I'\", \", green, yellow, orange, purple, brown, black, white, gray.\\n\\nI'\"]  # fmt: skip\n+        self.assertEqual(output_text, EXPECTED_COMPLETIONS)"
+        },
+        {
+            "sha": "cd159e750dd5fcc217d30996be1989e5410cbe7f",
+            "filename": "tests/models/paligemma2/test_modeling_paligemma2.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fc8764c9a618add64c33e83720f974750bcd0978/tests%2Fmodels%2Fpaligemma2%2Ftest_modeling_paligemma2.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fc8764c9a618add64c33e83720f974750bcd0978/tests%2Fmodels%2Fpaligemma2%2Ftest_modeling_paligemma2.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fpaligemma2%2Ftest_modeling_paligemma2.py?ref=fc8764c9a618add64c33e83720f974750bcd0978",
+            "patch": "@@ -16,6 +16,7 @@\n \n import unittest\n \n+import pytest\n from parameterized import parameterized\n \n from transformers import (\n@@ -351,6 +352,7 @@ def test_beam_search_low_memory(self):\n         pass\n \n     @parameterized.expand([(\"random\",), (\"same\",)])\n+    @pytest.mark.generate\n     @unittest.skip(\"Gemma2 has HybridCache which is not compatible with assisted decoding\")\n     def test_assisted_decoding_matches_greedy_search(self, assistant_type):\n         pass\n@@ -359,6 +361,7 @@ def test_assisted_decoding_matches_greedy_search(self, assistant_type):\n     def test_prompt_lookup_decoding_matches_greedy_search(self, assistant_type):\n         pass\n \n+    @pytest.mark.generate\n     @unittest.skip(\"Gemma2 has HybridCache which is not compatible with assisted decoding\")\n     def test_assisted_decoding_sample(self):\n         pass"
+        },
+        {
+            "sha": "a7a8a74653df6906dffc71aa9c5c6707a431665b",
+            "filename": "tests/models/recurrent_gemma/test_modeling_recurrent_gemma.py",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fc8764c9a618add64c33e83720f974750bcd0978/tests%2Fmodels%2Frecurrent_gemma%2Ftest_modeling_recurrent_gemma.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fc8764c9a618add64c33e83720f974750bcd0978/tests%2Fmodels%2Frecurrent_gemma%2Ftest_modeling_recurrent_gemma.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Frecurrent_gemma%2Ftest_modeling_recurrent_gemma.py?ref=fc8764c9a618add64c33e83720f974750bcd0978",
+            "patch": "@@ -16,6 +16,8 @@\n \n import unittest\n \n+import pytest\n+\n from transformers import AutoModelForCausalLM, AutoTokenizer, RecurrentGemmaConfig, is_torch_available, set_seed\n from transformers.testing_utils import (\n     require_bitsandbytes,\n@@ -375,6 +377,7 @@ def test_model_parallelism(self):\n     def test_model_parallel_beam_search(self):\n         pass\n \n+    @pytest.mark.generate\n     @unittest.skip(reason=\"Rely on `past_key_values` to crop the assistant pkv. Not supported\")\n     def test_assisted_decoding_matches_greedy_search(self):\n         pass\n@@ -383,6 +386,7 @@ def test_assisted_decoding_matches_greedy_search(self):\n     def test_left_padding_compatibility(self):\n         pass\n \n+    @pytest.mark.generate\n     @unittest.skip(reason=\"Relies on `past_key_values` returned by the model. Not supported with recurrent gemma\")\n     def test_assisted_decoding_sample(self):\n         pass"
+        },
+        {
+            "sha": "050b198565c286e1eace4ddb2c0a77c5ae3216d2",
+            "filename": "tests/models/smolvlm/test_modeling_smolvlm.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fc8764c9a618add64c33e83720f974750bcd0978/tests%2Fmodels%2Fsmolvlm%2Ftest_modeling_smolvlm.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fc8764c9a618add64c33e83720f974750bcd0978/tests%2Fmodels%2Fsmolvlm%2Ftest_modeling_smolvlm.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fsmolvlm%2Ftest_modeling_smolvlm.py?ref=fc8764c9a618add64c33e83720f974750bcd0978",
+            "patch": "@@ -423,6 +423,7 @@ def test_eager_matches_sdpa_generate(self):\n         pass\n \n     @parameterized.expand([(\"random\",), (\"same\",)])\n+    @pytest.mark.generate\n     @unittest.skip(reason=\"Cache position is off by one leaving out image tokens, FIXME raushan\")\n     def test_assisted_decoding_matches_greedy_search(self, assistant_type):\n         pass"
+        }
+    ],
+    "stats": {
+        "total": 132,
+        "additions": 108,
+        "deletions": 24
+    }
+}

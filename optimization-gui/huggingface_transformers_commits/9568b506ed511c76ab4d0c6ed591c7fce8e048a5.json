@@ -1,0 +1,120 @@
+{
+    "author": "gante",
+    "message": "[generate] handle support for cache classes when num enc layers != num dec layers (#40277)\n\n* handle support for cache classes when num enc layers != num dec layers\n\n* handle overwrites\n\n* one more corner case\n\n* Update src/transformers/generation/utils.py\n\n* Update src/transformers/generation/utils.py\n\n* Apply suggestions from code review\n\n* handle corner case :o",
+    "sha": "9568b506ed511c76ab4d0c6ed591c7fce8e048a5",
+    "files": [
+        {
+            "sha": "f52bd780bcecbc1388bf7654a5d34c7d28bed16b",
+            "filename": "src/transformers/configuration_utils.py",
+            "status": "modified",
+            "additions": 35,
+            "deletions": 7,
+            "changes": 42,
+            "blob_url": "https://github.com/huggingface/transformers/blob/9568b506ed511c76ab4d0c6ed591c7fce8e048a5/src%2Ftransformers%2Fconfiguration_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/9568b506ed511c76ab4d0c6ed591c7fce8e048a5/src%2Ftransformers%2Fconfiguration_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fconfiguration_utils.py?ref=9568b506ed511c76ab4d0c6ed591c7fce8e048a5",
+            "patch": "@@ -1168,21 +1168,34 @@ def _get_non_default_generation_parameters(self) -> dict[str, Any]:\n \n         return non_default_generation_parameters\n \n-    def get_text_config(self, decoder=False) -> \"PretrainedConfig\":\n+    def get_text_config(self, decoder=None, encoder=None) -> \"PretrainedConfig\":\n         \"\"\"\n-        Returns the config that is meant to be used with text IO. On most models, it is the original config instance\n-        itself. On specific composite models, it is under a set of valid names.\n+        Returns the text config related to the text input (encoder) or text output (decoder) of the model. The\n+        `decoder` and `encoder` input arguments can be used to specify which end of the model we are interested in,\n+        which is useful on models that have both text input and output modalities.\n+\n+        There are three possible outcomes of using this method:\n+        1. On most models, it returns the original config instance itself.\n+        2. On newer (2024+) composite models, it returns the text section of the config, which is nested under a set\n+            of valid names.\n+        3. On older (2023-) composite models, it discards decoder-only parameters when `encoder=True` and vice-versa.\n \n         Args:\n-            decoder (`Optional[bool]`, *optional*, defaults to `False`):\n+            decoder (`Optional[bool]`, *optional*):\n                 If set to `True`, then only search for decoder config names.\n+            encoder (`Optional[bool]`, *optional*):\n+                If set to `True`, then only search for encoder config names.\n         \"\"\"\n+        return_both = decoder == encoder  # both unset or both set -> search all possible names\n+\n         decoder_possible_text_config_names = (\"decoder\", \"generator\", \"text_config\")\n         encoder_possible_text_config_names = (\"text_encoder\",)\n-        if decoder:\n+        if return_both:\n+            possible_text_config_names = encoder_possible_text_config_names + decoder_possible_text_config_names\n+        elif decoder:\n             possible_text_config_names = decoder_possible_text_config_names\n         else:\n-            possible_text_config_names = encoder_possible_text_config_names + decoder_possible_text_config_names\n+            possible_text_config_names = encoder_possible_text_config_names\n \n         valid_text_config_names = []\n         for text_config_name in possible_text_config_names:\n@@ -1194,12 +1207,27 @@ def get_text_config(self, decoder=False) -> \"PretrainedConfig\":\n         if len(valid_text_config_names) > 1:\n             raise ValueError(\n                 f\"Multiple valid text configs were found in the model config: {valid_text_config_names}. In this \"\n-                \"case, using `get_text_config()` would be ambiguous. Please specify the desied text config directly.\"\n+                \"case, using `get_text_config()` would be ambiguous. Please specify the desired text config directly, \"\n+                \"e.g. `text_config = config.sub_config_name`\"\n             )\n         elif len(valid_text_config_names) == 1:\n             config_to_return = getattr(self, valid_text_config_names[0])\n         else:\n             config_to_return = self\n+\n+        # handle legacy models with flat config structure, when we only want one of the configs\n+        if not return_both and len(valid_text_config_names) == 0 and config_to_return.is_encoder_decoder:\n+            config_to_return = copy.deepcopy(config_to_return)\n+            prefix_to_discard = \"encoder\" if decoder else \"decoder\"\n+            for key in config_to_return.to_dict():\n+                if key.startswith(prefix_to_discard):\n+                    delattr(config_to_return, key)\n+            # old encoder/decoder models may use \"encoder_layers\"/\"decoder_layers\" instead of \"num_hidden_layers\"\n+            if decoder and hasattr(config_to_return, \"decoder_layers\"):\n+                config_to_return.num_hidden_layers = config_to_return.decoder_layers\n+            elif encoder and hasattr(config_to_return, \"encoder_layers\"):\n+                config_to_return.num_hidden_layers = config_to_return.encoder_layers\n+\n         return config_to_return\n \n     @classmethod"
+        },
+        {
+            "sha": "864d68d7b6463ac218da579d7da1d351c6adf2ff",
+            "filename": "src/transformers/generation/utils.py",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 5,
+            "changes": 17,
+            "blob_url": "https://github.com/huggingface/transformers/blob/9568b506ed511c76ab4d0c6ed591c7fce8e048a5/src%2Ftransformers%2Fgeneration%2Futils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/9568b506ed511c76ab4d0c6ed591c7fce8e048a5/src%2Ftransformers%2Fgeneration%2Futils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fgeneration%2Futils.py?ref=9568b506ed511c76ab4d0c6ed591c7fce8e048a5",
+            "patch": "@@ -1844,12 +1844,19 @@ def _get_cache(self, cache_implementation: str, batch_size: int, max_cache_len:\n             )\n \n         if need_new_cache:\n-            cache_kwargs = {\"config\": self.config, \"max_cache_len\": max_cache_len, \"offloading\": offload_cache}\n-            self._cache = StaticCache(**cache_kwargs)\n+            self_attention_cache_kwargs = {\n+                \"config\": self.config.get_text_config(decoder=True),\n+                \"max_cache_len\": max_cache_len,\n+                \"offloading\": offload_cache,\n+            }\n+            self._cache = StaticCache(**self_attention_cache_kwargs)\n             if requires_cross_attention_cache:\n-                encoder_kwargs = cache_kwargs.copy()\n-                encoder_kwargs[\"max_cache_len\"] = model_kwargs[\"encoder_outputs\"][0].shape[1]\n-                self._cache = EncoderDecoderCache(self._cache, StaticCache(**encoder_kwargs))\n+                cross_attention_cache_kwargs = {\n+                    \"config\": self.config.get_text_config(encoder=True),\n+                    \"max_cache_len\": model_kwargs[\"encoder_outputs\"][0].shape[1],\n+                    \"offloading\": offload_cache,\n+                }\n+                self._cache = EncoderDecoderCache(self._cache, StaticCache(**cross_attention_cache_kwargs))\n         else:\n             self._cache.reset()\n         return self._cache"
+        },
+        {
+            "sha": "d9a42df4c97e5b81b5709e1c5154ee755808f456",
+            "filename": "src/transformers/models/colqwen2/configuration_colqwen2.py",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/huggingface/transformers/blob/9568b506ed511c76ab4d0c6ed591c7fce8e048a5/src%2Ftransformers%2Fmodels%2Fcolqwen2%2Fconfiguration_colqwen2.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/9568b506ed511c76ab4d0c6ed591c7fce8e048a5/src%2Ftransformers%2Fmodels%2Fcolqwen2%2Fconfiguration_colqwen2.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fcolqwen2%2Fconfiguration_colqwen2.py?ref=9568b506ed511c76ab4d0c6ed591c7fce8e048a5",
+            "patch": "@@ -87,8 +87,8 @@ def __init__(\n         self.initializer_range = initializer_range\n         super().__init__(**kwargs)\n \n-    def get_text_config(self, decoder=False) -> PretrainedConfig:\n-        return self.vlm_config.get_text_config(decoder=decoder)\n+    def get_text_config(self, *args, **kwargs) -> PretrainedConfig:\n+        return self.vlm_config.get_text_config(*args, **kwargs)\n \n \n __all__ = [\"ColQwen2Config\"]"
+        },
+        {
+            "sha": "d4dec60b3e4853574e4d528e7b641507a8c0b414",
+            "filename": "src/transformers/models/dia/configuration_dia.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/huggingface/transformers/blob/9568b506ed511c76ab4d0c6ed591c7fce8e048a5/src%2Ftransformers%2Fmodels%2Fdia%2Fconfiguration_dia.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/9568b506ed511c76ab4d0c6ed591c7fce8e048a5/src%2Ftransformers%2Fmodels%2Fdia%2Fconfiguration_dia.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fdia%2Fconfiguration_dia.py?ref=9568b506ed511c76ab4d0c6ed591c7fce8e048a5",
+            "patch": "@@ -368,7 +368,7 @@ def __init__(\n             **kwargs,\n         )\n \n-    def get_text_config(self, decoder=False):\n+    def get_text_config(self, *args, **kwargs):\n         \"\"\"Defaulting to audio config as it's the decoder in this case which is usually the text backbone\"\"\"\n         return self.decoder_config\n "
+        },
+        {
+            "sha": "5df1b10a65283b2ac1f80f5980beffe0d4e32d9f",
+            "filename": "src/transformers/models/qwen2_5_omni/configuration_qwen2_5_omni.py",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/huggingface/transformers/blob/9568b506ed511c76ab4d0c6ed591c7fce8e048a5/src%2Ftransformers%2Fmodels%2Fqwen2_5_omni%2Fconfiguration_qwen2_5_omni.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/9568b506ed511c76ab4d0c6ed591c7fce8e048a5/src%2Ftransformers%2Fmodels%2Fqwen2_5_omni%2Fconfiguration_qwen2_5_omni.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fqwen2_5_omni%2Fconfiguration_qwen2_5_omni.py?ref=9568b506ed511c76ab4d0c6ed591c7fce8e048a5",
+            "patch": "@@ -1073,7 +1073,7 @@ def __init__(\n \n         super().__init__(**kwargs)\n \n-    def get_text_config(self, decoder=False):\n+    def get_text_config(self, *args, **kwargs):\n         \"\"\"\n         Returns the config that is meant to be used with text IO. On most models, it is the original config instance\n         itself. On specific composite models, it is under a set of valid names.\n@@ -1085,7 +1085,7 @@ def get_text_config(self, decoder=False):\n         # Overridden for deeply nested config like Qwen2-Omni. We don't have any omni model\n         # except for Qwen yet. This has to be generalized if more deeply nested configs are\n         # added. NOTE: currently method used only by vLLM\n-        return self.thinker_config.get_text_config()\n+        return self.thinker_config.get_text_config(*args, **kwargs)\n \n \n __all__ = [\"Qwen2_5OmniConfig\", \"Qwen2_5OmniThinkerConfig\", \"Qwen2_5OmniTalkerConfig\", \"Qwen2_5OmniToken2WavConfig\"]"
+        },
+        {
+            "sha": "2ef432f7e17176a16f2d7795b4bfa2e316e96f8b",
+            "filename": "src/transformers/models/qwen2_5_omni/modular_qwen2_5_omni.py",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/huggingface/transformers/blob/9568b506ed511c76ab4d0c6ed591c7fce8e048a5/src%2Ftransformers%2Fmodels%2Fqwen2_5_omni%2Fmodular_qwen2_5_omni.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/9568b506ed511c76ab4d0c6ed591c7fce8e048a5/src%2Ftransformers%2Fmodels%2Fqwen2_5_omni%2Fmodular_qwen2_5_omni.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fqwen2_5_omni%2Fmodular_qwen2_5_omni.py?ref=9568b506ed511c76ab4d0c6ed591c7fce8e048a5",
+            "patch": "@@ -1108,7 +1108,7 @@ def __init__(\n \n         super().__init__(**kwargs)\n \n-    def get_text_config(self, decoder=False):\n+    def get_text_config(self, *args, **kwargs):\n         \"\"\"\n         Returns the config that is meant to be used with text IO. On most models, it is the original config instance\n         itself. On specific composite models, it is under a set of valid names.\n@@ -1120,7 +1120,7 @@ def get_text_config(self, decoder=False):\n         # Overridden for deeply nested config like Qwen2-Omni. We don't have any omni model\n         # except for Qwen yet. This has to be generalized if more deeply nested configs are\n         # added. NOTE: currently method used only by vLLM\n-        return self.thinker_config.get_text_config()\n+        return self.thinker_config.get_text_config(*args, **kwargs)\n \n \n class Qwen2_5OmniPreTrainedModel(Qwen2_5_VLPreTrainedModel):"
+        },
+        {
+            "sha": "86e367413aceeb86207777f26074fa341d7fb717",
+            "filename": "src/transformers/models/t5gemma/configuration_t5gemma.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/huggingface/transformers/blob/9568b506ed511c76ab4d0c6ed591c7fce8e048a5/src%2Ftransformers%2Fmodels%2Ft5gemma%2Fconfiguration_t5gemma.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/9568b506ed511c76ab4d0c6ed591c7fce8e048a5/src%2Ftransformers%2Fmodels%2Ft5gemma%2Fconfiguration_t5gemma.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Ft5gemma%2Fconfiguration_t5gemma.py?ref=9568b506ed511c76ab4d0c6ed591c7fce8e048a5",
+            "patch": "@@ -323,9 +323,8 @@ def __setattr__(self, key, value):\n             setattr(self.decoder, key, value)\n         super().__setattr__(key, value)\n \n-    def get_text_config(self, decoder=False):\n+    def get_text_config(self, *args, **kwargs):\n         # Always return self, regardless of the decoder option.\n-        del decoder\n         return self\n \n "
+        },
+        {
+            "sha": "1d74fe8b33f6af73214759530841f1d77e330d6a",
+            "filename": "src/transformers/models/t5gemma/modular_t5gemma.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/huggingface/transformers/blob/9568b506ed511c76ab4d0c6ed591c7fce8e048a5/src%2Ftransformers%2Fmodels%2Ft5gemma%2Fmodular_t5gemma.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/9568b506ed511c76ab4d0c6ed591c7fce8e048a5/src%2Ftransformers%2Fmodels%2Ft5gemma%2Fmodular_t5gemma.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Ft5gemma%2Fmodular_t5gemma.py?ref=9568b506ed511c76ab4d0c6ed591c7fce8e048a5",
+            "patch": "@@ -213,9 +213,8 @@ def __setattr__(self, key, value):\n             setattr(self.decoder, key, value)\n         super().__setattr__(key, value)\n \n-    def get_text_config(self, decoder=False):\n+    def get_text_config(self, *args, **kwargs):\n         # Always return self, regardless of the decoder option.\n-        del decoder\n         return self\n \n "
+        },
+        {
+            "sha": "dac7669dd7978c8cff785743605040a62d459e20",
+            "filename": "tests/utils/test_configuration_utils.py",
+            "status": "modified",
+            "additions": 33,
+            "deletions": 1,
+            "changes": 34,
+            "blob_url": "https://github.com/huggingface/transformers/blob/9568b506ed511c76ab4d0c6ed591c7fce8e048a5/tests%2Futils%2Ftest_configuration_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/9568b506ed511c76ab4d0c6ed591c7fce8e048a5/tests%2Futils%2Ftest_configuration_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Futils%2Ftest_configuration_utils.py?ref=9568b506ed511c76ab4d0c6ed591c7fce8e048a5",
+            "patch": "@@ -24,7 +24,7 @@\n from huggingface_hub import HfFolder\n from requests.exceptions import HTTPError\n \n-from transformers import AutoConfig, BertConfig, GPT2Config\n+from transformers import AutoConfig, BertConfig, Florence2Config, GPT2Config\n from transformers.configuration_utils import PretrainedConfig\n from transformers.testing_utils import TOKEN, TemporaryHubRepo, is_staging_test\n \n@@ -300,3 +300,35 @@ def test_loading_config_do_not_raise_future_warnings(self):\n         with warnings.catch_warnings():\n             warnings.simplefilter(\"error\")\n             PretrainedConfig.from_pretrained(\"bert-base-uncased\")\n+\n+    def test_get_text_config(self):\n+        \"\"\"Tests the `get_text_config` method.\"\"\"\n+        # 1. model with only text input -> returns the original config instance\n+        config = AutoConfig.from_pretrained(\"hf-internal-testing/tiny-random-LlamaForCausalLM\")\n+        self.assertEqual(config.get_text_config(), config)\n+        self.assertEqual(config.get_text_config(decoder=True), config)\n+\n+        # 2. composite model (VLM) -> returns the text component\n+        config = AutoConfig.from_pretrained(\"hf-internal-testing/tiny-random-LlavaForConditionalGeneration\")\n+        self.assertEqual(config.get_text_config(), config.text_config)\n+        self.assertEqual(config.get_text_config(decoder=True), config.text_config)\n+\n+        # 3. ! corner case! : composite model whose sub-config is an old composite model (should behave as above)\n+        config = Florence2Config()\n+        self.assertEqual(config.get_text_config(), config.text_config)\n+        self.assertEqual(config.get_text_config(decoder=True), config.text_config)\n+\n+        # 4. old composite model -> may remove components based on the `decoder` or `encoder` argument\n+        config = AutoConfig.from_pretrained(\"hf-internal-testing/tiny-random-bart\")\n+        self.assertEqual(config.get_text_config(), config)\n+        # both encoder_layers and decoder_layers exist\n+        self.assertTrue(getattr(config, \"encoder_layers\", None) is not None)\n+        self.assertTrue(getattr(config, \"decoder_layers\", None) is not None)\n+        decoder_config = config.get_text_config(decoder=True)\n+        self.assertNotEqual(decoder_config, config)\n+        self.assertEqual(decoder_config.num_hidden_layers, config.decoder_layers)\n+        self.assertTrue(getattr(decoder_config, \"encoder_layers\", None) is None)  # encoder_layers is removed\n+        encoder_config = config.get_text_config(encoder=True)\n+        self.assertNotEqual(encoder_config, config)\n+        self.assertEqual(encoder_config.num_hidden_layers, config.encoder_layers)\n+        self.assertTrue(getattr(encoder_config, \"decoder_layers\", None) is None)  # decoder_layers is removed"
+        }
+    ],
+    "stats": {
+        "total": 113,
+        "additions": 89,
+        "deletions": 24
+    }
+}

@@ -1,0 +1,48 @@
+{
+    "author": "sokra",
+    "message": "Turbopack: skip db lookups on the initial build (#82405)\n\n### What?\r\n\r\nIn certain cases (e.g. on initial build) the backend knows that the backing storage has no more info than the memory cache. In these cases it can skip looking up every task on the backing storage.",
+    "sha": "9490832f7f7a74f4b14ec6ba91aaa805dcd4bfe6",
+    "files": [
+        {
+            "sha": "8fcc4c22edebdfa3aebc40f6d5450a2be8058c5b",
+            "filename": "turbopack/crates/turbo-tasks-backend/src/backend/mod.rs",
+            "status": "modified",
+            "additions": 19,
+            "deletions": 8,
+            "changes": 27,
+            "blob_url": "https://github.com/vercel/next.js/blob/9490832f7f7a74f4b14ec6ba91aaa805dcd4bfe6/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fbackend%2Fmod.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/9490832f7f7a74f4b14ec6ba91aaa805dcd4bfe6/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fbackend%2Fmod.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fbackend%2Fmod.rs?ref=9490832f7f7a74f4b14ec6ba91aaa805dcd4bfe6",
+            "patch": "@@ -176,6 +176,9 @@ struct TurboTasksBackendInner<B: BackingStorage> {\n \n     storage: Storage,\n \n+    /// When true, the backing_storage has data that is not in the local storage.\n+    local_is_partial: AtomicBool,\n+\n     /// Number of executing operations + Highest bit is set when snapshot is\n     /// requested. When that bit is set, operations should pause until the\n     /// snapshot is completed. When the bit is set and in progress counter\n@@ -231,16 +234,17 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n             options.active_tracking = false;\n         }\n         let small_preallocation = options.small_preallocation;\n+        let next_task_id = backing_storage\n+            .next_free_task_id()\n+            .expect(\"Failed to get task id\");\n         Self {\n             options,\n             start_time: Instant::now(),\n             session_id: backing_storage\n                 .next_session_id()\n                 .expect(\"Failed get session id\"),\n             persisted_task_id_factory: IdFactoryWithReuse::new(\n-                backing_storage\n-                    .next_free_task_id()\n-                    .expect(\"Failed to get task id\"),\n+                next_task_id,\n                 TaskId::try_from(TRANSIENT_TASK_BIT - 1).unwrap(),\n             ),\n             transient_task_id_factory: IdFactoryWithReuse::new(\n@@ -250,6 +254,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n             persisted_task_cache_log: need_log.then(|| Sharded::new(shard_amount)),\n             task_cache: BiMap::new(),\n             transient_tasks: FxDashMap::default(),\n+            local_is_partial: AtomicBool::new(next_task_id != TaskId::MIN),\n             storage: Storage::new(small_preallocation),\n             in_progress_operations: AtomicUsize::new(0),\n             snapshot_request: Mutex::new(SnapshotRequest::new()),\n@@ -910,6 +915,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n             return Some(task_type);\n         }\n         if self.should_restore()\n+            && self.local_is_partial.load(Ordering::Acquire)\n             && !task_id.is_transient()\n             && let Some(task_type) = unsafe {\n                 self.backing_storage\n@@ -1271,16 +1277,21 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {\n             return task_id;\n         }\n \n-        let tx = self\n-            .should_restore()\n+        let check_backing_storage =\n+            self.should_restore() && self.local_is_partial.load(Ordering::Acquire);\n+        let tx = check_backing_storage\n             .then(|| self.backing_storage.start_read_transaction())\n             .flatten();\n         let task_id = {\n             // Safety: `tx` is a valid transaction from `self.backend.backing_storage`.\n             if let Some(task_id) = unsafe {\n-                self.backing_storage\n-                    .forward_lookup_task_cache(tx.as_ref(), &task_type)\n-                    .expect(\"Failed to lookup task id\")\n+                check_backing_storage\n+                    .then(|| {\n+                        self.backing_storage\n+                            .forward_lookup_task_cache(tx.as_ref(), &task_type)\n+                            .expect(\"Failed to lookup task id\")\n+                    })\n+                    .flatten()\n             } {\n                 self.track_cache_hit(&task_type);\n                 let _ = self.task_cache.try_insert(Arc::new(task_type), task_id);"
+        },
+        {
+            "sha": "71099c4d8aae0ece9fa47a6dc89377c89280591c",
+            "filename": "turbopack/crates/turbo-tasks-backend/src/backend/operation/mod.rs",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/vercel/next.js/blob/9490832f7f7a74f4b14ec6ba91aaa805dcd4bfe6/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fbackend%2Foperation%2Fmod.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/9490832f7f7a74f4b14ec6ba91aaa805dcd4bfe6/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fbackend%2Foperation%2Fmod.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fbackend%2Foperation%2Fmod.rs?ref=9490832f7f7a74f4b14ec6ba91aaa805dcd4bfe6",
+            "patch": "@@ -11,6 +11,7 @@ mod update_output;\n use std::{\n     fmt::{Debug, Formatter},\n     mem::transmute,\n+    sync::atomic::Ordering,\n };\n \n use serde::{Deserialize, Serialize};\n@@ -113,6 +114,12 @@ where\n         category: TaskDataCategory,\n     ) -> Vec<CachedDataItem> {\n         if matches!(self.transaction, TransactionState::None) {\n+            let check_backing_storage = self.backend.should_restore()\n+                && self.backend.local_is_partial.load(Ordering::Acquire);\n+            if !check_backing_storage {\n+                // If we don't need to restore, we can just return an empty vector\n+                return Vec::new();\n+            }\n             let tx = self.backend.backing_storage.start_read_transaction();\n             let tx = tx.map(|tx| {\n                 // Safety: self is actually valid for 'a, so it's safe to transmute 'l to 'a"
+        },
+        {
+            "sha": "76bd40db4cb47b3deb61e90decde265bd3187b77",
+            "filename": "turbopack/crates/turbo-tasks-backend/src/kv_backing_storage.rs",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 6,
+            "changes": 11,
+            "blob_url": "https://github.com/vercel/next.js/blob/9490832f7f7a74f4b14ec6ba91aaa805dcd4bfe6/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fkv_backing_storage.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/9490832f7f7a74f4b14ec6ba91aaa805dcd4bfe6/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fkv_backing_storage.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbo-tasks-backend%2Fsrc%2Fkv_backing_storage.rs?ref=9490832f7f7a74f4b14ec6ba91aaa805dcd4bfe6",
+            "patch": "@@ -262,12 +262,11 @@ impl<T: KeyValueDatabase + Send + Sync + 'static> BackingStorageSealed\n     type ReadTransaction<'l> = T::ReadTransaction<'l>;\n \n     fn next_free_task_id(&self) -> Result<TaskId> {\n-        Ok(TaskId::try_from(\n-            self.inner\n-                .get_infra_u32(META_KEY_NEXT_FREE_TASK_ID)\n-                .context(\"Unable to read next free task id from database\")?\n-                .unwrap_or(1),\n-        )?)\n+        Ok(self\n+            .inner\n+            .get_infra_u32(META_KEY_NEXT_FREE_TASK_ID)\n+            .context(\"Unable to read next free task id from database\")?\n+            .map_or(Ok(TaskId::MIN), TaskId::try_from)?)\n     }\n \n     fn next_session_id(&self) -> Result<SessionId> {"
+        }
+    ],
+    "stats": {
+        "total": 45,
+        "additions": 31,
+        "deletions": 14
+    }
+}

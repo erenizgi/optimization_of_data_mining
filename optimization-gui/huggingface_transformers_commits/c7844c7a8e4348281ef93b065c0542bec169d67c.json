@@ -1,0 +1,48 @@
+{
+    "author": "matthewdouglas",
+    "message": "Enable gpt-oss mxfp4 on older hardware (sm75+) (#39940)\n\nCo-authored-by: Marc Sun <57196510+SunMarc@users.noreply.github.com>",
+    "sha": "c7844c7a8e4348281ef93b065c0542bec169d67c",
+    "files": [
+        {
+            "sha": "6e10535951d66b05f9c1c8b535f48a8ebc8c5298",
+            "filename": "src/transformers/integrations/mxfp4.py",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 1,
+            "changes": 5,
+            "blob_url": "https://github.com/huggingface/transformers/blob/c7844c7a8e4348281ef93b065c0542bec169d67c/src%2Ftransformers%2Fintegrations%2Fmxfp4.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/c7844c7a8e4348281ef93b065c0542bec169d67c/src%2Ftransformers%2Fintegrations%2Fmxfp4.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fintegrations%2Fmxfp4.py?ref=c7844c7a8e4348281ef93b065c0542bec169d67c",
+            "patch": "@@ -280,7 +280,10 @@ def mlp_forward(self, hidden_states):\n     batch_size = hidden_states.shape[0]\n     hidden_states = hidden_states.reshape(-1, self.router.hidden_dim)\n     router_logits = nn.functional.linear(hidden_states, self.router.weight, self.router.bias)\n-    routing_data, gather_idx, scatter_idx = routing(router_logits, self.router.top_k)\n+\n+    with torch.cuda.device(router_logits.device):\n+        routing_data, gather_idx, scatter_idx = routing(router_logits, self.router.top_k)\n+\n     routed_out = self.experts(hidden_states, routing_data, gather_idx, scatter_idx)\n     routed_out = routed_out.reshape(batch_size, -1, self.router.hidden_dim)\n     return routed_out, router_logits"
+        },
+        {
+            "sha": "f68a00e8977807f1a635f9858fd12307ba952c97",
+            "filename": "src/transformers/quantizers/quantizer_mxfp4.py",
+            "status": "modified",
+            "additions": 19,
+            "deletions": 9,
+            "changes": 28,
+            "blob_url": "https://github.com/huggingface/transformers/blob/c7844c7a8e4348281ef93b065c0542bec169d67c/src%2Ftransformers%2Fquantizers%2Fquantizer_mxfp4.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/c7844c7a8e4348281ef93b065c0542bec169d67c/src%2Ftransformers%2Fquantizers%2Fquantizer_mxfp4.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fquantizers%2Fquantizer_mxfp4.py?ref=c7844c7a8e4348281ef93b065c0542bec169d67c",
+            "patch": "@@ -67,23 +67,33 @@ def validate_environment(self, *args, **kwargs):\n             raise ImportError(\"Using mxfp4 requires Accelerate: `pip install accelerate`\")\n \n         compute_capability = torch.cuda.get_device_capability()\n-        major, minor = compute_capability\n+        gpu_is_supported = compute_capability >= (7, 5)\n+        kernels_available = is_triton_available(\"3.4.0\") and is_triton_kernels_availalble()\n \n-        if not is_triton_available(\"3.4.0\") or not is_triton_kernels_availalble():\n-            if self.pre_quantized and not self.quantization_config.dequantize:\n+        if self.pre_quantized:\n+            # On unsupported GPUs or without kernels, we will dequantize the model to bf16\n+            if not gpu_is_supported:\n                 logger.warning_once(\n-                    \"MXFP4 quantization requires triton >= 3.4.0 and triton_kernels installed, we will default to dequantizing the model to bf16\"\n+                    \"MXFP4 quantization is only supported on GPUs with compute capability >= 7.5 (e.g T4, A100, L4, H100, or B200). \"\n+                    \"We will default to dequantizing the model to bf16.\"\n                 )\n                 self.quantization_config.dequantize = True\n                 return\n-            else:\n-                # we can't quantize the model in this case so we raise an error\n-                raise ValueError(\"MXFP4 quantization requires triton >= 3.4.0 and triton_kernels installed\")\n \n-        if major < 9:\n+            if not kernels_available:\n+                logger.warning_once(\n+                    \"MXFP4 quantization requires triton >= 3.4.0 and triton_kernels installed, we will default to dequantizing the model to bf16\"\n+                )\n+                self.quantization_config.dequantize = True\n+                return\n+        elif not gpu_is_supported:\n+            # we can't quantize the model in this case so we raise an error\n             raise ValueError(\n-                \"MXFP4 quantized models is only supported on GPUs with compute capability >= 9.0 (e.g H100, or B100)\"\n+                \"MXFP4 quantization is only supported on GPUs with compute capability >= 7.5 (e.g T4, A100, L4, H100, or B200)\"\n             )\n+        elif not kernels_available:\n+            # we can't quantize the model in this case so we raise an error\n+            raise ValueError(\"MXFP4 quantization requires triton >= 3.4.0 and triton_kernels installed\")\n \n         device_map = kwargs.get(\"device_map\", None)\n         if device_map is None:"
+        },
+        {
+            "sha": "ca14d86a3497d6e8ff5fd71e2d65ecbb29478c53",
+            "filename": "tests/quantization/mxfp4/test_mxfp4.py",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 2,
+            "changes": 17,
+            "blob_url": "https://github.com/huggingface/transformers/blob/c7844c7a8e4348281ef93b065c0542bec169d67c/tests%2Fquantization%2Fmxfp4%2Ftest_mxfp4.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/c7844c7a8e4348281ef93b065c0542bec169d67c/tests%2Fquantization%2Fmxfp4%2Ftest_mxfp4.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fquantization%2Fmxfp4%2Ftest_mxfp4.py?ref=c7844c7a8e4348281ef93b065c0542bec169d67c",
+            "patch": "@@ -107,18 +107,31 @@ def test_quantizer_validation_no_cuda(self):\n \n     def test_quantizer_validation_low_compute_capability(self):\n         \"\"\"Test quantizer validation with low compute capability\"\"\"\n-        with patch(\"torch.cuda.get_device_capability\", return_value=(8, 0)):\n+        with patch(\"torch.cuda.get_device_capability\", return_value=(7, 0)):\n             from transformers.quantizers.quantizer_mxfp4 import Mxfp4HfQuantizer\n \n             config = Mxfp4Config()\n             quantizer = Mxfp4HfQuantizer(config)\n+            quantizer.pre_quantized = False\n \n             with self.assertRaises(ValueError):\n                 quantizer.validate_environment()\n \n+    def test_quantizer_validation_low_compute_capability_with_prequantized(self):\n+        \"\"\"Test quantizer validation with low compute capability\"\"\"\n+        with patch(\"torch.cuda.get_device_capability\", return_value=(7, 0)):\n+            from transformers.quantizers.quantizer_mxfp4 import Mxfp4HfQuantizer\n+\n+            config = Mxfp4Config()\n+            quantizer = Mxfp4HfQuantizer(config)\n+\n+            # Should automatically set dequantize=True and warn\n+            quantizer.validate_environment()\n+            self.assertTrue(quantizer.quantization_config.dequantize)\n+\n     def test_quantizer_validation_low_compute_capability_with_dequantize(self):\n         \"\"\"Test quantizer validation with low compute capability but dequantize enabled\"\"\"\n-        with patch(\"torch.cuda.get_device_capability\", return_value=(8, 0)):\n+        with patch(\"torch.cuda.get_device_capability\", return_value=(7, 0)):\n             from transformers.quantizers.quantizer_mxfp4 import Mxfp4HfQuantizer\n \n             config = Mxfp4Config(dequantize=True)"
+        }
+    ],
+    "stats": {
+        "total": 50,
+        "additions": 38,
+        "deletions": 12
+    }
+}

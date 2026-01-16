@@ -1,0 +1,60 @@
+{
+    "author": "Cy-Tek",
+    "message": "cleanup(turbopack): Added documentation comments and small optimizations to CSS import validations (#80901)\n\n## Refactor CSS Import Validation Logic in Next.js\n\n### What?\nRefactored the CSS import validation logic to improve readability and\nmaintainability by reorganizing the code flow and adding comprehensive\ncomments.\n\n### Why?\nThe previous implementation had a confusing flow that made it difficult\nto understand the validation rules for global CSS imports. This refactor\nmakes the logic clearer by:\n1. Checking if the imported module is a global CSS module first\n2. Validating imports from node_modules\n3. Handling root nodes with no parents\n4. Allowing imports from CSS modules\n5. Finally checking if the parent is the app module\n\n### How?\n- Reordered the validation checks in `validate_pages_css_imports` to\nfollow a more optimized flow\n- Added detailed comments explaining each validation rule and its\npurpose\n- Added documentation for the `validate_pages_css_imports` function\n- Improved comments in the `pages.rs` file to explain why we recreate\nthe app_module\n\n---------\n\nCo-authored-by: Niklas Mischkulnig <4586894+mischnic@users.noreply.github.com>",
+    "sha": "2a93c30f3870255b7d2c1ee74a7967ea463af383",
+    "files": [
+        {
+            "sha": "783e15a4bb15c0c1e44f9959c5127ebd4d1d04e5",
+            "filename": "crates/next-api/src/module_graph.rs",
+            "status": "modified",
+            "additions": 43,
+            "deletions": 25,
+            "changes": 68,
+            "blob_url": "https://github.com/vercel/next.js/blob/2a93c30f3870255b7d2c1ee74a7967ea463af383/crates%2Fnext-api%2Fsrc%2Fmodule_graph.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/2a93c30f3870255b7d2c1ee74a7967ea463af383/crates%2Fnext-api%2Fsrc%2Fmodule_graph.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/crates%2Fnext-api%2Fsrc%2Fmodule_graph.rs?ref=2a93c30f3870255b7d2c1ee74a7967ea463af383",
+            "patch": "@@ -512,6 +512,15 @@ async fn validate_pages_css_imports(\n     graph.traverse_edges_from_entries(entries, |parent_info, node| {\n         let module = node.module;\n \n+        // If the module being imported isn't a global css module, there is nothing to validate.\n+        let module_is_global_css =\n+            ResolvedVc::try_downcast_type::<CssModuleAsset>(module).is_some();\n+\n+        if !module_is_global_css {\n+            return GraphTraversalAction::Continue;\n+        }\n+\n+        // We allow imports of global CSS files which are inside of `node_modules`.\n         let module_name_contains_node_modules = module_name_map\n             .get(&module)\n             .is_some_and(|s| s.contains(\"node_modules\"));\n@@ -520,8 +529,9 @@ async fn validate_pages_css_imports(\n             return GraphTraversalAction::Continue;\n         }\n \n+        // If we're at a root node, there is nothing importing this module and we can skip\n+        // any further validations.\n         let Some((parent_node, _)) = parent_info else {\n-            // root node, no parent\n             return GraphTraversalAction::Continue;\n         };\n \n@@ -530,17 +540,14 @@ async fn validate_pages_css_imports(\n             .is_some()\n             || ResolvedVc::try_downcast_type::<CssModuleAsset>(parent_module).is_some();\n \n+        // We also always allow .module css/scss/sass files to import global css files as well.\n         if parent_is_css_module {\n             return GraphTraversalAction::Continue;\n         }\n \n-        let module_is_global_css =\n-            ResolvedVc::try_downcast_type::<CssModuleAsset>(module).is_some();\n-\n-        if !module_is_global_css {\n-            return GraphTraversalAction::Continue;\n-        }\n-\n+        // If all of the above invariants have been checked, we look to see if the parent module is\n+        // the same as the app module. If it isn't we know it isn't a valid place to import global\n+        // css.\n         if parent_module != app_module {\n             CssGlobalImportIssue::new(parent_module, module)\n                 .resolved_cell()\n@@ -740,43 +747,54 @@ impl ReducedGraphs {\n     }\n \n     #[turbo_tasks::function]\n+    /// Validates that the global CSS/SCSS/SASS imports are only valid imports with the following\n+    /// rules:\n+    /// * The import is made from a `node_modules` package\n+    /// * The import is made from a `.module.css` file\n+    /// * The import is made from the `pages/_app.js`, or equivalent file.\n     pub async fn validate_pages_css_imports(\n         &self,\n         entry: Vc<Box<dyn Module>>,\n         app_module: Vc<Box<dyn Module>>,\n     ) -> Result<()> {\n         let span = tracing::info_span!(\"validate pages css imports\");\n         async move {\n-            let mut ident_vec = Vec::new();\n-            for graph in self.bare_graphs.await?.graphs.iter() {\n-                let inputs = graph\n+            let graphs = &self.bare_graphs.await?.graphs;\n+\n+            // We need to collect the module names here to pass into the\n+            // `validate_pages_css_imports` function. This is because the function is\n+            // called for each graph, and we need to know the module names of the parent\n+            // modules to determine if the import is valid. We can't do this in the\n+            // called function because it's within a closure that can't resolve turbo tasks.\n+            let graph_to_module_ident_tuples = async |graph: &ResolvedVc<SingleModuleGraph>| {\n+                graph\n                     .await?\n                     .graph\n                     .node_weights()\n-                    .map(async |n| {\n-                        Ok((\n-                            n.module(),\n-                            RcStr::from(n.module().ident().to_string().await?.as_str()),\n-                        ))\n-                    })\n+                    .map(async |n| Ok((n.module(), n.module().ident().to_string().owned().await?)))\n                     .try_join()\n-                    .await?;\n-                ident_vec.extend(inputs);\n-            }\n-            let idents = ModuleNameMap(ident_vec.into_iter().collect::<FxIndexMap<_, _>>()).cell();\n+                    .await\n+            };\n \n-            let _ = self\n-                .bare_graphs\n+            let identifier_map = graphs\n+                .iter()\n+                .map(graph_to_module_ident_tuples)\n+                .try_join()\n                 .await?\n-                .graphs\n+                .into_iter()\n+                .flatten()\n+                .collect::<FxIndexMap<_, _>>();\n+            let identifier_map = ModuleNameMap(identifier_map).cell();\n+\n+            let _ = graphs\n                 .iter()\n                 .map(|graph| {\n                     validate_pages_css_imports(\n                         **graph,\n                         self.is_single_page,\n                         entry,\n                         app_module,\n-                        idents,\n+                        identifier_map,\n                     )\n                 })\n                 .try_join()"
+        },
+        {
+            "sha": "af58a40c573af9bfb08091a04b0af99ba9a7113d",
+            "filename": "crates/next-api/src/pages.rs",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/2a93c30f3870255b7d2c1ee74a7967ea463af383/crates%2Fnext-api%2Fsrc%2Fpages.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/2a93c30f3870255b7d2c1ee74a7967ea463af383/crates%2Fnext-api%2Fsrc%2Fpages.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/crates%2Fnext-api%2Fsrc%2Fpages.rs?ref=2a93c30f3870255b7d2c1ee74a7967ea463af383",
+            "patch": "@@ -1005,6 +1005,11 @@ impl PageEndpoint {\n                 // We only validate the global css imports when there is not a `app` folder at the\n                 // root of the project.\n                 if project.app_project().await?.is_none() {\n+                    // We recreate the app_module here because the one provided from the\n+                    // `internal_ssr_chunk_module` is not the same as the one\n+                    // provided from the `client_module_graph`. There can be cases where\n+                    // the `app_module` is None, and we are processing the `pages/_app.js` file\n+                    // as a page rather than the app module.\n                     let app_module = project\n                         .pages_project()\n                         .client_module_context()"
+        },
+        {
+            "sha": "10e0c95f36ff4a6c73ed0cdd3dbaff043a8b6c10",
+            "filename": "turbopack/crates/turbopack-css/src/asset.rs",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/2a93c30f3870255b7d2c1ee74a7967ea463af383/turbopack%2Fcrates%2Fturbopack-css%2Fsrc%2Fasset.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/2a93c30f3870255b7d2c1ee74a7967ea463af383/turbopack%2Fcrates%2Fturbopack-css%2Fsrc%2Fasset.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-css%2Fsrc%2Fasset.rs?ref=2a93c30f3870255b7d2c1ee74a7967ea463af383",
+            "patch": "@@ -33,6 +33,7 @@ use crate::{\n \n #[turbo_tasks::value]\n #[derive(Clone)]\n+/// A global CSS asset. Notably not a `.module.css` module, which is [`ModuleCssAsset`] instead.\n pub struct CssModuleAsset {\n     source: ResolvedVc<Box<dyn Source>>,\n     asset_context: ResolvedVc<Box<dyn AssetContext>>,"
+        },
+        {
+            "sha": "574cd5e2a3c6b14b2448c3663840a0579aeb17c8",
+            "filename": "turbopack/crates/turbopack-css/src/module_asset.rs",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/2a93c30f3870255b7d2c1ee74a7967ea463af383/turbopack%2Fcrates%2Fturbopack-css%2Fsrc%2Fmodule_asset.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/2a93c30f3870255b7d2c1ee74a7967ea463af383/turbopack%2Fcrates%2Fturbopack-css%2Fsrc%2Fmodule_asset.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-css%2Fsrc%2Fmodule_asset.rs?ref=2a93c30f3870255b7d2c1ee74a7967ea463af383",
+            "patch": "@@ -37,6 +37,7 @@ use crate::{\n \n #[turbo_tasks::value]\n #[derive(Clone)]\n+/// A CSS Module asset, as in `.module.css`. For a global CSS module, see [`CssModuleAsset`].\n pub struct ModuleCssAsset {\n     pub source: ResolvedVc<Box<dyn Source>>,\n     pub asset_context: ResolvedVc<Box<dyn AssetContext>>,"
+        }
+    ],
+    "stats": {
+        "total": 75,
+        "additions": 50,
+        "deletions": 25
+    }
+}

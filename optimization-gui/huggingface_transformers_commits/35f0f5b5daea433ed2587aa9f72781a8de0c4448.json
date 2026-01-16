@@ -1,0 +1,36 @@
+{
+    "author": "gante",
+    "message": "[llama 4] dynamic rope decorator (#37365)\n\nl4 + dynamic rope decorator",
+    "sha": "35f0f5b5daea433ed2587aa9f72781a8de0c4448",
+    "files": [
+        {
+            "sha": "12673a8d41a59cd85c714b6017e3ad2834bd9057",
+            "filename": "src/transformers/cache_utils.py",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 6,
+            "changes": 15,
+            "blob_url": "https://github.com/huggingface/transformers/blob/35f0f5b5daea433ed2587aa9f72781a8de0c4448/src%2Ftransformers%2Fcache_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/35f0f5b5daea433ed2587aa9f72781a8de0c4448/src%2Ftransformers%2Fcache_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fcache_utils.py?ref=35f0f5b5daea433ed2587aa9f72781a8de0c4448",
+            "patch": "@@ -1611,9 +1611,10 @@ def batch_select_indices(self, indices: torch.Tensor):\n \n class HybridCache(Cache):\n     \"\"\"\n-    Hybrid Cache class to be used with `torch.compile` for Gemma2 models that alternate between a local sliding window attention\n-    and global attention in every other layer. Under the hood, Hybrid Cache leverages [\"SlidingWindowCache\"] for sliding window attention\n-    and [\"StaticCache\"] for global attention. For more information, see the documentation of each subcomponeent cache class.\n+    Hybrid Cache class to be used with `torch.compile` for models that alternate between a local sliding window\n+    attention and global attention in every other layer (originally implemented for Gemma2).\n+    Under the hood, Hybrid Cache leverages [\"SlidingWindowCache\"] for sliding window attention and [\"StaticCache\"]\n+    for global attention.For more information, see the documentation of each subcomponent cache class.\n \n     Parameters:\n         config (`PretrainedConfig):\n@@ -1813,9 +1814,11 @@ def reset(self):\n \n class HybridChunkedCache(Cache):\n     \"\"\"\n-    Hybrid Cache class to be used with `torch.compile` for Gemma2 models that alternate between a local sliding window attention\n-    and global attention in every other layer. Under the hood, Hybrid Cache leverages [\"SlidingWindowCache\"] for sliding window attention\n-    and [\"StaticCache\"] for global attention. For more information, see the documentation of each subcomponeent cache class.\n+    Hybrid Cache class to be used with `torch.compile` for models that alternate between a local sliding window\n+    attention and global attention in every other layer, with support for chunked attention (originally implemented\n+    for Llama4).\n+    Under the hood, Hybrid Cache leverages [\"SlidingWindowCache\"] for sliding window attention and [\"StaticCache\"]\n+    for global attention. For more information, see the documentation of each subcomponent cache class.\n \n     Parameters:\n         config (`PretrainedConfig):"
+        },
+        {
+            "sha": "ed200b7c2757e6b8ae86a02ce69e52889ec1c706",
+            "filename": "src/transformers/models/llama4/modeling_llama4.py",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 29,
+            "changes": 35,
+            "blob_url": "https://github.com/huggingface/transformers/blob/35f0f5b5daea433ed2587aa9f72781a8de0c4448/src%2Ftransformers%2Fmodels%2Fllama4%2Fmodeling_llama4.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/35f0f5b5daea433ed2587aa9f72781a8de0c4448/src%2Ftransformers%2Fmodels%2Fllama4%2Fmodeling_llama4.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fllama4%2Fmodeling_llama4.py?ref=35f0f5b5daea433ed2587aa9f72781a8de0c4448",
+            "patch": "@@ -35,7 +35,7 @@\n     CausalLMOutputWithPast,\n     ModelOutput,\n )\n-from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS\n+from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update\n from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel\n from ...processing_utils import Unpack\n from ...utils import (\n@@ -206,41 +206,18 @@ def __init__(self, config: Llama4TextConfig, device=None):\n         self.register_buffer(\"inv_freq\", inv_freq, persistent=False)\n         self.original_inv_freq = self.inv_freq\n \n-    def _dynamic_frequency_update(self, position_ids, device):\n-        \"\"\"\n-        dynamic RoPE layers should recompute `inv_freq` in the following situations:\n-        1 - growing beyond the cached sequence length (allow scaling)\n-        2 - the current sequence length is in the original scale (avoid losing precision with small sequences)\n-        \"\"\"\n-        seq_len = torch.max(position_ids) + 1\n-        if seq_len > self.max_seq_len_cached:  # growth\n-            inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device, seq_len=seq_len)\n-            self.register_buffer(\"inv_freq\", inv_freq, persistent=False)  # TODO joao: may break with compilation\n-            self.max_seq_len_cached = seq_len\n-\n-        if seq_len < self.original_max_seq_len and self.max_seq_len_cached > self.original_max_seq_len:  # reset\n-            # This .to() is needed if the model has been moved to a device after being initialized (because\n-            # the buffer is automatically moved, but not the original copy)\n-            self.original_inv_freq = self.original_inv_freq.to(device)\n-            self.register_buffer(\"inv_freq\", self.original_inv_freq, persistent=False)\n-            self.max_seq_len_cached = self.original_max_seq_len\n-\n     @torch.no_grad()\n+    @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)\n     def forward(self, x, position_ids):\n-        if \"dynamic\" in self.rope_type:\n-            self._dynamic_frequency_update(position_ids, device=x.device)\n-        # Core RoPE block\n         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)\n         position_ids_expanded = position_ids[:, None, :].float()\n-        # Force float32 (see https://github.com/huggingface/transformers/pull/29285)\n-        device_type = x.device.type\n-        device_type = device_type if isinstance(device_type, str) and device_type != \"mps\" else \"cpu\"\n-        with torch.autocast(device_type=device_type, enabled=False):\n+\n+        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != \"mps\" else \"cpu\"\n+        with torch.autocast(device_type=device_type, enabled=False):  # Force float32\n             freqs = (inv_freq_expanded.to(x.device) @ position_ids_expanded).transpose(1, 2)\n             freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # Convert to complex representation\n+            freqs_cis = freqs_cis * self.attention_scaling\n \n-        # Advanced RoPE types (e.g. yarn) apply a post-processing scaling factor, equivalent to scaling attention\n-        freqs_cis = freqs_cis * self.attention_scaling\n         return freqs_cis\n \n "
+        }
+    ],
+    "stats": {
+        "total": 50,
+        "additions": 15,
+        "deletions": 35
+    }
+}

@@ -1,0 +1,36 @@
+{
+    "author": "kylesayrs",
+    "message": "[Core] [Offloading] Fix saving offloaded submodules (#39280)\n\n* fix counting meta tensors, fix onloading meta tensors\n\nSigned-off-by: Kyle Sayers <kylesayrs@gmail.com>\n\n* remove unrelated fix\n\nSigned-off-by: Kyle Sayers <kylesayrs@gmail.com>\n\n* remove unrelated change\n\nSigned-off-by: Kyle Sayers <kylesayrs@gmail.com>\n\n* add clarifying comment\n\nSigned-off-by: Kyle Sayers <kylesayrs@gmail.com>\n\n* add test_save_offloaded_model_with_direct_params\n\nSigned-off-by: Kyle Sayers <kylesayrs@gmail.com>\n\n* fix merge conflict, add decorators\n\nSigned-off-by: Kyle Sayers <kylesayrs@gmail.com>\n\n---------\n\nSigned-off-by: Kyle Sayers <kylesayrs@gmail.com>",
+    "sha": "31d81943c994d11a079223809cfca89bfaaee363",
+    "files": [
+        {
+            "sha": "6070bd56bf8e82c2b6640f656df3709a0cae4d49",
+            "filename": "src/transformers/modeling_utils.py",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 6,
+            "changes": 13,
+            "blob_url": "https://github.com/huggingface/transformers/blob/31d81943c994d11a079223809cfca89bfaaee363/src%2Ftransformers%2Fmodeling_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/31d81943c994d11a079223809cfca89bfaaee363/src%2Ftransformers%2Fmodeling_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodeling_utils.py?ref=31d81943c994d11a079223809cfca89bfaaee363",
+            "patch": "@@ -3900,12 +3900,13 @@ def save_pretrained(\n                 # init state_dict for this shard\n                 shard_state_dict = dict.fromkeys(shard, \"\")\n                 for module_name in shard:\n-                    # skip to collect this weight again\n-                    if shard_state_dict.get(module_name) != \"\":\n-                        continue\n-                    module = module_map[module_name]\n-                    # update state dict with onloaded parameters\n-                    shard_state_dict = get_state_dict_from_offload(module, module_name, shard_state_dict)\n+                    # note that get_state_dict_from_offload can update with meta tensors\n+                    # if both a parent module and its descendant are offloaded\n+                    tensor = shard_state_dict[module_name]\n+                    if tensor == \"\" or (isinstance(tensor, torch.Tensor) and tensor.device.type == \"meta\"):\n+                        # update state dict with onloaded parameters\n+                        module = module_map[module_name]\n+                        shard_state_dict = get_state_dict_from_offload(module, module_name, shard_state_dict)\n \n                 # assign shard to be the completed state dict\n                 shard = shard_state_dict"
+        },
+        {
+            "sha": "4da0aefce952894cd5f2444514d39c1b6c4316da",
+            "filename": "tests/utils/test_modeling_utils.py",
+            "status": "modified",
+            "additions": 45,
+            "deletions": 0,
+            "changes": 45,
+            "blob_url": "https://github.com/huggingface/transformers/blob/31d81943c994d11a079223809cfca89bfaaee363/tests%2Futils%2Ftest_modeling_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/31d81943c994d11a079223809cfca89bfaaee363/tests%2Futils%2Ftest_modeling_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Futils%2Ftest_modeling_utils.py?ref=31d81943c994d11a079223809cfca89bfaaee363",
+            "patch": "@@ -158,6 +158,38 @@ def __init__(self, config):\n         def forward(self, x):\n             return self.linear2(self.linear(self.base(x)))\n \n+    class ModelWithDirectParam(PreTrainedModel):\n+        base_model_prefix = \"base\"\n+        config_class = PretrainedConfig\n+\n+        def _init_weights(self, module):\n+            pass\n+\n+        def __init__(self, config):\n+            super().__init__(config)\n+            # direct params and submodules is helpful for testing offloading logic\n+            self.weight = nn.Parameter(torch.rand((5, 5)))\n+            self.base = BaseModel(config)\n+\n+        def forward(self, x):\n+            return self.base(x @ self.weight.T)\n+\n+    class ModelWithDirectParamSubmodule(PreTrainedModel):\n+        base_model_prefix = \"base\"\n+        config_class = PretrainedConfig\n+\n+        def _init_weights(self, module):\n+            pass\n+\n+        def __init__(self, config):\n+            super().__init__(config)\n+            self.submodule = ModelWithDirectParam(config)\n+            # needed so model can have at least one module on accelerator\n+            self.linear = nn.Linear(5, 5)\n+\n+        def forward(self, x):\n+            return self.linear(self.submodule(x))\n+\n     class ModelWithHeadAndTiedWeights(PreTrainedModel):\n         base_model_prefix = \"base\"\n         config_class = PretrainedConfig\n@@ -1187,6 +1219,19 @@ def test_save_offloaded_model(self):\n         torch.testing.assert_close(output, presaved_output, rtol=1e-4, atol=1e-4)\n         torch.testing.assert_close(presaved_output, postsaved_output)\n \n+    @require_accelerate\n+    @mark.accelerate_tests\n+    @require_torch_accelerator\n+    def test_save_offloaded_model_with_direct_params(self):\n+        from accelerate import dispatch_model\n+\n+        device_map = {\"submodule\": \"cpu\", \"linear\": f\"{torch_device}:0\"}\n+        model = ModelWithDirectParamSubmodule(PretrainedConfig())\n+        dispatch_model(model, device_map)\n+\n+        with tempfile.TemporaryDirectory() as tmp_dir:\n+            model.save_pretrained(tmp_dir)\n+\n     @require_accelerate\n     @mark.accelerate_tests\n     @require_torch_accelerator"
+        }
+    ],
+    "stats": {
+        "total": 58,
+        "additions": 52,
+        "deletions": 6
+    }
+}

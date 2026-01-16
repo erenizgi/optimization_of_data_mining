@@ -1,0 +1,36 @@
+{
+    "author": "Aaraviitkgp",
+    "message": "Kernel mapping error resolve (#42466)\n\n* mapping error resolved with test check\n\n* Fix undefined variable 'device' in kernel_config\n\n* added test in test_kernels\n\n* added test with proper format\n\n* added test with proper format once again\n\n* Removed mapping_test.py file\n\n* reformated with ruff\n\n* removed the test",
+    "sha": "3f17410925a0c62f6844f1395270bf0066133cbf",
+    "files": [
+        {
+            "sha": "457e6a8faa0509a94eb246a0000886d0d18cb703",
+            "filename": "src/transformers/utils/kernel_config.py",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 2,
+            "changes": 6,
+            "blob_url": "https://github.com/huggingface/transformers/blob/3f17410925a0c62f6844f1395270bf0066133cbf/src%2Ftransformers%2Futils%2Fkernel_config.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/3f17410925a0c62f6844f1395270bf0066133cbf/src%2Ftransformers%2Futils%2Fkernel_config.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Futils%2Fkernel_config.py?ref=3f17410925a0c62f6844f1395270bf0066133cbf",
+            "patch": "@@ -208,6 +208,7 @@ def create_compatible_mapping(self, model, compile=False):\n         from kernels import Mode\n \n         compatible_mapping = {}\n+        current_device = infer_device(model)\n         for layer_name, kernel in self.kernel_mapping.items():\n             # Infer Mode: use Mode.TRAINING if model is training, else use Mode.INFERENCE\n             mode = Mode.TRAINING if model.training else Mode.INFERENCE\n@@ -216,10 +217,11 @@ def create_compatible_mapping(self, model, compile=False):\n \n             if isinstance(kernel, str):\n                 repo_name = kernel\n-                device = infer_device(model)\n-                add_to_mapping(layer_name, device, repo_name, mode, compatible_mapping)\n+                add_to_mapping(layer_name, current_device, repo_name, mode, compatible_mapping)\n             elif isinstance(kernel, dict):\n                 for device, repo_name in kernel.items():\n+                    if device != current_device:\n+                        continue\n                     add_to_mapping(layer_name, device, repo_name, mode, compatible_mapping)\n \n         self.kernel_mapping = compatible_mapping"
+        },
+        {
+            "sha": "bc4e64dc0a9c81ee181959e986483929d681426a",
+            "filename": "tests/kernels/test_kernels.py",
+            "status": "modified",
+            "additions": 72,
+            "deletions": 1,
+            "changes": 73,
+            "blob_url": "https://github.com/huggingface/transformers/blob/3f17410925a0c62f6844f1395270bf0066133cbf/tests%2Fkernels%2Ftest_kernels.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/3f17410925a0c62f6844f1395270bf0066133cbf/tests%2Fkernels%2Ftest_kernels.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fkernels%2Ftest_kernels.py?ref=3f17410925a0c62f6844f1395270bf0066133cbf",
+            "patch": "@@ -17,7 +17,7 @@\n \n import copy\n import types\n-from unittest.mock import patch\n+from unittest.mock import MagicMock, patch\n \n from transformers import AutoModelForCausalLM, AutoTokenizer, KernelConfig\n from transformers.integrations.hub_kernels import (\n@@ -401,3 +401,74 @@ def spy_kernelize(model, device=None, mode=None):\n             self.assertTrue(any(m == Mode.TRAINING for m in last_modes))\n             self.model.eval()\n             self.assertTrue(any(m == Mode.INFERENCE for m in last_modes))\n+\n+\n+@require_kernels\n+class TestKernelMappingDeviceFiltering(TestCasePlus):\n+    \"\"\"Test that kernel mappings correctly filter by current device.\"\"\"\n+\n+    def test_multi_device_mapping_filters_correctly(self):\n+        \"\"\"\n+        Test that when a kernel_mapping contains multiple devices (cuda, rocm),\n+        only the current device's kernel is registered.\n+        Regression test for issue where ROCm overwrote CUDA mapping.\n+        \"\"\"\n+        kernel_mapping = {\n+            \"RMSNorm\": {\n+                \"cuda\": \"kernels-community/layer_norm:LlamaRMSNorm\",\n+                \"rocm\": \"kernels-community/layer_norm:LlamaRMSNorm\",\n+            }\n+        }\n+\n+        kernel_config = KernelConfig(kernel_mapping)\n+\n+        # Create a mock model on CUDA device\n+        mock_model = MagicMock()\n+        mock_model.training = False\n+\n+        # Mock parameter with CUDA device\n+        mock_param = MagicMock()\n+        mock_param.device.type = \"cuda\"\n+        mock_model.parameters.return_value = iter([mock_param])\n+\n+        # Mock named_modules with RMSNorm layer\n+        mock_layer = MagicMock()\n+        mock_layer.kernel_layer_name = \"RMSNorm\"\n+        mock_model.named_modules.return_value = [(\"layers.0\", mock_layer)]\n+\n+        # Trigger the mapping creation\n+        kernel_config.create_compatible_mapping(mock_model)\n+\n+        # Verify results\n+        result_mapping = kernel_config.kernel_mapping\n+\n+        self.assertIn(\"RMSNorm\", result_mapping, \"RMSNorm should be in mapping\")\n+        backends = list(result_mapping[\"RMSNorm\"].keys())\n+\n+        # Assert only CUDA is present, not ROCm\n+        self.assertIn(\"cuda\", backends, \"CUDA backend should be registered\")\n+        self.assertNotIn(\"rocm\", backends, \"ROCm backend should NOT be registered on CUDA device\")\n+\n+    def test_single_device_mapping_still_works(self):\n+        \"\"\"\n+        Test that single-device mappings continue to work as expected.\n+        \"\"\"\n+        kernel_mapping = {\"RMSNorm\": \"kernels-community/layer_norm:LlamaRMSNorm\"}\n+\n+        kernel_config = KernelConfig(kernel_mapping)\n+\n+        # Create a mock model\n+        mock_model = MagicMock()\n+        mock_model.training = False\n+\n+        mock_param = MagicMock()\n+        mock_param.device.type = \"cuda\"\n+        mock_model.parameters.return_value = iter([mock_param])\n+\n+        mock_layer = MagicMock()\n+        mock_layer.kernel_layer_name = \"RMSNorm\"\n+        mock_model.named_modules.return_value = [(\"layers.0\", mock_layer)]\n+        kernel_config.create_compatible_mapping(mock_model)\n+\n+        result_mapping = kernel_config.kernel_mapping\n+        self.assertIn(\"RMSNorm\", result_mapping, \"RMSNorm should be in mapping\")"
+        }
+    ],
+    "stats": {
+        "total": 79,
+        "additions": 76,
+        "deletions": 3
+    }
+}

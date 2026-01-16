@@ -1,0 +1,36 @@
+{
+    "author": "timneutkens",
+    "message": "Turbopack: Skip ssr processing when next/dynamic ssr: false (#77636)\n\n### What?\n\nEnsuring server-side processing for the loader function of\n`next/dynamic` with `ssr: false` is properly skipped in Turbopack.\n\n### Why?\nPreviously, client components imported through `next/dynamic` with `ssr:\nfalse` were not skipped, while they are skipped in webpack. This fix\nensures consistent behavior between Webpack and Turbopack. This is a\ncompilation performance win for applications that leverage this pattern\nheavily, as it can skip work it doesn't need to process.\n\nWas looking at fixing one of the failing tests in the list of remaining\ntests. Found it checked for this behavior and fixed it.\n\n### How?\n- Added the same `should_skip_ssr_compile` logic to the Turbopack state\nthat was already implemented for Webpack\n- When `ssr: false` is specified and we're in the server compiler we\nreplace the dynamic import with an empty async function to avoid\nbundling the client component on the server",
+    "sha": "55f24e0eb094ace8107717c1817db0cc49e517d9",
+    "files": [
+        {
+            "sha": "54afd85cc63a71f5809383f38edde0a85101b30e",
+            "filename": "crates/next-custom-transforms/src/transforms/dynamic.rs",
+            "status": "modified",
+            "additions": 34,
+            "deletions": 10,
+            "changes": 44,
+            "blob_url": "https://github.com/vercel/next.js/blob/55f24e0eb094ace8107717c1817db0cc49e517d9/crates%2Fnext-custom-transforms%2Fsrc%2Ftransforms%2Fdynamic.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/55f24e0eb094ace8107717c1817db0cc49e517d9/crates%2Fnext-custom-transforms%2Fsrc%2Ftransforms%2Fdynamic.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/crates%2Fnext-custom-transforms%2Fsrc%2Ftransforms%2Fdynamic.rs?ref=55f24e0eb094ace8107717c1817db0cc49e517d9",
+            "patch": "@@ -306,6 +306,11 @@ impl Fold for NextDynamicPatcher {\n                         }\n                     }\n \n+                    let should_skip_ssr_compile = has_ssr_false\n+                        && self.is_server_compiler\n+                        && !self.is_react_server_layer\n+                        && self.prefer_esm;\n+\n                     match &self.state {\n                         NextDynamicPatcherState::Webpack => {\n                             // Only use `require.resolveWebpack` to decouple modules for webpack,\n@@ -316,11 +321,7 @@ impl Fold for NextDynamicPatcher {\n                             //\n                             // Also transforming it to `require.resolveWeak` doesn't work with ESM\n                             // imports ( i.e. require.resolveWeak(esm asset)).\n-                            if has_ssr_false\n-                                && self.is_server_compiler\n-                                && !self.is_react_server_layer\n-                                && self.prefer_esm\n-                            {\n+                            if should_skip_ssr_compile {\n                                 // if it's server components SSR layer\n                                 // Transform 1st argument `expr.args[0]` aka the module loader from:\n                                 // dynamic(() => import('./client-mod'), { ssr: false }))`\n@@ -368,11 +369,34 @@ impl Fold for NextDynamicPatcher {\n                             dynamic_transition_name,\n                             ..\n                         } => {\n-                            // Add `{with:{turbopack-transition: ...}}` to the dynamic import\n-                            let mut visitor = DynamicImportTransitionAdder {\n-                                transition_name: dynamic_transition_name,\n-                            };\n-                            expr.args[0].visit_mut_with(&mut visitor);\n+                            // When `ssr: false`\n+                            // if it's server components SSR layer\n+                            // Transform 1st argument `expr.args[0]` aka the module loader from:\n+                            // dynamic(() => import('./client-mod'), { ssr: false }))`\n+                            // into:\n+                            // dynamic(async () => {}, { ssr: false }))`\n+                            if should_skip_ssr_compile {\n+                                let side_effect_free_loader_arg = Expr::Arrow(ArrowExpr {\n+                                    span: DUMMY_SP,\n+                                    params: vec![],\n+                                    body: Box::new(BlockStmtOrExpr::BlockStmt(BlockStmt {\n+                                        span: DUMMY_SP,\n+                                        stmts: vec![],\n+                                        ..Default::default()\n+                                    })),\n+                                    is_async: true,\n+                                    is_generator: false,\n+                                    ..Default::default()\n+                                });\n+\n+                                expr.args[0] = side_effect_free_loader_arg.as_arg();\n+                            } else {\n+                                // Add `{with:{turbopack-transition: ...}}` to the dynamic import\n+                                let mut visitor = DynamicImportTransitionAdder {\n+                                    transition_name: dynamic_transition_name,\n+                                };\n+                                expr.args[0].visit_mut_with(&mut visitor);\n+                            }\n                         }\n                     }\n "
+        },
+        {
+            "sha": "bea9e1b38892e4b993c7f24243b856fdd4e88e18",
+            "filename": "test/turbopack-build-tests-manifest.json",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 3,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/55f24e0eb094ace8107717c1817db0cc49e517d9/test%2Fturbopack-build-tests-manifest.json",
+            "raw_url": "https://github.com/vercel/next.js/raw/55f24e0eb094ace8107717c1817db0cc49e517d9/test%2Fturbopack-build-tests-manifest.json",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fturbopack-build-tests-manifest.json?ref=55f24e0eb094ace8107717c1817db0cc49e517d9",
+            "patch": "@@ -2146,11 +2146,10 @@\n       \"app dir - next/dynamic should handle next/dynamic in hydration correctly\",\n       \"app dir - next/dynamic should handle ssr: false in pages when appDir is enabled\",\n       \"app dir - next/dynamic should not render loading by default\",\n-      \"app dir - next/dynamic should render loading by default if loading is specified and loader is slow\"\n-    ],\n-    \"failed\": [\n+      \"app dir - next/dynamic should render loading by default if loading is specified and loader is slow\",\n       \"app dir - next/dynamic no SSR should not render client component imported through ssr: false in client components in edge runtime\"\n     ],\n+    \"failed\": [],\n     \"pending\": [],\n     \"flakey\": [],\n     \"runtimeError\": false"
+        }
+    ],
+    "stats": {
+        "total": 49,
+        "additions": 36,
+        "deletions": 13
+    }
+}

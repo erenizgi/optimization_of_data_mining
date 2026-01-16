@@ -1,0 +1,72 @@
+{
+    "author": "ijjk",
+    "message": "Fix tracing of server actions imported by client components (#78968)\n\nThis fixes us failing to trace actions imported by client components due\nto the transform removing the actions import so our tracing isn't able\nto discover the action import correctly. This was previously handled in\nhttps://github.com/vercel/next.js/pull/73710/files#diff-f39646a8a89ce97754025c8258dc0709f67e4340c07735a3a82a87595ba01c10L526\nbut removed as part of the experiment.\n\nA regression test for the `use client` importing an actions file with\nfile needing to be traced has been added.",
+    "sha": "af0473b7f43bbabe0b327ec65348bf85610a1153",
+    "files": [
+        {
+            "sha": "5709b0440d1413425911025bcbeee4ec15513ad5",
+            "filename": "packages/next/src/build/webpack-config.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/af0473b7f43bbabe0b327ec65348bf85610a1153/packages%2Fnext%2Fsrc%2Fbuild%2Fwebpack-config.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/af0473b7f43bbabe0b327ec65348bf85610a1153/packages%2Fnext%2Fsrc%2Fbuild%2Fwebpack-config.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Fwebpack-config.ts?ref=af0473b7f43bbabe0b327ec65348bf85610a1153",
+            "patch": "@@ -1962,6 +1962,7 @@ export default async function getBaseWebpackConfig(\n             appDirEnabled: hasAppDir,\n             traceIgnores: [],\n             compilerType,\n+            swcLoaderConfig: swcDefaultLoader,\n           }\n         ),\n       // Moment.js is an extremely popular library that bundles large locale files"
+        },
+        {
+            "sha": "3f0d1c98666c5133d464ecc4af589de3c24b8fb1",
+            "filename": "packages/next/src/build/webpack/plugins/next-trace-entrypoints-plugin.ts",
+            "status": "modified",
+            "additions": 75,
+            "deletions": 0,
+            "changes": 75,
+            "blob_url": "https://github.com/vercel/next.js/blob/af0473b7f43bbabe0b327ec65348bf85610a1153/packages%2Fnext%2Fsrc%2Fbuild%2Fwebpack%2Fplugins%2Fnext-trace-entrypoints-plugin.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/af0473b7f43bbabe0b327ec65348bf85610a1153/packages%2Fnext%2Fsrc%2Fbuild%2Fwebpack%2Fplugins%2Fnext-trace-entrypoints-plugin.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Fwebpack%2Fplugins%2Fnext-trace-entrypoints-plugin.ts?ref=af0473b7f43bbabe0b327ec65348bf85610a1153",
+            "patch": "@@ -18,8 +18,10 @@ import picomatch from 'next/dist/compiled/picomatch'\n import { getModuleBuildInfo } from '../loaders/get-module-build-info'\n import { getPageFilePath } from '../../entries'\n import { resolveExternal } from '../../handle-externals'\n+import swcLoader, { type SWCLoaderOptions } from '../loaders/next-swc-loader'\n import { isMetadataRouteFile } from '../../../lib/metadata/is-metadata-route'\n import { getCompilationSpan } from '../utils'\n+import { isClientComponentEntryModule } from '../loaders/utils'\n \n const PLUGIN_NAME = 'TraceEntryPointsPlugin'\n export const TRACE_IGNORES = [\n@@ -137,6 +139,10 @@ export class TraceEntryPointsPlugin implements webpack.WebpackPluginInstance {\n   private traceIgnores: string[]\n   private esmExternals?: NextConfigComplete['experimental']['esmExternals']\n   private compilerType: CompilerNameValues\n+  private swcLoaderConfig: {\n+    loader: string\n+    options: Partial<SWCLoaderOptions>\n+  }\n \n   constructor({\n     rootDir,\n@@ -147,6 +153,7 @@ export class TraceEntryPointsPlugin implements webpack.WebpackPluginInstance {\n     traceIgnores,\n     esmExternals,\n     outputFileTracingRoot,\n+    swcLoaderConfig,\n   }: {\n     rootDir: string\n     compilerType: CompilerNameValues\n@@ -156,6 +163,7 @@ export class TraceEntryPointsPlugin implements webpack.WebpackPluginInstance {\n     traceIgnores?: string[]\n     outputFileTracingRoot?: string\n     esmExternals?: NextConfigComplete['experimental']['esmExternals']\n+    swcLoaderConfig: TraceEntryPointsPlugin['swcLoaderConfig']\n   }) {\n     this.rootDir = rootDir\n     this.appDir = appDir\n@@ -166,6 +174,7 @@ export class TraceEntryPointsPlugin implements webpack.WebpackPluginInstance {\n     this.traceIgnores = traceIgnores || []\n     this.tracingRoot = outputFileTracingRoot || rootDir\n     this.compilerType = compilerType\n+    this.swcLoaderConfig = swcLoaderConfig\n   }\n \n   // Here we output all traced assets and webpack chunks to a\n@@ -400,6 +409,18 @@ export class TraceEntryPointsPlugin implements webpack.WebpackPluginInstance {\n                 }\n               })\n \n+            const readOriginalSource = (path: string) => {\n+              return new Promise<string | Buffer>((resolve) => {\n+                compilation.inputFileSystem.readFile(path, (err, result) => {\n+                  if (err) {\n+                    // we can't throw here as that crashes build un-necessarily\n+                    return resolve('')\n+                  }\n+                  resolve(result || '')\n+                })\n+              })\n+            }\n+\n             const readFile = async (\n               path: string\n             ): Promise<Buffer | string | null> => {\n@@ -408,6 +429,60 @@ export class TraceEntryPointsPlugin implements webpack.WebpackPluginInstance {\n               // map the transpiled source when available to avoid\n               // parse errors in node-file-trace\n               let source: Buffer | string = mod?.originalSource?.()?.buffer()\n+\n+              try {\n+                // fallback to reading raw source file, this may fail\n+                // due to unsupported syntax but best effort attempt\n+                let usingOriginalSource = false\n+                if (!source || isClientComponentEntryModule(mod)) {\n+                  source = await readOriginalSource(path)\n+                  usingOriginalSource = true\n+                }\n+                const sourceString = source.toString()\n+\n+                // If this is a client component we need to trace the\n+                // original transpiled source not the client proxy which is\n+                // applied before this plugin is run due to the\n+                // client-module-loader\n+                if (\n+                  usingOriginalSource &&\n+                  // don't attempt transpiling CSS or image imports\n+                  path.match(/\\.(tsx|ts|js|cjs|mjs|jsx)$/)\n+                ) {\n+                  let transformResolve: (result: string) => void\n+                  let transformReject: (error: unknown) => void\n+                  const transformPromise = new Promise<string>(\n+                    (resolve, reject) => {\n+                      transformResolve = resolve\n+                      transformReject = reject\n+                    }\n+                  )\n+\n+                  // TODO: should we apply all loaders except the\n+                  // client-module-loader?\n+                  swcLoader.apply(\n+                    {\n+                      resourcePath: path,\n+                      getOptions: () => {\n+                        return this.swcLoaderConfig.options\n+                      },\n+                      async: () => {\n+                        return (err: unknown, result: string) => {\n+                          if (err) {\n+                            return transformReject(err)\n+                          }\n+                          return transformResolve(result)\n+                        }\n+                      },\n+                    },\n+                    [sourceString, undefined]\n+                  )\n+                  source = await transformPromise\n+                }\n+              } catch {\n+                /* non-fatal */\n+              }\n+\n               return source || ''\n             }\n "
+        },
+        {
+            "sha": "f6f8c4a65c24e02e5dac0cb119cc4bd14ca7137f",
+            "filename": "test/e2e/app-dir/actions/app-action.test.ts",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 1,
+            "changes": 13,
+            "blob_url": "https://github.com/vercel/next.js/blob/af0473b7f43bbabe0b327ec65348bf85610a1153/test%2Fe2e%2Fapp-dir%2Factions%2Fapp-action.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/af0473b7f43bbabe0b327ec65348bf85610a1153/test%2Fe2e%2Fapp-dir%2Factions%2Fapp-action.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Factions%2Fapp-action.test.ts?ref=af0473b7f43bbabe0b327ec65348bf85610a1153",
+            "patch": "@@ -10,7 +10,7 @@ import {\n import type { Request, Response } from 'playwright'\n import fs from 'fs-extra'\n import nodeFs from 'fs'\n-import { join } from 'path'\n+import path, { join } from 'path'\n import { outdent } from 'outdent'\n \n const GENERIC_RSC_ERROR =\n@@ -31,6 +31,17 @@ describe('app-dir action handling', () => {\n       },\n     })\n \n+  if (isNextStart) {\n+    it('should trace server action imported by client correctly', async () => {\n+      const traceData = await next.readJSON(\n+        path.join('.next', 'server', 'app', 'client', 'page.js.nft.json')\n+      )\n+      expect(traceData.files.some((file) => file.includes('data.txt'))).toBe(\n+        true\n+      )\n+    })\n+  }\n+\n   it('should handle action correctly with middleware rewrite', async () => {\n     const browser = await next.browser('/rewrite-to-static-first')\n     let actionRequestStatus: number | undefined"
+        },
+        {
+            "sha": "bab80a65022efed6ed6c3a1f3d32415ec66a2b40",
+            "filename": "test/e2e/app-dir/actions/app/client/actions.js",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/vercel/next.js/blob/af0473b7f43bbabe0b327ec65348bf85610a1153/test%2Fe2e%2Fapp-dir%2Factions%2Fapp%2Fclient%2Factions.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/af0473b7f43bbabe0b327ec65348bf85610a1153/test%2Fe2e%2Fapp-dir%2Factions%2Fapp%2Fclient%2Factions.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Factions%2Fapp%2Fclient%2Factions.js?ref=af0473b7f43bbabe0b327ec65348bf85610a1153",
+            "patch": "@@ -5,6 +5,13 @@ import 'server-only'\n import { redirect } from 'next/navigation'\n import { headers, cookies } from 'next/headers'\n \n+try {\n+  require('fs').readFileSync(\n+    require('path').join(process.cwd(), 'data.txt'),\n+    'utf8'\n+  )\n+} catch {}\n+\n export async function getHeaders() {\n   console.log('accept header:', (await headers()).get('accept'))\n   ;(await cookies()).set('test-cookie', Date.now())"
+        },
+        {
+            "sha": "95d09f2b10159347eece71399a7e2e907ea3df4f",
+            "filename": "test/e2e/app-dir/actions/data.txt",
+            "status": "added",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/af0473b7f43bbabe0b327ec65348bf85610a1153/test%2Fe2e%2Fapp-dir%2Factions%2Fdata.txt",
+            "raw_url": "https://github.com/vercel/next.js/raw/af0473b7f43bbabe0b327ec65348bf85610a1153/test%2Fe2e%2Fapp-dir%2Factions%2Fdata.txt",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Factions%2Fdata.txt?ref=af0473b7f43bbabe0b327ec65348bf85610a1153",
+            "patch": "@@ -0,0 +1 @@\n+hello world\n\\ No newline at end of file"
+        }
+    ],
+    "stats": {
+        "total": 97,
+        "additions": 96,
+        "deletions": 1
+    }
+}

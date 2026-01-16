@@ -1,0 +1,96 @@
+{
+    "author": "zucchini-nlp",
+    "message": "IDEFICS: support inputs embeds (#34043)\n\n* support embeds\r\n\r\n* use cache from config\r\n\r\n* style...\r\n\r\n* fix tests after rebase",
+    "sha": "d087165db08a2ebae6bca29ea014784197511ebd",
+    "files": [
+        {
+            "sha": "f9ab6fce6cf2eb8c136646a4fcdbd67dd330036b",
+            "filename": "src/transformers/generation/utils.py",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 4,
+            "changes": 8,
+            "blob_url": "https://github.com/huggingface/transformers/blob/d087165db08a2ebae6bca29ea014784197511ebd/src%2Ftransformers%2Fgeneration%2Futils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/d087165db08a2ebae6bca29ea014784197511ebd/src%2Ftransformers%2Fgeneration%2Futils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fgeneration%2Futils.py?ref=d087165db08a2ebae6bca29ea014784197511ebd",
+            "patch": "@@ -857,7 +857,7 @@ def _get_logits_processor(\n                     self,\n                     unconditional_ids=negative_prompt_ids,\n                     unconditional_attention_mask=negative_prompt_attention_mask,\n-                    use_cache=model_kwargs[\"use_cache\"],\n+                    use_cache=generation_config.use_cache,\n                 )\n             )\n         if generation_config.sequence_bias is not None:\n@@ -2004,10 +2004,7 @@ def generate(\n         # decoder-only models with inputs_embeds forwarding must use caching (otherwise we can't detect whether we are\n         # generating the first new token or not, and we only want to use the embeddings for the first new token)\n         if not self.config.is_encoder_decoder and model_input_name == \"inputs_embeds\":\n-            model_kwargs[\"use_cache\"] = True\n             generation_config.use_cache = True\n-        else:\n-            model_kwargs[\"use_cache\"] = generation_config.use_cache\n \n         if not kwargs_has_attention_mask and requires_attention_mask and accepts_attention_mask:\n             model_kwargs[\"attention_mask\"] = self._prepare_attention_mask_for_generation(\n@@ -2116,6 +2113,9 @@ def generate(\n             generation_config=generation_config, stopping_criteria=stopping_criteria, tokenizer=tokenizer, **kwargs\n         )\n \n+        # Set model_kwargs `use_cache` so we can use it later in forward runs\n+        model_kwargs[\"use_cache\"] = generation_config.use_cache\n+\n         # 10. go into different generation modes\n         if generation_mode == GenerationMode.ASSISTED_GENERATION:\n             if generation_config.num_return_sequences > 1:"
+        },
+        {
+            "sha": "4dd5f36a93e166c061f7c13d6f0fcd49ed903ef8",
+            "filename": "src/transformers/models/idefics/modeling_idefics.py",
+            "status": "modified",
+            "additions": 22,
+            "deletions": 12,
+            "changes": 34,
+            "blob_url": "https://github.com/huggingface/transformers/blob/d087165db08a2ebae6bca29ea014784197511ebd/src%2Ftransformers%2Fmodels%2Fidefics%2Fmodeling_idefics.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/d087165db08a2ebae6bca29ea014784197511ebd/src%2Ftransformers%2Fmodels%2Fidefics%2Fmodeling_idefics.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fidefics%2Fmodeling_idefics.py?ref=d087165db08a2ebae6bca29ea014784197511ebd",
+            "patch": "@@ -1663,19 +1663,31 @@ def forward(\n     def prepare_inputs_for_generation(\n         self,\n         input_ids,\n-        past_key_values=None,\n         attention_mask=None,\n         position_ids=None,\n+        inputs_embeds=None,\n+        past_key_values=None,\n+        cache_position=None,\n         pixel_values=None,\n         image_hidden_states=None,\n         image_attention_mask=None,\n         use_cache=None,\n-        cache_position=None,\n         **kwargs,\n     ):\n+        model_inputs = {}\n+        if image_hidden_states is not None:\n+            if self.config.use_resampler:\n+                model_inputs[\"perceiver_embeddings\"] = image_hidden_states\n+            else:\n+                model_inputs[\"image_encoder_embeddings\"] = image_hidden_states\n+        else:\n+            model_inputs[\"pixel_values\"] = pixel_values\n+\n         # If we have cache: let's slice `input_ids` through `cache_position`, to keep only the unprocessed tokens\n         if past_key_values is not None:\n-            if input_ids.shape[1] != cache_position.shape[0]:\n+            if inputs_embeds is not None:\n+                input_ids = input_ids[:, -cache_position.shape[0] :]\n+            elif input_ids.shape[1] != cache_position.shape[0]:\n                 input_ids = input_ids[:, cache_position]\n                 if image_attention_mask is not None:\n                     image_attention_mask = image_attention_mask[:, -input_ids.shape[1] :]\n@@ -1690,19 +1702,17 @@ def prepare_inputs_for_generation(\n                 # This `clone` call is needed to avoid recapturing cuda graphs with `torch.compile`'s  `mode=\"reduce-overhead`, as otherwise the input `position_ids` would have various stride during the decoding. Here, simply using `.contiguous()` is not sufficient as in the batch size = 1 case, `position_ids` is already contiguous but with varying stride which retriggers a capture.\n                 position_ids = position_ids.clone(memory_format=torch.contiguous_format)\n \n-        model_inputs = {}\n-        image_hidden_states = kwargs.pop(\"image_hidden_states\", None)\n-        if image_hidden_states is not None:\n-            if self.config.use_resampler:\n-                model_inputs[\"perceiver_embeddings\"] = image_hidden_states\n-            else:\n-                model_inputs[\"image_encoder_embeddings\"] = image_hidden_states\n+        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step\n+        if inputs_embeds is not None and cache_position[0] == 0:\n+            model_inputs.update({\"inputs_embeds\": inputs_embeds, \"input_ids\": None})\n         else:\n-            model_inputs[\"pixel_values\"] = pixel_values\n+            # The clone here is for the same reason as for `position_ids`.\n+            model_inputs.update(\n+                {\"input_ids\": input_ids.clone(memory_format=torch.contiguous_format), \"inputs_embeds\": None}\n+            )\n \n         model_inputs.update(\n             {\n-                \"input_ids\": input_ids,\n                 \"past_key_values\": past_key_values,\n                 \"use_cache\": use_cache,\n                 \"cache_position\": cache_position,"
+        },
+        {
+            "sha": "250c47c3a7e8ceb1e7407f75e38e54a33fb70c0e",
+            "filename": "tests/models/idefics/test_modeling_idefics.py",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/huggingface/transformers/blob/d087165db08a2ebae6bca29ea014784197511ebd/tests%2Fmodels%2Fidefics%2Ftest_modeling_idefics.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/d087165db08a2ebae6bca29ea014784197511ebd/tests%2Fmodels%2Fidefics%2Ftest_modeling_idefics.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fidefics%2Ftest_modeling_idefics.py?ref=d087165db08a2ebae6bca29ea014784197511ebd",
+            "patch": "@@ -772,6 +772,12 @@ def test_contrastive_generate_low_memory(self):\n     def test_custom_4d_attention_mask(self):\n         pass\n \n+    @unittest.skip(\n+        reason=\"IDEFICS has specific requirements for working with inputs embeds like passing also the ids and pixels\"\n+    )\n+    def test_generate_from_inputs_embeds_decoder_only(self):\n+        pass\n+\n     @unittest.skip(reason=\"IDEFICS cannot compile due to dynamic control flow when checking inputs\")\n     def test_generate_compile_fullgraph(self):\n         pass"
+        },
+        {
+            "sha": "4071fcbb23280526a63b1118a582d60c846f7bf3",
+            "filename": "tests/models/idefics2/test_modeling_idefics2.py",
+            "status": "modified",
+            "additions": 25,
+            "deletions": 0,
+            "changes": 25,
+            "blob_url": "https://github.com/huggingface/transformers/blob/d087165db08a2ebae6bca29ea014784197511ebd/tests%2Fmodels%2Fidefics2%2Ftest_modeling_idefics2.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/d087165db08a2ebae6bca29ea014784197511ebd/tests%2Fmodels%2Fidefics2%2Ftest_modeling_idefics2.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fidefics2%2Ftest_modeling_idefics2.py?ref=d087165db08a2ebae6bca29ea014784197511ebd",
+            "patch": "@@ -539,6 +539,31 @@ def test_resize_embeddings_untied(self):\n             # Check that the model can still do a forward pass successfully (every parameter should be resized)\n             model(**self._prepare_for_class(inputs_dict, model_class))\n \n+    def test_inputs_embeds_matches_input_ids_with_generate(self):\n+        # overwrite because IDEFICS needs ids and embeds at the input to be not None\n+        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()\n+        for model_class in self.all_model_classes:\n+            model = model_class(config)\n+            model.to(torch_device)\n+            model.eval()\n+\n+            inputs = copy.deepcopy(self._prepare_for_class(inputs_dict, model_class))\n+            pad_token_id = config.pad_token_id if config.pad_token_id is not None else 1\n+\n+            wte = model.get_input_embeddings()\n+\n+            input_ids = inputs[\"input_ids\"]\n+            # some models infer position ids/attn mask differently when input ids\n+            # by check if pad_token let's make sure no padding is in input ids\n+            not_pad_token_id = pad_token_id + 1 if max(0, pad_token_id - 1) == 0 else pad_token_id - 1\n+            input_ids[input_ids == pad_token_id] = not_pad_token_id\n+            del inputs[\"input_ids\"]\n+            inputs_embeds = wte(input_ids)\n+            out_ids = model.generate(input_ids=input_ids, **inputs, max_new_tokens=2)\n+            out_embeds = model.generate(input_ids=input_ids, inputs_embeds=inputs_embeds, **inputs, max_new_tokens=2)\n+\n+            self.assertTrue(torch.allclose(out_embeds, out_ids))\n+\n \n @require_torch\n class Idefics2ForConditionalGenerationIntegrationTest(unittest.TestCase):"
+        },
+        {
+            "sha": "f0366e7b539a5070601249f89618c81be1522437",
+            "filename": "tests/models/idefics3/test_modeling_idefics3.py",
+            "status": "modified",
+            "additions": 25,
+            "deletions": 0,
+            "changes": 25,
+            "blob_url": "https://github.com/huggingface/transformers/blob/d087165db08a2ebae6bca29ea014784197511ebd/tests%2Fmodels%2Fidefics3%2Ftest_modeling_idefics3.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/d087165db08a2ebae6bca29ea014784197511ebd/tests%2Fmodels%2Fidefics3%2Ftest_modeling_idefics3.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fidefics3%2Ftest_modeling_idefics3.py?ref=d087165db08a2ebae6bca29ea014784197511ebd",
+            "patch": "@@ -526,6 +526,31 @@ def test_resize_embeddings_untied(self):\n             # Check that the model can still do a forward pass successfully (every parameter should be resized)\n             model(**self._prepare_for_class(inputs_dict, model_class))\n \n+    def test_inputs_embeds_matches_input_ids_with_generate(self):\n+        # overwrite because IDEFICS needs ids and embeds at the input to be not None\n+        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()\n+        for model_class in self.all_model_classes:\n+            model = model_class(config)\n+            model.to(torch_device)\n+            model.eval()\n+\n+            inputs = copy.deepcopy(self._prepare_for_class(inputs_dict, model_class))\n+            pad_token_id = config.pad_token_id if config.pad_token_id is not None else 1\n+\n+            wte = model.get_input_embeddings()\n+\n+            input_ids = inputs[\"input_ids\"]\n+            # some models infer position ids/attn mask differently when input ids\n+            # by check if pad_token let's make sure no padding is in input ids\n+            not_pad_token_id = pad_token_id + 1 if max(0, pad_token_id - 1) == 0 else pad_token_id - 1\n+            input_ids[input_ids == pad_token_id] = not_pad_token_id\n+            del inputs[\"input_ids\"]\n+            inputs_embeds = wte(input_ids)\n+            out_ids = model.generate(input_ids=input_ids, **inputs, max_new_tokens=2)\n+            out_embeds = model.generate(input_ids=input_ids, inputs_embeds=inputs_embeds, **inputs, max_new_tokens=2)\n+\n+            self.assertTrue(torch.allclose(out_embeds, out_ids))\n+\n \n @require_torch\n class Idefics3ForConditionalGenerationIntegrationTest(unittest.TestCase):"
+        },
+        {
+            "sha": "22cbffcfdb6b130325e34634889a63d00d37c8f0",
+            "filename": "tests/models/kosmos2/test_modeling_kosmos2.py",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/huggingface/transformers/blob/d087165db08a2ebae6bca29ea014784197511ebd/tests%2Fmodels%2Fkosmos2%2Ftest_modeling_kosmos2.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/d087165db08a2ebae6bca29ea014784197511ebd/tests%2Fmodels%2Fkosmos2%2Ftest_modeling_kosmos2.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fkosmos2%2Ftest_modeling_kosmos2.py?ref=d087165db08a2ebae6bca29ea014784197511ebd",
+            "patch": "@@ -428,6 +428,12 @@ def check_same_values(layer_1, layer_2):\n             # self.assertTrue(model.transformer.wte.weight.shape, model.lm_head.weight.shape)\n             # self.assertTrue(check_same_values(model.transformer.wte, model.lm_head))\n \n+    @unittest.skip(\n+        \"KOSMOS-2 doesn't support inputs embeds. The test isn't skipped by checking ipnut args because KOSMOS-2 has `generate()` overwritten\"\n+    )\n+    def test_inputs_embeds_matches_input_ids_with_generate(self):\n+        pass\n+\n     @slow\n     def test_model_from_pretrained(self):\n         model_name = \"microsoft/kosmos-2-patch14-224\""
+        },
+        {
+            "sha": "da33bbb48c5a363224473b8d264aa8115aede6be",
+            "filename": "tests/test_modeling_common.py",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 2,
+            "changes": 14,
+            "blob_url": "https://github.com/huggingface/transformers/blob/d087165db08a2ebae6bca29ea014784197511ebd/tests%2Ftest_modeling_common.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/d087165db08a2ebae6bca29ea014784197511ebd/tests%2Ftest_modeling_common.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Ftest_modeling_common.py?ref=d087165db08a2ebae6bca29ea014784197511ebd",
+            "patch": "@@ -3000,8 +3000,11 @@ def test_inputs_embeds_matches_input_ids(self):\n \n     def test_inputs_embeds_matches_input_ids_with_generate(self):\n         config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()\n-        for model_class in self.all_generative_model_classes:\n-            if model_class.__name__ not in get_values(MODEL_FOR_CAUSAL_LM_MAPPING_NAMES):\n+        for model_class in self.all_model_classes:\n+            if model_class.__name__ not in [\n+                *get_values(MODEL_FOR_CAUSAL_LM_MAPPING_NAMES),\n+                *get_values(MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES),\n+            ]:\n                 continue\n             model = model_class(config)\n             model.to(torch_device)\n@@ -3018,6 +3021,13 @@ def test_inputs_embeds_matches_input_ids_with_generate(self):\n             inputs = copy.deepcopy(self._prepare_for_class(inputs_dict, model_class))\n             pad_token_id = config.pad_token_id if config.pad_token_id is not None else 1\n \n+            # VLMs can't generate with embeds and pixels at the same time. We expect the user to pass merged\n+            # embeds already\n+            if model_class.__name__ in get_values(MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES):\n+                inputs.pop(\"pixel_values\", None)\n+                inputs.pop(\"pixel_values_videos\", None)\n+                inputs.pop(\"pixel_values_images\", None)\n+\n             wte = model.get_input_embeddings()\n             if not self.is_encoder_decoder:\n                 input_ids = inputs[\"input_ids\"]"
+        }
+    ],
+    "stats": {
+        "total": 118,
+        "additions": 100,
+        "deletions": 18
+    }
+}

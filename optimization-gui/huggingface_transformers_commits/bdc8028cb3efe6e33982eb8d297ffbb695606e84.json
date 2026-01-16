@@ -1,0 +1,36 @@
+{
+    "author": "kylesayrs",
+    "message": "[Core] [Offloading] Enable saving offloaded models with multiple shared tensor groups (#39263)\n\n* fix counting meta tensors, fix onloading meta tensors\n\nSigned-off-by: Kyle Sayers <kylesayrs@gmail.com>\n\n* remove unrelated fix\n\nSigned-off-by: Kyle Sayers <kylesayrs@gmail.com>\n\n* add test\n\nSigned-off-by: Kyle Sayers <kylesayrs@gmail.com>\n\n---------\n\nSigned-off-by: Kyle Sayers <kylesayrs@gmail.com>",
+    "sha": "bdc8028cb3efe6e33982eb8d297ffbb695606e84",
+    "files": [
+        {
+            "sha": "a2913f22965138c60052283c0cf7b75fc5815e0d",
+            "filename": "src/transformers/modeling_utils.py",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 18,
+            "changes": 34,
+            "blob_url": "https://github.com/huggingface/transformers/blob/bdc8028cb3efe6e33982eb8d297ffbb695606e84/src%2Ftransformers%2Fmodeling_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/bdc8028cb3efe6e33982eb8d297ffbb695606e84/src%2Ftransformers%2Fmodeling_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodeling_utils.py?ref=bdc8028cb3efe6e33982eb8d297ffbb695606e84",
+            "patch": "@@ -3835,27 +3835,23 @@ def save_pretrained(\n             # We're going to remove aliases before saving\n             ptrs = collections.defaultdict(list)\n             for name, tensor in state_dict.items():\n-                # Sometimes in the state_dict we have non-tensor objects.\n-                # e.g. in bitsandbytes we have some `str` objects in the state_dict\n-                if isinstance(tensor, torch.Tensor):\n-                    ptrs[id_tensor_storage(tensor)].append(name)\n-                else:\n+                if not isinstance(tensor, torch.Tensor):\n+                    # Sometimes in the state_dict we have non-tensor objects.\n+                    # e.g. in bitsandbytes we have some `str` objects in the state_dict\n                     # In the non-tensor case, fall back to the pointer of the object itself\n                     ptrs[id(tensor)].append(name)\n \n-            # These are all the pointers of shared tensors\n-            if hasattr(self, \"hf_device_map\"):\n-                # if the model has offloaded parameters, we must check using find_tied_parameters()\n-                tied_params = find_tied_parameters(self)\n-                if tied_params:\n-                    tied_names = tied_params[0]\n-                    shared_ptrs = {\n-                        ptr: names for ptr, names in ptrs.items() if any(name in tied_names for name in names)\n-                    }\n+                elif tensor.device.type == \"meta\":\n+                    # In offloaded cases, there may be meta tensors in the state_dict.\n+                    # For these cases, key by the pointer of the original tensor object\n+                    # (state_dict tensors are detached and therefore no longer shared)\n+                    tensor = self.get_parameter(name)\n+                    ptrs[id(tensor)].append(name)\n+\n                 else:\n-                    shared_ptrs = {}\n-            else:\n-                shared_ptrs = {ptr: names for ptr, names in ptrs.items() if len(names) > 1}\n+                    ptrs[id_tensor_storage(tensor)].append(name)\n+\n+            shared_ptrs = {ptr: names for ptr, names in ptrs.items() if len(names) > 1}\n \n             # Recursively descend to find tied weight keys\n             _tied_weights_keys = _get_tied_weight_keys(self)\n@@ -3899,7 +3895,9 @@ def save_pretrained(\n \n             if len(error_names) > 0:\n                 raise RuntimeError(\n-                    f\"The weights trying to be saved contained shared tensors {error_names} that are mismatching the transformers base configuration. Try saving using `safe_serialization=False` or remove this tensor sharing.\",\n+                    f\"The weights trying to be saved contained shared tensors {error_names} that are mismatching \"\n+                    \"the transformers base configuration. Try saving using `safe_serialization=False`, setting the \"\n+                    \"`_dynamic_tied_weights_keys` attribute for affected modules, or remove this tensor sharing.\",\n                 )\n \n         # Shard the model if it is too big."
+        },
+        {
+            "sha": "6754e229125d419162695abfa18e4ccdc6b52e36",
+            "filename": "tests/utils/test_modeling_utils.py",
+            "status": "modified",
+            "additions": 23,
+            "deletions": 0,
+            "changes": 23,
+            "blob_url": "https://github.com/huggingface/transformers/blob/bdc8028cb3efe6e33982eb8d297ffbb695606e84/tests%2Futils%2Ftest_modeling_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/bdc8028cb3efe6e33982eb8d297ffbb695606e84/tests%2Futils%2Ftest_modeling_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Futils%2Ftest_modeling_utils.py?ref=bdc8028cb3efe6e33982eb8d297ffbb695606e84",
+            "patch": "@@ -1187,6 +1187,29 @@ def test_save_offloaded_model(self):\n         torch.testing.assert_close(output, presaved_output, rtol=1e-4, atol=1e-4)\n         torch.testing.assert_close(presaved_output, postsaved_output)\n \n+    @require_accelerate\n+    @mark.accelerate_tests\n+    @require_torch_accelerator\n+    def test_save_offloaded_model_dynamic_tied_weights_keys(self):\n+        from accelerate import dispatch_model\n+\n+        device_map = {\"base\": f\"{torch_device}:0\", \"linear\": \"cpu\", \"linear2\": \"cpu\"}\n+        model = ModelWithHead(PretrainedConfig())\n+        dispatch_model(model, device_map)\n+\n+        transform_a = torch.nn.Linear(1, 1, bias=False)\n+        transform_a._dynamic_tied_weights_keys = [\"weight\"]\n+        transform_b = torch.nn.Linear(1, 1, bias=False)\n+        transform_b._dynamic_tied_weights_keys = [\"weight\"]\n+\n+        model.linear.register_module(\"transform_a\", transform_a)\n+        model.linear.register_module(\"transform_b\", transform_b)\n+        model.linear2.register_module(\"transform_a\", transform_a)\n+        model.linear2.register_module(\"transform_b\", transform_b)\n+\n+        with tempfile.TemporaryDirectory() as tmp_dir:\n+            model.save_pretrained(tmp_dir)\n+\n     @require_safetensors\n     def test_use_safetensors(self):\n         # Should not raise anymore"
+        }
+    ],
+    "stats": {
+        "total": 57,
+        "additions": 39,
+        "deletions": 18
+    }
+}

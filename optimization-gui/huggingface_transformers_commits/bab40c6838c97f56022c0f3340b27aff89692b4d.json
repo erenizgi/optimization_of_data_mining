@@ -1,0 +1,36 @@
+{
+    "author": "pstjohn",
+    "message": "[core] support tensor-valued _extra_state values in `from_pretrained` (#38155)\n\nSupport tensor-valued _extra_state values\n\nTransformerEngine uses the pytorch get/set_extra_state API to store FP8\nlayer config information as bytes Tensor in the _extra_state entry in\nthe state dict. With recent changes to from_pretrained, this\nfunctionality has broken and loading a model that uses this API doesn't\nappear to work. This PR fixes the save/load pretrained functions for\nextra state entries that use a pytorch tensor, and adds a (currently\nx-failing) test for a dictionary extra state.\n\nSigned-off-by: Peter St. John <pstjohn@nvidia.com>",
+    "sha": "bab40c6838c97f56022c0f3340b27aff89692b4d",
+    "files": [
+        {
+            "sha": "bd09c1ae57d19518b67c8c6dbd03e6a07c9bef37",
+            "filename": "src/transformers/modeling_utils.py",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 3,
+            "changes": 14,
+            "blob_url": "https://github.com/huggingface/transformers/blob/bab40c6838c97f56022c0f3340b27aff89692b4d/src%2Ftransformers%2Fmodeling_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/bab40c6838c97f56022c0f3340b27aff89692b4d/src%2Ftransformers%2Fmodeling_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodeling_utils.py?ref=bab40c6838c97f56022c0f3340b27aff89692b4d",
+            "patch": "@@ -5577,8 +5577,8 @@ def _initialize_missing_keys(\n     def get_parameter_or_buffer(self, target: str):\n         \"\"\"\n         Return the parameter or buffer given by `target` if it exists, otherwise throw an error. This combines\n-        `get_parameter()` and `get_buffer()` in a single handy function. Note that it only work if `target` is a\n-        leaf of the model.\n+        `get_parameter()` and `get_buffer()` in a single handy function. If the target is an `_extra_state` attribute,\n+        it will return the extra state provided by the module. Note that it only work if `target` is a leaf of the model.\n         \"\"\"\n         try:\n             return self.get_parameter(target)\n@@ -5588,7 +5588,15 @@ def get_parameter_or_buffer(self, target: str):\n             return self.get_buffer(target)\n         except AttributeError:\n             pass\n-        raise AttributeError(f\"`{target}` is neither a parameter nor a buffer.\")\n+        module, param_name = get_module_from_name(self, target)\n+        if (\n+            param_name == \"_extra_state\"\n+            and getattr(module.__class__, \"get_extra_state\", torch.nn.Module.get_extra_state)\n+            is not torch.nn.Module.get_extra_state\n+        ):\n+            return module.get_extra_state()\n+\n+        raise AttributeError(f\"`{target}` is neither a parameter, buffer, nor extra state.\")\n \n \n PreTrainedModel.push_to_hub = copy_func(PreTrainedModel.push_to_hub)"
+        },
+        {
+            "sha": "cd0edd94571dcac06f1d05f260a5585eb704238d",
+            "filename": "tests/utils/test_modeling_utils.py",
+            "status": "modified",
+            "additions": 83,
+            "deletions": 0,
+            "changes": 83,
+            "blob_url": "https://github.com/huggingface/transformers/blob/bab40c6838c97f56022c0f3340b27aff89692b4d/tests%2Futils%2Ftest_modeling_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/bab40c6838c97f56022c0f3340b27aff89692b4d/tests%2Futils%2Ftest_modeling_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Futils%2Ftest_modeling_utils.py?ref=bab40c6838c97f56022c0f3340b27aff89692b4d",
+            "patch": "@@ -2815,3 +2815,86 @@ def test_identical(self):\n         shared_names, identical_names = _find_identical([{\"a\", \"b\"}], state_dict)\n         self.assertEqual(shared_names, [{\"a\", \"b\"}])\n         self.assertEqual(identical_names, [])\n+\n+\n+@require_torch\n+class TestSaveAndLoadModelWithExtraState(TestCasePlus):\n+    \"\"\"\n+    This test checks that a model can be saved and loaded that uses the torch extra state API.\n+    https://pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module.get_extra_state.\n+\n+    Currently, only tensor-valued extra_states are supported.\n+    \"\"\"\n+\n+    def test_save_and_load_model_with_tensor_extra_state(self):\n+        class MyConfig(PretrainedConfig):\n+            def __init__(self, **kwargs):\n+                super().__init__(**kwargs)\n+\n+        class MyModule(torch.nn.Module):\n+            def __init__(self):\n+                super().__init__()\n+                self.some_counter = 0\n+                self.linear = torch.nn.Linear(320, 320)\n+\n+            def get_extra_state(self):\n+                return torch.tensor(self.some_counter)\n+\n+            def set_extra_state(self, state):\n+                self.some_counter = state.item()\n+\n+        class MyModel(PreTrainedModel):\n+            config_class = MyConfig\n+\n+            def __init__(self, config: MyConfig):\n+                super().__init__(config)\n+                self.my_layer = MyModule()\n+\n+            def forward(self, hidden_states, attention_mask):\n+                return self.my_layer(hidden_states, attention_mask)\n+\n+        config = MyConfig()\n+        model = MyModel(config)\n+        model.my_layer.some_counter = 42\n+\n+        with tempfile.TemporaryDirectory() as tmpdirname:\n+            model.save_pretrained(tmpdirname)\n+            model = MyModel.from_pretrained(tmpdirname)\n+            self.assertEqual(model.my_layer.some_counter, 42)\n+\n+    @mark.xfail(reason=\"save and from_pretrained currently only supports tensor extra_state\")\n+    def test_save_and_load_model_with_dict_extra_state(self):\n+        class MyConfig(PretrainedConfig):\n+            def __init__(self, **kwargs):\n+                super().__init__(**kwargs)\n+\n+        class MyModule(torch.nn.Module):\n+            def __init__(self):\n+                super().__init__()\n+                self.some_counter = 0\n+                self.linear = torch.nn.Linear(320, 320)\n+\n+            def get_extra_state(self):\n+                return {\"some_counter\": self.some_counter}\n+\n+            def set_extra_state(self, state):\n+                self.some_counter = state[\"some_counter\"]\n+\n+        class MyModel(PreTrainedModel):\n+            config_class = MyConfig\n+\n+            def __init__(self, config: MyConfig):\n+                super().__init__(config)\n+                self.my_layer = MyModule()\n+\n+            def forward(self, hidden_states, attention_mask):\n+                return self.my_layer(hidden_states, attention_mask)\n+\n+        config = MyConfig()\n+        model = MyModel(config)\n+        model.my_layer.some_counter = 42\n+\n+        with tempfile.TemporaryDirectory() as tmpdirname:\n+            model.save_pretrained(tmpdirname)\n+            model = MyModel.from_pretrained(tmpdirname)\n+            self.assertEqual(model.my_layer.some_counter, 42)"
+        }
+    ],
+    "stats": {
+        "total": 97,
+        "additions": 94,
+        "deletions": 3
+    }
+}

@@ -1,0 +1,84 @@
+{
+    "author": "jiqing-feng",
+    "message": "Fix gpt-oss router_indices in EP (#40545)\n\n* fix out shape\n\nSigned-off-by: jiqing-feng <jiqing.feng@intel.com>\n\n* fix router indice\n\nSigned-off-by: jiqing-feng <jiqing.feng@intel.com>\n\n* fix mod\n\nSigned-off-by: jiqing-feng <jiqing.feng@intel.com>\n\n* fix masking\n\nSigned-off-by: jiqing-feng <jiqing.feng@intel.com>\n\n* fix typo\n\nSigned-off-by: jiqing-feng <jiqing.feng@intel.com>\n\n* fix typo\n\nSigned-off-by: jiqing-feng <jiqing.feng@intel.com>\n\n* fix format\n\nSigned-off-by: jiqing-feng <jiqing.feng@intel.com>\n\n* add safety cheking\n\nSigned-off-by: jiqing-feng <jiqing.feng@intel.com>\n\n* fix checking\n\nSigned-off-by: jiqing-feng <jiqing.feng@intel.com>\n\n* enable 1 expert per rank\n\nSigned-off-by: jiqing-feng <jiqing.feng@intel.com>\n\n* fix skip\n\nSigned-off-by: jiqing-feng <jiqing.feng@intel.com>\n\n* add ep plan in config\n\nSigned-off-by: jiqing-feng <jiqing.feng@intel.com>\n\n* add update ep plan\n\nSigned-off-by: jiqing-feng <jiqing.feng@intel.com>\n\n* fix typo\n\nSigned-off-by: jiqing-feng <jiqing.feng@intel.com>\n\n* rm ep_plan and add comments\n\nSigned-off-by: jiqing-feng <jiqing.feng@intel.com>\n\n---------\n\nSigned-off-by: jiqing-feng <jiqing.feng@intel.com>",
+    "sha": "3340ccbd403b3f5f9cec79a063b674eb174f2b60",
+    "files": [
+        {
+            "sha": "3f9d40f1338815323662c916ef59f71adbb73d74",
+            "filename": "src/transformers/integrations/tensor_parallel.py",
+            "status": "modified",
+            "additions": 20,
+            "deletions": 8,
+            "changes": 28,
+            "blob_url": "https://github.com/huggingface/transformers/blob/3340ccbd403b3f5f9cec79a063b674eb174f2b60/src%2Ftransformers%2Fintegrations%2Ftensor_parallel.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/3340ccbd403b3f5f9cec79a063b674eb174f2b60/src%2Ftransformers%2Fintegrations%2Ftensor_parallel.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fintegrations%2Ftensor_parallel.py?ref=3340ccbd403b3f5f9cec79a063b674eb174f2b60",
+            "patch": "@@ -846,7 +846,7 @@ def _prepare_input_fn(input_layouts, desired_input_layouts, mod, inputs, device_\n     def _prepare_output_fn(output_layouts, use_local_output, mod, outputs, device_mesh):\n         \"\"\"\n         Imagine if you had 4 tokens, top_k = 4, and 128experts.\n-        With EP = 8.\n+        With EP = 8. The num_local_expert should be 128/8 = 16\n         Imagine router_indices being:\n         [ 52,  42, 119,  67],\n         [102,  89,  61,  40],\n@@ -860,12 +860,12 @@ def _prepare_output_fn(output_layouts, use_local_output, mod, outputs, device_me\n         [5, 6, 0, 2],\n         [5, 1, 6, 0],\n \n-        Thus for say rank 0, you fill with 0 the index tensor\n+        Thus for say rank 0, you fill with 16 (num_local_expert) the index tensor\n \n-        [ 0, 0, 0, 0],\n-        [ 0, 0, 0, 0],\n-        [ 0, 0, 4, 0],\n-        [ 0, 0, 0, 11],\n+        [ 16, 16, 16, 16],\n+        [ 16, 16, 16, 16],\n+        [ 16, 16, 4, 16],\n+        [ 16, 16, 16, 11],\n \n         This works well. For another rank you need to make sure you round to num_local_expert\n         because the next operation will one hot encode the router index vector.\n@@ -876,13 +876,25 @@ def _prepare_output_fn(output_layouts, use_local_output, mod, outputs, device_me\n \n         The kinda naive training loop that we use for device_map \"auto\" uses a similar logic.\n         Here we are just making each rank believe that he is alone, and he computes his part of the hiddenstates.\n+        Mask invalid indices with num_local_expert for one-hot encoding, so the computes will skip the masking index.\n         \"\"\"\n         ep_rank, ep_size = device_mesh.get_local_rank(), device_mesh.size()\n+        if mod.num_experts % ep_size != 0:\n+            raise ValueError(\n+                f\"The number of experts must be divisible by number of ep_size: {mod.num_experts} % {ep_size} != 0\"\n+            )\n         num_local_experts = mod.num_experts // ep_size\n         router_scores, router_indices = outputs\n         router_scores = router_scores[:, ep_rank * num_local_experts : (ep_rank + 1) * num_local_experts]\n-        router_indices = router_indices.masked_fill((router_indices // num_local_experts) != ep_rank, 0)\n-        router_indices = router_indices % num_local_experts\n+        router_indices = router_indices.masked_fill((router_indices // num_local_experts) != ep_rank, -1)\n+        # As -1 % 1 is 0, we can only use mask fill when num_local_experts is 1\n+        if num_local_experts > 1:\n+            router_indices = torch.fmod(router_indices, num_local_experts)\n+        else:\n+            router_indices = router_indices.masked_fill(router_indices > 0, 0).masked_fill(router_indices < 0, -1)\n+        router_indices = router_indices.masked_fill(\n+            router_indices == -1, num_local_experts\n+        )  # masking class for one hot\n         return router_scores, router_indices\n \n     def partition_tensor(self, param, empty_param, param_type, param_casting_dtype, to_contiguous, rank, device_mesh):"
+        },
+        {
+            "sha": "ffb420b067e2ffe501979e4d7f1e0f1448896024",
+            "filename": "src/transformers/models/gpt_oss/modeling_gpt_oss.py",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 1,
+            "changes": 7,
+            "blob_url": "https://github.com/huggingface/transformers/blob/3340ccbd403b3f5f9cec79a063b674eb174f2b60/src%2Ftransformers%2Fmodels%2Fgpt_oss%2Fmodeling_gpt_oss.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/3340ccbd403b3f5f9cec79a063b674eb174f2b60/src%2Ftransformers%2Fmodels%2Fgpt_oss%2Fmodeling_gpt_oss.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fgpt_oss%2Fmodeling_gpt_oss.py?ref=3340ccbd403b3f5f9cec79a063b674eb174f2b60",
+            "patch": "@@ -98,14 +98,19 @@ def forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weig\n         if hidden_states.device.type == \"cpu\" or self.training:\n             next_states = torch.zeros_like(hidden_states, dtype=hidden_states.dtype, device=hidden_states.device)\n             with torch.no_grad():\n-                expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)\n+                expert_mask = torch.nn.functional.one_hot(\n+                    router_indices, num_classes=num_experts + 1\n+                )  # masking is also a class\n                 expert_mask = expert_mask.permute(2, 1, 0)\n                 # we sum on the top_k and on the sequence length to get which experts\n                 # are hit this time around\n                 expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()\n             for expert_idx in expert_hit[:]:\n                 # expert_idx only have 1 element, so we can use scale for fast indexing\n                 expert_idx = expert_idx[0]\n+                # skip masking index\n+                if expert_idx == num_experts:\n+                    continue\n                 with torch.no_grad():\n                     _, token_idx = torch.where(expert_mask[expert_idx])\n                 current_state = hidden_states[token_idx]"
+        },
+        {
+            "sha": "193792bf0a01c4072461098a0994da5d664708ca",
+            "filename": "src/transformers/models/gpt_oss/modular_gpt_oss.py",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 1,
+            "changes": 7,
+            "blob_url": "https://github.com/huggingface/transformers/blob/3340ccbd403b3f5f9cec79a063b674eb174f2b60/src%2Ftransformers%2Fmodels%2Fgpt_oss%2Fmodular_gpt_oss.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/3340ccbd403b3f5f9cec79a063b674eb174f2b60/src%2Ftransformers%2Fmodels%2Fgpt_oss%2Fmodular_gpt_oss.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fgpt_oss%2Fmodular_gpt_oss.py?ref=3340ccbd403b3f5f9cec79a063b674eb174f2b60",
+            "patch": "@@ -97,14 +97,19 @@ def forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weig\n         if hidden_states.device.type == \"cpu\" or self.training:\n             next_states = torch.zeros_like(hidden_states, dtype=hidden_states.dtype, device=hidden_states.device)\n             with torch.no_grad():\n-                expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)\n+                expert_mask = torch.nn.functional.one_hot(\n+                    router_indices, num_classes=num_experts + 1\n+                )  # masking is also a class\n                 expert_mask = expert_mask.permute(2, 1, 0)\n                 # we sum on the top_k and on the sequence length to get which experts\n                 # are hit this time around\n                 expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()\n             for expert_idx in expert_hit[:]:\n                 # expert_idx only have 1 element, so we can use scale for fast indexing\n                 expert_idx = expert_idx[0]\n+                # skip masking index\n+                if expert_idx == num_experts:\n+                    continue\n                 with torch.no_grad():\n                     _, token_idx = torch.where(expert_mask[expert_idx])\n                 current_state = hidden_states[token_idx]"
+        },
+        {
+            "sha": "42d8626ceaec5a28dedbd010231a123f8afabcc7",
+            "filename": "src/transformers/quantizers/auto.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/huggingface/transformers/blob/3340ccbd403b3f5f9cec79a063b674eb174f2b60/src%2Ftransformers%2Fquantizers%2Fauto.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/3340ccbd403b3f5f9cec79a063b674eb174f2b60/src%2Ftransformers%2Fquantizers%2Fauto.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fquantizers%2Fauto.py?ref=3340ccbd403b3f5f9cec79a063b674eb174f2b60",
+            "patch": "@@ -326,6 +326,7 @@ def get_hf_quantizer(config, quantization_config, dtype, from_tf, from_flax, dev\n         dtype = hf_quantizer.update_dtype(dtype)\n         device_map = hf_quantizer.update_device_map(device_map)\n         config = hf_quantizer.update_tp_plan(config)\n+        config = hf_quantizer.update_ep_plan(config)\n \n         # In order to ensure popular quantization methods are supported. Can be disable with `disable_telemetry`\n         if not getattr(hf_quantizer.quantization_config, \"dequantize\", False):"
+        },
+        {
+            "sha": "653953abec0aeb7f951183c65db8ffa18c598e06",
+            "filename": "src/transformers/quantizers/base.py",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/huggingface/transformers/blob/3340ccbd403b3f5f9cec79a063b674eb174f2b60/src%2Ftransformers%2Fquantizers%2Fbase.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/3340ccbd403b3f5f9cec79a063b674eb174f2b60/src%2Ftransformers%2Fquantizers%2Fbase.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fquantizers%2Fbase.py?ref=3340ccbd403b3f5f9cec79a063b674eb174f2b60",
+            "patch": "@@ -219,6 +219,10 @@ def update_tp_plan(self, config):\n         \"updates the tp plan for the scales\"\n         return config\n \n+    def update_ep_plan(self, config):\n+        \"updates the tp plan for the scales\"\n+        return config\n+\n     def preprocess_model(self, model: \"PreTrainedModel\", **kwargs):\n         \"\"\"\n         Setting model attributes and/or converting model before weights loading. At this point"
+        },
+        {
+            "sha": "b9076007d38d856791c3bbda471f632ee36a347e",
+            "filename": "src/transformers/quantizers/quantizer_mxfp4.py",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 0,
+            "changes": 13,
+            "blob_url": "https://github.com/huggingface/transformers/blob/3340ccbd403b3f5f9cec79a063b674eb174f2b60/src%2Ftransformers%2Fquantizers%2Fquantizer_mxfp4.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/3340ccbd403b3f5f9cec79a063b674eb174f2b60/src%2Ftransformers%2Fquantizers%2Fquantizer_mxfp4.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fquantizers%2Fquantizer_mxfp4.py?ref=3340ccbd403b3f5f9cec79a063b674eb174f2b60",
+            "patch": "@@ -353,6 +353,19 @@ def update_tp_plan(self, config):\n                 )\n         return config\n \n+    def update_ep_plan(self, config):\n+        if \"GptOssConfig\" in config.__class__.__name__:\n+            if getattr(config, \"base_model_ep_plan\", None) is not None:\n+                config.base_model_ep_plan.update(\n+                    {\n+                        \"layers.*.mlp.experts.gate_up_proj_blocks\": \"grouped_gemm\",\n+                        \"layers.*.mlp.experts.gate_up_proj_scales\": \"grouped_gemm\",\n+                        \"layers.*.mlp.experts.down_proj_blocks\": \"grouped_gemm\",\n+                        \"layers.*.mlp.experts.down_proj_scales\": \"grouped_gemm\",\n+                    }\n+                )\n+        return config\n+\n     def update_param_name(self, param_name: str) -> str:\n         if self.quantization_config.dequantize:\n             if \"_blocks\" in param_name:"
+        }
+    ],
+    "stats": {
+        "total": 60,
+        "additions": 50,
+        "deletions": 10
+    }
+}

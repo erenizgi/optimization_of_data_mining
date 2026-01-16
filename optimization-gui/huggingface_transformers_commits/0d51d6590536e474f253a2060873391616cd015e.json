@@ -1,0 +1,60 @@
+{
+    "author": "Cyrilvallez",
+    "message": "Cleaner attention interfaces (#35342)\n\n* cleaner attention interfaces\r\n\r\n* correctly set the _attn_implementation when adding other functions to it\r\n\r\n* update\r\n\r\n* Update modeling_utils.py\r\n\r\n* CIs",
+    "sha": "0d51d6590536e474f253a2060873391616cd015e",
+    "files": [
+        {
+            "sha": "b8407bc29c6a8af0ef3c160aca2b85ff36b84cb1",
+            "filename": "src/transformers/integrations/flash_attention.py",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 5,
+            "changes": 21,
+            "blob_url": "https://github.com/huggingface/transformers/blob/0d51d6590536e474f253a2060873391616cd015e/src%2Ftransformers%2Fintegrations%2Fflash_attention.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/0d51d6590536e474f253a2060873391616cd015e/src%2Ftransformers%2Fintegrations%2Fflash_attention.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fintegrations%2Fflash_attention.py?ref=0d51d6590536e474f253a2060873391616cd015e",
+            "patch": "@@ -29,23 +29,34 @@ def flash_attention_forward(\n     key = key.transpose(1, 2)\n     value = value.transpose(1, 2)\n \n+    # In PEFT, usually we cast the layer norms in float32 for training stability reasons\n+    # therefore the input hidden states gets silently casted in float32. Hence, we need\n+    # cast them back in the correct dtype just to be sure everything works as expected.\n+    # This might slowdown training & inference so it is recommended to not cast the LayerNorms\n+    # in fp32. (usually our RMSNorm modules handle it correctly)\n+    target_dtype = None\n     if query.dtype == torch.float32:\n-        query = query.to(torch.float16)\n-        key = key.to(torch.float16)\n-        value = value.to(torch.float16)\n+        if torch.is_autocast_enabled():\n+            target_dtype = torch.get_autocast_gpu_dtype()\n+        # Handle the case where the model is quantized\n+        elif hasattr(module.config, \"_pre_quantization_dtype\"):\n+            target_dtype = module.config._pre_quantization_dtype\n+        else:\n+            target_dtype = next(layer for layer in module.modules() if isinstance(layer, torch.nn.Linear)).weight.dtype\n \n     attn_output = _flash_attention_forward(\n         query,\n         key,\n         value,\n         attention_mask,\n-        seq_len,\n-        module.is_causal,\n+        query_length=seq_len,\n+        is_causal=module.is_causal,\n         dropout=dropout,\n         softmax_scale=scaling,\n         sliding_window=sliding_window,\n         softcap=softcap,\n         use_top_left_mask=_use_top_left_mask,\n+        target_dtype=target_dtype,\n         **kwargs,\n     )\n "
+        },
+        {
+            "sha": "66ffc5638838cb890ea5705fdb5b9be582b193d0",
+            "filename": "src/transformers/integrations/flex_attention.py",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 2,
+            "changes": 8,
+            "blob_url": "https://github.com/huggingface/transformers/blob/0d51d6590536e474f253a2060873391616cd015e/src%2Ftransformers%2Fintegrations%2Fflex_attention.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/0d51d6590536e474f253a2060873391616cd015e/src%2Ftransformers%2Fintegrations%2Fflex_attention.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fintegrations%2Fflex_attention.py?ref=0d51d6590536e474f253a2060873391616cd015e",
+            "patch": "@@ -2,10 +2,10 @@\n \n import torch\n \n-from ..utils import is_torch_greater_or_equal\n+from ..utils import is_torch_flex_attn_available\n \n \n-if is_torch_greater_or_equal(\"2.5\"):\n+if is_torch_flex_attn_available():\n     from torch.nn.attention.flex_attention import flex_attention\n \n \n@@ -37,8 +37,12 @@ def causal_mod(score, b, h, q_idx, kv_idx):\n         score_mod=causal_mod,\n         enable_gqa=True,\n         scale=scaling,\n+        # Last time checked on PyTorch == 2.5.1: Flex Attention always computes the lse regardless.\n+        # For simplification, we thus always return it as no additional computations are introduced.\n         return_lse=True,\n     )\n+    # lse is returned in float32\n+    attention_weights = attention_weights.to(value.dtype)\n     attn_output = attn_output.transpose(1, 2).contiguous()\n \n     return attn_output, attention_weights"
+        },
+        {
+            "sha": "38701690bf7c2a628b942233aeb1e3129d978845",
+            "filename": "src/transformers/integrations/sdpa_attention.py",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/huggingface/transformers/blob/0d51d6590536e474f253a2060873391616cd015e/src%2Ftransformers%2Fintegrations%2Fsdpa_attention.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/0d51d6590536e474f253a2060873391616cd015e/src%2Ftransformers%2Fintegrations%2Fsdpa_attention.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fintegrations%2Fsdpa_attention.py?ref=0d51d6590536e474f253a2060873391616cd015e",
+            "patch": "@@ -34,10 +34,14 @@ def sdpa_attention_forward(\n     if attention_mask is not None:\n         causal_mask = causal_mask[:, :, :, : key.shape[-2]]\n \n+    # SDPA with memory-efficient backend is bugged with non-contiguous inputs and custom attn_mask for some torch versions\n+    # Reference: https://github.com/pytorch/pytorch/issues/112577.\n     query = query.contiguous()\n     key = key.contiguous()\n     value = value.contiguous()\n \n+    # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment\n+    # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.\n     if is_causal is None:\n         is_causal = causal_mask is None and query.shape[2] > 1\n "
+        },
+        {
+            "sha": "49d086c76e868311c79abc4291b02f79e67a6938",
+            "filename": "src/transformers/modeling_utils.py",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 5,
+            "changes": 9,
+            "blob_url": "https://github.com/huggingface/transformers/blob/0d51d6590536e474f253a2060873391616cd015e/src%2Ftransformers%2Fmodeling_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/0d51d6590536e474f253a2060873391616cd015e/src%2Ftransformers%2Fmodeling_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodeling_utils.py?ref=0d51d6590536e474f253a2060873391616cd015e",
+            "patch": "@@ -1474,11 +1474,8 @@ def _autoset_attn_implementation(\n                 )\n \n             if not isinstance(config._attn_implementation, dict) and config._attn_implementation not in [\n-                \"eager\",\n-                \"sdpa\",\n-                \"flash_attention_2\",\n-                \"flex_attention\",\n-            ]:\n+                \"eager\"\n+            ] + list(ALL_ATTENTION_FUNCTIONS.keys()):\n                 message = f'Specified `attn_implementation=\"{config._attn_implementation}\"` is not supported. The only possible arguments are `attn_implementation=\"eager\"` (manual attention implementation)'\n                 if cls._supports_flash_attn_2:\n                     message += ', `\"attn_implementation=flash_attention_2\"` (implementation using flash attention 2)'\n@@ -1540,6 +1537,8 @@ def _autoset_attn_implementation(\n                     \"Using the `SDPA` attention implementation on multi-gpu setup with ROCM may lead to performance issues due to the FA backend. Disabling it to use alternative backends.\"\n                 )\n                 torch.backends.cuda.enable_flash_sdp(False)\n+        elif requested_attn_implementation in list(ALL_ATTENTION_FUNCTIONS.keys()):\n+            config._attn_implementation = requested_attn_implementation\n         elif isinstance(requested_attn_implementation, dict):\n             config._attn_implementation = None\n         else:"
+        }
+    ],
+    "stats": {
+        "total": 42,
+        "additions": 30,
+        "deletions": 12
+    }
+}

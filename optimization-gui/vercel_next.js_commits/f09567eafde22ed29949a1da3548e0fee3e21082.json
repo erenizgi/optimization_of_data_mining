@@ -1,0 +1,72 @@
+{
+    "author": "lukesandberg",
+    "message": "[turbopack] Emit a warning when there are too many matches from a FileSourceReference (#84701)\n\nPreviously we would `eprintln!` in this case, but that is missing key source information that would help with debugging.\n\n\nExample warning (i hacked the limit to be lower to make this less tedious to repro):\n\n![image.png](https://app.graphite.dev/user-attachments/assets/084b9b27-2558-4131-8f31-e54e3c188359.png)\n\nIf there are more than 10K matches we will issue this warning.\n\n\nA tricky thing is that because we issue this warning during the module graph construction, but `resolve_reference` won't be called again for a FileSource reference during chunking the issue actually wouldn't get emitted.  The fix is to drop the `take_issues` call inside of `whole_app_module_graphs` in production builds.",
+    "sha": "f09567eafde22ed29949a1da3548e0fee3e21082",
+    "files": [
+        {
+            "sha": "8afabc9a64f0ee47df4ae5c91f29c481407f09bb",
+            "filename": "crates/next-api/src/module_graph.rs",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/f09567eafde22ed29949a1da3548e0fee3e21082/crates%2Fnext-api%2Fsrc%2Fmodule_graph.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/f09567eafde22ed29949a1da3548e0fee3e21082/crates%2Fnext-api%2Fsrc%2Fmodule_graph.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/crates%2Fnext-api%2Fsrc%2Fmodule_graph.rs?ref=f09567eafde22ed29949a1da3548e0fee3e21082",
+            "patch": "@@ -490,7 +490,7 @@ impl Issue for CssGlobalImportIssue {\n     }\n \n     fn severity(&self) -> IssueSeverity {\n-        IssueSeverity::Fatal\n+        IssueSeverity::Error\n     }\n \n     #[turbo_tasks::function]"
+        },
+        {
+            "sha": "1f142320e8e591778b0a5b78dbaf5c00d412499a",
+            "filename": "crates/next-api/src/project.rs",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 3,
+            "changes": 13,
+            "blob_url": "https://github.com/vercel/next.js/blob/f09567eafde22ed29949a1da3548e0fee3e21082/crates%2Fnext-api%2Fsrc%2Fproject.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/f09567eafde22ed29949a1da3548e0fee3e21082/crates%2Fnext-api%2Fsrc%2Fproject.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/crates%2Fnext-api%2Fsrc%2Fproject.rs?ref=f09567eafde22ed29949a1da3548e0fee3e21082",
+            "patch": "@@ -984,8 +984,15 @@ impl Project {\n     pub async fn whole_app_module_graphs(self: ResolvedVc<Self>) -> Result<Vc<ModuleGraphs>> {\n         async move {\n             let module_graphs_op = whole_app_module_graph_operation(self);\n-            let module_graphs_vc = module_graphs_op.resolve_strongly_consistent().await?;\n-            let _ = module_graphs_op.take_issues();\n+            let module_graphs_vc = if self.next_mode().await?.is_production() {\n+                module_graphs_op.connect()\n+            } else {\n+                // In development mode, we need to to take and drop the issues, otherwise every\n+                // route will report all issues.\n+                let vc = module_graphs_op.resolve_strongly_consistent().await?;\n+                let _ = module_graphs_op.take_issues();\n+                *vc\n+            };\n \n             // At this point all modules have been computed and we can get rid of the node.js\n             // process pools\n@@ -995,7 +1002,7 @@ impl Project {\n                 turbopack_node::evaluate::scale_zero();\n             }\n \n-            Ok(*module_graphs_vc)\n+            Ok(module_graphs_vc)\n         }\n         .instrument(tracing::info_span!(\"module graph for app\"))\n         .await"
+        },
+        {
+            "sha": "7b43d4687900f805284161a8e8b6ca92f6d093ea",
+            "filename": "turbopack/crates/turbopack-core/src/resolve/mod.rs",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 23,
+            "changes": 31,
+            "blob_url": "https://github.com/vercel/next.js/blob/f09567eafde22ed29949a1da3548e0fee3e21082/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fresolve%2Fmod.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/f09567eafde22ed29949a1da3548e0fee3e21082/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fresolve%2Fmod.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-core%2Fsrc%2Fresolve%2Fmod.rs?ref=f09567eafde22ed29949a1da3548e0fee3e21082",
+            "patch": "@@ -1467,6 +1467,8 @@ pub async fn resolve_raw(\n     let pat = path.await?;\n     if let Some(pat) = pat\n         .filter_could_match(\"/ROOT/\")\n+        // Checks if this pattern is more specific than everything, so we test using a random path\n+        // that is unlikely to actually exist\n         .and_then(|pat| pat.filter_could_not_match(\"/ROOT/fsd8nz8og54z\"))\n     {\n         let path = Pattern::new(pat);\n@@ -1477,34 +1479,17 @@ pub async fn resolve_raw(\n             path,\n         )\n         .await?;\n-        if matches.len() > 10000 {\n-            let path_str = path.to_string().await?;\n-            println!(\n-                \"WARN: resolving abs pattern {} in {} leads to {} results\",\n-                path_str,\n-                lookup_dir.value_to_string().await?,\n-                matches.len()\n-            );\n-        } else {\n-            results.extend(\n-                collect_matches(&matches, collect_affecting_sources)\n-                    .await?\n-                    .into_iter(),\n-            );\n-        }\n+        results.extend(\n+            collect_matches(&matches, collect_affecting_sources)\n+                .await?\n+                .into_iter(),\n+        );\n     }\n \n     {\n         let matches =\n             read_matches(lookup_dir.clone(), rcstr!(\"\"), force_in_lookup_dir, path).await?;\n-        if matches.len() > 10000 {\n-            println!(\n-                \"WARN: resolving pattern {} in {} leads to {} results\",\n-                pat.describe_as_string(),\n-                lookup_dir.value_to_string().await?,\n-                matches.len()\n-            );\n-        }\n+\n         results.extend(\n             collect_matches(&matches, collect_affecting_sources)\n                 .await?"
+        },
+        {
+            "sha": "15d4c3be0664343aa2f36ffb826365693e271e95",
+            "filename": "turbopack/crates/turbopack-ecmascript/src/references/mod.rs",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 0,
+            "changes": 10,
+            "blob_url": "https://github.com/vercel/next.js/blob/f09567eafde22ed29949a1da3548e0fee3e21082/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Freferences%2Fmod.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/f09567eafde22ed29949a1da3548e0fee3e21082/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Freferences%2Fmod.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Freferences%2Fmod.rs?ref=f09567eafde22ed29949a1da3548e0fee3e21082",
+            "patch": "@@ -1987,6 +1987,11 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(\n                             context_dir,\n                             Pattern::new(pat),\n                             collect_affecting_sources,\n+                            IssueSource::from_swc_offsets(\n+                                source,\n+                                span.lo.to_u32(),\n+                                span.hi.to_u32(),\n+                            ),\n                         )\n                         .to_resolved()\n                         .await?,\n@@ -2136,6 +2141,11 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(\n                             context_dir,\n                             Pattern::new(pat),\n                             collect_affecting_sources,\n+                            IssueSource::from_swc_offsets(\n+                                source,\n+                                span.lo.to_u32(),\n+                                span.hi.to_u32(),\n+                            ),\n                         )\n                         .to_resolved()\n                         .await?,"
+        },
+        {
+            "sha": "4f9c312b145283d4bf97f6f69978e69b8e54a5f9",
+            "filename": "turbopack/crates/turbopack-ecmascript/src/references/raw.rs",
+            "status": "modified",
+            "additions": 78,
+            "deletions": 3,
+            "changes": 81,
+            "blob_url": "https://github.com/vercel/next.js/blob/f09567eafde22ed29949a1da3548e0fee3e21082/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Freferences%2Fraw.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/f09567eafde22ed29949a1da3548e0fee3e21082/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Freferences%2Fraw.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Freferences%2Fraw.rs?ref=f09567eafde22ed29949a1da3548e0fee3e21082",
+            "patch": "@@ -1,10 +1,14 @@\n use anyhow::Result;\n use tracing::Instrument;\n-use turbo_rcstr::RcStr;\n+use turbo_rcstr::{RcStr, rcstr};\n use turbo_tasks::{ResolvedVc, ValueToString, Vc};\n use turbo_tasks_fs::FileSystemPath;\n use turbopack_core::{\n     chunk::{ChunkableModuleReference, ChunkingType, ChunkingTypeOption},\n+    issue::{\n+        Issue, IssueExt, IssueSeverity, IssueSource, IssueStage, OptionIssueSource,\n+        OptionStyledString, StyledString,\n+    },\n     reference::ModuleReference,\n     resolve::{ModuleResolveResult, pattern::Pattern, resolve_raw},\n };\n@@ -15,6 +19,7 @@ pub struct FileSourceReference {\n     context_dir: FileSystemPath,\n     path: ResolvedVc<Pattern>,\n     collect_affecting_sources: bool,\n+    issue_source: IssueSource,\n }\n \n #[turbo_tasks::value_impl]\n@@ -24,11 +29,13 @@ impl FileSourceReference {\n         context_dir: FileSystemPath,\n         path: ResolvedVc<Pattern>,\n         collect_affecting_sources: bool,\n+        issue_source: IssueSource,\n     ) -> Vc<Self> {\n         Self::cell(FileSourceReference {\n             context_dir,\n             path,\n             collect_affecting_sources,\n+            issue_source,\n         })\n     }\n }\n@@ -42,20 +49,88 @@ impl ModuleReference for FileSourceReference {\n             pattern = display(self.path.to_string().await?)\n         );\n         async {\n-            resolve_raw(\n+            let result = resolve_raw(\n                 self.context_dir.clone(),\n                 *self.path,\n                 self.collect_affecting_sources,\n                 /* force_in_lookup_dir */ false,\n             )\n             .as_raw_module_result()\n             .resolve()\n-            .await\n+            .await?;\n+            let num_matches = result.await?.primary.len();\n+            if num_matches > TOO_MANY_MATCHES_LIMIT {\n+                TooManyMatchesWarning {\n+                    source: self.issue_source,\n+                    context_dir: self.context_dir.clone(),\n+                    num_matches,\n+                    pattern: self.path,\n+                }\n+                .resolved_cell()\n+                .emit();\n+            }\n+\n+            Ok(result)\n         }\n         .instrument(span)\n         .await\n     }\n }\n+/// If a pattern resolves to more than 10000 results, it's likely a mistake so issue a warning.\n+const TOO_MANY_MATCHES_LIMIT: usize = 10000;\n+#[turbo_tasks::value(shared)]\n+struct TooManyMatchesWarning {\n+    source: IssueSource,\n+    context_dir: FileSystemPath,\n+    num_matches: usize,\n+    pattern: ResolvedVc<Pattern>,\n+}\n+\n+#[turbo_tasks::value_impl]\n+impl Issue for TooManyMatchesWarning {\n+    #[turbo_tasks::function]\n+    async fn title(&self) -> Result<Vc<StyledString>> {\n+        Ok(StyledString::Text(\n+            format!(\n+                \"The file pattern {pattern} matches {num_matches} files in {context_dir}\",\n+                pattern = self.pattern.to_string().await?,\n+                context_dir = self.context_dir.value_to_string().await?,\n+                num_matches = self.num_matches\n+            )\n+            .into(),\n+        )\n+        .cell())\n+    }\n+\n+    #[turbo_tasks::function]\n+    fn description(&self) -> Vc<OptionStyledString> {\n+        Vc::cell(Some(\n+            StyledString::Text(rcstr!(\n+                \"Overly broad patterns can lead to build performance issues and over bundling.\"\n+            ))\n+            .resolved_cell(),\n+        ))\n+    }\n+\n+    #[turbo_tasks::function]\n+    async fn file_path(&self) -> Vc<FileSystemPath> {\n+        self.source.file_path()\n+    }\n+\n+    #[turbo_tasks::function]\n+    fn stage(&self) -> Vc<IssueStage> {\n+        IssueStage::Resolve.cell()\n+    }\n+\n+    fn severity(&self) -> IssueSeverity {\n+        IssueSeverity::Error\n+    }\n+\n+    #[turbo_tasks::function]\n+    fn source(&self) -> Vc<OptionIssueSource> {\n+        Vc::cell(Some(self.source))\n+    }\n+}\n \n #[turbo_tasks::value_impl]\n impl ChunkableModuleReference for FileSourceReference {"
+        }
+    ],
+    "stats": {
+        "total": 137,
+        "additions": 107,
+        "deletions": 30
+    }
+}

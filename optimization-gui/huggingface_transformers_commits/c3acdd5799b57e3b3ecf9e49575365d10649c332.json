@@ -1,0 +1,48 @@
+{
+    "author": "MekkCyber",
+    "message": "[core] fix fp-quant (#42613)\n\n* initial\n\n* quantization fixed\n\n* up\n\n* working\n\n* fix\n\n* style\n\n* clean\n\n* reset\n\n* style\n\n* rm duplicate\n\n* ci: empty commit\n\n---------\n\nCo-authored-by: Marc Sun <57196510+SunMarc@users.noreply.github.com>",
+    "sha": "c3acdd5799b57e3b3ecf9e49575365d10649c332",
+    "files": [
+        {
+            "sha": "710382668d172a255859d4245e313f898da9ceb5",
+            "filename": "src/transformers/conversion_mapping.py",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/huggingface/transformers/blob/c3acdd5799b57e3b3ecf9e49575365d10649c332/src%2Ftransformers%2Fconversion_mapping.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/c3acdd5799b57e3b3ecf9e49575365d10649c332/src%2Ftransformers%2Fconversion_mapping.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fconversion_mapping.py?ref=c3acdd5799b57e3b3ecf9e49575365d10649c332",
+            "patch": "@@ -142,11 +142,11 @@ def _build_checkpoint_conversion_mapping():\n     if hasattr(torch.nn.utils.parametrizations, \"weight_norm\"):\n         mapping[\"legacy\"] += [\n             WeightRenaming(\n-                source_patterns=\"weight_g\",\n+                source_patterns=r\"weight_g$\",\n                 target_patterns=\"parametrizations.weight.original0\",\n             ),\n             WeightRenaming(\n-                source_patterns=\"weight_v\",\n+                source_patterns=r\"weight_v$\",\n                 target_patterns=\"parametrizations.weight.original1\",\n             ),\n         ]"
+        },
+        {
+            "sha": "af7821786d6c5c8239a9492c1d950740a0fa3652",
+            "filename": "src/transformers/integrations/fp_quant.py",
+            "status": "modified",
+            "additions": 92,
+            "deletions": 0,
+            "changes": 92,
+            "blob_url": "https://github.com/huggingface/transformers/blob/c3acdd5799b57e3b3ecf9e49575365d10649c332/src%2Ftransformers%2Fintegrations%2Ffp_quant.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/c3acdd5799b57e3b3ecf9e49575365d10649c332/src%2Ftransformers%2Fintegrations%2Ffp_quant.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fintegrations%2Ffp_quant.py?ref=c3acdd5799b57e3b3ecf9e49575365d10649c332",
+            "patch": "@@ -13,6 +13,10 @@\n # limitations under the License.\n \"FP-Quant integration file\"\n \n+from typing import Optional\n+\n+import torch\n+\n from ..utils import (\n     is_fp_quant_available,\n )\n@@ -24,6 +28,94 @@\n \n from transformers.utils.quantization_config import FPQuantConfig\n \n+from ..core_model_loading import ConversionOps\n+from ..quantizers.quantizers_utils import get_module_from_name\n+\n+\n+class FpQuantQuantize(ConversionOps):\n+    def __init__(self, hf_quantizer):\n+        self.hf_quantizer = hf_quantizer\n+\n+    def convert(\n+        self,\n+        input_dict: torch.Tensor,\n+        model: Optional[torch.nn.Module] = None,\n+        missing_keys: Optional[list[str]] = None,\n+        **kwargs,\n+    ) -> dict[str, torch.Tensor]:\n+        target_key, value = tuple(input_dict.items())[0]\n+        value = value[0]\n+        # Loading master weights or an unquantized checkpoint\n+        weight = torch.nn.Parameter(value)\n+        module, _ = get_module_from_name(model, target_key)\n+        module.weight = weight\n+\n+        # Let pre-forward handle the quantization and set None where necessary\n+        # This operation will quantize the weights internally\n+        with torch.cuda.device(value.device):\n+            module.pre_forward()\n+\n+        prefix_target_key = target_key.rsplit(\".\", 1)[0]\n+\n+        # keys are set inside the module.pre_forward() method, we don't need remove them from the missing keys list\n+        missing_keys.discard(target_key)\n+        missing_keys.discard(f\"{prefix_target_key}.backward_hadamard_matrix\")\n+        missing_keys.discard(f\"{prefix_target_key}.forward_hadamard_matrix\")\n+        missing_keys.discard(f\"{prefix_target_key}.act_global_scale\")\n+        missing_keys.discard(f\"{prefix_target_key}.weight_global_scale\")\n+        missing_keys.discard(f\"{prefix_target_key}.qweight\")\n+        missing_keys.discard(f\"{prefix_target_key}.scales\")\n+        missing_keys.discard(f\"{prefix_target_key}.dqweight\")\n+        return {}\n+\n+\n+class FpQuantDeserialize(ConversionOps):\n+    def __init__(self, hf_quantizer):\n+        self.hf_quantizer = hf_quantizer\n+\n+    def convert(\n+        self,\n+        input_dict: torch.Tensor,\n+        model: Optional[torch.nn.Module] = None,\n+        full_layer_name: str | None = None,\n+        missing_keys: Optional[list[str]] = None,\n+        **kwargs,\n+    ) -> dict[str, torch.Tensor]:\n+        target_key, value = tuple(input_dict.items())[0]\n+        value = value[0] if isinstance(value, list) else value\n+        module, _ = get_module_from_name(model, target_key)\n+        # The module holds either:\n+        #  * `weight` when `store_master_weights=True`\n+        #  * `qweight` and `scales` when `store_master_weights=False` and `pseudoquantization=False`\n+        #  * `dqweight` when `store_master_weights=False` and `pseudoquantization=True`\n+        if target_key == \".qweight\":\n+            # Loading a real quantized checkpoint without master weights\n+            qweight = torch.nn.Parameter(\n+                value,\n+                requires_grad=False,\n+            )\n+\n+            return {\n+                \".qweight\": qweight,\n+                # the way the FPQuantLinear module is designed, these parameters are expected in the model\n+                # even though they are not used so we need to set them to zeros\n+                \".weight\": torch.nn.Parameter(torch.zeros(0)),\n+                \".dqweight\": torch.nn.Parameter(torch.zeros(0)),\n+            }\n+\n+        if target_key == \".dqweight\":\n+            # Loading a pseudo-quantized checkpoint without master weights\n+            dqweight = torch.nn.Parameter(value)\n+\n+            return {\n+                \".dqweight\": dqweight,\n+                # the way the FPQuantLinear module ips designed, these parameters are expected in the model\n+                # even though they are not used so we need to set them to zeros\n+                \".weight\": torch.nn.Parameter(torch.zeros(0)),\n+                \".qweight\": torch.nn.Parameter(torch.zeros(0)),\n+                \".scales\": torch.nn.Parameter(torch.zeros(0)),\n+            }\n+\n \n def adapt_fp_quant_config(config: FPQuantConfig):\n     if config.forward_dtype == \"mxfp4\":"
+        },
+        {
+            "sha": "4f3fee61cc9c6dd0ca00118e42318a6aee688a1a",
+            "filename": "src/transformers/quantizers/quantizer_fp_quant.py",
+            "status": "modified",
+            "additions": 28,
+            "deletions": 0,
+            "changes": 28,
+            "blob_url": "https://github.com/huggingface/transformers/blob/c3acdd5799b57e3b3ecf9e49575365d10649c332/src%2Ftransformers%2Fquantizers%2Fquantizer_fp_quant.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/c3acdd5799b57e3b3ecf9e49575365d10649c332/src%2Ftransformers%2Fquantizers%2Fquantizer_fp_quant.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fquantizers%2Fquantizer_fp_quant.py?ref=c3acdd5799b57e3b3ecf9e49575365d10649c332",
+            "patch": "@@ -120,3 +120,31 @@ def is_trainable(self, model: Optional[\"PreTrainedModel\"] = None):\n \n     def is_serializable(self):\n         return True\n+\n+    def get_quantize_ops(self):\n+        from ..integrations.fp_quant import FpQuantQuantize\n+\n+        return FpQuantQuantize(self)\n+\n+    def get_weight_conversions(self):\n+        from ..core_model_loading import WeightConverter\n+        from ..integrations.fp_quant import FpQuantDeserialize\n+\n+        if self.pre_quantized:\n+            if self.quantization_config.pseudoquantization:\n+                return [\n+                    WeightConverter(\n+                        source_patterns=[\".dqweight\"],\n+                        target_patterns=\".dqweight\",\n+                        operations=[FpQuantDeserialize(self)],\n+                    ),\n+                ]\n+            else:\n+                return [\n+                    WeightConverter(\n+                        source_patterns=[\".qweight\"],\n+                        target_patterns=\".qweight\",\n+                        operations=[FpQuantDeserialize(self)],\n+                    ),\n+                ]\n+        return []"
+        }
+    ],
+    "stats": {
+        "total": 124,
+        "additions": 122,
+        "deletions": 2
+    }
+}

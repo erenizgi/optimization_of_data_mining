@@ -1,0 +1,156 @@
+{
+    "author": "Stonepia",
+    "message": "Fix convert_and_export_with_cache failures for GPU models (#38976)\n\n* Add the `device` option for `generate()`\n\n* Add device for default tensors to avoid tensor mismatch\n\n* [test] Enable test_static_cache_exportability for torch_device\n\n* infer device from the prompt_token_ids\n\n* Add device for generated tensor\n\n* [Test] Make `test_export_static_cache` tests to run on devices rather than only CPU\n\n* fix format\n\n* infer device from the model",
+    "sha": "fc700c2a26af9e1b27162d408e8edfa2903c715f",
+    "files": [
+        {
+            "sha": "71777d123cda9baffd621ecaa1f2be5267e5da66",
+            "filename": "src/transformers/integrations/executorch.py",
+            "status": "modified",
+            "additions": 44,
+            "deletions": 14,
+            "changes": 58,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fc700c2a26af9e1b27162d408e8edfa2903c715f/src%2Ftransformers%2Fintegrations%2Fexecutorch.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fc700c2a26af9e1b27162d408e8edfa2903c715f/src%2Ftransformers%2Fintegrations%2Fexecutorch.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fintegrations%2Fexecutorch.py?ref=fc700c2a26af9e1b27162d408e8edfa2903c715f",
+            "patch": "@@ -107,9 +107,23 @@ def export(\n             strict(`Optional[bool]`):\n                 Flag to instruct `torch.export` to use `torchdynamo`.\n         \"\"\"\n+        if hasattr(self.model, \"base_model_prefix\"):\n+            base = getattr(self.model, self.model.base_model_prefix, self.model)\n+            model_device = base.device\n+        elif hasattr(self.model, \"model\"):\n+            model_device = self.model.model.device\n+        else:\n+            model_device = \"cpu\"\n+            logging.warning(\n+                \"TorchExportableModuleForDecoderOnlyLM.export Can't infer device from the model. Set to CPU by default.\"\n+            )\n \n-        example_input_ids = input_ids if input_ids is not None else torch.tensor([[1]], dtype=torch.long)\n-        example_cache_position = cache_position if cache_position is not None else torch.tensor([0], dtype=torch.long)\n+        example_input_ids = (\n+            input_ids if input_ids is not None else torch.tensor([[1]], dtype=torch.long, device=model_device)\n+        )\n+        example_cache_position = (\n+            cache_position if cache_position is not None else torch.tensor([0], dtype=torch.long, device=model_device)\n+        )\n \n         exported_program = torch.export.export(\n             self.model,\n@@ -322,7 +336,9 @@ def forward(self, input_ids: torch.Tensor, cache_position: torch.Tensor):\n \n     @staticmethod\n     def generate(\n-        exported_program: torch.export.ExportedProgram, prompt_token_ids: torch.Tensor, max_new_tokens: int\n+        exported_program: torch.export.ExportedProgram,\n+        prompt_token_ids: torch.Tensor,\n+        max_new_tokens: int,\n     ) -> torch.Tensor:\n         \"\"\"\n         Generate a sequence of tokens using an exported program.\n@@ -341,6 +357,7 @@ def generate(\n         Returns:\n             torch.Tensor: A tensor containing the generated sequence of token IDs, including the original prompt tokens.\n         \"\"\"\n+        device = prompt_token_ids.device\n         prompt_token_len = prompt_token_ids.shape[-1]\n         max_generation_length = prompt_token_len + max_new_tokens\n         for buffer_name, buffer in exported_program.named_buffers():\n@@ -353,7 +370,7 @@ def generate(\n         for input_pos in range(min(max_generation_length, prompt_token_len)):\n             result = exported_program.module().forward(\n                 input_ids=prompt_token_ids[:, input_pos : input_pos + 1],\n-                cache_position=torch.tensor([input_pos], dtype=torch.long),\n+                cache_position=torch.tensor([input_pos], dtype=torch.long, device=device),\n             )\n             response_tokens.append(prompt_token_ids[0][input_pos].item())\n \n@@ -362,13 +379,13 @@ def generate(\n \n         while len(response_tokens) < max_generation_length:\n             result = exported_program.module().forward(\n-                input_ids=torch.tensor([[current_token]], dtype=torch.long),\n-                cache_position=torch.tensor([len(response_tokens)], dtype=torch.long),\n+                input_ids=torch.tensor([[current_token]], dtype=torch.long, device=device),\n+                cache_position=torch.tensor([len(response_tokens)], dtype=torch.long, device=device),\n             )\n             current_token = torch.argmax(result[:, -1, :], dim=-1).item()\n             response_tokens.append(current_token)\n \n-        return torch.tensor([response_tokens], dtype=torch.long)\n+        return torch.tensor([response_tokens], dtype=torch.long, device=device)\n \n \n class TorchExportableModuleWithHybridCache(torch.nn.Module):\n@@ -484,10 +501,14 @@ def convert_and_export_with_cache(\n     with torch.no_grad():\n         # TODO: The default inputs only work for text models. We need to add support for vision/audio models.\n         example_input_ids = (\n-            example_input_ids if example_input_ids is not None else torch.tensor([[1]], dtype=torch.long)\n+            example_input_ids\n+            if example_input_ids is not None\n+            else torch.tensor([[1]], dtype=torch.long, device=model.device)\n         )\n         example_cache_position = (\n-            example_cache_position if example_cache_position is not None else torch.tensor([0], dtype=torch.long)\n+            example_cache_position\n+            if example_cache_position is not None\n+            else torch.tensor([0], dtype=torch.long, device=model.device)\n         )\n \n         if is_torch_greater_or_equal(\"2.6.0\"):\n@@ -602,7 +623,7 @@ def __init__(\n         self.exported_decoder = None\n \n     def _export_encoder(self, encoder_input_ids):\n-        wrapped_encoder = Seq2SeqLMEncoderExportableModule(self.encoder).to(\"cpu\").eval()\n+        wrapped_encoder = Seq2SeqLMEncoderExportableModule(self.encoder).to(self.full_model.device).eval()\n \n         # Define dynamic sequence length for encoder\n         seq_len_dim = torch.export.Dim(\"encoder_seq_length\", max=self.max_hidden_seq_length)\n@@ -645,18 +666,27 @@ def _export_decoder(self, decoder_input_ids, encoder_hidden_states, cache_positi\n         return exported_decoder\n \n     def export(self, encoder_input_ids=None, decoder_input_ids=None, encoder_hidden_states=None, cache_position=None):\n+        device = self.full_model.device\n         example_encoder_input_ids = (\n-            encoder_input_ids if encoder_input_ids is not None else torch.ones((1, 10), dtype=torch.long)\n+            encoder_input_ids\n+            if encoder_input_ids is not None\n+            else torch.ones((1, 10), dtype=torch.long, device=device)\n         )\n         example_decoder_input_ids = (\n-            decoder_input_ids if decoder_input_ids is not None else torch.tensor([[0]], dtype=torch.long)\n+            decoder_input_ids\n+            if decoder_input_ids is not None\n+            else torch.tensor([[0]], dtype=torch.long, device=device)\n         )  # Start token\n-        example_cache_position = cache_position if cache_position is not None else torch.tensor([0], dtype=torch.long)\n+        example_cache_position = (\n+            cache_position if cache_position is not None else torch.tensor([0], dtype=torch.long, device=device)\n+        )\n         example_encoder_hidden_states = (\n             encoder_hidden_states\n             if encoder_hidden_states is not None\n             else torch.zeros(\n-                (self.generation_config.cache_config.batch_size, 10, self.config.d_model), dtype=torch.float32\n+                (self.generation_config.cache_config.batch_size, 10, self.config.d_model),\n+                dtype=torch.float32,\n+                device=device,\n             )\n         )\n         self.exported_encoder = self._export_encoder(example_encoder_input_ids)"
+        },
+        {
+            "sha": "2fe532f67374e742782ec3e254ab13296762f96d",
+            "filename": "tests/models/cohere2/test_modeling_cohere2.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fc700c2a26af9e1b27162d408e8edfa2903c715f/tests%2Fmodels%2Fcohere2%2Ftest_modeling_cohere2.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fc700c2a26af9e1b27162d408e8edfa2903c715f/tests%2Fmodels%2Fcohere2%2Ftest_modeling_cohere2.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fcohere2%2Ftest_modeling_cohere2.py?ref=fc700c2a26af9e1b27162d408e8edfa2903c715f",
+            "patch": "@@ -248,7 +248,7 @@ def test_export_static_cache(self):\n \n         tokenizer = AutoTokenizer.from_pretrained(model_id, pad_token=\"<PAD>\", padding_side=\"right\")\n         # Load model\n-        device = \"cpu\"\n+        device = torch_device\n         dtype = torch.bfloat16\n         cache_implementation = \"static\"\n         attn_implementation = \"sdpa\""
+        },
+        {
+            "sha": "d7f7a0ce0e4fa3fd2cc0d430cfc81b7d98876f08",
+            "filename": "tests/models/gemma/test_modeling_gemma.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fc700c2a26af9e1b27162d408e8edfa2903c715f/tests%2Fmodels%2Fgemma%2Ftest_modeling_gemma.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fc700c2a26af9e1b27162d408e8edfa2903c715f/tests%2Fmodels%2Fgemma%2Ftest_modeling_gemma.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fgemma%2Ftest_modeling_gemma.py?ref=fc700c2a26af9e1b27162d408e8edfa2903c715f",
+            "patch": "@@ -423,7 +423,7 @@ def test_export_static_cache(self):\n         ].shape[-1]\n \n         # Load model\n-        device = \"cpu\"\n+        device = torch_device\n         dtype = torch.bfloat16\n         cache_implementation = \"static\"\n         attn_implementation = \"sdpa\""
+        },
+        {
+            "sha": "76418997daccf45ca3325bc98661c05408155787",
+            "filename": "tests/models/gemma2/test_modeling_gemma2.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fc700c2a26af9e1b27162d408e8edfa2903c715f/tests%2Fmodels%2Fgemma2%2Ftest_modeling_gemma2.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fc700c2a26af9e1b27162d408e8edfa2903c715f/tests%2Fmodels%2Fgemma2%2Ftest_modeling_gemma2.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fgemma2%2Ftest_modeling_gemma2.py?ref=fc700c2a26af9e1b27162d408e8edfa2903c715f",
+            "patch": "@@ -335,7 +335,7 @@ def test_export_static_cache(self):\n         ].shape[-1]\n \n         # Load model\n-        device = \"cpu\"\n+        device = torch_device\n         dtype = torch.bfloat16\n         cache_implementation = \"static\"\n         attn_implementation = \"sdpa\""
+        },
+        {
+            "sha": "2ffc423be45933a10e73900cafcd31c0eaf9231b",
+            "filename": "tests/models/llama/test_modeling_llama.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fc700c2a26af9e1b27162d408e8edfa2903c715f/tests%2Fmodels%2Fllama%2Ftest_modeling_llama.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fc700c2a26af9e1b27162d408e8edfa2903c715f/tests%2Fmodels%2Fllama%2Ftest_modeling_llama.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fllama%2Ftest_modeling_llama.py?ref=fc700c2a26af9e1b27162d408e8edfa2903c715f",
+            "patch": "@@ -322,7 +322,7 @@ def test_export_static_cache(self):\n             ].shape[-1]\n \n             # Load model\n-            device = \"cpu\"\n+            device = torch_device\n             dtype = torch.bfloat16\n             cache_implementation = \"static\"\n             attn_implementation = \"sdpa\""
+        },
+        {
+            "sha": "eea85c75364e0bbbd0d0dd99e6b846977892f5b0",
+            "filename": "tests/models/olmo/test_modeling_olmo.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fc700c2a26af9e1b27162d408e8edfa2903c715f/tests%2Fmodels%2Folmo%2Ftest_modeling_olmo.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fc700c2a26af9e1b27162d408e8edfa2903c715f/tests%2Fmodels%2Folmo%2Ftest_modeling_olmo.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Folmo%2Ftest_modeling_olmo.py?ref=fc700c2a26af9e1b27162d408e8edfa2903c715f",
+            "patch": "@@ -347,7 +347,7 @@ def test_export_static_cache(self):\n         ].shape[-1]\n \n         # Load model\n-        device = \"cpu\"\n+        device = torch_device\n         dtype = torch.bfloat16\n         cache_implementation = \"static\"\n         attn_implementation = \"sdpa\""
+        },
+        {
+            "sha": "29fb3517d65ce429585d6361726d5df5dc78e334",
+            "filename": "tests/models/olmo2/test_modeling_olmo2.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fc700c2a26af9e1b27162d408e8edfa2903c715f/tests%2Fmodels%2Folmo2%2Ftest_modeling_olmo2.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fc700c2a26af9e1b27162d408e8edfa2903c715f/tests%2Fmodels%2Folmo2%2Ftest_modeling_olmo2.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Folmo2%2Ftest_modeling_olmo2.py?ref=fc700c2a26af9e1b27162d408e8edfa2903c715f",
+            "patch": "@@ -348,7 +348,7 @@ def test_export_static_cache(self):\n         ].shape[-1]\n \n         # Load model\n-        device = \"cpu\"\n+        device = torch_device\n         dtype = torch.bfloat16\n         cache_implementation = \"static\"\n         attn_implementation = \"sdpa\""
+        },
+        {
+            "sha": "aec3c30802f25f29e1318f501cd893dc9e480f43",
+            "filename": "tests/models/phi3/test_modeling_phi3.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fc700c2a26af9e1b27162d408e8edfa2903c715f/tests%2Fmodels%2Fphi3%2Ftest_modeling_phi3.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fc700c2a26af9e1b27162d408e8edfa2903c715f/tests%2Fmodels%2Fphi3%2Ftest_modeling_phi3.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fphi3%2Ftest_modeling_phi3.py?ref=fc700c2a26af9e1b27162d408e8edfa2903c715f",
+            "patch": "@@ -384,7 +384,7 @@ def test_export_static_cache(self):\n             config.rope_scaling[\"type\"] = \"default\"\n \n         # Load model\n-        device = \"cpu\"\n+        device = torch_device\n         dtype = torch.bfloat16\n         cache_implementation = \"static\"\n         attn_implementation = \"sdpa\""
+        },
+        {
+            "sha": "d66341901efa825f43b27ec2fd8a89138936263f",
+            "filename": "tests/models/qwen2/test_modeling_qwen2.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fc700c2a26af9e1b27162d408e8edfa2903c715f/tests%2Fmodels%2Fqwen2%2Ftest_modeling_qwen2.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fc700c2a26af9e1b27162d408e8edfa2903c715f/tests%2Fmodels%2Fqwen2%2Ftest_modeling_qwen2.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fqwen2%2Ftest_modeling_qwen2.py?ref=fc700c2a26af9e1b27162d408e8edfa2903c715f",
+            "patch": "@@ -270,7 +270,7 @@ def test_export_static_cache(self):\n         ].shape[-1]\n \n         # Load model\n-        device = \"cpu\"\n+        device = torch_device\n         dtype = torch.bfloat16\n         cache_implementation = \"static\"\n         attn_implementation = \"sdpa\""
+        },
+        {
+            "sha": "424be1c866b4f348e6240b253e9392aedde6575e",
+            "filename": "tests/models/qwen3/test_modeling_qwen3.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fc700c2a26af9e1b27162d408e8edfa2903c715f/tests%2Fmodels%2Fqwen3%2Ftest_modeling_qwen3.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fc700c2a26af9e1b27162d408e8edfa2903c715f/tests%2Fmodels%2Fqwen3%2Ftest_modeling_qwen3.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fqwen3%2Ftest_modeling_qwen3.py?ref=fc700c2a26af9e1b27162d408e8edfa2903c715f",
+            "patch": "@@ -261,7 +261,7 @@ def test_export_static_cache(self):\n         max_generation_length = tokenizer(EXPECTED_TEXT_COMPLETION, return_tensors=\"pt\", padding=True)[\n             \"input_ids\"\n         ].shape[-1]\n-        device = \"cpu\"\n+        device = torch_device\n         dtype = torch.bfloat16\n         cache_implementation = \"static\"\n         attn_implementation = \"sdpa\""
+        },
+        {
+            "sha": "97b8cc2511b2684d370e9ed6ff06fc2116767a27",
+            "filename": "tests/models/t5/test_modeling_t5.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fc700c2a26af9e1b27162d408e8edfa2903c715f/tests%2Fmodels%2Ft5%2Ftest_modeling_t5.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fc700c2a26af9e1b27162d408e8edfa2903c715f/tests%2Fmodels%2Ft5%2Ftest_modeling_t5.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Ft5%2Ftest_modeling_t5.py?ref=fc700c2a26af9e1b27162d408e8edfa2903c715f",
+            "patch": "@@ -1774,7 +1774,7 @@ def test_export_t5_summarization(self):\n         from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, T5ForConditionalGeneration\n         from transformers.integrations.executorch import Seq2SeqLMExportableModule\n \n-        device = \"cpu\"\n+        device = torch_device\n         batch_size = 1\n         max_cache_length = 1234\n         max_hidden_seq_length = 5678"
+        },
+        {
+            "sha": "26f9f56996a63512f176fb3b1a5f3b9d20ff7a00",
+            "filename": "tests/utils/test_cache_utils.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 3,
+            "changes": 6,
+            "blob_url": "https://github.com/huggingface/transformers/blob/fc700c2a26af9e1b27162d408e8edfa2903c715f/tests%2Futils%2Ftest_cache_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/fc700c2a26af9e1b27162d408e8edfa2903c715f/tests%2Futils%2Ftest_cache_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Futils%2Ftest_cache_utils.py?ref=fc700c2a26af9e1b27162d408e8edfa2903c715f",
+            "patch": "@@ -700,7 +700,7 @@ def test_static_cache_exportability(self):\n             self.skipTest(reason=\"This test requires torch >= 2.3 to run.\")\n \n         set_seed(0)\n-        device = \"cpu\"\n+        device = torch_device\n         dtype = \"bfloat16\"\n         cache_implementation = \"static\"\n         attn_implementation = \"sdpa\"  # Export and ExecuTorch only works for SdpaAttention\n@@ -748,8 +748,8 @@ def test_static_cache_exportability(self):\n         self.assertEqual(n_static_value_caches, model.config.num_hidden_layers)\n \n         # Export with dynamic shapes\n-        input_ids = torch.zeros((1, 3), dtype=torch.long)\n-        cache_position = torch.tensor([0, 1, 2], dtype=torch.long)\n+        input_ids = torch.zeros((1, 3), dtype=torch.long, device=device)\n+        cache_position = torch.tensor([0, 1, 2], dtype=torch.long, device=device)\n         dynamic_shapes = {\"input_ids\": {1: torch.export.Dim.DYNAMIC}, \"cache_position\": {0: torch.export.Dim.DYNAMIC}}\n         strict = version.parse(torch.__version__) != version.parse(\"2.7.0\")\n         exported_program = convert_and_export_with_cache("
+        }
+    ],
+    "stats": {
+        "total": 84,
+        "additions": 57,
+        "deletions": 27
+    }
+}

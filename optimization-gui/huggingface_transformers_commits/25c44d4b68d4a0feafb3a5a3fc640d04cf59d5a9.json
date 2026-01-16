@@ -1,0 +1,96 @@
+{
+    "author": "remi-or",
+    "message": "Internvl fix (#38946)\n\n* Image processor compile fix (#38540)\n\n* Added a compile-friendly versiom of resize to BaseImgProcessorFast\n\n* Changed qwen2 processor to use its parent class .resize\n\n* Style\n\n* underlined issue only happens on AMD w/ comment and bool check\n\n* Fixed some utils functions\n\n* Fixed the same issue for bridgetower\n\n* Fixed the same issue for llava_next\n\n* Repo consistency for llava onevision\n\n* Update src/transformers/image_processing_utils_fast.py\n\nCo-authored-by: Mohit Sharma <mohit21sharma.ms@gmail.com>\n\n---------\n\nCo-authored-by: Mohit Sharma <mohit21sharma.ms@gmail.com>\n\n* Added an Expectation to an internvl test\n\n* Made qwen2_vl use the resize method of its parent clas\n\n* Changed to torch.where\n\n---------\n\nCo-authored-by: Mohit Sharma <mohit21sharma.ms@gmail.com>",
+    "sha": "25c44d4b68d4a0feafb3a5a3fc640d04cf59d5a9",
+    "files": [
+        {
+            "sha": "cb02ed2874d3a74178d1a9ac0a0c776690fcc667",
+            "filename": "src/transformers/image_processing_utils_fast.py",
+            "status": "modified",
+            "additions": 27,
+            "deletions": 0,
+            "changes": 27,
+            "blob_url": "https://github.com/huggingface/transformers/blob/25c44d4b68d4a0feafb3a5a3fc640d04cf59d5a9/src%2Ftransformers%2Fimage_processing_utils_fast.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/25c44d4b68d4a0feafb3a5a3fc640d04cf59d5a9/src%2Ftransformers%2Fimage_processing_utils_fast.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fimage_processing_utils_fast.py?ref=25c44d4b68d4a0feafb3a5a3fc640d04cf59d5a9",
+            "patch": "@@ -49,6 +49,7 @@\n     is_vision_available,\n     logging,\n )\n+from .utils.import_utils import is_rocm_platform\n \n \n if is_vision_available():\n@@ -280,8 +281,34 @@ def resize(\n                 \"Size must contain 'height' and 'width' keys, or 'max_height' and 'max_width', or 'shortest_edge' key. Got\"\n                 f\" {size}.\"\n             )\n+        # This is a workaround to avoid a bug in torch.compile when dealing with uint8 on AMD MI3XX GPUs\n+        # Tracked in PyTorch issue: https://github.com/pytorch/pytorch/issues/155209\n+        # TODO: remove this once the bug is fixed (detected with torch==2.7.0+git1fee196, torchvision==0.22.0+9eb57cd)\n+        if torch.compiler.is_compiling() and is_rocm_platform():\n+            return self.compile_friendly_resize(image, new_size, interpolation, antialias)\n         return F.resize(image, new_size, interpolation=interpolation, antialias=antialias)\n \n+    @staticmethod\n+    def compile_friendly_resize(\n+        image: \"torch.Tensor\",\n+        new_size: tuple[int, int],\n+        interpolation: Optional[\"F.InterpolationMode\"] = None,\n+        antialias: bool = True,\n+    ) -> \"torch.Tensor\":\n+        \"\"\"\n+        A wrapper around `F.resize` so that it is compatible with torch.compile when the image is a uint8 tensor.\n+        \"\"\"\n+        if image.dtype == torch.uint8:\n+            image = image.float() / 256\n+            image = F.resize(image, new_size, interpolation=interpolation, antialias=antialias)\n+            image = image * 256\n+            image = torch.where(image > 255, 255, image)\n+            image = torch.where(image < 0, 0, image)\n+            image = image.round().to(torch.uint8)\n+        else:\n+            image = F.resize(image, new_size, interpolation=interpolation, antialias=antialias)\n+        return image\n+\n     def rescale(\n         self,\n         image: \"torch.Tensor\","
+        },
+        {
+            "sha": "95ce3885caf7acf3115ac3f4a7a86a5cf758e88a",
+            "filename": "src/transformers/models/bridgetower/image_processing_bridgetower_fast.py",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 2,
+            "changes": 9,
+            "blob_url": "https://github.com/huggingface/transformers/blob/25c44d4b68d4a0feafb3a5a3fc640d04cf59d5a9/src%2Ftransformers%2Fmodels%2Fbridgetower%2Fimage_processing_bridgetower_fast.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/25c44d4b68d4a0feafb3a5a3fc640d04cf59d5a9/src%2Ftransformers%2Fmodels%2Fbridgetower%2Fimage_processing_bridgetower_fast.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fbridgetower%2Fimage_processing_bridgetower_fast.py?ref=25c44d4b68d4a0feafb3a5a3fc640d04cf59d5a9",
+            "patch": "@@ -165,13 +165,18 @@ def resize(\n             raise ValueError(f\"The `size` dictionary must contain the key `shortest_edge`. Got {size.keys()}\")\n         shorter = size.shortest_edge\n         longer = int(1333 / 800 * shorter)\n-        output_size = get_resize_output_image_size(\n+        output_height, output_width = get_resize_output_image_size(\n             image,\n             shorter=shorter,\n             longer=longer,\n             size_divisor=size_divisor,\n         )\n-        return F.resize(image, output_size, interpolation=interpolation, antialias=antialias)\n+        return super().resize(\n+            image=image,\n+            size=SizeDict(height=output_height, width=output_width),\n+            interpolation=interpolation,\n+            antialias=antialias,\n+        )\n \n     def center_crop(\n         self,"
+        },
+        {
+            "sha": "2d095485922ea4ec035774728f787ed6e7403c45",
+            "filename": "src/transformers/models/llava_next/image_processing_llava_next_fast.py",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 1,
+            "changes": 6,
+            "blob_url": "https://github.com/huggingface/transformers/blob/25c44d4b68d4a0feafb3a5a3fc640d04cf59d5a9/src%2Ftransformers%2Fmodels%2Fllava_next%2Fimage_processing_llava_next_fast.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/25c44d4b68d4a0feafb3a5a3fc640d04cf59d5a9/src%2Ftransformers%2Fmodels%2Fllava_next%2Fimage_processing_llava_next_fast.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fllava_next%2Fimage_processing_llava_next_fast.py?ref=25c44d4b68d4a0feafb3a5a3fc640d04cf59d5a9",
+            "patch": "@@ -137,7 +137,11 @@ def _resize_for_patching(\n         new_height, new_width = get_patch_output_size(image, target_resolution, input_data_format)\n \n         # Resize the image\n-        resized_image = F.resize(image, (new_height, new_width), interpolation=interpolation)\n+        resized_image = self.resize(\n+            image=image,\n+            size=SizeDict(height=new_height, width=new_width),\n+            interpolation=interpolation,\n+        )\n \n         return resized_image\n "
+        },
+        {
+            "sha": "9a727a62b31d272f4b87ec6ab4b8ad7f6ef9afba",
+            "filename": "src/transformers/models/llava_onevision/image_processing_llava_onevision_fast.py",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 1,
+            "changes": 6,
+            "blob_url": "https://github.com/huggingface/transformers/blob/25c44d4b68d4a0feafb3a5a3fc640d04cf59d5a9/src%2Ftransformers%2Fmodels%2Fllava_onevision%2Fimage_processing_llava_onevision_fast.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/25c44d4b68d4a0feafb3a5a3fc640d04cf59d5a9/src%2Ftransformers%2Fmodels%2Fllava_onevision%2Fimage_processing_llava_onevision_fast.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fllava_onevision%2Fimage_processing_llava_onevision_fast.py?ref=25c44d4b68d4a0feafb3a5a3fc640d04cf59d5a9",
+            "patch": "@@ -142,7 +142,11 @@ def _resize_for_patching(\n         new_height, new_width = get_patch_output_size(image, target_resolution, input_data_format)\n \n         # Resize the image\n-        resized_image = F.resize(image, (new_height, new_width), interpolation=interpolation)\n+        resized_image = self.resize(\n+            image=image,\n+            size=SizeDict(height=new_height, width=new_width),\n+            interpolation=interpolation,\n+        )\n \n         return resized_image\n "
+        },
+        {
+            "sha": "2c947e758f1ed9636150a45021c55376a5c7254e",
+            "filename": "src/transformers/models/qwen2_vl/image_processing_qwen2_vl_fast.py",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 2,
+            "changes": 6,
+            "blob_url": "https://github.com/huggingface/transformers/blob/25c44d4b68d4a0feafb3a5a3fc640d04cf59d5a9/src%2Ftransformers%2Fmodels%2Fqwen2_vl%2Fimage_processing_qwen2_vl_fast.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/25c44d4b68d4a0feafb3a5a3fc640d04cf59d5a9/src%2Ftransformers%2Fmodels%2Fqwen2_vl%2Fimage_processing_qwen2_vl_fast.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fqwen2_vl%2Fimage_processing_qwen2_vl_fast.py?ref=25c44d4b68d4a0feafb3a5a3fc640d04cf59d5a9",
+            "patch": "@@ -203,8 +203,10 @@ def _preprocess(\n                     min_pixels=size[\"shortest_edge\"],\n                     max_pixels=size[\"longest_edge\"],\n                 )\n-                stacked_images = F.resize(\n-                    stacked_images, size=(resized_height, resized_width), interpolation=interpolation\n+                stacked_images = self.resize(\n+                    image=stacked_images,\n+                    size=SizeDict(height=resized_height, width=resized_width),\n+                    interpolation=interpolation,\n                 )\n             resized_images_grouped[shape] = stacked_images\n         resized_images = reorder_images(resized_images_grouped, grouped_images_index)"
+        },
+        {
+            "sha": "6eac7efedfecb63a1e04ab03b4cd03ac30b3bc28",
+            "filename": "src/transformers/models/qwen2_vl/video_processing_qwen2_vl.py",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 2,
+            "changes": 6,
+            "blob_url": "https://github.com/huggingface/transformers/blob/25c44d4b68d4a0feafb3a5a3fc640d04cf59d5a9/src%2Ftransformers%2Fmodels%2Fqwen2_vl%2Fvideo_processing_qwen2_vl.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/25c44d4b68d4a0feafb3a5a3fc640d04cf59d5a9/src%2Ftransformers%2Fmodels%2Fqwen2_vl%2Fvideo_processing_qwen2_vl.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fqwen2_vl%2Fvideo_processing_qwen2_vl.py?ref=25c44d4b68d4a0feafb3a5a3fc640d04cf59d5a9",
+            "patch": "@@ -250,8 +250,10 @@ def _preprocess(\n                     min_pixels=min_pixels,\n                     max_pixels=max_pixels,\n                 )\n-                stacked_videos = F.resize(\n-                    stacked_videos, size=(resized_height, resized_width), interpolation=interpolation\n+                stacked_videos = self.resize(\n+                    image=stacked_videos,\n+                    size=SizeDict(height=resized_height, width=resized_width),\n+                    interpolation=interpolation,\n                 )\n             resized_videos_grouped[shape] = stacked_videos\n         resized_videos = reorder_videos(resized_videos_grouped, grouped_videos_index)"
+        },
+        {
+            "sha": "d7e1132be667798f0eef1baf660e4f95e9e3dc47",
+            "filename": "tests/models/internvl/test_modeling_internvl.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/huggingface/transformers/blob/25c44d4b68d4a0feafb3a5a3fc640d04cf59d5a9/tests%2Fmodels%2Finternvl%2Ftest_modeling_internvl.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/25c44d4b68d4a0feafb3a5a3fc640d04cf59d5a9/tests%2Fmodels%2Finternvl%2Ftest_modeling_internvl.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Finternvl%2Ftest_modeling_internvl.py?ref=25c44d4b68d4a0feafb3a5a3fc640d04cf59d5a9",
+            "patch": "@@ -705,6 +705,7 @@ def test_llama_small_model_integration_forward(self):\n                 (\"xpu\", 3): torch.tensor([-9.8750, -0.5703, 1.4297, -10.3125, -10.3125], dtype=torch.float16),\n                 (\"cuda\", 7): torch.tensor([-9.8750,  -0.4861,   1.4648, -10.3359, -10.3359], dtype=torch.float16),\n                 (\"cuda\", 8): torch.tensor([-9.8906,  -0.4995,   1.4473, -10.3359, -10.3438], dtype=torch.float16),\n+                (\"rocm\", (9, 5)): torch.tensor([ -9.8906,  -0.4976,   1.4502, -10.3359, -10.3438], dtype=torch.float16),\n             }\n         )  # fmt: skip\n         expected_logits = torch.tensor(expected_logits_all.get_expectation(), dtype=torch.float16)"
+        }
+    ],
+    "stats": {
+        "total": 61,
+        "additions": 53,
+        "deletions": 8
+    }
+}

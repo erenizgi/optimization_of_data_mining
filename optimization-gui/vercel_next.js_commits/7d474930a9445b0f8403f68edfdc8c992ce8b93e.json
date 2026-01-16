@@ -1,0 +1,96 @@
+{
+    "author": "sokra",
+    "message": "Turbopack: fix hanging problem with reexport cycles (#81620)\n\n### What?\n\nFix a hanging compilation in a specific case when reexports modules in a cycle.\n\nFix reported issues for tree shaken modules",
+    "sha": "7d474930a9445b0f8403f68edfdc8c992ce8b93e",
+    "files": [
+        {
+            "sha": "635c5a4ed9d0d8c77a8d5b1c33409370849de3d1",
+            "filename": "turbopack/crates/turbopack-ecmascript/src/references/esm/export.rs",
+            "status": "modified",
+            "additions": 25,
+            "deletions": 17,
+            "changes": 42,
+            "blob_url": "https://github.com/vercel/next.js/blob/7d474930a9445b0f8403f68edfdc8c992ce8b93e/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Freferences%2Fesm%2Fexport.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/7d474930a9445b0f8403f68edfdc8c992ce8b93e/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Freferences%2Fesm%2Fexport.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-ecmascript%2Fsrc%2Freferences%2Fesm%2Fexport.rs?ref=7d474930a9445b0f8403f68edfdc8c992ce8b93e",
+            "patch": "@@ -13,7 +13,7 @@ use swc_core::{\n };\n use turbo_rcstr::{RcStr, rcstr};\n use turbo_tasks::{\n-    FxIndexMap, FxIndexSet, NonLocalValue, ResolvedVc, TryFlatJoinIterExt, ValueToString, Vc,\n+    FxIndexMap, NonLocalValue, ResolvedVc, TryFlatJoinIterExt, ValueToString, Vc,\n     trace::TraceRawVcs,\n };\n use turbo_tasks_fs::glob::Glob;\n@@ -345,7 +345,7 @@ async fn get_all_export_names(\n                 if let ReferencedAsset::Some(m) =\n                     *ReferencedAsset::from_resolve_result(esm_ref.resolve_reference()).await?\n                 {\n-                    Some(get_all_export_names(*m))\n+                    Some(expand_star_exports(*m))\n                 } else {\n                     None\n                 },\n@@ -374,30 +374,35 @@ async fn get_all_export_names(\n \n #[turbo_tasks::value]\n pub struct ExpandStarResult {\n-    pub star_exports: Vec<RcStr>,\n-    pub has_dynamic_exports: bool,\n+    pub esm_exports: FxIndexMap<RcStr, ResolvedVc<Box<dyn EcmascriptChunkPlaceable>>>,\n+    pub dynamic_exporting_modules: Vec<ResolvedVc<Box<dyn EcmascriptChunkPlaceable>>>,\n }\n \n #[turbo_tasks::function]\n pub async fn expand_star_exports(\n-    root_module: Vc<Box<dyn EcmascriptChunkPlaceable>>,\n+    root_module: ResolvedVc<Box<dyn EcmascriptChunkPlaceable>>,\n ) -> Result<Vc<ExpandStarResult>> {\n-    let mut set = FxIndexSet::default();\n-    let mut has_dynamic_exports = false;\n+    let mut esm_exports = FxIndexMap::default();\n+    let mut dynamic_exporting_modules = Vec::new();\n     let mut checked_modules = FxHashSet::default();\n     checked_modules.insert(root_module);\n     let mut queue = vec![(root_module, root_module.get_exports())];\n     while let Some((asset, exports)) = queue.pop() {\n         match &*exports.await? {\n             EcmascriptExports::EsmExports(exports) => {\n                 let exports = exports.await?;\n-                set.extend(exports.exports.keys().filter(|n| *n != \"default\").cloned());\n+                for key in exports.exports.keys() {\n+                    if key == \"default\" {\n+                        continue;\n+                    }\n+                    esm_exports.entry(key.clone()).or_insert_with(|| asset);\n+                }\n                 for esm_ref in exports.star_exports.iter() {\n                     if let ReferencedAsset::Some(asset) =\n                         &*ReferencedAsset::from_resolve_result(esm_ref.resolve_reference()).await?\n-                        && checked_modules.insert(**asset)\n+                        && checked_modules.insert(*asset)\n                     {\n-                        queue.push((**asset, asset.get_exports()));\n+                        queue.push((*asset, asset.get_exports()));\n                     }\n                 }\n             }\n@@ -429,7 +434,7 @@ pub async fn expand_star_exports(\n                 .await?\n             }\n             EcmascriptExports::CommonJs => {\n-                has_dynamic_exports = true;\n+                dynamic_exporting_modules.push(asset);\n                 emit_star_exports_issue(\n                     asset.ident(),\n                     format!(\n@@ -444,18 +449,18 @@ pub async fn expand_star_exports(\n                 .await?;\n             }\n             EcmascriptExports::DynamicNamespace => {\n-                has_dynamic_exports = true;\n+                dynamic_exporting_modules.push(asset);\n             }\n             EcmascriptExports::Unknown => {\n                 // Propagate the Unknown export type to a certain extent.\n-                has_dynamic_exports = true;\n+                dynamic_exporting_modules.push(asset);\n             }\n         }\n     }\n \n     Ok(ExpandStarResult {\n-        star_exports: set.into_iter().collect(),\n-        has_dynamic_exports,\n+        esm_exports,\n+        dynamic_exporting_modules,\n     }\n     .cell())\n }\n@@ -520,7 +525,10 @@ impl EsmExports {\n \n             let export_info = expand_star_exports(**asset).await?;\n \n-            for export in &export_info.star_exports {\n+            for export in export_info.esm_exports.keys() {\n+                if export == \"default\" {\n+                    continue;\n+                }\n                 if !export_usage_info.is_export_used(export) {\n                     continue;\n                 }\n@@ -537,7 +545,7 @@ impl EsmExports {\n                 }\n             }\n \n-            if export_info.has_dynamic_exports {\n+            if !export_info.dynamic_exporting_modules.is_empty() {\n                 dynamic_exports.push(*asset);\n             }\n         }"
+        },
+        {
+            "sha": "3880d5618a5ae4d08a83df946a08e9bec83431c8",
+            "filename": "turbopack/crates/turbopack-tests/tests/execution/turbopack/side-effects-optimization/basic/issues/unexpected export __star__-32fbe8.txt",
+            "status": "added",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/7d474930a9445b0f8403f68edfdc8c992ce8b93e/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fbasic%2Fissues%2Funexpected%20export%20__star__-32fbe8.txt",
+            "raw_url": "https://github.com/vercel/next.js/raw/7d474930a9445b0f8403f68edfdc8c992ce8b93e/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fbasic%2Fissues%2Funexpected%20export%20__star__-32fbe8.txt",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fbasic%2Fissues%2Funexpected%20export%20__star__-32fbe8.txt?ref=7d474930a9445b0f8403f68edfdc8c992ce8b93e",
+            "patch": "@@ -0,0 +1,5 @@\n+warning - [analysis] /turbopack/crates/turbopack-tests/tests/execution/turbopack/side-effects-optimization/basic/input/node_modules/package-star/not-executed.js  unexpected export *\n+  \n+  export * used with module [project]/turbopack/crates/turbopack-tests/tests/execution/turbopack/side-effects-optimization/basic/input/node_modules/package-star/not-executed.js [test] (ecmascript) which has no exports\n+  Typescript only: Did you want to export only types with `export type * from \"...\"`?\n+  Note: Using `export type` is more efficient than `export *` as it won't emit any runtime code.\n\\ No newline at end of file"
+        },
+        {
+            "sha": "0ddc8aedf72341451b739338bbfd34727960fded",
+            "filename": "turbopack/crates/turbopack-tests/tests/execution/turbopack/side-effects-optimization/cycle/input/a.js",
+            "status": "added",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/7d474930a9445b0f8403f68edfdc8c992ce8b93e/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fcycle%2Finput%2Fa.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/7d474930a9445b0f8403f68edfdc8c992ce8b93e/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fcycle%2Finput%2Fa.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fcycle%2Finput%2Fa.js?ref=7d474930a9445b0f8403f68edfdc8c992ce8b93e",
+            "patch": "@@ -0,0 +1,5 @@\n+export * from './b.js'\n+\n+export const value = 42\n+\n+export { value as reexported } from './b.js'"
+        },
+        {
+            "sha": "ae91476e74f0416e7177297f93e1896030976729",
+            "filename": "turbopack/crates/turbopack-tests/tests/execution/turbopack/side-effects-optimization/cycle/input/b.js",
+            "status": "added",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/7d474930a9445b0f8403f68edfdc8c992ce8b93e/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fcycle%2Finput%2Fb.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/7d474930a9445b0f8403f68edfdc8c992ce8b93e/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fcycle%2Finput%2Fb.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fcycle%2Finput%2Fb.js?ref=7d474930a9445b0f8403f68edfdc8c992ce8b93e",
+            "patch": "@@ -0,0 +1 @@\n+export * from './a.js'"
+        },
+        {
+            "sha": "c21a9b12ceb03a83532a034d3bf7a7779242dfd1",
+            "filename": "turbopack/crates/turbopack-tests/tests/execution/turbopack/side-effects-optimization/cycle/input/index.js",
+            "status": "added",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/7d474930a9445b0f8403f68edfdc8c992ce8b93e/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fcycle%2Finput%2Findex.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/7d474930a9445b0f8403f68edfdc8c992ce8b93e/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fcycle%2Finput%2Findex.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fcycle%2Finput%2Findex.js?ref=7d474930a9445b0f8403f68edfdc8c992ce8b93e",
+            "patch": "@@ -0,0 +1,5 @@\n+it('should allow reexport cycles', async () => {\n+  const module = await import('./a.js')\n+  expect(module.value).toBe(42)\n+  expect(module.reexported).toBe(42)\n+})"
+        },
+        {
+            "sha": "bf30b867b72132fe909283a871c7916ee8109fb5",
+            "filename": "turbopack/crates/turbopack-tests/tests/execution/turbopack/side-effects-optimization/cycle/options.json",
+            "status": "added",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/7d474930a9445b0f8403f68edfdc8c992ce8b93e/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fcycle%2Foptions.json",
+            "raw_url": "https://github.com/vercel/next.js/raw/7d474930a9445b0f8403f68edfdc8c992ce8b93e/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fcycle%2Foptions.json",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Fside-effects-optimization%2Fcycle%2Foptions.json?ref=7d474930a9445b0f8403f68edfdc8c992ce8b93e",
+            "patch": "@@ -0,0 +1,3 @@\n+{\n+  \"scopeHoisting\": false\n+}"
+        },
+        {
+            "sha": "3880d5618a5ae4d08a83df946a08e9bec83431c8",
+            "filename": "turbopack/crates/turbopack-tests/tests/execution/turbopack/tree-shaking/basic/issues/unexpected export __star__-32fbe8.txt",
+            "status": "added",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/7d474930a9445b0f8403f68edfdc8c992ce8b93e/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Ftree-shaking%2Fbasic%2Fissues%2Funexpected%20export%20__star__-32fbe8.txt",
+            "raw_url": "https://github.com/vercel/next.js/raw/7d474930a9445b0f8403f68edfdc8c992ce8b93e/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Ftree-shaking%2Fbasic%2Fissues%2Funexpected%20export%20__star__-32fbe8.txt",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution%2Fturbopack%2Ftree-shaking%2Fbasic%2Fissues%2Funexpected%20export%20__star__-32fbe8.txt?ref=7d474930a9445b0f8403f68edfdc8c992ce8b93e",
+            "patch": "@@ -0,0 +1,5 @@\n+warning - [analysis] /turbopack/crates/turbopack-tests/tests/execution/turbopack/side-effects-optimization/basic/input/node_modules/package-star/not-executed.js  unexpected export *\n+  \n+  export * used with module [project]/turbopack/crates/turbopack-tests/tests/execution/turbopack/side-effects-optimization/basic/input/node_modules/package-star/not-executed.js [test] (ecmascript) which has no exports\n+  Typescript only: Did you want to export only types with `export type * from \"...\"`?\n+  Note: Using `export type` is more efficient than `export *` as it won't emit any runtime code.\n\\ No newline at end of file"
+        }
+    ],
+    "stats": {
+        "total": 66,
+        "additions": 49,
+        "deletions": 17
+    }
+}

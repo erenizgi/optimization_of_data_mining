@@ -1,0 +1,48 @@
+{
+    "author": "huozhi",
+    "message": "[dev-overlay] ensure stripping overlay bundle in prod build (#76976)\n\n### What\n\nWhile adding a regression test for overlay JS bundle to ensure it's not\ngonna existed in client bundles by asserting the source map.\nFound that we're also including the indicator reducer from client JS\nbundles. This PR ensure we fully strips it out",
+    "sha": "b659ca61b062325b38d3964689ffc1bc4253b6ec",
+    "files": [
+        {
+            "sha": "588c63b8c7b0589122d99a4428f57c5b76cc8561",
+            "filename": "packages/next/src/client/components/use-reducer.ts",
+            "status": "modified",
+            "additions": 24,
+            "deletions": 10,
+            "changes": 34,
+            "blob_url": "https://github.com/vercel/next.js/blob/b659ca61b062325b38d3964689ffc1bc4253b6ec/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Fuse-reducer.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/b659ca61b062325b38d3964689ffc1bc4253b6ec/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Fuse-reducer.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Fuse-reducer.ts?ref=b659ca61b062325b38d3964689ffc1bc4253b6ec",
+            "patch": "@@ -7,7 +7,6 @@ import type {\n   ReducerActions,\n   ReducerState,\n } from './router-reducer/router-reducer-types'\n-import { useSyncDevRenderIndicator } from './react-dev-overlay/utils/dev-indicator/use-sync-dev-render-indicator'\n \n export function useUnwrapState(state: ReducerState): AppRouterState {\n   // reducer actions can be async, so sometimes we need to suspend until the state is resolved\n@@ -23,16 +22,31 @@ export function useReducer(\n   actionQueue: AppRouterActionQueue\n ): [ReducerState, Dispatch<ReducerActions>] {\n   const [state, setState] = React.useState<ReducerState>(actionQueue.state)\n-  const syncDevRenderIndicator = useSyncDevRenderIndicator()\n+  const actionDispatch = (action: ReducerActions) => {\n+    actionQueue.dispatch(action, setState)\n+  }\n+\n+  let syncDevRenderIndicator\n+  if (process.env.NODE_ENV !== 'production') {\n+    const useSyncDevRenderIndicator =\n+      require('./react-dev-overlay/utils/dev-indicator/use-sync-dev-render-indicator')\n+        .useSyncDevRenderIndicator as typeof import('./react-dev-overlay/utils/dev-indicator/use-sync-dev-render-indicator').useSyncDevRenderIndicator\n+    // eslint-disable-next-line react-hooks/rules-of-hooks\n+    syncDevRenderIndicator = useSyncDevRenderIndicator()\n+  }\n+\n+  const dispatchCallback =\n+    process.env.NODE_ENV !== 'production'\n+      ? (action: ReducerActions) => {\n+          syncDevRenderIndicator!(() => actionDispatch(action))\n+        }\n+      : actionDispatch\n \n-  const dispatch = useCallback(\n-    (action: ReducerActions) => {\n-      syncDevRenderIndicator(() => {\n-        actionQueue.dispatch(action, setState)\n-      })\n-    },\n-    [actionQueue, syncDevRenderIndicator]\n-  )\n+  const dispatch = useCallback(dispatchCallback, [\n+    actionQueue,\n+    dispatchCallback,\n+    syncDevRenderIndicator,\n+  ])\n \n   return [state, dispatch]\n }"
+        },
+        {
+            "sha": "47db005b50d46beaa68a4f9b33ca3e9694dd90a6",
+            "filename": "test/production/app-dir/browser-chunks/browser-chunks.test.ts",
+            "status": "modified",
+            "additions": 42,
+            "deletions": 22,
+            "changes": 64,
+            "blob_url": "https://github.com/vercel/next.js/blob/b659ca61b062325b38d3964689ffc1bc4253b6ec/test%2Fproduction%2Fapp-dir%2Fbrowser-chunks%2Fbrowser-chunks.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/b659ca61b062325b38d3964689ffc1bc4253b6ec/test%2Fproduction%2Fapp-dir%2Fbrowser-chunks%2Fbrowser-chunks.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fproduction%2Fapp-dir%2Fbrowser-chunks%2Fbrowser-chunks.test.ts?ref=b659ca61b062325b38d3964689ffc1bc4253b6ec",
+            "patch": "@@ -3,37 +3,57 @@ import { nextTestSetup } from 'e2e-utils'\n import { SourceMapPayload } from 'module'\n \n describe('browser-chunks', () => {\n-  const { next, isTurbopack } = nextTestSetup({\n+  const { next } = nextTestSetup({\n     files: __dirname,\n     skipDeployment: true,\n   })\n \n-  ;(isTurbopack ? it.skip : it)(\n-    'must not bundle any server modules into browser chunks',\n-    async () => {\n-      const sourcemaps = await next.readFiles(\n-        '.next/static/chunks',\n-        (filename) => filename.endsWith('.js.map')\n-      )\n+  let sources = []\n+  beforeAll(async () => {\n+    const sourcemaps = await next.readFiles('.next/static/chunks', (filename) =>\n+      filename.endsWith('.js.map')\n+    )\n+\n+    sources = sourcemaps.flatMap(\n+      (sourcemap) => (JSON.parse(sourcemap) as SourceMapPayload).sources\n+    )\n+  })\n+  it('must not bundle any server modules into browser chunks', () => {\n+    const serverSources = sources.filter(\n+      (source) =>\n+        /webpack:\\/\\/_N_E\\/(\\.\\.\\/)*src\\/server\\//.test(source) ||\n+        source.includes('next/dist/esm/server') ||\n+        source.includes('next/dist/server')\n+    )\n \n-      const sources = sourcemaps.flatMap(\n-        (sourcemap) => (JSON.parse(sourcemap) as SourceMapPayload).sources\n+    if (serverSources.length > 0) {\n+      console.error(\n+        `Found the following server modules:\\n  ${serverSources.join('\\n  ')}\\nIf any of these modules are allowed to be included in browser chunks, move them to src/shared or src/client.`\n       )\n \n-      const serverSources = sources.filter(\n-        (source) =>\n-          /webpack:\\/\\/_N_E\\/(\\.\\.\\/)*src\\/server\\//.test(source) ||\n-          source.includes('next/dist/esm/server') ||\n-          source.includes('next/dist/server')\n+      throw new Error('Did not expect any server modules in browser chunks.')\n+    }\n+  })\n+\n+  it('must not bundle any dev overlay into browser chunks', () => {\n+    const devOverlaySources = sources.filter((source) => {\n+      return (\n+        /webpack:\\/\\/_N_E\\/(\\.\\.\\/)*src\\/client\\/components\\/react-dev-overlay\\//.test(\n+          source\n+        ) ||\n+        /next\\/dist\\/(esm\\/)?client\\/components\\/react-dev-overlay/.test(source)\n       )\n+    })\n \n-      if (serverSources.length > 0) {\n-        console.error(\n-          `Found the following server modules:\\n  ${serverSources.join('\\n  ')}\\nIf any of these modules are allowed to be included in browser chunks, move them to src/shared or src/client.`\n-        )\n+    if (devOverlaySources.length > 0) {\n+      const message = `Found the following dev overlay modules:\\n  ${devOverlaySources.join('\\n')}`\n+      console.error(\n+        `${message}\\nIf any of these modules are allowed to be included in production chunks, check the import and render conditions.`\n+      )\n \n-        throw new Error('Did not expect any server modules in browser chunks.')\n-      }\n+      throw new Error(\n+        'Did not expect any dev overlay modules in browser chunks.\\n' + message\n+      )\n     }\n-  )\n+  })\n })"
+        },
+        {
+            "sha": "7596c9d1376d6157066ecedd9f653cfeadabaf6c",
+            "filename": "test/turbopack-build-tests-manifest.json",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 0,
+            "changes": 10,
+            "blob_url": "https://github.com/vercel/next.js/blob/b659ca61b062325b38d3964689ffc1bc4253b6ec/test%2Fturbopack-build-tests-manifest.json",
+            "raw_url": "https://github.com/vercel/next.js/raw/b659ca61b062325b38d3964689ffc1bc4253b6ec/test%2Fturbopack-build-tests-manifest.json",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fturbopack-build-tests-manifest.json?ref=b659ca61b062325b38d3964689ffc1bc4253b6ec",
+            "patch": "@@ -18689,6 +18689,16 @@\n       \"flakey\": [],\n       \"runtimeError\": false\n     },\n+    \"test/production/app-dir/browser-chunks/browser-chunks.test.ts\": {\n+      \"passed\": [],\n+      \"failed\": [],\n+      \"pending\": [\n+        \"browser-chunks must not bundle any server modules into browser chunks\",\n+        \"browser-chunks must not bundle any dev overlay into browser chunks\"\n+      ],\n+      \"flakey\": [],\n+      \"runtimeError\": false\n+    },\n     \"test/production/typescript-basic/typechecking.test.ts\": {\n       \"passed\": [\"typechecking should typecheck\"],\n       \"failed\": [],"
+        }
+    ],
+    "stats": {
+        "total": 108,
+        "additions": 76,
+        "deletions": 32
+    }
+}

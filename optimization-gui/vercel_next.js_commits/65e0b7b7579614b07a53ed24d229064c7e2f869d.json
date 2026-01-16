@@ -1,0 +1,36 @@
+{
+    "author": "ztanner",
+    "message": "bugfix: static resources staleTime should be renewed once refetched (#81771)\n\nWhen the `x-nextjs-staletime` header is sent from the server, the client\nrouter was discarding all of its staleTime heuristics (such as\nlastUsedTime and \"reusable\" cache entries). This caused an issue where\nafter the static staleTime window expired and the prefetch data was\nrenewed, the static staleTime itself was not being renewed.\n\nAs a result, once the static staleTime expired, the client would\ncontinuously refetch the resource on every navigation, even though it\nhad just been renewed.\n\nThis removes the `x-nextjs-staleTime` logic from this heuristic because\nit was only intended to be considered for the new `clientSegmentCache` &\ncache components work",
+    "sha": "65e0b7b7579614b07a53ed24d229064c7e2f869d",
+    "files": [
+        {
+            "sha": "ad58763260cb0e89ed86750bd88661070e12f423",
+            "filename": "packages/next/src/client/components/router-reducer/prefetch-cache-utils.ts",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 15,
+            "changes": 15,
+            "blob_url": "https://github.com/vercel/next.js/blob/65e0b7b7579614b07a53ed24d229064c7e2f869d/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Frouter-reducer%2Fprefetch-cache-utils.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/65e0b7b7579614b07a53ed24d229064c7e2f869d/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Frouter-reducer%2Fprefetch-cache-utils.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fclient%2Fcomponents%2Frouter-reducer%2Fprefetch-cache-utils.ts?ref=65e0b7b7579614b07a53ed24d229064c7e2f869d",
+            "patch": "@@ -404,22 +404,7 @@ function getPrefetchEntryCacheStatus({\n   kind,\n   prefetchTime,\n   lastUsedTime,\n-  staleTime,\n }: PrefetchCacheEntry): PrefetchCacheEntryStatus {\n-  if (staleTime !== -1) {\n-    // `staleTime` is the value sent by the server during static generation.\n-    // When this is available, it takes precedence over any of the heuristics\n-    // that follow.\n-    //\n-    // TODO: When PPR is enabled, the server will *always* return a stale time\n-    // when prefetching. We should never use a prefetch entry that hasn't yet\n-    // received data from the server. So the only two cases should be 1) we use\n-    // the server-generated stale time 2) the unresolved entry is discarded.\n-    return Date.now() < prefetchTime + staleTime\n-      ? PrefetchCacheEntryStatus.fresh\n-      : PrefetchCacheEntryStatus.stale\n-  }\n-\n   // We will re-use the cache entry data for up to the `dynamic` staletime window.\n   if (Date.now() < (lastUsedTime ?? prefetchTime) + DYNAMIC_STALETIME_MS) {\n     return lastUsedTime"
+        },
+        {
+            "sha": "4c1a9bce0c47709709004ee4b1f69810ab2de8fb",
+            "filename": "test/e2e/app-dir/app-prefetch/prefetching.stale-times.test.ts",
+            "status": "modified",
+            "additions": 74,
+            "deletions": 3,
+            "changes": 77,
+            "blob_url": "https://github.com/vercel/next.js/blob/65e0b7b7579614b07a53ed24d229064c7e2f869d/test%2Fe2e%2Fapp-dir%2Fapp-prefetch%2Fprefetching.stale-times.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/65e0b7b7579614b07a53ed24d229064c7e2f869d/test%2Fe2e%2Fapp-dir%2Fapp-prefetch%2Fprefetching.stale-times.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Fapp-prefetch%2Fprefetching.stale-times.test.ts?ref=65e0b7b7579614b07a53ed24d229064c7e2f869d",
+            "patch": "@@ -137,9 +137,11 @@ describe('app dir - prefetching (custom staleTime)', () => {\n     let requests: string[] = []\n \n     browser.on('request', (req) => {\n-      // only consider requests that have RSC header but not the prefetch header\n-      if (req.headers()['rsc'] && !req.headers()['next-router-prefetch']) {\n-        requests.push(new URL(req.url()).pathname)\n+      const path = new URL(req.url()).pathname\n+      const headers = req.headers()\n+\n+      if (headers['rsc']) {\n+        requests.push(path)\n       }\n     })\n \n@@ -164,4 +166,73 @@ describe('app dir - prefetching (custom staleTime)', () => {\n       ).toHaveLength(1)\n     })\n   })\n+\n+  it('should renew the stale time after refetching expired RSC data', async () => {\n+    const browser = await next.browser('/404')\n+    let requests: string[] = []\n+\n+    browser.on('request', (req) => {\n+      requests.push(new URL(req.url()).pathname)\n+    })\n+\n+    // Navigate to home and wait for static page to be prefetched\n+    await browser.eval('location.href = \"/\"')\n+\n+    await retry(async () => {\n+      expect(\n+        requests.filter((request) => request === '/static-page')\n+      ).toHaveLength(1)\n+    })\n+\n+    // Navigate to static page (should use cached data)\n+    await browser\n+      .elementByCss('#to-static-page')\n+      .click()\n+      .waitForElementByCss('#static-page')\n+\n+    // Go back to home\n+    await browser\n+      .elementByCss('#to-home')\n+      .click()\n+      .waitForElementByCss('#to-static-page')\n+\n+    // Wait for stale time to expire (10 seconds)\n+    await waitFor(10000)\n+\n+    // Navigate to static page again (should refetch due to expired cache)\n+    await browser\n+      .elementByCss('#to-static-page')\n+      .click()\n+      .waitForElementByCss('#static-page')\n+\n+    // Verify that refetch happened\n+    await retry(async () => {\n+      expect(\n+        requests.filter((request) => request === '/static-page')\n+      ).toHaveLength(2)\n+    })\n+\n+    // Go back to home\n+    await browser\n+      .elementByCss('#to-home')\n+      .click()\n+      .waitForElementByCss('#to-static-page')\n+\n+    // Wait less than the stale time (5 seconds - should still be fresh)\n+    await waitFor(5000)\n+\n+    // Navigate to static page again (should NOT refetch - stale time should be renewed)\n+    await browser\n+      .elementByCss('#to-static-page')\n+      .click()\n+      .waitForElementByCss('#static-page')\n+\n+    // This should still be 2 - no new request should have been made\n+    // If this fails, it means the stale time was not renewed after the refetch\n+    await retry(async () => {\n+      expect(\n+        requests.filter((request) => request === '/static-page')\n+      ).toHaveLength(2)\n+    })\n+  })\n })"
+        }
+    ],
+    "stats": {
+        "total": 92,
+        "additions": 74,
+        "deletions": 18
+    }
+}

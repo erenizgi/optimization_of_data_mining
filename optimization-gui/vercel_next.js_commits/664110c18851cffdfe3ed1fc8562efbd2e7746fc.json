@@ -1,0 +1,36 @@
+{
+    "author": "sokra",
+    "message": "Turbopack: read asset entries strongly consistent (#77974)\n\n### What?\n\nAvoid eventual consistent results influencing the map state.",
+    "sha": "664110c18851cffdfe3ed1fc8562efbd2e7746fc",
+    "files": [
+        {
+            "sha": "ba58fbbaafb88eaa69bc99817e5e8ea2540e0788",
+            "filename": "crates/next-api/src/versioned_content_map.rs",
+            "status": "modified",
+            "additions": 34,
+            "deletions": 21,
+            "changes": 55,
+            "blob_url": "https://github.com/vercel/next.js/blob/664110c18851cffdfe3ed1fc8562efbd2e7746fc/crates%2Fnext-api%2Fsrc%2Fversioned_content_map.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/664110c18851cffdfe3ed1fc8562efbd2e7746fc/crates%2Fnext-api%2Fsrc%2Fversioned_content_map.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/crates%2Fnext-api%2Fsrc%2Fversioned_content_map.rs?ref=664110c18851cffdfe3ed1fc8562efbd2e7746fc",
+            "patch": "@@ -120,30 +120,19 @@ impl VersionedContentMap {\n         client_relative_path: Vc<FileSystemPath>,\n         client_output_path: Vc<FileSystemPath>,\n     ) -> Result<Vc<OptionMapEntry>> {\n-        let assets = assets_operation.connect();\n-        async fn get_entries(\n-            assets: Vc<OutputAssets>,\n-        ) -> Result<Vec<(ResolvedVc<FileSystemPath>, ResolvedVc<Box<dyn OutputAsset>>)>> {\n-            let assets_ref = assets.await?;\n-            let entries = assets_ref\n-                .iter()\n-                .map(|&asset| async move {\n-                    let path = asset.path().to_resolved().await?;\n-                    Ok((path, asset))\n-                })\n-                .try_join()\n-                .await?;\n-            Ok(entries)\n-        }\n-        let entries = get_entries(assets).await.unwrap_or_default();\n+        let entries = get_entries(assets_operation)\n+            .read_strongly_consistent()\n+            .await\n+            // Any error should result in an empty list, which removes all assets from the map\n+            .ok();\n \n         self.map_path_to_op.update_conditionally(|map| {\n             let mut changed = false;\n \n             // get current map's keys, subtract keys that don't exist in operation\n             let mut stale_assets = map.0.keys().copied().collect::<FxHashSet<_>>();\n \n-            for (k, _) in entries.iter() {\n+            for (k, _) in entries.iter().flatten() {\n                 let res = map.0.entry(*k).or_default().insert(assets_operation);\n                 stale_assets.remove(k);\n                 changed = changed || res;\n@@ -163,12 +152,17 @@ impl VersionedContentMap {\n         });\n \n         // Make sure all written client assets are up-to-date\n-        let _ = emit_assets(assets, node_root, client_relative_path, client_output_path)\n-            .resolve()\n-            .await?;\n+        let _ = emit_assets(\n+            assets_operation.connect(),\n+            node_root,\n+            client_relative_path,\n+            client_output_path,\n+        )\n+        .resolve()\n+        .await?;\n         let map_entry = Vc::cell(Some(MapEntry {\n             assets_operation,\n-            path_to_asset: entries.into_iter().collect(),\n+            path_to_asset: entries.iter().flatten().copied().collect(),\n         }));\n         Ok(map_entry)\n     }\n@@ -265,6 +259,25 @@ impl VersionedContentMap {\n     }\n }\n \n+type GetEntriesResultT = Vec<(ResolvedVc<FileSystemPath>, ResolvedVc<Box<dyn OutputAsset>>)>;\n+\n+#[turbo_tasks::value(transparent)]\n+struct GetEntriesResult(GetEntriesResultT);\n+\n+#[turbo_tasks::function(operation)]\n+async fn get_entries(assets: OperationVc<OutputAssets>) -> Result<Vc<GetEntriesResult>> {\n+    let assets_ref = assets.connect().await?;\n+    let entries = assets_ref\n+        .iter()\n+        .map(|&asset| async move {\n+            let path = asset.path().to_resolved().await?;\n+            Ok((path, asset))\n+        })\n+        .try_join()\n+        .await?;\n+    Ok(Vc::cell(entries))\n+}\n+\n #[turbo_tasks::function(operation)]\n fn compute_entry_operation(\n     map: ResolvedVc<VersionedContentMap>,"
+        },
+        {
+            "sha": "067e6d81a1533144462c528555de7ece65f4a80b",
+            "filename": "test/development/app-dir/missing-required-html-tags/index.test.ts",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 18,
+            "changes": 21,
+            "blob_url": "https://github.com/vercel/next.js/blob/664110c18851cffdfe3ed1fc8562efbd2e7746fc/test%2Fdevelopment%2Fapp-dir%2Fmissing-required-html-tags%2Findex.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/664110c18851cffdfe3ed1fc8562efbd2e7746fc/test%2Fdevelopment%2Fapp-dir%2Fmissing-required-html-tags%2Findex.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fdevelopment%2Fapp-dir%2Fmissing-required-html-tags%2Findex.test.ts?ref=664110c18851cffdfe3ed1fc8562efbd2e7746fc",
+            "patch": "@@ -8,7 +8,7 @@ import {\n } from 'next-test-utils'\n \n describe('app-dir - missing required html tags', () => {\n-  const { next, isTurbopack } = nextTestSetup({ files: __dirname })\n+  const { next } = nextTestSetup({ files: __dirname })\n \n   it('should display correct error count in dev indicator', async () => {\n     const browser = await next.browser('/')\n@@ -75,22 +75,7 @@ describe('app-dir - missing required html tags', () => {\n       )\n     )\n \n-    if (isTurbopack) {\n-      await assertHasRedbox(browser)\n-      await expect(browser).toDisplayRedbox(`\n-       {\n-         \"count\": 1,\n-         \"description\": \"Error: Missing <html> and <body> tags in the root layout.\n-       Read more at https://nextjs.org/docs/messages/missing-root-layout-tags\",\n-         \"environmentLabel\": null,\n-         \"label\": \"Runtime Error\",\n-         \"source\": null,\n-         \"stack\": [],\n-       }\n-      `)\n-    } else {\n-      // TODO(NDX-768): Should show \"missing tags\" error\n-      await assertNoRedbox(browser)\n-    }\n+    // TODO(NDX-768): Should show \"missing tags\" error\n+    await assertNoRedbox(browser)\n   })\n })"
+        }
+    ],
+    "stats": {
+        "total": 76,
+        "additions": 37,
+        "deletions": 39
+    }
+}

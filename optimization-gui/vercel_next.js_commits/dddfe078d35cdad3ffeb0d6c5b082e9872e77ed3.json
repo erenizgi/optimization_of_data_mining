@@ -1,0 +1,24 @@
+{
+    "author": "timneutkens",
+    "message": "Turbopack: handle webpack loader event backpressure (#78462)\n\n## Improve IPC socket handling in Turbopack Node.js communication\n\n### What?\nEnhances the IPC communication between Turbopack and Node.js processes\nby implementing proper socket backpressure handling.\n\n### Why?\nThe current implementation doesn't properly handle backpressure when\nwriting to sockets, which can lead to hanging where Node.js doesn't\nwrite the rest of the data.\n\n### How?\n- Added a `Writable` stream wrapper around the socket to properly handle\nbackpressure\n- Implemented drain event handling to ensure data is written correctly\n- Enabled noDelay on both the Node.js client and Rust server sides\n- Moved stringify into the promise to make the stringify + write happen\nin the same tick.\n\nPart of PACK-4409\n\nFixes #78407",
+    "sha": "dddfe078d35cdad3ffeb0d6c5b082e9872e77ed3",
+    "files": [
+        {
+            "sha": "997fdc83d912079a49f553d94c431e92eb74fc75",
+            "filename": "turbopack/crates/turbopack-node/js/src/ipc/index.ts",
+            "status": "modified",
+            "additions": 36,
+            "deletions": 22,
+            "changes": 58,
+            "blob_url": "https://github.com/vercel/next.js/blob/dddfe078d35cdad3ffeb0d6c5b082e9872e77ed3/turbopack%2Fcrates%2Fturbopack-node%2Fjs%2Fsrc%2Fipc%2Findex.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/dddfe078d35cdad3ffeb0d6c5b082e9872e77ed3/turbopack%2Fcrates%2Fturbopack-node%2Fjs%2Fsrc%2Fipc%2Findex.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-node%2Fjs%2Fsrc%2Fipc%2Findex.ts?ref=dddfe078d35cdad3ffeb0d6c5b082e9872e77ed3",
+            "patch": "@@ -1,4 +1,5 @@\n import { createConnection } from \"node:net\";\n+import { Writable } from \"node:stream\";\n import type { StackFrame } from \"../compiled/stacktrace-parser\";\n import { parse as parseStackTrace } from \"../compiled/stacktrace-parser\";\n import { getProperError } from \"./error\";\n@@ -40,7 +41,30 @@ export type Ipc<TIncoming, TOutgoing> = {\n function createIpc<TIncoming, TOutgoing>(\n   port: number\n ): Ipc<TIncoming, TOutgoing> {\n-  const socket = createConnection(port, \"127.0.0.1\");\n+  const socket = createConnection({\n+    port,\n+    host: \"127.0.0.1\",\n+  });\n+\n+  /**\n+   * A writable stream that writes to the socket.\n+   * We don't write directly to the socket because we need to\n+   * handle backpressure and wait for the socket to be drained\n+   * before writing more data.\n+   */\n+  const socketWritable = new Writable({\n+    write(chunk, _enc, cb) {\n+      if (socket.write(chunk)) {\n+        cb();\n+      } else {\n+        socket.once('drain', cb);\n+      }\n+    },\n+    final(cb) {\n+      socket.end(cb);\n+    }\n+  });\n+\n   const packetQueue: Buffer[] = [];\n   const recvPromiseResolveQueue: Array<(message: TIncoming) => void> = [];\n \n@@ -97,13 +121,12 @@ function createIpc<TIncoming, TOutgoing>(\n \n   // TODO(lukesandberg): some of the messages being sent are very large and contain lots\n   //  of redundant information.  Consider adding gzip compression to our stream.\n-  function send(message: any): Promise<void> {\n-    // Reserve 4 bytes for our length prefix, we will over-write after encoding.\n-    const packet = Buffer.from(\"0000\" + JSON.stringify(message), \"utf8\");\n-    packet.writeUInt32BE(packet.length - 4, 0);\n-\n+  function doSend(message: any): Promise<void> {\n     return new Promise((resolve, reject) => {\n-      socket.write(packet, (err) => {\n+      // Reserve 4 bytes for our length prefix, we will over-write after encoding.\n+      const packet = Buffer.from(\"0000\" + message, \"utf8\");\n+      packet.writeUInt32BE(packet.length - 4, 0);\n+      socketWritable.write(packet, (err) => {\n         process.stderr.write(`TURBOPACK_OUTPUT_D\\n`);\n         process.stdout.write(`TURBOPACK_OUTPUT_D\\n`);\n         if (err != null) {\n@@ -115,21 +138,12 @@ function createIpc<TIncoming, TOutgoing>(\n     });\n   }\n \n-  function sendReady(): Promise<void> {\n-    const length = Buffer.from([0, 0, 0, 0]);\n-    return new Promise((resolve, reject) => {\n-      socket.write(length, (err) => {\n-        process.stderr.write(`TURBOPACK_OUTPUT_D\\n`);\n-        process.stdout.write(`TURBOPACK_OUTPUT_D\\n`);\n-\n-        if (err != null) {\n-          reject(err);\n-        } else {\n-          resolve();\n-        }\n-      });\n-    });\n-  }\n+  function send(message: any): Promise<void> {\n+    return doSend(JSON.stringify(message));\n+   }\n+   function sendReady(): Promise<void> {\n+      return doSend(\"\");\n+   }\n \n   return {\n     async recv() {"
+        }
+    ],
+    "stats": {
+        "total": 58,
+        "additions": 36,
+        "deletions": 22
+    }
+}

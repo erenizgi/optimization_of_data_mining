@@ -1,0 +1,36 @@
+{
+    "author": "SamuelBarryCS",
+    "message": "Fix attention sink implementation in flex attention (#41083)\n\n* Fix attention sink implementation in flex attention\n\n* fix dim\n\n* fix\n\n* Remove print\n\n* raisae error when return_lse is False yet s_aux is providewd\n\n* Clean test files for merge\n\n* Update src/transformers/integrations/flex_attention.py\n\nCo-authored-by: Arthur <48595927+ArthurZucker@users.noreply.github.com>\n\n* force return lse\n\n* Add to doc\n\n---------\n\nCo-authored-by: Arthur <48595927+ArthurZucker@users.noreply.github.com>",
+    "sha": "52cbc7c868fde27f10e39504fb74ac733cc98b63",
+    "files": [
+        {
+            "sha": "60741d8473fa739098909445d3924a31bdcee1fb",
+            "filename": "docs/source/en/model_doc/gpt_oss.md",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/huggingface/transformers/blob/52cbc7c868fde27f10e39504fb74ac733cc98b63/docs%2Fsource%2Fen%2Fmodel_doc%2Fgpt_oss.md",
+            "raw_url": "https://github.com/huggingface/transformers/raw/52cbc7c868fde27f10e39504fb74ac733cc98b63/docs%2Fsource%2Fen%2Fmodel_doc%2Fgpt_oss.md",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/docs%2Fsource%2Fen%2Fmodel_doc%2Fgpt_oss.md?ref=52cbc7c868fde27f10e39504fb74ac733cc98b63",
+            "patch": "@@ -35,6 +35,8 @@ The abstract from the paper is the following:\n *<INSERT PAPER ABSTRACT HERE>*\n \n Tips:\n+- **Attention Sinks with Flex Attention**: When using flex attention, attention sinks require special handling. Unlike with standard attention implementations where sinks can be added directly to attention scores, flex attention `score_mod` function operates on individual score elements rather than the full attention matrix. Therefore, attention sinks renormalization have to be applied after the flex attention computations by renormalizing the outputs using the log-sum-exp (LSE) values returned by flex attention.\n+\n \n <INSERT TIPS ABOUT MODEL HERE>\n "
+        },
+        {
+            "sha": "ee947808d8941fa16ee84512527d71b18aa87ae1",
+            "filename": "src/transformers/integrations/flex_attention.py",
+            "status": "modified",
+            "additions": 23,
+            "deletions": 6,
+            "changes": 29,
+            "blob_url": "https://github.com/huggingface/transformers/blob/52cbc7c868fde27f10e39504fb74ac733cc98b63/src%2Ftransformers%2Fintegrations%2Fflex_attention.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/52cbc7c868fde27f10e39504fb74ac733cc98b63/src%2Ftransformers%2Fintegrations%2Fflex_attention.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fintegrations%2Fflex_attention.py?ref=52cbc7c868fde27f10e39504fb74ac733cc98b63",
+            "patch": "@@ -272,12 +272,9 @@ def score_mod(score, batch_idx, head_idx, q_idx, kv_idx):\n             score = score + score_mask[batch_idx][0][q_idx][kv_idx]\n         if head_mask is not None:\n             score = score + head_mask[batch_idx][head_idx][0][0]\n-        if s_aux is not None:\n-            logits_max = torch.max(score, dim=-1, keepdim=True).values\n-            sinks = torch.exp(s_aux - logits_max)\n-            unnormalized_scores = torch.exp(score - logits_max)\n-            normalizer = unnormalized_scores.sum(dim=-1, keepdim=True) + sinks\n-            score = unnormalized_scores / normalizer\n+        # Note: attention sinks cannot be correctly implemented in score_mod\n+        # because it requires operating on the full attention matrix before softmax.\n+        # ==> this is done after flex attention\n         return score\n \n     enable_gqa = True\n@@ -293,6 +290,11 @@ def score_mod(score, batch_idx, head_idx, q_idx, kv_idx):\n     # On CPU we must skip returning LSE due to a runtime issue; elsewhere, follow PyTorch API and return it\n     return_lse = query.device.type != \"cpu\"\n \n+    # Validate that s_aux is not silently ignored\n+    if not return_lse and s_aux is not None:\n+        logger.warning_once(\"s_aux provided with return_lse=False - forcing return_lse=True to avoid silent failure\")\n+        return_lse = True\n+\n     flex_attention_output = compile_friendly_flex_attention(\n         query,\n         key,\n@@ -311,6 +313,21 @@ def score_mod(score, batch_idx, head_idx, q_idx, kv_idx):\n     if return_lse:\n         attention_output, lse = flex_attention_output  # type: ignore[misc]\n         lse = lse.to(value.dtype)\n+\n+        if s_aux is not None:\n+            # Apply attention sinks by renormalizing using LSE\n+            batch_size, num_heads, seq_len_q, _ = attention_output.shape  # batch, num_heads, seq_len, head_dim\n+            sinks = s_aux.view(1, -1, 1, 1).expand(batch_size, num_heads, seq_len_q, 1)\n+\n+            # We need to compute the normalization that includes the sinks\n+            # since log(sum(exp(scores))) = lse, exp(log(sum(exp(scores)))) = exp(lse)\n+            # NB: log(sum(exp(scores)) + exp(sink)) = log(exp(lse) + exp(sink))\n+            lse_expanded = lse.unsqueeze(-1)  # [batch, num_heads, seq_len, 1]\n+            combined_lse = torch.logsumexp(torch.cat([lse_expanded, sinks], dim=-1), dim=-1, keepdim=True)\n+\n+            # Use new_norm / old_norm = exp(combined_lse - lse) to compute renorm and apply\n+            renorm_factor = torch.exp(lse_expanded - combined_lse)\n+            attention_output = attention_output * renorm_factor\n     else:\n         attention_output = flex_attention_output  # type: ignore[assignment]\n         lse = None"
+        }
+    ],
+    "stats": {
+        "total": 31,
+        "additions": 25,
+        "deletions": 6
+    }
+}

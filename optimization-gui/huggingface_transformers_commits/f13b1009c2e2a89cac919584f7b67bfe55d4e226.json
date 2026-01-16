@@ -1,0 +1,36 @@
+{
+    "author": "eustlb",
+    "message": "Xcodec fix (#42095)\n\n* nit on dac!\n\n* fix\n\n* not for this pr\n\n* make style",
+    "sha": "f13b1009c2e2a89cac919584f7b67bfe55d4e226",
+    "files": [
+        {
+            "sha": "ed9b39e1d49938a9c1a6785d16c02e4bb9646700",
+            "filename": "src/transformers/audio_utils.py",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 0,
+            "changes": 12,
+            "blob_url": "https://github.com/huggingface/transformers/blob/f13b1009c2e2a89cac919584f7b67bfe55d4e226/src%2Ftransformers%2Faudio_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/f13b1009c2e2a89cac919584f7b67bfe55d4e226/src%2Ftransformers%2Faudio_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Faudio_utils.py?ref=f13b1009c2e2a89cac919584f7b67bfe55d4e226",
+            "patch": "@@ -219,6 +219,18 @@ def load_audio_as(\n         raise ValueError(f\"Error loading audio: {e}\")\n \n \n+def conv1d_output_length(module: \"torch.nn.Conv1d\", input_length: int) -> int:\n+    \"\"\"\n+    Computes the output length of a 1D convolution layer according to torch's documentation:\n+    https://docs.pytorch.org/docs/stable/generated/torch.nn.Conv1d.html\n+    \"\"\"\n+    return int(\n+        (input_length + 2 * module.padding[0] - module.dilation[0] * (module.kernel_size[0] - 1) - 1)\n+        / module.stride[0]\n+        + 1\n+    )\n+\n+\n def is_valid_audio(audio):\n     return is_numpy_array(audio) or is_torch_tensor(audio)\n "
+        },
+        {
+            "sha": "04018af855c54d57338b06426b2ac373ec839cef",
+            "filename": "src/transformers/models/xcodec/modeling_xcodec.py",
+            "status": "modified",
+            "additions": 42,
+            "deletions": 4,
+            "changes": 46,
+            "blob_url": "https://github.com/huggingface/transformers/blob/f13b1009c2e2a89cac919584f7b67bfe55d4e226/src%2Ftransformers%2Fmodels%2Fxcodec%2Fmodeling_xcodec.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/f13b1009c2e2a89cac919584f7b67bfe55d4e226/src%2Ftransformers%2Fmodels%2Fxcodec%2Fmodeling_xcodec.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodels%2Fxcodec%2Fmodeling_xcodec.py?ref=f13b1009c2e2a89cac919584f7b67bfe55d4e226",
+            "patch": "@@ -16,13 +16,15 @@\n \n import math\n from dataclasses import dataclass\n+from functools import lru_cache\n from typing import Optional, Union\n \n import torch\n import torch.nn as nn\n import torch.nn.functional as F\n \n from ... import initialization as init\n+from ...audio_utils import conv1d_output_length\n from ...modeling_utils import PreTrainedAudioTokenizerBase\n from ...utils import ModelOutput, auto_docstring\n from ..auto import AutoModel\n@@ -396,6 +398,40 @@ def remove_weight_norm(self):\n                 if hasattr(m, \"parametrizations\") and \"weight\" in m.parametrizations:\n                     torch.nn.utils.parametrize.remove_parametrizations(m, \"weight\", leave_parametrized=True)\n \n+    @lru_cache\n+    def _get_conv1d_layers(self, module):\n+        \"\"\"\n+        Recursively iterate to fetch all Conv1d layers.\n+        \"\"\"\n+\n+        def get_conv1d_layers_recursive(module: nn.Module):\n+            params_list = []\n+\n+            if isinstance(module, nn.Conv1d):\n+                params_list.append(module)\n+\n+            # Recursively check all child modules\n+            for child in module.children():\n+                params_list.extend(get_conv1d_layers_recursive(child))\n+\n+            return params_list\n+\n+        return tuple(get_conv1d_layers_recursive(module))\n+\n+    def _get_conv1d_output_lengths(self, input_length, module=None):\n+        \"\"\"\n+        For a given module, compute the output length that would be obtained after all Conv1d layers.\n+        \"\"\"\n+        if module is None:\n+            module = self\n+\n+        conv1d_layers = self._get_conv1d_layers(module)\n+\n+        for layer in conv1d_layers:\n+            input_length = conv1d_output_length(layer, input_length)\n+\n+        return input_length\n+\n \n @auto_docstring(custom_intro=\"\"\"The Xcodec neural audio codec model.\"\"\")\n class XcodecModel(XcodecPreTrainedModel):\n@@ -476,11 +512,13 @@ def encode(\n \n         e_semantic_input = self._extract_semantic_features(input_values).detach()\n         e_semantic = self.encoder_semantic(e_semantic_input.transpose(1, 2))\n-        e_acoustic = self.acoustic_encoder(input_values)\n \n-        if e_acoustic.shape[2] != e_semantic.shape[2]:\n-            # make sure they line up if frames don't match\n-            e_acoustic = self.acoustic_encoder(F.pad(input_values[:, 0, :], (self.pad, self.pad)).unsqueeze(1))\n+        # orignal codebase infer to get the output length, but we can directly infer it\n+        # from the model and know wether we should pad\n+        if self._get_conv1d_output_lengths(input_values.shape[2], self.acoustic_encoder) != e_semantic.shape[2]:\n+            e_acoustic = self.acoustic_encoder(F.pad(input_values, (self.pad, self.pad)))\n+        else:\n+            e_acoustic = self.acoustic_encoder(input_values)\n \n         embeddings = torch.cat([e_acoustic, e_semantic], dim=1)\n         embeddings = self.fc(embeddings.transpose(1, 2)).transpose(1, 2)"
+        }
+    ],
+    "stats": {
+        "total": 58,
+        "additions": 54,
+        "deletions": 4
+    }
+}

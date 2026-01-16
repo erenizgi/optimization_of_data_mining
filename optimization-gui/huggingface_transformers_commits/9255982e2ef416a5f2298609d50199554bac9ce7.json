@@ -1,0 +1,36 @@
+{
+    "author": "vasqu",
+    "message": "[`Fp8`] Fix experts (#43154)\n\n* fix fp8 experts\n\n* sync index select to base indexing\n\n* add test and comment; test will be enabled with the minimax PR\n\n* style",
+    "sha": "9255982e2ef416a5f2298609d50199554bac9ce7",
+    "files": [
+        {
+            "sha": "27717bee92626663f4fdaf2974952fd02fbd8e5e",
+            "filename": "src/transformers/integrations/finegrained_fp8.py",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 6,
+            "changes": 14,
+            "blob_url": "https://github.com/huggingface/transformers/blob/9255982e2ef416a5f2298609d50199554bac9ce7/src%2Ftransformers%2Fintegrations%2Ffinegrained_fp8.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/9255982e2ef416a5f2298609d50199554bac9ce7/src%2Ftransformers%2Fintegrations%2Ffinegrained_fp8.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fintegrations%2Ffinegrained_fp8.py?ref=9255982e2ef416a5f2298609d50199554bac9ce7",
+            "patch": "@@ -527,25 +527,27 @@ def __init__(self, config, block_size, dtype=torch.float8_e4m3fn):\n         # Keep a handle here; actual usage happens in forward of your MoE block\n         self.act_fn = ACT2FN[config.hidden_act]\n \n+    # We follow the mixtral \"eager\" moe implementation at\n+    # https://github.com/huggingface/transformers/blob/457048fbfdba9a7dee8bd03328c62f49e57b95f9/src/transformers/models/mixtral/modular_mixtral.py#L148\n+    # The core changes in this FP8 version should only relate to how we call the linear projections\n     def forward(\n         self,\n         hidden_states: torch.Tensor,\n         top_k_index: torch.Tensor,\n         top_k_weights: torch.Tensor,\n     ) -> torch.Tensor:\n         final_hidden_states = torch.zeros_like(hidden_states)\n-        num_experts = top_k_weights.shape[1]\n         with torch.no_grad():\n-            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=num_experts + 1)\n+            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)\n             expert_mask = expert_mask.permute(2, 1, 0)\n             expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()\n \n         for expert_idx in expert_hit:\n             expert_idx = expert_idx[0]\n-            if expert_idx == num_experts:\n+            if expert_idx == self.num_experts:\n                 continue\n-            _, token_idx = torch.where(expert_mask[expert_idx])\n-            current_state = hidden_states.index_select(0, token_idx)\n+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])\n+            current_state = hidden_states[token_idx]\n             gate, up = self.linear(\n                 current_state, self.gate_up_proj[expert_idx], self.gate_up_proj_scale_inv[expert_idx]\n             ).chunk(2, dim=-1)\n@@ -554,7 +556,7 @@ def forward(\n                 current_hidden_states, self.down_proj[expert_idx], self.down_proj_scale_inv[expert_idx]\n             )\n \n-            routing_weights = top_k_weights[token_idx, expert_idx].unsqueeze(-1)\n+            routing_weights = top_k_weights[token_idx, top_k_pos, None]\n             current_hidden_states = current_hidden_states * routing_weights.to(current_hidden_states.dtype)\n             final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))\n "
+        },
+        {
+            "sha": "30a726df62cdbc04f3af3dbde3027221061417f7",
+            "filename": "tests/quantization/finegrained_fp8/test_fp8.py",
+            "status": "modified",
+            "additions": 40,
+            "deletions": 0,
+            "changes": 40,
+            "blob_url": "https://github.com/huggingface/transformers/blob/9255982e2ef416a5f2298609d50199554bac9ce7/tests%2Fquantization%2Ffinegrained_fp8%2Ftest_fp8.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/9255982e2ef416a5f2298609d50199554bac9ce7/tests%2Fquantization%2Ffinegrained_fp8%2Ftest_fp8.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fquantization%2Ffinegrained_fp8%2Ftest_fp8.py?ref=9255982e2ef416a5f2298609d50199554bac9ce7",
+            "patch": "@@ -126,6 +126,14 @@ def setUpClass(cls):\n             cls.model_name, device_map=cls.device_map, quantization_config=cls.quantization_config\n         )\n \n+    def setup(self):\n+        \"\"\"\n+        Clear also on each setup (e.g. if a different model is used than the base cls one)\n+        \"\"\"\n+        gc.collect()\n+        backend_empty_cache(torch_device)\n+        gc.collect()\n+\n     def tearDown(self):\n         gc.collect()\n         backend_empty_cache(torch_device)\n@@ -368,6 +376,38 @@ def test_compute_module_sizes(self):\n         # we should at least have 1.5 times memory reduction in total\n         assert model_size[\"\"] > quantized_model_size[\"\"] * 1.5\n \n+    @unittest.skip(reason=\"Dependent on #42028, will be removed alongside that PR\")\n+    def test_quantized_moe_forward(self):\n+        \"\"\"\n+        Checks implicitly if the moe implementation is correct, i.e. it does not crash for cases\n+        where the indices go over `top_k` as shown within the Minimax M2 model\n+        \"\"\"\n+        model = AutoModelForCausalLM.from_pretrained(\n+            \"hf-internal-testing/MiniMax-M2-Tiny-FP8\",  # single layer version\n+            device_map=self.device_map,\n+        )\n+\n+        tokenizer = AutoTokenizer.from_pretrained(\"MiniMaxAI/MiniMax-M2\")\n+        messages = [\n+            {\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"What is your favourite condiment?\"}]},\n+            {\n+                \"role\": \"assistant\",\n+                \"content\": [\n+                    {\n+                        \"type\": \"text\",\n+                        \"text\": \"Well, I'm quite partial to a good squeeze of fresh lemon juice. It adds just the right amount of zesty flavour to whatever I'm cooking up in the kitchen!\",\n+                    }\n+                ],\n+            },\n+            {\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"Do you have mayonnaise recipes?\"}]},\n+        ]\n+        model_inputs = tokenizer.apply_chat_template(messages, return_tensors=\"pt\", add_generation_prompt=True).to(\n+            self.device_map\n+        )\n+\n+        # Only caring about this not crashing\n+        _ = model.generate(**model_inputs, max_new_tokens=24)\n+\n \n @require_torch_accelerator\n @unittest.skipIf("
+        }
+    ],
+    "stats": {
+        "total": 54,
+        "additions": 48,
+        "deletions": 6
+    }
+}

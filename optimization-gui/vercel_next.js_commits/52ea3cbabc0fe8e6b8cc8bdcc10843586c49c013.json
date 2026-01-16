@@ -1,0 +1,132 @@
+{
+    "author": "gaojude",
+    "message": "Fix stale dev types causing build failure after route deletion (#86489)\n\nWhen running `next dev`, then stopping it, deleting a route, and running\n`next build`, the build would fail with a type error like:\n\n```\n.next/dev/types/validator.ts:78:39\nType error: Cannot find module '../../../app/simple-test/page.js'\n```\n\nThe root cause here is a fundamental tension: we have **one\ntsconfig.json** that needs to serve **two different modes**. When\n`isolatedDevBuild` is enabled (which is the default), Next.js outputs\ntypes to different directories:\n- Development: `.next/dev/types/`\n- Production: `.next/types/`\n\nTo avoid tsconfig.json changing every time you switch between dev and\nbuild (which causes git noise and forces IDE reloads), we proactively\ninclude both paths:\n\n```json\n{\n  \"include\": [\n    \".next/types/**/*.ts\",\n    \".next/dev/types/**/*.ts\"\n  ]\n}\n```\n\nThe problem is that TypeScript checks ALL files matching these patterns.\nIf `.next/dev/types/validator.ts` exists from a previous dev session and\ncontains imports to routes that have since been deleted, TypeScript\nfails during build because those imports point to non-existent files.\n\nYou might ask: why not just completely separate them with two tsconfigs?\nThe issue is that would require users to know which tsconfig to use for\ntheir IDE, and switching between configs manually defeats the purpose of\na seamless dev/build experience. The single tsconfig approach is\nintentional.\n\nThe fix filters out `.next/dev/types` files programmatically when\nrunning type check during build, without touching tsconfig.json:\n\n```typescript\nlet fileNames = effectiveConfiguration.fileNames\nif (excludeDevTypes) {\n  const devTypesPattern = /[/\\\\]\\.next[/\\\\]dev[/\\\\]types[/\\\\]/\n  fileNames = fileNames.filter((fileName) => !devTypesPattern.test(fileName))\n}\n```\n\nThis way the tsconfig stays unchanged (no git churn, IDE stays happy),\ndev types are preserved for concurrent dev sessions, and build only\ntype-checks its own `.next/types` directory.",
+    "sha": "52ea3cbabc0fe8e6b8cc8bdcc10843586c49c013",
+    "files": [
+        {
+            "sha": "2dc8dd74eab6fad5e0faff3fd1432fa78c6c83af",
+            "filename": "packages/next/src/lib/typescript/runTypeCheck.ts",
+            "status": "modified",
+            "additions": 30,
+            "deletions": 8,
+            "changes": 38,
+            "blob_url": "https://github.com/vercel/next.js/blob/52ea3cbabc0fe8e6b8cc8bdcc10843586c49c013/packages%2Fnext%2Fsrc%2Flib%2Ftypescript%2FrunTypeCheck.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/52ea3cbabc0fe8e6b8cc8bdcc10843586c49c013/packages%2Fnext%2Fsrc%2Flib%2Ftypescript%2FrunTypeCheck.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Flib%2Ftypescript%2FrunTypeCheck.ts?ref=52ea3cbabc0fe8e6b8cc8bdcc10843586c49c013",
+            "patch": "@@ -2,9 +2,11 @@ import path from 'path'\n import { getFormattedDiagnostic } from './diagnosticFormatter'\n import { getTypeScriptConfiguration } from './getTypeScriptConfiguration'\n import { getRequiredConfiguration } from './writeConfigurationDefaults'\n+import { getDevTypesPath } from './type-paths'\n \n import { CompileError } from '../compile-error'\n import { warn } from '../../build/output/log'\n+import { defaultConfig } from '../../server/config-shared'\n \n export interface TypeCheckResult {\n   hasWarnings: boolean\n@@ -20,14 +22,37 @@ export async function runTypeCheck(\n   distDir: string,\n   tsConfigPath: string,\n   cacheDir?: string,\n-  isAppDirEnabled?: boolean\n+  isAppDirEnabled?: boolean,\n+  isolatedDevBuild?: boolean\n ): Promise<TypeCheckResult> {\n   const effectiveConfiguration = await getTypeScriptConfiguration(\n     typescript,\n     tsConfigPath\n   )\n \n-  if (effectiveConfiguration.fileNames.length < 1) {\n+  // When isolatedDevBuild is enabled, tsconfig includes both .next/types and\n+  // .next/dev/types to avoid config churn between dev/build modes. During build,\n+  // we filter out .next/dev/types files to prevent stale dev types from causing\n+  // errors when routes have been deleted since the last dev session.\n+  let fileNames = effectiveConfiguration.fileNames\n+  const resolvedIsolatedDevBuild =\n+    isolatedDevBuild === undefined\n+      ? defaultConfig.experimental.isolatedDevBuild\n+      : isolatedDevBuild\n+\n+  // Get the dev types path to filter (null if not applicable)\n+  const devTypesDir = getDevTypesPath(\n+    baseDir,\n+    distDir,\n+    resolvedIsolatedDevBuild\n+  )\n+  if (devTypesDir) {\n+    fileNames = fileNames.filter(\n+      (fileName) => !fileName.startsWith(devTypesDir)\n+    )\n+  }\n+\n+  if (fileNames.length < 1) {\n     return {\n       hasWarnings: false,\n       inputFilesCount: 0,\n@@ -57,7 +82,7 @@ export async function runTypeCheck(\n     }\n     incremental = true\n     program = typescript.createIncrementalProgram({\n-      rootNames: effectiveConfiguration.fileNames,\n+      rootNames: fileNames,\n       options: {\n         ...options,\n         composite: false,\n@@ -66,10 +91,7 @@ export async function runTypeCheck(\n       },\n     })\n   } else {\n-    program = typescript.createProgram(\n-      effectiveConfiguration.fileNames,\n-      options\n-    )\n+    program = typescript.createProgram(fileNames, options)\n   }\n \n   const result = program.emit()\n@@ -147,7 +169,7 @@ export async function runTypeCheck(\n   return {\n     hasWarnings: true,\n     warnings,\n-    inputFilesCount: effectiveConfiguration.fileNames.length,\n+    inputFilesCount: fileNames.length,\n     totalFilesCount: program.getSourceFiles().length,\n     incremental,\n   }"
+        },
+        {
+            "sha": "84e51265308fa4b052df07bad0b3593d09d4b2c2",
+            "filename": "packages/next/src/lib/typescript/type-paths.ts",
+            "status": "added",
+            "additions": 58,
+            "deletions": 0,
+            "changes": 58,
+            "blob_url": "https://github.com/vercel/next.js/blob/52ea3cbabc0fe8e6b8cc8bdcc10843586c49c013/packages%2Fnext%2Fsrc%2Flib%2Ftypescript%2Ftype-paths.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/52ea3cbabc0fe8e6b8cc8bdcc10843586c49c013/packages%2Fnext%2Fsrc%2Flib%2Ftypescript%2Ftype-paths.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Flib%2Ftypescript%2Ftype-paths.ts?ref=52ea3cbabc0fe8e6b8cc8bdcc10843586c49c013",
+            "patch": "@@ -0,0 +1,58 @@\n+import path from 'path'\n+\n+/**\n+ * Gets the glob patterns for type definition directories in tsconfig.\n+ * When isolatedDevBuild is enabled, Next.js uses different distDir paths:\n+ * - Development: \"{distDir}/dev\"\n+ * - Production: \"{distDir}\"\n+ */\n+export function getTypeDefinitionGlobPatterns(\n+  distDir: string,\n+  isolatedDevBuild: boolean\n+): string[] {\n+  const distDirPosix =\n+    path.win32.sep === path.sep\n+      ? distDir.replaceAll(path.win32.sep, path.posix.sep)\n+      : distDir\n+\n+  const typeGlobPatterns: string[] = [`${distDirPosix}/types/**/*.ts`]\n+\n+  // When isolatedDevBuild is enabled, include both .next/types and .next/dev/types\n+  // to avoid tsconfig churn when switching between dev/build modes\n+  if (isolatedDevBuild) {\n+    typeGlobPatterns.push(\n+      process.env.NODE_ENV === 'development'\n+        ? // In dev, distDir is \"{distDir}/dev\", so also include \"{distDir}/types\"\n+          `${distDirPosix.replace(/\\/dev$/, '')}/types/**/*.ts`\n+        : // In build, distDir is \"{distDir}\", so also include \"{distDir}/dev/types\"\n+          `${distDirPosix}/dev/types/**/*.ts`\n+    )\n+    // Sort for consistent order\n+    typeGlobPatterns.sort((a, b) => a.length - b.length)\n+  }\n+\n+  return typeGlobPatterns\n+}\n+\n+/**\n+ * Gets the absolute path to the dev types directory for filtering during type-checking.\n+ * Returns null if isolatedDevBuild is disabled or in dev mode (where dev types are the main types).\n+ */\n+export function getDevTypesPath(\n+  baseDir: string,\n+  distDir: string,\n+  isolatedDevBuild: boolean\n+): string | null {\n+  if (!isolatedDevBuild) {\n+    return null\n+  }\n+\n+  const isDev = process.env.NODE_ENV === 'development'\n+  if (isDev) {\n+    // In dev mode, dev types are the main types, so no need to filter\n+    return null\n+  }\n+\n+  // In build mode, dev types are at \"{baseDir}/{distDir}/dev/types\" and should be filtered\n+  return path.join(baseDir, distDir, 'dev', 'types')\n+}"
+        },
+        {
+            "sha": "e8f452dc6e8f34751bb0784e0a9ae5aedb7bc029",
+            "filename": "packages/next/src/lib/typescript/writeConfigurationDefaults.ts",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 25,
+            "changes": 38,
+            "blob_url": "https://github.com/vercel/next.js/blob/52ea3cbabc0fe8e6b8cc8bdcc10843586c49c013/packages%2Fnext%2Fsrc%2Flib%2Ftypescript%2FwriteConfigurationDefaults.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/52ea3cbabc0fe8e6b8cc8bdcc10843586c49c013/packages%2Fnext%2Fsrc%2Flib%2Ftypescript%2FwriteConfigurationDefaults.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Flib%2Ftypescript%2FwriteConfigurationDefaults.ts?ref=52ea3cbabc0fe8e6b8cc8bdcc10843586c49c013",
+            "patch": "@@ -1,11 +1,12 @@\n import { readFileSync, writeFileSync } from 'fs'\n-import * as path from 'path'\n import { bold, cyan, white } from '../picocolors'\n import * as CommentJson from 'next/dist/compiled/comment-json'\n import semver from 'next/dist/compiled/semver'\n import os from 'os'\n import type { CompilerOptions } from 'typescript'\n+import { getTypeDefinitionGlobPatterns } from './type-paths'\n import * as Log from '../../build/output/log'\n+import { defaultConfig } from '../../server/config-shared'\n \n type DesiredCompilerOptionsShape = {\n   [K in keyof CompilerOptions]:\n@@ -268,30 +269,17 @@ export async function writeConfigurationDefaults(\n     }\n   }\n \n-  const distDirPosix =\n-    path.win32.sep === path.sep\n-      ? distDir.replaceAll(path.win32.sep, path.posix.sep)\n-      : distDir\n-  const nextAppTypes: string[] = [`${distDirPosix}/types/**/*.ts`]\n-\n-  // When isolatedDevBuild is enabled, Next.js uses different distDir paths:\n-  // - Development: \"{distDir}/dev\"\n-  // - Production: \"{distDir}\"\n-  // To prevent tsconfig updates when switching between dev/build modes,\n-  // we proactively include both type paths regardless of current environment.\n-  if (isolatedDevBuild !== false) {\n-    nextAppTypes.push(\n-      process.env.NODE_ENV === 'development'\n-        ? // In dev, distDir is \"{distDir}/dev\", which is already in the array above, but we also need \"{distDir}/types\".\n-          // Here we remove \"/dev\" at the end of distDir for consistency.\n-          `${distDirPosix.replace(/\\/dev$/, '')}/types/**/*.ts`\n-        : // In build, distDir is \"{distDir}\", which is already in the array above, but we also need \"{distDir}/dev/types\".\n-          // Here we add \"/dev\" at the end of distDir for consistency.\n-          `${distDirPosix}/dev/types/**/*.ts`\n-    )\n-    // Sort the array to ensure consistent order.\n-    nextAppTypes.sort((a, b) => a.length - b.length)\n-  }\n+  const resolvedIsolatedDevBuild =\n+    isolatedDevBuild === undefined\n+      ? defaultConfig.experimental.isolatedDevBuild\n+      : isolatedDevBuild\n+\n+  // Get type definition glob patterns using shared utility to ensure consistency\n+  // with other TypeScript infrastructure (e.g., runTypeCheck.ts)\n+  const nextAppTypes = getTypeDefinitionGlobPatterns(\n+    distDir,\n+    resolvedIsolatedDevBuild\n+  )\n \n   if (!('include' in userTsConfig)) {\n     userTsConfig.include = hasAppDir"
+        },
+        {
+            "sha": "bcd55423cd091751ad2ac182cbef685b6f56c28d",
+            "filename": "packages/next/src/lib/verify-typescript-setup.ts",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/52ea3cbabc0fe8e6b8cc8bdcc10843586c49c013/packages%2Fnext%2Fsrc%2Flib%2Fverify-typescript-setup.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/52ea3cbabc0fe8e6b8cc8bdcc10843586c49c013/packages%2Fnext%2Fsrc%2Flib%2Fverify-typescript-setup.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Flib%2Fverify-typescript-setup.ts?ref=52ea3cbabc0fe8e6b8cc8bdcc10843586c49c013",
+            "patch": "@@ -158,7 +158,8 @@ export async function verifyTypeScriptSetup({\n         distDir,\n         resolvedTsConfigPath,\n         cacheDir,\n-        hasAppDir\n+        hasAppDir,\n+        isolatedDevBuild\n       )\n     }\n     return { result, version: typescriptVersion }"
+        },
+        {
+            "sha": "bb4e2b60b57dbaea3c4709eb96252970d2c4a637",
+            "filename": "packages/next/src/server/config.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/52ea3cbabc0fe8e6b8cc8bdcc10843586c49c013/packages%2Fnext%2Fsrc%2Fserver%2Fconfig.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/52ea3cbabc0fe8e6b8cc8bdcc10843586c49c013/packages%2Fnext%2Fsrc%2Fserver%2Fconfig.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fconfig.ts?ref=52ea3cbabc0fe8e6b8cc8bdcc10843586c49c013",
+            "patch": "@@ -1356,7 +1356,7 @@ function assignDefaultsAndValidate(\n   ;(result as NextConfigComplete).distDirRoot = result.distDir\n   if (\n     phase === PHASE_DEVELOPMENT_SERVER &&\n-    result.experimental?.isolatedDevBuild\n+    result.experimental.isolatedDevBuild\n   ) {\n     result.distDir = join(result.distDir, 'dev')\n   }"
+        },
+        {
+            "sha": "08eaa94fdc8896acfd343a0dbb61c713eec93a55",
+            "filename": "test/development/stale-dev-types/app/layout.tsx",
+            "status": "added",
+            "additions": 11,
+            "deletions": 0,
+            "changes": 11,
+            "blob_url": "https://github.com/vercel/next.js/blob/52ea3cbabc0fe8e6b8cc8bdcc10843586c49c013/test%2Fdevelopment%2Fstale-dev-types%2Fapp%2Flayout.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/52ea3cbabc0fe8e6b8cc8bdcc10843586c49c013/test%2Fdevelopment%2Fstale-dev-types%2Fapp%2Flayout.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fdevelopment%2Fstale-dev-types%2Fapp%2Flayout.tsx?ref=52ea3cbabc0fe8e6b8cc8bdcc10843586c49c013",
+            "patch": "@@ -0,0 +1,11 @@\n+export default function RootLayout({\n+  children,\n+}: {\n+  children: React.ReactNode\n+}) {\n+  return (\n+    <html>\n+      <body>{children}</body>\n+    </html>\n+  )\n+}"
+        },
+        {
+            "sha": "0ea792fc5ececc5f328d5f2acacf3acfcb454d53",
+            "filename": "test/development/stale-dev-types/app/page.tsx",
+            "status": "added",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/52ea3cbabc0fe8e6b8cc8bdcc10843586c49c013/test%2Fdevelopment%2Fstale-dev-types%2Fapp%2Fpage.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/52ea3cbabc0fe8e6b8cc8bdcc10843586c49c013/test%2Fdevelopment%2Fstale-dev-types%2Fapp%2Fpage.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fdevelopment%2Fstale-dev-types%2Fapp%2Fpage.tsx?ref=52ea3cbabc0fe8e6b8cc8bdcc10843586c49c013",
+            "patch": "@@ -0,0 +1,3 @@\n+export default function Page() {\n+  return <div>Home</div>\n+}"
+        },
+        {
+            "sha": "d656d9c1b65485cda12fbf012522d6cdd370db4b",
+            "filename": "test/development/stale-dev-types/app/temp-route/page.tsx",
+            "status": "added",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/52ea3cbabc0fe8e6b8cc8bdcc10843586c49c013/test%2Fdevelopment%2Fstale-dev-types%2Fapp%2Ftemp-route%2Fpage.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/52ea3cbabc0fe8e6b8cc8bdcc10843586c49c013/test%2Fdevelopment%2Fstale-dev-types%2Fapp%2Ftemp-route%2Fpage.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fdevelopment%2Fstale-dev-types%2Fapp%2Ftemp-route%2Fpage.tsx?ref=52ea3cbabc0fe8e6b8cc8bdcc10843586c49c013",
+            "patch": "@@ -0,0 +1,3 @@\n+export default function TempRoutePage() {\n+  return <div>Temp Route</div>\n+}"
+        },
+        {
+            "sha": "cdd2f81b298c389106869144aba5163118d24109",
+            "filename": "test/development/stale-dev-types/stale-dev-types.test.ts",
+            "status": "added",
+            "additions": 48,
+            "deletions": 0,
+            "changes": 48,
+            "blob_url": "https://github.com/vercel/next.js/blob/52ea3cbabc0fe8e6b8cc8bdcc10843586c49c013/test%2Fdevelopment%2Fstale-dev-types%2Fstale-dev-types.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/52ea3cbabc0fe8e6b8cc8bdcc10843586c49c013/test%2Fdevelopment%2Fstale-dev-types%2Fstale-dev-types.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fdevelopment%2Fstale-dev-types%2Fstale-dev-types.test.ts?ref=52ea3cbabc0fe8e6b8cc8bdcc10843586c49c013",
+            "patch": "@@ -0,0 +1,48 @@\n+import { nextTestSetup } from 'e2e-utils'\n+import { retry } from 'next-test-utils'\n+\n+describe('stale-dev-types', () => {\n+  const { next } = nextTestSetup({\n+    files: __dirname,\n+  })\n+\n+  it('should not fail build when .next/dev has stale types from deleted routes', async () => {\n+    // Step 1: Wait for dev server to generate .next/dev/types/validator.ts\n+    await retry(\n+      async () => {\n+        const exists = await next\n+          .readFile('.next/dev/types/validator.ts')\n+          .then(() => true)\n+          .catch(() => false)\n+        if (!exists) {\n+          throw new Error('validator.ts not generated yet')\n+        }\n+      },\n+      5000,\n+      500\n+    )\n+\n+    // Verify validator.ts contains reference to temp-route\n+    const validatorContent = await next.readFile('.next/dev/types/validator.ts')\n+    expect(validatorContent).toContain('temp-route/page')\n+\n+    // Step 2: Stop dev server\n+    await next.stop()\n+\n+    // Step 3: Delete the temp-route (simulating user deleting a route)\n+    await next.deleteFile('app/temp-route/page.tsx')\n+\n+    // Verify .next/dev/types/validator.ts still references deleted route (stale)\n+    const staleValidator = await next.readFile('.next/dev/types/validator.ts')\n+    expect(staleValidator).toContain('temp-route/page')\n+\n+    // Step 4: Run build - should NOT fail due to stale .next/dev types\n+    const { exitCode, cliOutput } = await next.build()\n+\n+    // Build should succeed - stale dev types should be excluded from type checking\n+    expect(cliOutput).not.toContain(\n+      \"Cannot find module '../../../app/temp-route/page\"\n+    )\n+    expect(exitCode).toBe(0)\n+  })\n+})"
+        },
+        {
+            "sha": "22c40864e1e50eea83c9666c6fd2fe28a0a40fa0",
+            "filename": "test/lib/next-modes/next-dev.ts",
+            "status": "modified",
+            "additions": 99,
+            "deletions": 0,
+            "changes": 99,
+            "blob_url": "https://github.com/vercel/next.js/blob/52ea3cbabc0fe8e6b8cc8bdcc10843586c49c013/test%2Flib%2Fnext-modes%2Fnext-dev.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/52ea3cbabc0fe8e6b8cc8bdcc10843586c49c013/test%2Flib%2Fnext-modes%2Fnext-dev.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Flib%2Fnext-modes%2Fnext-dev.ts?ref=52ea3cbabc0fe8e6b8cc8bdcc10843586c49c013",
+            "patch": "@@ -21,6 +21,105 @@ export class NextDevInstance extends NextInstance {\n     return this._cliOutput || ''\n   }\n \n+  private handleStdio = (childProcess) => {\n+    childProcess.stdout.on('data', (chunk) => {\n+      const msg = chunk.toString()\n+      process.stdout.write(chunk)\n+      this._cliOutput += msg\n+      this.emit('stdout', [msg])\n+    })\n+    childProcess.stderr.on('data', (chunk) => {\n+      const msg = chunk.toString()\n+      process.stderr.write(chunk)\n+      this._cliOutput += msg\n+      this.emit('stderr', [msg])\n+    })\n+  }\n+\n+  private getBuildArgs(args?: string[]) {\n+    let buildArgs = ['pnpm', 'next', 'build']\n+\n+    if (this.buildCommand) {\n+      buildArgs = this.buildCommand.split(' ')\n+    }\n+\n+    if (this.buildArgs) {\n+      buildArgs.push(...this.buildArgs)\n+    }\n+\n+    if (args) {\n+      buildArgs.push(...args)\n+    }\n+\n+    if (process.env.NEXT_SKIP_ISOLATE) {\n+      // without isolation yarn can't be used and pnpm must be used instead\n+      if (buildArgs[0] === 'yarn') {\n+        buildArgs[0] = 'pnpm'\n+      }\n+    }\n+\n+    return buildArgs\n+  }\n+\n+  private getSpawnOpts(\n+    env?: Record<string, string>\n+  ): import('child_process').SpawnOptions {\n+    return {\n+      cwd: this.testDir,\n+      stdio: ['ignore', 'pipe', 'pipe'],\n+      shell: false,\n+      env: {\n+        ...process.env,\n+        ...this.env,\n+        ...env,\n+        NODE_ENV: this.env.NODE_ENV || ('' as any),\n+        PORT: this.forcedPort || '0',\n+        __NEXT_TEST_MODE: 'e2e',\n+      },\n+    }\n+  }\n+\n+  public async build(\n+    options: { env?: Record<string, string>; args?: string[] } = {}\n+  ) {\n+    if (this.childProcess) {\n+      throw new Error(\n+        `can not run build while server is running, use next.stop() first`\n+      )\n+    }\n+\n+    return new Promise<{\n+      exitCode: NodeJS.Signals | number | null\n+      cliOutput: string\n+    }>((resolve) => {\n+      const curOutput = this._cliOutput.length\n+      const spawnOpts = this.getSpawnOpts(options.env)\n+      const buildArgs = this.getBuildArgs(options.args)\n+\n+      console.log('running', shellQuote(buildArgs))\n+\n+      this.childProcess = spawn(buildArgs[0], buildArgs.slice(1), spawnOpts)\n+      this.handleStdio(this.childProcess)\n+\n+      this.childProcess.on('error', (error) => {\n+        this.childProcess = undefined\n+        resolve({\n+          exitCode: 1,\n+          cliOutput:\n+            this.cliOutput.slice(curOutput) + '\\nSpawn error: ' + error.message,\n+        })\n+      })\n+\n+      this.childProcess.on('exit', (code, signal) => {\n+        this.childProcess = undefined\n+        resolve({\n+          exitCode: signal || code,\n+          cliOutput: this.cliOutput.slice(curOutput),\n+        })\n+      })\n+    })\n+  }\n+\n   public async start() {\n     if (this.childProcess) {\n       throw new Error('next already started')"
+        }
+    ],
+    "stats": {
+        "total": 303,
+        "additions": 268,
+        "deletions": 35
+    }
+}

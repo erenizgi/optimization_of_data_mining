@@ -1,0 +1,120 @@
+{
+    "author": "gaojude",
+    "message": "Fix telemetry event loss on build failures and server shutdown (#85867)\n\n## Problem\n\nTelemetry events were not being captured in three scenarios:\n\n### 1. MCP Telemetry Lost on Dev Server Shutdown\n\nTwo telemetry instances were created during dev server startup. MCP\nevents were recorded to one instance but shutdown flushed a different\ninstance.\n\n**Fix:** Reuse the existing telemetry instance from `traceGlobals`.\n\n### 2. Process Exit Timeout Killing Async Telemetry\n\nThe CLI force-kills child processes after 100ms\n(`NEXT_EXIT_TIMEOUT_MS`). Async telemetry operations were interrupted\nbefore completion.\n\n**Fix:** Use `flushDetached()` to write events to disk and spawn a\ndetached process for async submission, allowing immediate parent exit.\n\n### 3. Build Errors Calling `process.exit()` Before Telemetry Flush\n\n`process.exit()` calls in error handlers (SWC failures, missing\ndependencies, route conflicts) bypassed finally blocks and killed\nprocesses before telemetry completed.\n\n**Fix:** Throw errors instead of calling `process.exit()`, add finally\nblocks with `await telemetry.flush()` in critical paths.\n\n## Changes\n\n**Core:**\n- `server/dev/next-dev-server.ts`: Reuse telemetry instance\n- `server/lib/start-server.ts`: Use `flushDetached()` for shutdown\n- `build/swc/index.ts`: Remove `process.exit()` calls\n- `build/turbopack-build/impl.ts`: Add telemetry flush in worker finally\nblock\n- `build/index.ts`: Add telemetry flush in finally block, throw instead\nof exit\n- `lib/verify-partytown-setup.ts`: Throw instead of exit\n\n**Supporting:**\n- `telemetry/storage.ts`: Generate unique event files per PID\n- `telemetry/detached-flush.ts`: Accept optional eventsFile parameter\n- `errors.json`: Update detached-flush error message\n\n## Testing\n\nAll telemetry tests now pass:\n- MCP telemetry on dev server shutdown\n- SWC load failures in worker threads\n- Build configuration errors\n\n✅ Non-blocking shutdown  \n✅ Timeout-independent  \n✅ No race conditions  \n✅ Works in worker threads",
+    "sha": "ad93e452a458a27110e7cf5e8272e40d4741b756",
+    "files": [
+        {
+            "sha": "58ba5de507f9e4253f1050cab5f9545477d9af89",
+            "filename": "packages/next/errors.json",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 1,
+            "changes": 4,
+            "blob_url": "https://github.com/vercel/next.js/blob/ad93e452a458a27110e7cf5e8272e40d4741b756/packages%2Fnext%2Ferrors.json",
+            "raw_url": "https://github.com/vercel/next.js/raw/ad93e452a458a27110e7cf5e8272e40d4741b756/packages%2Fnext%2Ferrors.json",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Ferrors.json?ref=ad93e452a458a27110e7cf5e8272e40d4741b756",
+            "patch": "@@ -905,5 +905,7 @@\n   \"904\": \"The file \\\"%s\\\" must export a function, either as a default export or as a named \\\"%s\\\" export.\",\n   \"905\": \"Page \\\"%s\\\" cannot use \\\\`export const unstable_prefetch = ...\\\\` without enabling \\\\`cacheComponents\\\\`.\",\n   \"906\": \"Bindings not loaded yet, but they are being loaded, did you forget to await?\",\n-  \"907\": \"bindings not loaded yet.  Either call `loadBindings` to wait for them to be available or ensure that `installBindings` has already been called.\"\n+  \"907\": \"bindings not loaded yet.  Either call `loadBindings` to wait for them to be available or ensure that `installBindings` has already been called.\",\n+  \"908\": \"Invalid flags should be run as node detached-flush dev ./path-to/project [eventsFile]\",\n+  \"909\": \"Failed to load SWC binary for %s/%s, see more info here: https://nextjs.org/docs/messages/failed-loading-swc\"\n }"
+        },
+        {
+            "sha": "22022ea386d335d562ca9639a1659b943c1070c6",
+            "filename": "packages/next/src/build/index.ts",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 11,
+            "changes": 27,
+            "blob_url": "https://github.com/vercel/next.js/blob/ad93e452a458a27110e7cf5e8272e40d4741b756/packages%2Fnext%2Fsrc%2Fbuild%2Findex.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/ad93e452a458a27110e7cf5e8272e40d4741b756/packages%2Fnext%2Fsrc%2Fbuild%2Findex.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Findex.ts?ref=ad93e452a458a27110e7cf5e8272e40d4741b756",
+            "patch": "@@ -1151,11 +1151,11 @@ export default async function build(\n       }\n \n       if (appDir && 'exportPathMap' in config) {\n-        Log.error(\n+        const errorMessage =\n           'The \"exportPathMap\" configuration cannot be used with the \"app\" directory. Please use generateStaticParams() instead.'\n-        )\n+        Log.error(errorMessage)\n         await telemetry.flush()\n-        process.exit(1)\n+        throw new Error(errorMessage)\n       }\n \n       const validFileMatcher = createValidFileMatcher(\n@@ -1495,16 +1495,15 @@ export default async function build(\n       if (bundler !== Bundler.Turbopack) {\n         const numConflictingAppPaths = conflictingAppPagePaths.length\n         if (mappedAppPages && numConflictingAppPaths > 0) {\n-          Log.error(\n-            `Conflicting app and page file${\n-              numConflictingAppPaths === 1 ? ' was' : 's were'\n-            } found, please remove the conflicting files to continue:`\n-          )\n+          const errorMessage = `Conflicting app and page file${\n+            numConflictingAppPaths === 1 ? ' was' : 's were'\n+          } found, please remove the conflicting files to continue:`\n+          Log.error(errorMessage)\n           for (const [pagePath, appPath] of conflictingAppPagePaths) {\n             Log.error(`  \"${pagePath}\" - \"${appPath}\"`)\n           }\n           await telemetry.flush()\n-          process.exit(1)\n+          throw new Error(errorMessage)\n         }\n       }\n \n@@ -1835,7 +1834,7 @@ export default async function build(\n                       })\n                       .catch((err) => {\n                         console.error(err)\n-                        process.exit(1)\n+                        throw err\n                       })\n                   })\n               }\n@@ -2702,7 +2701,7 @@ export default async function build(\n               outputFileTracingRoot,\n             }).catch((err) => {\n               console.error(err)\n-              process.exit(1)\n+              throw err\n             })\n           })\n       }\n@@ -4304,6 +4303,12 @@ export default async function build(\n     // Ensure we wait for lockfile patching if present\n     await lockfilePatchPromise.cur\n \n+    // Flush telemetry before finishing (waits for async operations like setTimeout in debug mode)\n+    const telemetry: Telemetry | undefined = traceGlobals.get('telemetry')\n+    if (telemetry) {\n+      await telemetry.flush()\n+    }\n+\n     // Ensure all traces are flushed before finishing the command\n     await flushAllTraces()\n     teardownTraceSubscriber()"
+        },
+        {
+            "sha": "3b4071d4083e3906abb96fcf595bb976035035d6",
+            "filename": "packages/next/src/build/swc/index.ts",
+            "status": "modified",
+            "additions": 24,
+            "deletions": 11,
+            "changes": 35,
+            "blob_url": "https://github.com/vercel/next.js/blob/ad93e452a458a27110e7cf5e8272e40d4741b756/packages%2Fnext%2Fsrc%2Fbuild%2Fswc%2Findex.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/ad93e452a458a27110e7cf5e8272e40d4741b756/packages%2Fnext%2Fsrc%2Fbuild%2Fswc%2Findex.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Fswc%2Findex.ts?ref=ad93e452a458a27110e7cf5e8272e40d4741b756",
+            "patch": "@@ -224,7 +224,7 @@ export async function loadBindings(\n     process.stderr._handle.setBlocking?.(true)\n   }\n \n-  pendingBindings = new Promise(async (resolve, _reject) => {\n+  pendingBindings = new Promise(async (resolve, reject) => {\n     if (!lockfilePatchPromise.cur) {\n       // always run lockfile check once so that it gets patched\n       // even if it doesn't fail to load locally\n@@ -294,7 +294,13 @@ export async function loadBindings(\n       }\n     }\n \n-    logLoadFailure(attempts, true)\n+    await logLoadFailure(attempts, true)\n+    // Reject the promise to propagate the error (process.exit was removed to allow telemetry flush)\n+    reject(\n+      new Error(\n+        `Failed to load SWC binary for ${PlatformName}/${ArchName}, see more info here: https://nextjs.org/docs/messages/failed-loading-swc`\n+      )\n+    )\n   })\n   loadedBindings = await pendingBindings\n   pendingBindings = undefined\n@@ -380,13 +386,22 @@ function loadBindingsSync() {\n     attempts = attempts.concat(a)\n   }\n \n+  // Fire-and-forget telemetry logging (loadBindingsSync must remain synchronous)\n+  // Worker error handler will await telemetry.flush() before exit\n   logLoadFailure(attempts)\n+\n   throw new Error('Failed to load bindings', { cause: attempts })\n }\n \n let loggingLoadFailure = false\n \n-function logLoadFailure(attempts: any, triedWasm = false) {\n+/**\n+ * Logs SWC load failure telemetry and error messages.\n+ *\n+ * Note: Does NOT call process.exit() - errors must propagate to caller's error handler\n+ * which will await telemetry.flush() before exit (critical for worker threads with async telemetry).\n+ */\n+async function logLoadFailure(attempts: any, triedWasm = false) {\n   // make sure we only emit the event and log the failure once\n   if (loggingLoadFailure) return\n   loggingLoadFailure = true\n@@ -396,17 +411,15 @@ function logLoadFailure(attempts: any, triedWasm = false) {\n   }\n \n   // @ts-expect-error TODO: this event has a wrong type.\n-  eventSwcLoadFailure({\n+  await eventSwcLoadFailure({\n     wasm: triedWasm ? 'failed' : undefined,\n     nativeBindingsErrorCode: lastNativeBindingsLoadErrorCode,\n   })\n-    .then(() => lockfilePatchPromise.cur || Promise.resolve())\n-    .finally(() => {\n-      Log.error(\n-        `Failed to load SWC binary for ${PlatformName}/${ArchName}, see more info here: https://nextjs.org/docs/messages/failed-loading-swc`\n-      )\n-      process.exit(1)\n-    })\n+  await (lockfilePatchPromise.cur || Promise.resolve())\n+\n+  Log.error(\n+    `Failed to load SWC binary for ${PlatformName}/${ArchName}, see more info here: https://nextjs.org/docs/messages/failed-loading-swc`\n+  )\n }\n \n type RustifiedEnv = { name: string; value: string }[]"
+        },
+        {
+            "sha": "4a6612641dcb9cb23d3c6ebeb89df64eec3cfcdd",
+            "filename": "packages/next/src/build/turbopack-build/impl.ts",
+            "status": "modified",
+            "additions": 14,
+            "deletions": 9,
+            "changes": 23,
+            "blob_url": "https://github.com/vercel/next.js/blob/ad93e452a458a27110e7cf5e8272e40d4741b756/packages%2Fnext%2Fsrc%2Fbuild%2Fturbopack-build%2Fimpl.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/ad93e452a458a27110e7cf5e8272e40d4741b756/packages%2Fnext%2Fsrc%2Fbuild%2Fturbopack-build%2Fimpl.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Fturbopack-build%2Fimpl.ts?ref=ad93e452a458a27110e7cf5e8272e40d4741b756",
+            "patch": "@@ -245,15 +245,20 @@ export async function workerMain(workerData: {\n   // Install bindings early so we can access synchronously later\n   await installBindings(config.experimental?.useWasmBinary)\n \n-  const {\n-    shutdownPromise: resultShutdownPromise,\n-    buildTraceContext,\n-    duration,\n-  } = await turbopackBuild()\n-  shutdownPromise = resultShutdownPromise\n-  return {\n-    buildTraceContext,\n-    duration,\n+  try {\n+    const {\n+      shutdownPromise: resultShutdownPromise,\n+      buildTraceContext,\n+      duration,\n+    } = await turbopackBuild()\n+    shutdownPromise = resultShutdownPromise\n+    return {\n+      buildTraceContext,\n+      duration,\n+    }\n+  } finally {\n+    // Always flush telemetry before worker exits (waits for async operations like setTimeout in debug mode)\n+    await telemetry.flush()\n   }\n }\n "
+        },
+        {
+            "sha": "eccd7ebfe5cc5c931fa2e61bc669b8b4415d5838",
+            "filename": "packages/next/src/lib/verify-partytown-setup.ts",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/ad93e452a458a27110e7cf5e8272e40d4741b756/packages%2Fnext%2Fsrc%2Flib%2Fverify-partytown-setup.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/ad93e452a458a27110e7cf5e8272e40d4741b756/packages%2Fnext%2Fsrc%2Flib%2Fverify-partytown-setup.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Flib%2Fverify-partytown-setup.ts?ref=ad93e452a458a27110e7cf5e8272e40d4741b756",
+            "patch": "@@ -91,7 +91,8 @@ export async function verifyPartytownSetup(\n     // Don't show a stack trace when there is an error due to missing dependencies\n     if (err instanceof FatalError) {\n       console.error(err.message)\n-      process.exit(1)\n+      // Throw to allow finally blocks to run (e.g., telemetry flush)\n+      throw err\n     }\n     throw err\n   }"
+        },
+        {
+            "sha": "894a21ad6ea1fd01292367375b96482dfc88aa76",
+            "filename": "packages/next/src/server/dev/next-dev-server.ts",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 2,
+            "changes": 13,
+            "blob_url": "https://github.com/vercel/next.js/blob/ad93e452a458a27110e7cf5e8272e40d4741b756/packages%2Fnext%2Fsrc%2Fserver%2Fdev%2Fnext-dev-server.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/ad93e452a458a27110e7cf5e8272e40d4741b756/packages%2Fnext%2Fsrc%2Fserver%2Fdev%2Fnext-dev-server.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fdev%2Fnext-dev-server.ts?ref=ad93e452a458a27110e7cf5e8272e40d4741b756",
+            "patch": "@@ -40,6 +40,7 @@ import { pathHasPrefix } from '../../shared/lib/router/utils/path-has-prefix'\n import { removePathPrefix } from '../../shared/lib/router/utils/remove-path-prefix'\n import { Telemetry } from '../../telemetry/storage'\n import { type Span, setGlobal, trace } from '../../trace'\n+import { traceGlobals } from '../../trace/shared'\n import { findPageFile } from '../lib/find-page-file'\n import { getFormattedNodeOptionsWithoutInspect } from '../lib/utils'\n import { withCoalescedInvoke } from '../../lib/coalesced-function'\n@@ -289,7 +290,12 @@ export default class DevServer extends Server {\n     setGlobal('distDir', this.distDir)\n     setGlobal('phase', PHASE_DEVELOPMENT_SERVER)\n \n-    const telemetry = new Telemetry({ distDir: this.distDir })\n+    // Use existing telemetry instance from traceGlobals instead of creating a new one.\n+    // Creating a new instance would overwrite the existing one, causing any telemetry\n+    // events recorded to the original instance to be lost during cleanup/flush.\n+    const existingTelemetry = traceGlobals.get('telemetry')\n+    const telemetry =\n+      existingTelemetry || new Telemetry({ distDir: this.distDir })\n \n     await super.prepareImpl()\n     await this.matchers.reload()\n@@ -303,7 +309,10 @@ export default class DevServer extends Server {\n     // This is required by the tracing subsystem.\n     setGlobal('appDir', this.appDir)\n     setGlobal('pagesDir', this.pagesDir)\n-    setGlobal('telemetry', telemetry)\n+    // Only set telemetry if it wasn't already set\n+    if (!existingTelemetry) {\n+      setGlobal('telemetry', telemetry)\n+    }\n \n     process.on('unhandledRejection', (reason) => {\n       if (isPostpone(reason)) {"
+        },
+        {
+            "sha": "689187e19e61bdad07541a113a0bd6b42ad0fb6a",
+            "filename": "packages/next/src/server/lib/start-server.ts",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 1,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/ad93e452a458a27110e7cf5e8272e40d4741b756/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Fstart-server.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/ad93e452a458a27110e7cf5e8272e40d4741b756/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Fstart-server.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Fstart-server.ts?ref=ad93e452a458a27110e7cf5e8272e40d4741b756",
+            "patch": "@@ -417,7 +417,10 @@ export async function startServer(\n                     >\n                   | undefined\n                 if (telemetry) {\n-                  await telemetry.flush()\n+                  // Use flushDetached to avoid blocking process exit\n+                  // Each process writes to a unique file (_events_${pid}.json)\n+                  // to avoid race conditions with the parent process\n+                  telemetry.flushDetached('dev', dir)\n                 }\n               } catch (_) {\n                 // Ignore telemetry errors during cleanup"
+        },
+        {
+            "sha": "5e13aa1f03b1e73ee165fa793a305d02c59ea4eb",
+            "filename": "packages/next/src/telemetry/detached-flush.ts",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 4,
+            "changes": 15,
+            "blob_url": "https://github.com/vercel/next.js/blob/ad93e452a458a27110e7cf5e8272e40d4741b756/packages%2Fnext%2Fsrc%2Ftelemetry%2Fdetached-flush.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/ad93e452a458a27110e7cf5e8272e40d4741b756/packages%2Fnext%2Fsrc%2Ftelemetry%2Fdetached-flush.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Ftelemetry%2Fdetached-flush.ts?ref=ad93e452a458a27110e7cf5e8272e40d4741b756",
+            "patch": "@@ -9,21 +9,27 @@ import { PHASE_DEVELOPMENT_SERVER } from '../shared/lib/constants'\n // this process should be started with following arg order\n // 1. mode e.g. dev, export, start\n // 2. project dir\n+// 3. events filename (optional, defaults to _events.json)\n ;(async () => {\n   const args = [...process.argv]\n+  const eventsFile = args.pop()\n   let dir = args.pop()\n   const mode = args.pop()\n \n   if (!dir || mode !== 'dev') {\n     throw new Error(\n-      `Invalid flags should be run as node detached-flush dev ./path-to/project`\n+      `Invalid flags should be run as node detached-flush dev ./path-to/project [eventsFile]`\n     )\n   }\n   dir = getProjectDir(dir)\n \n   const config = await loadConfig(PHASE_DEVELOPMENT_SERVER, dir)\n   const distDir = path.join(dir, config.distDir || '.next')\n-  const eventsPath = path.join(distDir, '_events.json')\n+  // Support both old format (no eventsFile arg) and new format (with eventsFile arg)\n+  const eventsPath = path.join(\n+    distDir,\n+    eventsFile && !eventsFile.includes('/') ? eventsFile : '_events.json'\n+  )\n \n   let events: TelemetryEvent[]\n   try {\n@@ -40,7 +46,8 @@ import { PHASE_DEVELOPMENT_SERVER } from '../shared/lib/constants'\n   await telemetry.record(events)\n   await telemetry.flush()\n \n-  // finished flushing events clean-up/exit\n+  // finished flushing events clean-up\n   fs.unlinkSync(eventsPath)\n-  process.exit(0)\n+  // Don't call process.exit() here - let Node.js exit naturally after\n+  // all pending work completes (e.g., setTimeout in debug telemetry)\n })()"
+        },
+        {
+            "sha": "8e7ce54d58ebfd69bfc985a60ea23ab241b15ec6",
+            "filename": "packages/next/src/telemetry/storage.ts",
+            "status": "modified",
+            "additions": 39,
+            "deletions": 21,
+            "changes": 60,
+            "blob_url": "https://github.com/vercel/next.js/blob/ad93e452a458a27110e7cf5e8272e40d4741b756/packages%2Fnext%2Fsrc%2Ftelemetry%2Fstorage.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/ad93e452a458a27110e7cf5e8272e40d4741b756/packages%2Fnext%2Fsrc%2Ftelemetry%2Fstorage.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Ftelemetry%2Fstorage.ts?ref=ad93e452a458a27110e7cf5e8272e40d4741b756",
+            "patch": "@@ -216,7 +216,9 @@ export class Telemetry {\n     return prom\n   }\n \n-  flush = async () => Promise.all(this.queue).catch(() => null)\n+  flush = async () => {\n+    return Promise.all(this.queue).catch(() => null)\n+  }\n \n   // writes current events to disk and spawns separate\n   // detached process to submit the records without blocking\n@@ -232,9 +234,17 @@ export class Telemetry {\n         // if we fail to abort ignore this event\n       }\n     })\n+\n+    if (allEvents.length === 0) {\n+      // No events to flush\n+      return\n+    }\n+\n     fs.mkdirSync(this.distDir, { recursive: true })\n+    // Use unique filename per process to avoid race conditions between parent/child\n+    const eventsFile = `_events_${process.pid}.json`\n     fs.writeFileSync(\n-      path.join(this.distDir, '_events.json'),\n+      path.join(this.distDir, eventsFile),\n       JSON.stringify(allEvents)\n     )\n \n@@ -249,16 +259,20 @@ export class Telemetry {\n       ? child_process.spawnSync\n       : child_process.spawn\n \n-    spawn(process.execPath, [require.resolve('./detached-flush'), mode, dir], {\n-      detached: !this.NEXT_TELEMETRY_DEBUG,\n-      windowsHide: true,\n-      shell: false,\n-      ...(this.NEXT_TELEMETRY_DEBUG\n-        ? {\n-            stdio: 'inherit',\n-          }\n-        : {}),\n-    })\n+    spawn(\n+      process.execPath,\n+      [require.resolve('./detached-flush'), mode, dir, eventsFile],\n+      {\n+        detached: !this.NEXT_TELEMETRY_DEBUG,\n+        windowsHide: true,\n+        shell: false,\n+        ...(this.NEXT_TELEMETRY_DEBUG\n+          ? {\n+              stdio: 'inherit',\n+            }\n+          : {}),\n+      }\n+    )\n   }\n \n   private submitRecord = async (\n@@ -276,15 +290,19 @@ export class Telemetry {\n     }\n \n     if (this.NEXT_TELEMETRY_DEBUG) {\n-      // Print to standard error to simplify selecting the output\n-      events.forEach(({ eventName, payload }) =>\n-        console.error(\n-          `[telemetry] ` + JSON.stringify({ eventName, payload }, null, 2)\n-        )\n-      )\n-      // Do not send the telemetry data if debugging. Users may use this feature\n-      // to preview what data would be sent.\n-      return Promise.resolve()\n+      // Return a promise that resolves after logging to ensure the output\n+      // is captured before the process exits (e.g., during flushDetached)\n+      return new Promise((resolve) => {\n+        setTimeout(() => {\n+          // Print to standard error to simplify selecting the output\n+          events.forEach(({ eventName, payload }) =>\n+            console.error(\n+              `[telemetry] ` + JSON.stringify({ eventName, payload }, null, 2)\n+            )\n+          )\n+          resolve(undefined)\n+        }, 100)\n+      })\n     }\n \n     // Skip recording telemetry if the feature is disabled"
+        }
+    ],
+    "stats": {
+        "total": 185,
+        "additions": 124,
+        "deletions": 61
+    }
+}

@@ -1,0 +1,60 @@
+{
+    "author": "bgw",
+    "message": "perf: Use synchronous IO when cleaning `distDir` in `next dev` and `next build` (#84472)\n\nThis is blocking the critical path for starting `next build` (on both webpack and Turbopack) and `next dev` (only on webpack).\n\n## Testing\n\nRun\n\n```\npnpm next build --turbopack --experimental-build-mode compile\n```\n\na couple of times in `~/front/apps/conf-2025` (small-medium size app).\n\n### Before\n\n![Screenshot 2025-10-02 at 3.09.31 PM.png](https://app.graphite.dev/user-attachments/assets/ad56ebc1-a9dd-4b18-ba51-50435c9e6584.png)\n\n### After\n\n![Screenshot 2025-10-02 at 3.03.25 PM.png](https://app.graphite.dev/user-attachments/assets/39170ed1-7379-48ac-aeed-638b57322a6a.png)",
+    "sha": "3e65babdeaa81b7a981c792e02c0ba1c8816af18",
+    "files": [
+        {
+            "sha": "768a2e54cbf4a9b48e2ddbb701f00f7a113aed16",
+            "filename": "packages/next/src/build/index.ts",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 2,
+            "changes": 8,
+            "blob_url": "https://github.com/vercel/next.js/blob/3e65babdeaa81b7a981c792e02c0ba1c8816af18/packages%2Fnext%2Fsrc%2Fbuild%2Findex.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/3e65babdeaa81b7a981c792e02c0ba1c8816af18/packages%2Fnext%2Fsrc%2Fbuild%2Findex.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Findex.ts?ref=3e65babdeaa81b7a981c792e02c0ba1c8816af18",
+            "patch": "@@ -47,7 +47,7 @@ import type {\n   RouteHas,\n } from '../lib/load-custom-routes'\n import { nonNullable } from '../lib/non-nullable'\n-import { recursiveDelete } from '../lib/recursive-delete'\n+import { recursiveDeleteSyncWithAsyncRetries } from '../lib/recursive-delete'\n import { verifyPartytownSetup } from '../lib/verify-partytown-setup'\n import {\n   BUILD_ID_FILE,\n@@ -1123,7 +1123,11 @@ export default async function build(\n       }\n \n       if (config.cleanDistDir && !isGenerateMode) {\n-        await recursiveDelete(distDir, /^(cache|dev)/)\n+        await nextBuildSpan\n+          .traceChild('clean')\n+          .traceAsyncFn(() =>\n+            recursiveDeleteSyncWithAsyncRetries(distDir, /^(cache|dev)/)\n+          )\n       }\n \n       if (appDir && 'exportPathMap' in config) {"
+        },
+        {
+            "sha": "78a96d197c42aa4060120a53e3a781be109e57a8",
+            "filename": "packages/next/src/lib/recursive-delete.ts",
+            "status": "modified",
+            "additions": 25,
+            "deletions": 16,
+            "changes": 41,
+            "blob_url": "https://github.com/vercel/next.js/blob/3e65babdeaa81b7a981c792e02c0ba1c8816af18/packages%2Fnext%2Fsrc%2Flib%2Frecursive-delete.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/3e65babdeaa81b7a981c792e02c0ba1c8816af18/packages%2Fnext%2Fsrc%2Flib%2Frecursive-delete.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Flib%2Frecursive-delete.ts?ref=3e65babdeaa81b7a981c792e02c0ba1c8816af18",
+            "patch": "@@ -1,6 +1,6 @@\n-import type { Dirent } from 'fs'\n-import { promises } from 'fs'\n-import { join, isAbsolute, dirname } from 'path'\n+import type { Dirent } from 'node:fs'\n+import * as fs from 'node:fs'\n+import { join, isAbsolute, dirname } from 'node:path'\n import isError from './is-error'\n import { wait } from './wait'\n \n@@ -23,16 +23,16 @@ export function calcBackoffMs(attempt: number): number {\n   return Math.min(INITIAL_RETRY_MS * Math.pow(2, attempt), MAX_RETRY_MS)\n }\n \n-const unlinkPath = async (\n+function unlinkPath(\n   p: string,\n   isDir = false,\n   attempt = 0\n-): Promise<void> => {\n+): Promise<void> | void {\n   try {\n     if (isDir) {\n-      await promises.rmdir(p)\n+      fs.rmdirSync(p)\n     } else {\n-      await promises.unlink(p)\n+      fs.unlinkSync(p)\n     }\n   } catch (e) {\n     const code = isError(e) && e.code\n@@ -44,9 +44,11 @@ const unlinkPath = async (\n       attempt < MAX_RETRIES\n     ) {\n       // retrying is unlikely to succeed on POSIX platforms, but Windows can\n-      // fail due to temporarily-open files or due to\n-      await wait(calcBackoffMs(attempt))\n-      return unlinkPath(p, isDir, attempt + 1)\n+      // fail due to temporarily-open files\n+      return (async () => {\n+        await wait(calcBackoffMs(attempt))\n+        return unlinkPath(p, isDir, attempt + 1)\n+      })()\n     }\n \n     if (code === 'ENOENT') {\n@@ -58,9 +60,16 @@ const unlinkPath = async (\n }\n \n /**\n- * Recursively delete directory contents\n+ * Recursively delete directory contents.\n+ *\n+ * This is used when cleaning the `distDir`, and is part of the critical path\n+ * for starting the server, so we use synchronous file IO, as we're always\n+ * blocked on it anyways.\n+ *\n+ * Despite using sync IO, the function signature is still `async` because we\n+ * asynchronously perform retries.\n  */\n-export async function recursiveDelete(\n+export async function recursiveDeleteSyncWithAsyncRetries(\n   /** Directory to delete the contents of */\n   dir: string,\n   /** Exclude based on relative file path */\n@@ -70,7 +79,7 @@ export async function recursiveDelete(\n ): Promise<void> {\n   let result\n   try {\n-    result = await promises.readdir(dir, { withFileTypes: true })\n+    result = fs.readdirSync(dir, { withFileTypes: true })\n   } catch (e) {\n     if (isError(e) && e.code === 'ENOENT') {\n       return\n@@ -88,10 +97,10 @@ export async function recursiveDelete(\n       const isSymlink = part.isSymbolicLink()\n \n       if (isSymlink) {\n-        const linkPath = await promises.readlink(absolutePath)\n+        const linkPath = fs.readlinkSync(absolutePath)\n \n         try {\n-          const stats = await promises.stat(\n+          const stats = fs.statSync(\n             isAbsolute(linkPath)\n               ? linkPath\n               : join(dirname(absolutePath), linkPath)\n@@ -105,7 +114,7 @@ export async function recursiveDelete(\n \n       if (isNotExcluded) {\n         if (!isSymlink && isDirectory) {\n-          await recursiveDelete(absolutePath, exclude, pp)\n+          await recursiveDeleteSyncWithAsyncRetries(absolutePath, exclude, pp)\n         }\n         return unlinkPath(absolutePath, !isSymlink && isDirectory)\n       }"
+        },
+        {
+            "sha": "79f179e0e48d6923c4d9c21f4129e690169f359b",
+            "filename": "packages/next/src/server/dev/hot-reloader-webpack.ts",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 2,
+            "changes": 7,
+            "blob_url": "https://github.com/vercel/next.js/blob/3e65babdeaa81b7a981c792e02c0ba1c8816af18/packages%2Fnext%2Fsrc%2Fserver%2Fdev%2Fhot-reloader-webpack.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/3e65babdeaa81b7a981c792e02c0ba1c8816af18/packages%2Fnext%2Fsrc%2Fserver%2Fdev%2Fhot-reloader-webpack.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fdev%2Fhot-reloader-webpack.ts?ref=3e65babdeaa81b7a981c792e02c0ba1c8816af18",
+            "patch": "@@ -32,7 +32,7 @@ import getBaseWebpackConfig, {\n   loadProjectInfo,\n } from '../../build/webpack-config'\n import { APP_DIR_ALIAS, WEBPACK_LAYERS } from '../../lib/constants'\n-import { recursiveDelete } from '../../lib/recursive-delete'\n+import { recursiveDeleteSyncWithAsyncRetries } from '../../lib/recursive-delete'\n import {\n   BLOCKED_PAGES,\n   CLIENT_STATIC_FILES_RUNTIME_MAIN,\n@@ -634,7 +634,10 @@ export default class HotReloaderWebpack implements NextJsHotReloaderInterface {\n     return span\n       .traceChild('clean')\n       .traceAsyncFn(() =>\n-        recursiveDelete(join(this.dir, this.config.distDir), /^cache/)\n+        recursiveDeleteSyncWithAsyncRetries(\n+          join(this.dir, this.config.distDir),\n+          /^cache/\n+        )\n       )\n   }\n "
+        },
+        {
+            "sha": "860f5ba7d29b172fe85648de70554d09156867b7",
+            "filename": "test/unit/recursive-delete.test.ts",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 6,
+            "changes": 15,
+            "blob_url": "https://github.com/vercel/next.js/blob/3e65babdeaa81b7a981c792e02c0ba1c8816af18/test%2Funit%2Frecursive-delete.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/3e65babdeaa81b7a981c792e02c0ba1c8816af18/test%2Funit%2Frecursive-delete.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Funit%2Frecursive-delete.test.ts?ref=3e65babdeaa81b7a981c792e02c0ba1c8816af18",
+            "patch": "@@ -1,6 +1,9 @@\n /* eslint-env jest */\n import fs from 'fs-extra'\n-import { recursiveDelete, calcBackoffMs } from 'next/dist/lib/recursive-delete'\n+import {\n+  recursiveDeleteSyncWithAsyncRetries,\n+  calcBackoffMs,\n+} from 'next/dist/lib/recursive-delete'\n import { recursiveReadDir } from 'next/dist/lib/recursive-readdir'\n import { recursiveCopy } from 'next/dist/lib/recursive-copy'\n import { join } from 'path'\n@@ -9,7 +12,7 @@ const resolveDataDir = join(__dirname, 'isolated', '_resolvedata')\n const testResolveDataDir = join(__dirname, 'isolated', 'test_resolvedata')\n const testpreservefileDir = join(__dirname, 'isolated', 'preservefiles')\n \n-describe('recursiveDelete', () => {\n+describe('recursiveDeleteSyncWithAsyncRetries', () => {\n   if (process.platform === 'win32') {\n     it('should skip on windows to avoid symlink issues', () => {})\n     return\n@@ -20,11 +23,11 @@ describe('recursiveDelete', () => {\n     try {\n       await recursiveCopy(resolveDataDir, testResolveDataDir)\n       await fs.symlink('./aa', join(testResolveDataDir, 'symlink'))\n-      await recursiveDelete(testResolveDataDir)\n+      await recursiveDeleteSyncWithAsyncRetries(testResolveDataDir)\n       const result = await recursiveReadDir(testResolveDataDir)\n       expect(result.length).toBe(0)\n     } finally {\n-      await recursiveDelete(testResolveDataDir)\n+      await recursiveDeleteSyncWithAsyncRetries(testResolveDataDir)\n     }\n   })\n \n@@ -35,13 +38,13 @@ describe('recursiveDelete', () => {\n         overwrite: true,\n       })\n       // preserve cache dir\n-      await recursiveDelete(testpreservefileDir, /^cache/)\n+      await recursiveDeleteSyncWithAsyncRetries(testpreservefileDir, /^cache/)\n \n       const result = await recursiveReadDir(testpreservefileDir)\n       expect(result.length).toBe(1)\n     } finally {\n       // Ensure test cleanup\n-      await recursiveDelete(testpreservefileDir)\n+      await recursiveDeleteSyncWithAsyncRetries(testpreservefileDir)\n \n       const cleanupResult = await recursiveReadDir(testpreservefileDir)\n       expect(cleanupResult.length).toBe(0)"
+        }
+    ],
+    "stats": {
+        "total": 71,
+        "additions": 45,
+        "deletions": 26
+    }
+}

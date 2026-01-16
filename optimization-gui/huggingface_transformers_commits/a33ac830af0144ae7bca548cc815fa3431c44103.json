@@ -1,0 +1,48 @@
+{
+    "author": "techkang",
+    "message": "Fix multi gpu loss sync condition, add doc and test (#35743)\n\n* Fix multi gpu loss sync condition, add doc and test\r\n\r\n* rename function and class\r\n\r\n* loss should not scale during inference\r\n\r\n* fix typo",
+    "sha": "a33ac830af0144ae7bca548cc815fa3431c44103",
+    "files": [
+        {
+            "sha": "9c8d5a03a8e02d69bedde853c0e41141a55b0d47",
+            "filename": "src/transformers/trainer.py",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 1,
+            "changes": 6,
+            "blob_url": "https://github.com/huggingface/transformers/blob/a33ac830af0144ae7bca548cc815fa3431c44103/src%2Ftransformers%2Ftrainer.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/a33ac830af0144ae7bca548cc815fa3431c44103/src%2Ftransformers%2Ftrainer.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Ftrainer.py?ref=a33ac830af0144ae7bca548cc815fa3431c44103",
+            "patch": "@@ -3741,7 +3741,11 @@ def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=N\n             # We don't use .loss here since the model may return tuples instead of ModelOutput.\n             loss = outputs[\"loss\"] if isinstance(outputs, dict) else outputs[0]\n \n-        if self.args.average_tokens_across_devices and self.model_accepts_loss_kwargs:\n+        if (\n+            self.args.average_tokens_across_devices\n+            and (self.model_accepts_loss_kwargs or self.compute_loss_func)\n+            and num_items_in_batch is not None\n+        ):\n             loss *= self.accelerator.num_processes\n \n         return (loss, outputs) if return_outputs else loss"
+        },
+        {
+            "sha": "6afdfb33249fe016dcfc8d66394235dbf4d4b686",
+            "filename": "src/transformers/training_args.py",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/huggingface/transformers/blob/a33ac830af0144ae7bca548cc815fa3431c44103/src%2Ftransformers%2Ftraining_args.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/a33ac830af0144ae7bca548cc815fa3431c44103/src%2Ftransformers%2Ftraining_args.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Ftraining_args.py?ref=a33ac830af0144ae7bca548cc815fa3431c44103",
+            "patch": "@@ -813,6 +813,11 @@ class TrainingArguments:\n             Whether enable [Liger](https://github.com/linkedin/Liger-Kernel) Kernel for LLM model training.\n             It can effectively increase multi-GPU training throughput by ~20% and reduces memory usage by ~60%, works out of the box with\n             flash attention, PyTorch FSDP, and Microsoft DeepSpeed. Currently, it supports llama, mistral, mixtral and gemma models.\n+\n+        average_tokens_across_devices (`bool`, *optional*, defaults to `False`):\n+            Whether or not to average tokens across devices. If enabled, will use all_reduce to synchronize\n+            num_tokens_in_batch for precise loss calculation. Reference:\n+            https://github.com/huggingface/transformers/issues/34242\n     \"\"\"\n \n     framework = \"pt\""
+        },
+        {
+            "sha": "925b7b8ba5fcfdb02e703f785d2169cba9222d04",
+            "filename": "tests/trainer/test_trainer_distributed_loss.py",
+            "status": "added",
+            "additions": 103,
+            "deletions": 0,
+            "changes": 103,
+            "blob_url": "https://github.com/huggingface/transformers/blob/a33ac830af0144ae7bca548cc815fa3431c44103/tests%2Ftrainer%2Ftest_trainer_distributed_loss.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/a33ac830af0144ae7bca548cc815fa3431c44103/tests%2Ftrainer%2Ftest_trainer_distributed_loss.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Ftrainer%2Ftest_trainer_distributed_loss.py?ref=a33ac830af0144ae7bca548cc815fa3431c44103",
+            "patch": "@@ -0,0 +1,103 @@\n+import json\n+\n+import datasets\n+import torch\n+\n+from tests.trainer.test_trainer import StoreLossCallback\n+from transformers import (\n+    AutoModelForCausalLM,\n+    AutoTokenizer,\n+    DataCollatorForLanguageModeling,\n+    HfArgumentParser,\n+    Trainer,\n+    TrainingArguments,\n+    set_seed,\n+)\n+from transformers.testing_utils import (\n+    TestCasePlus,\n+    execute_subprocess_async,\n+    get_torch_dist_unique_port,\n+    require_torch_multi_gpu,\n+)\n+\n+\n+class TestTrainerDistributedLoss(TestCasePlus):\n+    @require_torch_multi_gpu\n+    def test_trainer(self):\n+        device_count = torch.cuda.device_count()\n+        min_bs = 1\n+        output_dir = self.get_auto_remove_tmp_dir()\n+        for gpu_num, enable, bs, name in (\n+            (1, True, min_bs * device_count, \"base\"),\n+            (device_count, False, min_bs, \"broken\"),\n+            (device_count, True, min_bs, \"fixed\"),\n+        ):\n+            distributed_args = f\"\"\"--nproc_per_node={gpu_num}\n+                --master_port={get_torch_dist_unique_port()}\n+                {self.test_file_dir}/test_trainer_distributed_loss.py\n+            \"\"\".split()\n+            args = f\"--output_dir {output_dir}/{name} --per_device_train_batch_size {bs} --average_tokens_across_devices {enable}\".split()\n+            cmd = [\"torchrun\"] + distributed_args + args\n+            execute_subprocess_async(cmd, env=self.get_env())\n+        with open(f\"{output_dir}/base_losses.json\") as f:\n+            base_loss = json.load(f)\n+        with open(f\"{output_dir}/broken_losses.json\") as f:\n+            broken_loss = json.load(f)\n+        with open(f\"{output_dir}/fixed_losses.json\") as f:\n+            fixed_loss = json.load(f)\n+\n+        broken_diff = [abs(base_loss[i] - broken_loss[i]) for i in range(len(base_loss))]\n+        fixed_diff = [abs(base_loss[i] - fixed_loss[i]) for i in range(len(base_loss))]\n+        sum_base = sum(base_loss)\n+        sum_broken = sum(broken_diff)\n+        relative_broken = abs(sum_base - sum_broken) / max(sum_base, sum_broken)\n+\n+        self.assertGreater(max(broken_diff), 0.5)\n+        self.assertLess(max(fixed_diff), 0.005)\n+        self.assertLess(relative_broken, 0.1)\n+\n+\n+def run_distributed_training(training_args):\n+    set_seed(42)\n+    model_name = \"nickypro/tinyllama-15M\"\n+    dataset_name = \"wikitext\"\n+    dataset_config = \"wikitext-2-raw-v1\"\n+    dataset = datasets.load_dataset(dataset_name, dataset_config, split=\"train[:17]\")\n+    tokenizer = AutoTokenizer.from_pretrained(model_name)\n+    tokenizer.pad_token = tokenizer.eos_token\n+\n+    def tokenize_function(examples):\n+        return tokenizer(examples[\"text\"], max_length=16, padding=\"max_length\", truncation=True)\n+\n+    tokenized_dataset = dataset.map(tokenize_function, batched=True)\n+\n+    tokenizer.pad_token = tokenizer.eos_token\n+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)\n+\n+    model = AutoModelForCausalLM.from_pretrained(model_name)\n+\n+    loss_callback = StoreLossCallback()\n+\n+    training_args.logging_steps = 1\n+    training_args.max_steps = 10\n+    training_args.learning_rate = 3e-4\n+    training_args.disable_tqdm = True\n+    training_args.dataloader_drop_last = True\n+    training_args.report_to = []\n+\n+    trainer = Trainer(\n+        model,\n+        training_args,\n+        train_dataset=tokenized_dataset,\n+        callbacks=[loss_callback],\n+        data_collator=data_collator,\n+    )\n+    trainer.train()\n+    with open(training_args.output_dir + \"_losses.json\", \"w\") as f:\n+        json.dump(loss_callback.losses, f)\n+\n+\n+if __name__ == \"__main__\":\n+    parser = HfArgumentParser((TrainingArguments,))\n+    training_args = parser.parse_args_into_dataclasses()[0]\n+    run_distributed_training(training_args)"
+        }
+    ],
+    "stats": {
+        "total": 114,
+        "additions": 113,
+        "deletions": 1
+    }
+}

@@ -1,0 +1,48 @@
+{
+    "author": "kdy1",
+    "message": "perf(turbopack): Optimize `next_page_static_info` (#79009)\n\n### What?\n\nAvoid using `FxHashMap` for the `next_page_static_info` pass and use a custom trait instead. The goal of using a custom trait is to keep it general and make the responsibility of each code.\n\n### Why?\n\nWe do not need to allocate at all. \n\nAlso, visitor calls are expensive, and we don't have to pay for them in this case.\n\n### How?\n\n - Closes SWC-655",
+    "sha": "d422d87a067cc2e45eaa67770799846d0c66f59f",
+    "files": [
+        {
+            "sha": "690e71fed154288abcf7ab4e77c617e4bf69002a",
+            "filename": "crates/next-core/src/next_shared/transforms/next_page_static_info.rs",
+            "status": "modified",
+            "additions": 21,
+            "deletions": 7,
+            "changes": 28,
+            "blob_url": "https://github.com/vercel/next.js/blob/d422d87a067cc2e45eaa67770799846d0c66f59f/crates%2Fnext-core%2Fsrc%2Fnext_shared%2Ftransforms%2Fnext_page_static_info.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/d422d87a067cc2e45eaa67770799846d0c66f59f/crates%2Fnext-core%2Fsrc%2Fnext_shared%2Ftransforms%2Fnext_page_static_info.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/crates%2Fnext-core%2Fsrc%2Fnext_shared%2Ftransforms%2Fnext_page_static_info.rs?ref=d422d87a067cc2e45eaa67770799846d0c66f59f",
+            "patch": "@@ -1,10 +1,13 @@\n use anyhow::Result;\n use async_trait::async_trait;\n use next_custom_transforms::transforms::page_static_info::{\n-    Const, collect_exports, extract_exported_const_values,\n+    Const, collect_exported_const_visitor::GetMut, collect_exports, extract_exported_const_values,\n };\n use serde_json::Value;\n-use swc_core::{atoms::atom, ecma::ast::Program};\n+use swc_core::{\n+    atoms::{Atom, atom},\n+    ecma::ast::Program,\n+};\n use turbo_tasks::{ResolvedVc, Vc};\n use turbo_tasks_fs::FileSystemPath;\n use turbopack::module_options::{ModuleRule, ModuleRuleEffect};\n@@ -45,15 +48,27 @@ struct NextPageStaticInfo {\n     client_context: Option<ClientContextType>,\n }\n \n+#[derive(Default)]\n+struct PropertiesToExtract {\n+    config: Option<Const>,\n+}\n+impl GetMut<Atom, Option<Const>> for PropertiesToExtract {\n+    fn get_mut(&mut self, key: &Atom) -> Option<&mut Option<Const>> {\n+        if key == &atom!(\"config\") {\n+            Some(&mut self.config)\n+        } else {\n+            None\n+        }\n+    }\n+}\n #[async_trait]\n impl CustomTransformer for NextPageStaticInfo {\n     #[tracing::instrument(level = tracing::Level::TRACE, name = \"next_page_static_info\", skip_all)]\n     async fn transform(&self, program: &mut Program, ctx: &TransformContext<'_>) -> Result<()> {\n         if let Some(collected_exports) = collect_exports(program)? {\n-            let mut properties_to_extract = collected_exports.extra_properties.clone();\n-            properties_to_extract.insert(atom!(\"config\"));\n+            let mut properties_to_extract = PropertiesToExtract::default();\n \n-            let extracted = extract_exported_const_values(program, properties_to_extract);\n+            extract_exported_const_values(program, &mut properties_to_extract);\n \n             let is_server_layer_page = matches!(\n                 self.server_context,\n@@ -82,8 +97,7 @@ impl CustomTransformer for NextPageStaticInfo {\n             }\n \n             if is_app_page {\n-                if let Some(Some(Const::Value(Value::Object(config_obj)))) =\n-                    extracted.get(&atom!(\"config\"))\n+                if let Some(Const::Value(Value::Object(config_obj))) = properties_to_extract.config\n                 {\n                     let mut messages = vec![format!(\n                         \"Page config in {} is deprecated. Replace `export const config=…` with \\"
+        },
+        {
+            "sha": "01c30f2947cd32e170d3fc37e1f44c8ea7ac2ff0",
+            "filename": "crates/next-custom-transforms/src/transforms/page_static_info/collect_exported_const_visitor.rs",
+            "status": "modified",
+            "additions": 23,
+            "deletions": 18,
+            "changes": 41,
+            "blob_url": "https://github.com/vercel/next.js/blob/d422d87a067cc2e45eaa67770799846d0c66f59f/crates%2Fnext-custom-transforms%2Fsrc%2Ftransforms%2Fpage_static_info%2Fcollect_exported_const_visitor.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/d422d87a067cc2e45eaa67770799846d0c66f59f/crates%2Fnext-custom-transforms%2Fsrc%2Ftransforms%2Fpage_static_info%2Fcollect_exported_const_visitor.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/crates%2Fnext-custom-transforms%2Fsrc%2Ftransforms%2Fpage_static_info%2Fcollect_exported_const_visitor.rs?ref=d422d87a067cc2e45eaa67770799846d0c66f59f",
+            "patch": "@@ -1,15 +1,13 @@\n-use rustc_hash::{FxHashMap, FxHashSet};\n use serde_json::{Map, Number, Value};\n use swc_core::{\n     atoms::Atom,\n     common::{Mark, SyntaxContext},\n     ecma::{\n         ast::{\n-            BindingIdent, Decl, ExportDecl, Expr, Lit, ModuleDecl, ModuleItem, Pat, Prop, PropName,\n-            PropOrSpread, VarDecl, VarDeclKind, VarDeclarator,\n+            BindingIdent, Decl, ExportDecl, Expr, Lit, Module, ModuleDecl, ModuleItem, Pat,\n+            Program, Prop, PropName, PropOrSpread, VarDecl, VarDeclKind, VarDeclarator,\n         },\n         utils::{ExprCtx, ExprExt},\n-        visit::{Visit, VisitWith},\n     },\n };\n \n@@ -21,18 +19,21 @@ pub enum Const {\n     Unsupported(String),\n }\n \n-pub(crate) struct CollectExportedConstVisitor {\n-    pub properties: FxHashMap<Atom, Option<Const>>,\n+pub(crate) struct CollectExportedConstVisitor<'a, M>\n+where\n+    M: GetMut<Atom, Option<Const>>,\n+{\n+    pub properties: &'a mut M,\n     expr_ctx: ExprCtx,\n }\n \n-impl CollectExportedConstVisitor {\n-    pub fn new(properties_to_extract: FxHashSet<Atom>) -> Self {\n+impl<'a, M> CollectExportedConstVisitor<'a, M>\n+where\n+    M: GetMut<Atom, Option<Const>>,\n+{\n+    pub fn new(properties: &'a mut M) -> Self {\n         Self {\n-            properties: properties_to_extract\n-                .into_iter()\n-                .map(|p| (p, None))\n-                .collect(),\n+            properties,\n             expr_ctx: ExprCtx {\n                 unresolved_ctxt: SyntaxContext::empty().apply_mark(Mark::new()),\n                 is_unresolved_ref_safe: false,\n@@ -41,11 +42,13 @@ impl CollectExportedConstVisitor {\n             },\n         }\n     }\n-}\n \n-impl Visit for CollectExportedConstVisitor {\n-    fn visit_module_items(&mut self, module_items: &[ModuleItem]) {\n-        for module_item in module_items {\n+    pub fn check_program(&mut self, program: &Program) {\n+        let Program::Module(Module { body, .. }) = program else {\n+            return;\n+        };\n+\n+        for module_item in body {\n             if let ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(ExportDecl {\n                 decl: Decl::Var(decl),\n                 ..\n@@ -69,11 +72,13 @@ impl Visit for CollectExportedConstVisitor {\n                 }\n             }\n         }\n-\n-        module_items.visit_children_with(self);\n     }\n }\n \n+pub trait GetMut<K, V> {\n+    fn get_mut(&mut self, key: &K) -> Option<&mut V>;\n+}\n+\n /// Coerece the actual value of the given ast node.\n fn extract_value(ctx: ExprCtx, init: &Expr, id: String) -> Option<Const> {\n     match init {"
+        },
+        {
+            "sha": "863bd1b4465126f5f495e546c69d76dcbfd5d84f",
+            "filename": "crates/next-custom-transforms/src/transforms/page_static_info/mod.rs",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 6,
+            "changes": 12,
+            "blob_url": "https://github.com/vercel/next.js/blob/d422d87a067cc2e45eaa67770799846d0c66f59f/crates%2Fnext-custom-transforms%2Fsrc%2Ftransforms%2Fpage_static_info%2Fmod.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/d422d87a067cc2e45eaa67770799846d0c66f59f/crates%2Fnext-custom-transforms%2Fsrc%2Ftransforms%2Fpage_static_info%2Fmod.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/crates%2Fnext-custom-transforms%2Fsrc%2Ftransforms%2Fpage_static_info%2Fmod.rs?ref=d422d87a067cc2e45eaa67770799846d0c66f59f",
+            "patch": "@@ -3,7 +3,7 @@ pub use collect_exported_const_visitor::Const;\n use collect_exports_visitor::CollectExportsVisitor;\n use once_cell::sync::Lazy;\n use regex::Regex;\n-use rustc_hash::{FxHashMap, FxHashSet};\n+use rustc_hash::FxHashSet;\n use serde::{Deserialize, Serialize};\n use swc_core::{\n     atoms::Atom,\n@@ -12,6 +12,8 @@ use swc_core::{\n     ecma::{ast::Program, visit::VisitWith},\n };\n \n+use crate::transforms::page_static_info::collect_exported_const_visitor::GetMut;\n+\n pub mod collect_exported_const_visitor;\n pub mod collect_exports_visitor;\n \n@@ -209,15 +211,13 @@ pub fn collect_rsc_module_info(\n /// error.\n pub fn extract_exported_const_values(\n     source_ast: &Program,\n-    properties_to_extract: FxHashSet<Atom>,\n-) -> FxHashMap<Atom, Option<Const>> {\n+    properties_to_extract: &mut impl GetMut<Atom, Option<Const>>,\n+) {\n     GLOBALS.set(&Default::default(), || {\n         let mut visitor =\n             collect_exported_const_visitor::CollectExportedConstVisitor::new(properties_to_extract);\n \n-        source_ast.visit_with(&mut visitor);\n-\n-        visitor.properties\n+        visitor.check_program(source_ast);\n     })\n }\n "
+        }
+    ],
+    "stats": {
+        "total": 81,
+        "additions": 50,
+        "deletions": 31
+    }
+}

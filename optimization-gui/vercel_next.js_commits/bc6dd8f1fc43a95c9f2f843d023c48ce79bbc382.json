@@ -1,0 +1,156 @@
+{
+    "author": "unstubbable",
+    "message": "Respond with `404` for unknown server actions (#80613)\n\nWhen a server action is sent from an older deployment and skew\nprotection is not enabled or implemented, we intended to return a `404`\nresponse.\n\nHowever, this behavior was never properly tested and was accidentally\nbroken in #48626 when `actionAsyncStorage` was added to the action\nhandler without a `return`, preventing the early `'not-found'` returns\nfrom taking effect.\n\nThis PR restores the `404` response handling and adds end-to-end tests\nfor all server action variations. It also changes logs from errors to\nwarnings to reflect that this scenario is expected to occur\noccasionally. Warnings remain useful (instead of silent failures), as\nusers may want to tune their skew protection settings based on how often\nthey see them.\n\nfixes #75541",
+    "sha": "bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382",
+    "files": [
+        {
+            "sha": "0c9f07f7d7d1ea6358995f3585d1f04f52084048",
+            "filename": "packages/next/src/server/app-render/action-handler.ts",
+            "status": "modified",
+            "additions": 91,
+            "deletions": 43,
+            "changes": 134,
+            "blob_url": "https://github.com/vercel/next.js/blob/bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Faction-handler.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Faction-handler.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fapp-render%2Faction-handler.ts?ref=bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382",
+            "patch": "@@ -50,7 +50,6 @@ import { RedirectStatusCode } from '../../client/components/redirect-status-code\n import { synchronizeMutableCookies } from '../async-storage/request-store'\n import type { TemporaryReferenceSet } from 'react-server-dom-webpack/server.edge'\n import { workUnitAsyncStorage } from '../app-render/work-unit-async-storage.external'\n-import { InvariantError } from '../../shared/lib/invariant-error'\n import { executeRevalidates } from '../revalidation-utils'\n import { getRequestMeta } from '../request-meta'\n \n@@ -625,7 +624,7 @@ export async function handleAction({\n   }\n \n   try {\n-    await actionAsyncStorage.run({ isAction: true }, async () => {\n+    return await actionAsyncStorage.run({ isAction: true }, async () => {\n       if (\n         // The type check here ensures that `req` is correctly typed, and the\n         // environment variable check provides dead code elimination.\n@@ -658,7 +657,21 @@ export async function handleAction({\n               { temporaryReferences }\n             )\n           } else {\n-            const action = await decodeAction(formData, serverModuleMap)\n+            let action: (() => unknown) | null = null\n+\n+            try {\n+              action = await decodeAction(formData, serverModuleMap)\n+            } catch (err) {\n+              const unknownActionId = getActionIdFromReactError(err)\n+\n+              if (unknownActionId) {\n+                console.warn(createUnknownServerActionError(unknownActionId))\n+                return { type: 'not-found' }\n+              }\n+\n+              throw err\n+            }\n+\n             if (typeof action === 'function') {\n               // Only warn if it's a server action, otherwise skip for other post requests\n               warnBadServerActionRequest()\n@@ -678,19 +691,19 @@ export async function handleAction({\n               )\n             }\n \n-            // Skip the fetch path\n-            return\n+            return { type: 'done', result: undefined, formState }\n           }\n         } else {\n+          if (!actionId) {\n+            // We don't consider this a server action when there's no actionId.\n+            return undefined\n+          }\n+\n           try {\n             actionModId = getActionModIdOrError(actionId, serverModuleMap)\n           } catch (err) {\n-            if (actionId !== null) {\n-              console.error(err)\n-            }\n-            return {\n-              type: 'not-found',\n-            }\n+            console.warn(err)\n+            return { type: 'not-found' }\n           }\n \n           const chunks: Buffer[] = []\n@@ -829,8 +842,23 @@ export async function handleAction({\n               }),\n               duplex: 'half',\n             })\n+\n             const formData = await fakeRequest.formData()\n-            const action = await decodeAction(formData, serverModuleMap)\n+            let action: (() => unknown) | null = null\n+\n+            try {\n+              action = await decodeAction(formData, serverModuleMap)\n+            } catch (err) {\n+              const unknownActionId = getActionIdFromReactError(err)\n+\n+              if (unknownActionId) {\n+                console.warn(createUnknownServerActionError(unknownActionId))\n+                return { type: 'not-found' }\n+              }\n+\n+              throw err\n+            }\n+\n             if (typeof action === 'function') {\n               // Only warn if it's a server action, otherwise skip for other post requests\n               warnBadServerActionRequest()\n@@ -850,19 +878,19 @@ export async function handleAction({\n               )\n             }\n \n-            // Skip the fetch path\n-            return\n+            return { type: 'done', result: undefined, formState }\n           }\n         } else {\n+          if (!actionId) {\n+            // We don't consider this a server action when there's no actionId.\n+            return undefined\n+          }\n+\n           try {\n             actionModId = getActionModIdOrError(actionId, serverModuleMap)\n           } catch (err) {\n-            if (actionId !== null) {\n-              console.error(err)\n-            }\n-            return {\n-              type: 'not-found',\n-            }\n+            console.warn(err)\n+            return { type: 'not-found' }\n           }\n \n           const chunks: Buffer[] = []\n@@ -903,16 +931,16 @@ export async function handleAction({\n       // / -> fire action -> POST / -> appRender1 -> modId for the action file\n       // /foo -> fire action -> POST /foo -> appRender2 -> modId for the action file\n \n+      if (!actionId) {\n+        // We don't consider this a server action when there's no actionId.\n+        return undefined\n+      }\n+\n       try {\n-        actionModId =\n-          actionModId ?? getActionModIdOrError(actionId, serverModuleMap)\n+        actionModId ??= getActionModIdOrError(actionId, serverModuleMap)\n       } catch (err) {\n-        if (actionId !== null) {\n-          console.error(err)\n-        }\n-        return {\n-          type: 'not-found',\n-        }\n+        console.warn(err)\n+        return { type: 'not-found' }\n       }\n \n       const actionMod = (await ComponentMod.__next_app__.require(\n@@ -942,13 +970,13 @@ export async function handleAction({\n           temporaryReferences,\n         })\n       }\n-    })\n \n-    return {\n-      type: 'done',\n-      result: actionResult,\n-      formState,\n-    }\n+      return {\n+        type: 'done',\n+        result: actionResult,\n+        formState,\n+      }\n+    })\n   } catch (err) {\n     if (isRedirectError(err)) {\n       const redirectUrl = getURLFromRedirectError(err)\n@@ -1072,26 +1100,46 @@ async function executeActionAndPrepareForRender<\n   }\n }\n \n+function createUnknownServerActionError(actionId: string): Error {\n+  return new Error(\n+    `Failed to find Server Action \"${actionId}\". This request might be from an older or newer deployment.\\nRead more: https://nextjs.org/docs/messages/failed-to-find-server-action`\n+  )\n+}\n+\n+const unknownServerActionErrorMessageRegExp =\n+  /Could not find the module \"(?<actionId>[0-9A-Fa-f]+)\" in the React Server Manifest./\n+\n+/**\n+ * Extract the action ID from a React error message that indicates the action ID\n+ * could not be found in the server module map. Brand-checking the error message\n+ * is a bit unfortunate, but there's currently no other way to detect this case\n+ * for MPA server actions, unless we duplicate React's form data parsing.\n+ */\n+function getActionIdFromReactError(err: unknown): string | undefined {\n+  if (err instanceof Error) {\n+    const match = err.message.match(unknownServerActionErrorMessageRegExp)\n+\n+    if (match?.groups?.actionId) {\n+      return match.groups.actionId\n+    }\n+  }\n+\n+  return undefined\n+}\n+\n /**\n  * Attempts to find the module ID for the action from the module map. When this fails, it could be a deployment skew where\n  * the action came from a different deployment. It could also simply be an invalid POST request that is not a server action.\n  * In either case, we'll throw an error to be handled by the caller.\n  */\n function getActionModIdOrError(\n-  actionId: string | null,\n+  actionId: string,\n   serverModuleMap: ServerModuleMap\n ): string {\n-  // if we're missing the action ID header, we can't do any further processing\n-  if (!actionId) {\n-    throw new InvariantError(\"Missing 'next-action' header.\")\n-  }\n-\n   const actionModId = serverModuleMap[actionId]?.id\n \n   if (!actionModId) {\n-    throw new Error(\n-      `Failed to find Server Action \"${actionId}\". This request might be from an older or newer deployment.\\nRead more: https://nextjs.org/docs/messages/failed-to-find-server-action`\n-    )\n+    throw createUnknownServerActionError(actionId)\n   }\n \n   return actionModId"
+        },
+        {
+            "sha": "ef66db058bc6f16980f33041ebff03e5a542b7b8",
+            "filename": "test/e2e/app-dir/actions-deployment-skew/actions-deployment-skew.test.ts",
+            "status": "added",
+            "additions": 113,
+            "deletions": 0,
+            "changes": 113,
+            "blob_url": "https://github.com/vercel/next.js/blob/bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382/test%2Fe2e%2Fapp-dir%2Factions-deployment-skew%2Factions-deployment-skew.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382/test%2Fe2e%2Fapp-dir%2Factions-deployment-skew%2Factions-deployment-skew.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Factions-deployment-skew%2Factions-deployment-skew.test.ts?ref=bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382",
+            "patch": "@@ -0,0 +1,113 @@\n+/* eslint-disable jest/no-standalone-expect */\n+import { nextTestSetup } from 'e2e-utils'\n+\n+const unknownActionId = 'abcdef1234567890'\n+\n+describe('actions-deployment-skew', () => {\n+  const { next, isNextDeploy, isNextDev, isTurbopack } = nextTestSetup({\n+    files: __dirname,\n+  })\n+\n+  let cliOutputLength = 0\n+\n+  beforeEach(() => {\n+    cliOutputLength = next.cliOutput.length\n+  })\n+\n+  describe.each(['node', 'edge'])('in the %s runtime', (runtime) => {\n+    describe.each([\n+      {\n+        name: 'with a normal action',\n+        page: 'action',\n+        disableJavaScript: false,\n+      },\n+      {\n+        name: 'with a form action and JavaScript enabled',\n+        page: 'form-action',\n+        disableJavaScript: false,\n+      },\n+      {\n+        name: 'with a form action and JavaScript disabled',\n+        page: 'form-action',\n+        disableJavaScript: true,\n+      },\n+    ])('$name', ({ page, disableJavaScript }) => {\n+      // TODO: In the Edge runtime with Turbopack in dev mode, there's a \"use client\" error\n+      // in next/dist/esm/next-devtools/userspace/use-app-dev-rendering-indicator.js.\n+      ;(runtime === 'edge' && isNextDev && isTurbopack ? it.skip : it)(\n+        'should respond with a 404 for an unknown server action',\n+        async () => {\n+          const pathname = `/${runtime}/${page}`\n+          const browser = await next.browser(pathname, {\n+            disableJavaScript,\n+            beforePageLoad(page) {\n+              page.route(\n+                (url) => url.pathname === pathname,\n+                async (route, request) => {\n+                  if (request.method() === 'POST') {\n+                    const headers = request.headers()\n+                    let postData = request.postData()\n+\n+                    if (headers['next-action']) {\n+                      headers['next-action'] = unknownActionId\n+                    }\n+\n+                    if (\n+                      headers['content-type']?.startsWith('multipart/form-data')\n+                    ) {\n+                      // Currently not used because the form uses useActionState,\n+                      // which makes React encode the action ID differently.\n+                      postData = postData.replace(\n+                        /\\$ACTION_ID_[0-9A-Fa-f]+/,\n+                        `$ACTION_ID_${unknownActionId}`\n+                      )\n+                      // Instead, this is required to be patched:\n+                      postData = postData.replace(\n+                        /\"id\":\"[0-9A-Fa-f]+\"/g,\n+                        `\"id\":\"${unknownActionId}\"`\n+                      )\n+                    }\n+\n+                    return route.continue({ headers, postData })\n+                  }\n+\n+                  return route.continue()\n+                }\n+              )\n+\n+              page.on('response', async (response) => {\n+                const request = response.request()\n+\n+                if (\n+                  request.url().endsWith(pathname) &&\n+                  request.method() === 'POST'\n+                ) {\n+                  expect(response.status()).toBe(404)\n+                }\n+              })\n+            },\n+          })\n+\n+          const button = await browser.elementById('action-button')\n+          await button.click()\n+\n+          if (disableJavaScript) {\n+            expect(await browser.elementByCss('h2').text()).toBe(\n+              'This page could not be found.'\n+            )\n+          } else {\n+            expect(await browser.elementById('error-message').text()).toBe(\n+              'An unexpected response was received from the server.'\n+            )\n+          }\n+\n+          if (!isNextDeploy) {\n+            expect(next.cliOutput.slice(cliOutputLength)).toInclude(\n+              `Error: Failed to find Server Action \"${unknownActionId}\". This request might be from an older or newer deployment.`\n+            )\n+          }\n+        }\n+      )\n+    })\n+  })\n+})"
+        },
+        {
+            "sha": "f76c9f7e08fcfafa012af0f24184714400d99719",
+            "filename": "test/e2e/app-dir/actions-deployment-skew/app/edge/action/page.tsx",
+            "status": "added",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382/test%2Fe2e%2Fapp-dir%2Factions-deployment-skew%2Fapp%2Fedge%2Faction%2Fpage.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382/test%2Fe2e%2Fapp-dir%2Factions-deployment-skew%2Fapp%2Fedge%2Faction%2Fpage.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Factions-deployment-skew%2Fapp%2Fedge%2Faction%2Fpage.tsx?ref=bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382",
+            "patch": "@@ -0,0 +1,2 @@\n+export { default } from '../../node/action/page'\n+export const runtime = 'edge'"
+        },
+        {
+            "sha": "070169be3da8e5cacba8742647cfe14460861eef",
+            "filename": "test/e2e/app-dir/actions-deployment-skew/app/edge/form-action/page.tsx",
+            "status": "added",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382/test%2Fe2e%2Fapp-dir%2Factions-deployment-skew%2Fapp%2Fedge%2Fform-action%2Fpage.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382/test%2Fe2e%2Fapp-dir%2Factions-deployment-skew%2Fapp%2Fedge%2Fform-action%2Fpage.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Factions-deployment-skew%2Fapp%2Fedge%2Fform-action%2Fpage.tsx?ref=bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382",
+            "patch": "@@ -0,0 +1,2 @@\n+export { default } from '../../node/form-action/page'\n+export const runtime = 'edge'"
+        },
+        {
+            "sha": "e89193c1234a25f495eedd24f5eeacedd836d8d4",
+            "filename": "test/e2e/app-dir/actions-deployment-skew/app/error-boundary.tsx",
+            "status": "added",
+            "additions": 22,
+            "deletions": 0,
+            "changes": 22,
+            "blob_url": "https://github.com/vercel/next.js/blob/bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382/test%2Fe2e%2Fapp-dir%2Factions-deployment-skew%2Fapp%2Ferror-boundary.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382/test%2Fe2e%2Fapp-dir%2Factions-deployment-skew%2Fapp%2Ferror-boundary.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Factions-deployment-skew%2Fapp%2Ferror-boundary.tsx?ref=bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382",
+            "patch": "@@ -0,0 +1,22 @@\n+'use client'\n+\n+import { Component } from 'react'\n+\n+export default class ErrorBoundary extends Component<\n+  { children: React.ReactNode },\n+  { message: null | string }\n+> {\n+  state = { message: null }\n+\n+  static getDerivedStateFromError(error: any) {\n+    return { message: error.message }\n+  }\n+\n+  render() {\n+    return this.state.message !== null ? (\n+      <p id=\"error-message\">{this.state.message}</p>\n+    ) : (\n+      this.props.children\n+    )\n+  }\n+}"
+        },
+        {
+            "sha": "9c873aad6351c6db2288c98742d7cd56b0f6d111",
+            "filename": "test/e2e/app-dir/actions-deployment-skew/app/layout.tsx",
+            "status": "added",
+            "additions": 12,
+            "deletions": 0,
+            "changes": 12,
+            "blob_url": "https://github.com/vercel/next.js/blob/bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382/test%2Fe2e%2Fapp-dir%2Factions-deployment-skew%2Fapp%2Flayout.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382/test%2Fe2e%2Fapp-dir%2Factions-deployment-skew%2Fapp%2Flayout.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Factions-deployment-skew%2Fapp%2Flayout.tsx?ref=bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382",
+            "patch": "@@ -0,0 +1,12 @@\n+import { ReactNode } from 'react'\n+import ErrorBoundary from './error-boundary'\n+\n+export default function Root({ children }: { children: ReactNode }) {\n+  return (\n+    <html>\n+      <body>\n+        <ErrorBoundary>{children}</ErrorBoundary>\n+      </body>\n+    </html>\n+  )\n+}"
+        },
+        {
+            "sha": "5ec5c06e0e79afae2406095629d3da8c09e37793",
+            "filename": "test/e2e/app-dir/actions-deployment-skew/app/node/action/button.tsx",
+            "status": "added",
+            "additions": 17,
+            "deletions": 0,
+            "changes": 17,
+            "blob_url": "https://github.com/vercel/next.js/blob/bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382/test%2Fe2e%2Fapp-dir%2Factions-deployment-skew%2Fapp%2Fnode%2Faction%2Fbutton.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382/test%2Fe2e%2Fapp-dir%2Factions-deployment-skew%2Fapp%2Fnode%2Faction%2Fbutton.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Factions-deployment-skew%2Fapp%2Fnode%2Faction%2Fbutton.tsx?ref=bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382",
+            "patch": "@@ -0,0 +1,17 @@\n+'use client'\n+\n+import { useTransition } from 'react'\n+\n+export function Button({ action }: { action: () => Promise<void> }) {\n+  const [isPending, startTransition] = useTransition()\n+\n+  return (\n+    <button\n+      id=\"action-button\"\n+      disabled={isPending}\n+      onClick={() => startTransition(action)}\n+    >\n+      Submit\n+    </button>\n+  )\n+}"
+        },
+        {
+            "sha": "ce27476cab82ba6d2e6c717793a10766b7f0f642",
+            "filename": "test/e2e/app-dir/actions-deployment-skew/app/node/action/page.tsx",
+            "status": "added",
+            "additions": 12,
+            "deletions": 0,
+            "changes": 12,
+            "blob_url": "https://github.com/vercel/next.js/blob/bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382/test%2Fe2e%2Fapp-dir%2Factions-deployment-skew%2Fapp%2Fnode%2Faction%2Fpage.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382/test%2Fe2e%2Fapp-dir%2Factions-deployment-skew%2Fapp%2Fnode%2Faction%2Fpage.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Factions-deployment-skew%2Fapp%2Fnode%2Faction%2Fpage.tsx?ref=bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382",
+            "patch": "@@ -0,0 +1,12 @@\n+import { Button } from './button'\n+\n+export default function Page() {\n+  return (\n+    <Button\n+      action={async () => {\n+        'use server'\n+        console.log('Action!')\n+      }}\n+    />\n+  )\n+}"
+        },
+        {
+            "sha": "287f3b4af752b199416f27536a324c8e6e425232",
+            "filename": "test/e2e/app-dir/actions-deployment-skew/app/node/form-action/form.tsx",
+            "status": "added",
+            "additions": 16,
+            "deletions": 0,
+            "changes": 16,
+            "blob_url": "https://github.com/vercel/next.js/blob/bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382/test%2Fe2e%2Fapp-dir%2Factions-deployment-skew%2Fapp%2Fnode%2Fform-action%2Fform.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382/test%2Fe2e%2Fapp-dir%2Factions-deployment-skew%2Fapp%2Fnode%2Fform-action%2Fform.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Factions-deployment-skew%2Fapp%2Fnode%2Fform-action%2Fform.tsx?ref=bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382",
+            "patch": "@@ -0,0 +1,16 @@\n+'use client'\n+\n+import { useActionState } from 'react'\n+\n+export function Form({ action }: { action: () => Promise<string> }) {\n+  const [result, formAction, isPending] = useActionState(action, 'initial')\n+\n+  return (\n+    <form action={formAction}>\n+      <p id=\"result\">{result}</p>\n+      <button id=\"action-button\" disabled={isPending}>\n+        Submit Form\n+      </button>\n+    </form>\n+  )\n+}"
+        },
+        {
+            "sha": "804f6210792721cac376e9760159e87f95c5f3b4",
+            "filename": "test/e2e/app-dir/actions-deployment-skew/app/node/form-action/page.tsx",
+            "status": "added",
+            "additions": 12,
+            "deletions": 0,
+            "changes": 12,
+            "blob_url": "https://github.com/vercel/next.js/blob/bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382/test%2Fe2e%2Fapp-dir%2Factions-deployment-skew%2Fapp%2Fnode%2Fform-action%2Fpage.tsx",
+            "raw_url": "https://github.com/vercel/next.js/raw/bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382/test%2Fe2e%2Fapp-dir%2Factions-deployment-skew%2Fapp%2Fnode%2Fform-action%2Fpage.tsx",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Factions-deployment-skew%2Fapp%2Fnode%2Fform-action%2Fpage.tsx?ref=bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382",
+            "patch": "@@ -0,0 +1,12 @@\n+import { Form } from './form'\n+\n+export default function Page() {\n+  return (\n+    <Form\n+      action={async () => {\n+        'use server'\n+        return 'result'\n+      }}\n+    />\n+  )\n+}"
+        },
+        {
+            "sha": "807126e4cf0bf5b1c8c917e6e0148a27331587d1",
+            "filename": "test/e2e/app-dir/actions-deployment-skew/next.config.js",
+            "status": "added",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/vercel/next.js/blob/bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382/test%2Fe2e%2Fapp-dir%2Factions-deployment-skew%2Fnext.config.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382/test%2Fe2e%2Fapp-dir%2Factions-deployment-skew%2Fnext.config.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Factions-deployment-skew%2Fnext.config.js?ref=bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382",
+            "patch": "@@ -0,0 +1,6 @@\n+/**\n+ * @type {import('next').NextConfig}\n+ */\n+const nextConfig = {}\n+\n+module.exports = nextConfig"
+        },
+        {
+            "sha": "34f9127ab77abc513a9124e6947b4728746613ea",
+            "filename": "test/e2e/app-dir/actions/app-action.test.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382/test%2Fe2e%2Fapp-dir%2Factions%2Fapp-action.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382/test%2Fe2e%2Fapp-dir%2Factions%2Fapp-action.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fe2e%2Fapp-dir%2Factions%2Fapp-action.test.ts?ref=bc6dd8f1fc43a95c9f2f843d023c48ce79bbc382",
+            "patch": "@@ -1778,7 +1778,7 @@ describe('app-dir action handling', () => {\n     })\n \n     it.each(['307', '308'])(\n-      `redirects properly when server action handler redirects with a %s status code`,\n+      `redirects properly when route handler redirects with a %s status code`,\n       async (statusCode) => {\n         const postRequests = []\n         const responseCodes = []"
+        }
+    ],
+    "stats": {
+        "total": 350,
+        "additions": 306,
+        "deletions": 44
+    }
+}

@@ -1,0 +1,192 @@
+{
+    "author": "jerryzh168",
+    "message": "Enable non-safetensor ser/deser for TorchAoConfig quantized model 🔴  (#33456)\n\n* Enable non-safetensor serialization and deserialization for TorchAoConfig quantized model\r\n\r\nSummary:\r\nAfter https://github.com/huggingface/huggingface_hub/pull/2440 we added non-safetensor serialization and deserialization\r\nin huggingface, with this we can now add the support in transformers\r\n\r\nNote that we don't plan to add safetensor serialization due to different goals of wrapper tensor subclass and safetensor\r\nsee README for more details\r\n\r\nTest Plan:\r\ntested locally\r\n\r\nReviewers:\r\n\r\nSubscribers:\r\n\r\nTasks:\r\n\r\nTags:\r\n\r\n* formatting\r\n\r\n* formatting\r\n\r\n* minor fix\r\n\r\n* formatting\r\n\r\n* address comments\r\n\r\n* comments\r\n\r\n* minor fix\r\n\r\n* update doc\r\n\r\n* refactor compressed tensor quantizer",
+    "sha": "4bb49d4e00a2fe6ecfb644c424dc8d88edc02590",
+    "files": [
+        {
+            "sha": "cd1d0188c33eb5f0b2140b579209d4a42d404c33",
+            "filename": "docs/source/en/quantization/torchao.md",
+            "status": "modified",
+            "additions": 48,
+            "deletions": 2,
+            "changes": 50,
+            "blob_url": "https://github.com/huggingface/transformers/blob/4bb49d4e00a2fe6ecfb644c424dc8d88edc02590/docs%2Fsource%2Fen%2Fquantization%2Ftorchao.md",
+            "raw_url": "https://github.com/huggingface/transformers/raw/4bb49d4e00a2fe6ecfb644c424dc8d88edc02590/docs%2Fsource%2Fen%2Fquantization%2Ftorchao.md",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/docs%2Fsource%2Fen%2Fquantization%2Ftorchao.md?ref=4bb49d4e00a2fe6ecfb644c424dc8d88edc02590",
+            "patch": "@@ -11,7 +11,7 @@ rendered properly in your Markdown viewer.\n \n # TorchAO\n \n-[TorchAO](https://github.com/pytorch/ao) is an architecture optimization library for PyTorch, it provides high performance dtypes, optimization techniques and kernels for inference and training, featuring composability with native PyTorch features like `torch.compile`, FSDP etc.. Some benchmark numbers can be found [here](https://github.com/pytorch/ao/tree/main?tab=readme-ov-file#without-intrusive-code-changes)\n+[TorchAO](https://github.com/pytorch/ao) is an architecture optimization library for PyTorch, it provides high performance dtypes, optimization techniques and kernels for inference and training, featuring composability with native PyTorch features like `torch.compile`, FSDP etc.. Some benchmark numbers can be found [here](https://github.com/pytorch/ao/tree/main/torchao/quantization#benchmarks).\n \n Before you begin, make sure the following libraries are installed with their latest version:\n \n@@ -21,6 +21,7 @@ pip install --upgrade torch torchao\n \n \n ```py\n+import torch\n from transformers import TorchAoConfig, AutoModelForCausalLM, AutoTokenizer\n \n model_name = \"meta-llama/Meta-Llama-3-8B\"\n@@ -40,6 +41,51 @@ quantized_model = torch.compile(quantized_model, mode=\"max-autotune\")\n \n output = quantized_model.generate(**input_ids, max_new_tokens=10)\n print(tokenizer.decode(output[0], skip_special_tokens=True))\n+\n+# benchmark the performance\n+import torch.utils.benchmark as benchmark\n+\n+def benchmark_fn(f, *args, **kwargs):\n+    # Manual warmup\n+    for _ in range(5):\n+        f(*args, **kwargs)\n+        \n+    t0 = benchmark.Timer(\n+        stmt=\"f(*args, **kwargs)\",\n+        globals={\"args\": args, \"kwargs\": kwargs, \"f\": f},\n+        num_threads=torch.get_num_threads(),\n+    )\n+    return f\"{(t0.blocked_autorange().mean):.3f}\"\n+\n+MAX_NEW_TOKENS = 1000\n+print(\"int4wo-128 model:\", benchmark_fn(quantized_model.generate, **input_ids, max_new_tokens=MAX_NEW_TOKENS))\n+\n+bf16_model = AutoModelForCausalLM.from_pretrained(model_name, device_map=\"cuda\", torch_dtype=torch.bfloat16)\n+bf16_model = torch.compile(bf16_model, mode=\"max-autotune\")\n+print(\"bf16 model:\", benchmark_fn(bf16_model.generate, **input_ids, max_new_tokens=MAX_NEW_TOKENS))\n+\n ```\n \n-torchao quantization is implemented with tensor subclasses, currently it does not work with huggingface serialization, both the safetensor option and [non-safetensor option](https://github.com/huggingface/transformers/issues/32364), we'll update here with instructions when it's working.\n+## Serialization and Deserialization\n+torchao quantization is implemented with [tensor subclasses](https://pytorch.org/docs/stable/notes/extending.html#subclassing-torch-tensor), it only work with huggingface non-safetensor serialization and deserialization. It relies on `torch.load(..., weights_only=True)` to avoid arbitrary user code execution during load time and use [add_safe_globals](https://pytorch.org/docs/stable/notes/serialization.html#torch.serialization.add_safe_globals) to allowlist some known user functions.\n+\n+The reason why it does not support safe tensor serialization is that wrapper tensor subclass allows maximum flexibility so we want to make sure the effort of supporting new format of quantized Tensor is low, while safe tensor optimizes for maximum safety (no user code execution), it also means we have to make sure to manually support new quantization format.\n+\n+```py\n+# save quantized model locally\n+output_dir = \"llama3-8b-int4wo-128\"\n+quantized_model.save_pretrained(output_dir, safe_serialization=False)\n+\n+# push to huggingface hub\n+# save_to = \"{user_id}/llama3-8b-int4wo-128\"\n+# quantized_model.push_to_hub(save_to, safe_serialization=False)\n+\n+# load quantized model\n+ckpt_id = \"llama3-8b-int4wo-128\"  # or huggingface hub model id\n+loaded_quantized_model = AutoModelForCausalLM.from_pretrained(ckpt_id, device_map=\"cuda\")\n+\n+\n+# confirm the speedup\n+loaded_quantized_model = torch.compile(loaded_quantized_model, mode=\"max-autotune\")\n+print(\"loaded int4wo-128 model:\", benchmark_fn(loaded_quantized_model.generate, **input_ids, max_new_tokens=MAX_NEW_TOKENS))\n+```"
+        },
+        {
+            "sha": "40b6ff5d18031adb9d936b3a68988bcbc1a6fd53",
+            "filename": "src/transformers/modeling_utils.py",
+            "status": "modified",
+            "additions": 29,
+            "deletions": 10,
+            "changes": 39,
+            "blob_url": "https://github.com/huggingface/transformers/blob/4bb49d4e00a2fe6ecfb644c424dc8d88edc02590/src%2Ftransformers%2Fmodeling_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/4bb49d4e00a2fe6ecfb644c424dc8d88edc02590/src%2Ftransformers%2Fmodeling_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodeling_utils.py?ref=4bb49d4e00a2fe6ecfb644c424dc8d88edc02590",
+            "patch": "@@ -540,7 +540,11 @@ def load_sharded_checkpoint(model, folder, strict=True, prefer_safe=True):\n     return torch.nn.modules.module._IncompatibleKeys(missing_keys, unexpected_keys)\n \n \n-def load_state_dict(checkpoint_file: Union[str, os.PathLike], is_quantized: bool = False):\n+def load_state_dict(\n+    checkpoint_file: Union[str, os.PathLike],\n+    is_quantized: bool = False,\n+    map_location: Optional[Union[str, torch.device]] = None,\n+):\n     \"\"\"\n     Reads a PyTorch checkpoint file, returning properly formatted errors if they arise.\n     \"\"\"\n@@ -555,13 +559,18 @@ def load_state_dict(checkpoint_file: Union[str, os.PathLike], is_quantized: bool\n             )\n         return safe_load_file(checkpoint_file)\n     try:\n-        if (\n-            (is_deepspeed_zero3_enabled() and torch.distributed.is_initialized() and torch.distributed.get_rank() > 0)\n-            or (is_fsdp_enabled() and not is_local_dist_rank_0())\n-        ) and not is_quantized:\n-            map_location = \"meta\"\n-        else:\n-            map_location = \"cpu\"\n+        if map_location is None:\n+            if (\n+                (\n+                    is_deepspeed_zero3_enabled()\n+                    and torch.distributed.is_initialized()\n+                    and torch.distributed.get_rank() > 0\n+                )\n+                or (is_fsdp_enabled() and not is_local_dist_rank_0())\n+            ) and not is_quantized:\n+                map_location = \"meta\"\n+            else:\n+                map_location = \"cpu\"\n         extra_args = {}\n         # mmap can only be used with files serialized with zipfile-based format.\n         if (\n@@ -2564,7 +2573,9 @@ def save_pretrained(\n \n         hf_quantizer = getattr(self, \"hf_quantizer\", None)\n         quantization_serializable = (\n-            hf_quantizer is not None and isinstance(hf_quantizer, HfQuantizer) and hf_quantizer.is_serializable\n+            hf_quantizer is not None\n+            and isinstance(hf_quantizer, HfQuantizer)\n+            and hf_quantizer.is_serializable(safe_serialization=safe_serialization)\n         )\n \n         if hf_quantizer is not None and not _hf_peft_config_loaded and not quantization_serializable:\n@@ -4479,7 +4490,15 @@ def _find_mismatched_keys(\n                 # Skip the load for shards that only contain disk-offloaded weights when using safetensors for the offload.\n                 if shard_file in disk_only_shard_files:\n                     continue\n-                state_dict = load_state_dict(shard_file, is_quantized=is_quantized)\n+                map_location = None\n+                if (\n+                    device_map is not None\n+                    and hf_quantizer is not None\n+                    and hf_quantizer.quantization_config.quant_method == QuantizationMethod.TORCHAO\n+                    and hf_quantizer.quantization_config.quant_type == \"int4_weight_only\"\n+                ):\n+                    map_location = torch.device([d for d in device_map.values() if d not in [\"cpu\", \"disk\"]][0])\n+                state_dict = load_state_dict(shard_file, is_quantized=is_quantized, map_location=map_location)\n \n                 # Mistmatched keys contains tuples key/shape1/shape2 of weights in the checkpoint that have a shape not\n                 # matching the weights in the model."
+        },
+        {
+            "sha": "73b3dbd8b25908ed4bb0af2db98aa91d35af14f4",
+            "filename": "src/transformers/quantizers/base.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/huggingface/transformers/blob/4bb49d4e00a2fe6ecfb644c424dc8d88edc02590/src%2Ftransformers%2Fquantizers%2Fbase.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/4bb49d4e00a2fe6ecfb644c424dc8d88edc02590/src%2Ftransformers%2Fquantizers%2Fbase.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fquantizers%2Fbase.py?ref=4bb49d4e00a2fe6ecfb644c424dc8d88edc02590",
+            "patch": "@@ -217,9 +217,8 @@ def _process_model_before_weight_loading(self, model, **kwargs): ...\n     @abstractmethod\n     def _process_model_after_weight_loading(self, model, **kwargs): ...\n \n-    @property\n     @abstractmethod\n-    def is_serializable(self): ...\n+    def is_serializable(self, safe_serialization=None): ...\n \n     @property\n     @abstractmethod"
+        },
+        {
+            "sha": "9d1d6f7e89f1e9aa2454a1fd56c81524660f9079",
+            "filename": "src/transformers/quantizers/quantizer_aqlm.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/huggingface/transformers/blob/4bb49d4e00a2fe6ecfb644c424dc8d88edc02590/src%2Ftransformers%2Fquantizers%2Fquantizer_aqlm.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/4bb49d4e00a2fe6ecfb644c424dc8d88edc02590/src%2Ftransformers%2Fquantizers%2Fquantizer_aqlm.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fquantizers%2Fquantizer_aqlm.py?ref=4bb49d4e00a2fe6ecfb644c424dc8d88edc02590",
+            "patch": "@@ -93,6 +93,5 @@ def is_trainable(self, model: Optional[\"PreTrainedModel\"] = None):\n             )\n             return False\n \n-    @property\n-    def is_serializable(self):\n+    def is_serializable(self, safe_serialization=None):\n         return True"
+        },
+        {
+            "sha": "9c66ba385a6b96f30de5c911227cf49c794b28f0",
+            "filename": "src/transformers/quantizers/quantizer_awq.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/huggingface/transformers/blob/4bb49d4e00a2fe6ecfb644c424dc8d88edc02590/src%2Ftransformers%2Fquantizers%2Fquantizer_awq.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/4bb49d4e00a2fe6ecfb644c424dc8d88edc02590/src%2Ftransformers%2Fquantizers%2Fquantizer_awq.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fquantizers%2Fquantizer_awq.py?ref=4bb49d4e00a2fe6ecfb644c424dc8d88edc02590",
+            "patch": "@@ -106,8 +106,7 @@ def _process_model_after_weight_loading(self, model):\n \n             model = post_init_awq_exllama_modules(model, self.quantization_config.exllama_config)\n \n-    @property\n-    def is_serializable(self):\n+    def is_serializable(self, safe_serialization=None):\n         # AWQ through auto-awq has been always serializable, except if the model is fused.\n         if self.quantization_config.do_fuse:\n             logger.warning(\"You cannot save an AWQ model that uses fused modules!\")"
+        },
+        {
+            "sha": "eed45192e7ad9c2d1bd896dc9da8b51b68dd4040",
+            "filename": "src/transformers/quantizers/quantizer_bnb_4bit.py",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 3,
+            "changes": 5,
+            "blob_url": "https://github.com/huggingface/transformers/blob/4bb49d4e00a2fe6ecfb644c424dc8d88edc02590/src%2Ftransformers%2Fquantizers%2Fquantizer_bnb_4bit.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/4bb49d4e00a2fe6ecfb644c424dc8d88edc02590/src%2Ftransformers%2Fquantizers%2Fquantizer_bnb_4bit.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fquantizers%2Fquantizer_bnb_4bit.py?ref=4bb49d4e00a2fe6ecfb644c424dc8d88edc02590",
+            "patch": "@@ -320,11 +320,10 @@ def _process_model_before_weight_loading(\n     # Copied from transformers.quantizers.quantizer_bnb_8bit.Bnb8BitHfQuantizer._process_model_after_weight_loading with 8bit->4bit\n     def _process_model_after_weight_loading(self, model: \"PreTrainedModel\", **kwargs):\n         model.is_loaded_in_4bit = True\n-        model.is_4bit_serializable = self.is_serializable\n+        model.is_4bit_serializable = self.is_serializable()\n         return model\n \n-    @property\n-    def is_serializable(self):\n+    def is_serializable(self, safe_serialization=None):\n         _is_4bit_serializable = version.parse(importlib.metadata.version(\"bitsandbytes\")) >= version.parse(\"0.41.3\")\n \n         if not _is_4bit_serializable:"
+        },
+        {
+            "sha": "020ff7cc6214a7711cd301782cb991735152be67",
+            "filename": "src/transformers/quantizers/quantizer_bnb_8bit.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 4,
+            "changes": 7,
+            "blob_url": "https://github.com/huggingface/transformers/blob/4bb49d4e00a2fe6ecfb644c424dc8d88edc02590/src%2Ftransformers%2Fquantizers%2Fquantizer_bnb_8bit.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/4bb49d4e00a2fe6ecfb644c424dc8d88edc02590/src%2Ftransformers%2Fquantizers%2Fquantizer_bnb_8bit.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fquantizers%2Fquantizer_bnb_8bit.py?ref=4bb49d4e00a2fe6ecfb644c424dc8d88edc02590",
+            "patch": "@@ -210,7 +210,7 @@ def create_quantized_param(\n             raise ValueError(f\"{tensor_name} is on the meta device, we need a `value` to put in on {target_device}.\")\n \n         new_value = param_value.to(\"cpu\")\n-        if self.pre_quantized and not self.is_serializable:\n+        if self.pre_quantized and not self.is_serializable():\n             raise ValueError(\n                 \"Detected int8 weights but the version of bitsandbytes is not compatible with int8 serialization. \"\n                 \"Make sure to download the latest `bitsandbytes` version. `pip install --upgrade bitsandbytes`.\"\n@@ -238,7 +238,7 @@ def create_quantized_param(\n \n     def _process_model_after_weight_loading(self, model: \"PreTrainedModel\", **kwargs):\n         model.is_loaded_in_8bit = True\n-        model.is_8bit_serializable = self.is_serializable\n+        model.is_8bit_serializable = self.is_serializable()\n         return model\n \n     def _process_model_before_weight_loading(\n@@ -282,8 +282,7 @@ def _process_model_before_weight_loading(\n \n         model.config.quantization_config = self.quantization_config\n \n-    @property\n-    def is_serializable(self):\n+    def is_serializable(self, safe_serialization=None):\n         _bnb_supports_8bit_serialization = version.parse(importlib.metadata.version(\"bitsandbytes\")) > version.parse(\n             \"0.37.2\"\n         )"
+        },
+        {
+            "sha": "347be5c6654fe70dd666795715da79c77d562571",
+            "filename": "src/transformers/quantizers/quantizer_compressed_tensors.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/huggingface/transformers/blob/4bb49d4e00a2fe6ecfb644c424dc8d88edc02590/src%2Ftransformers%2Fquantizers%2Fquantizer_compressed_tensors.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/4bb49d4e00a2fe6ecfb644c424dc8d88edc02590/src%2Ftransformers%2Fquantizers%2Fquantizer_compressed_tensors.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fquantizers%2Fquantizer_compressed_tensors.py?ref=4bb49d4e00a2fe6ecfb644c424dc8d88edc02590",
+            "patch": "@@ -72,6 +72,5 @@ def _process_model_after_weight_loading(self, model, **kwargs):\n     def is_trainable(self):\n         return False\n \n-    @property\n-    def is_serializable(self):\n+    def is_serializable(self, safe_serialization=None):\n         return False"
+        },
+        {
+            "sha": "602df62c012a18797e53ba0ebc6a18e4a436744a",
+            "filename": "src/transformers/quantizers/quantizer_eetq.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/huggingface/transformers/blob/4bb49d4e00a2fe6ecfb644c424dc8d88edc02590/src%2Ftransformers%2Fquantizers%2Fquantizer_eetq.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/4bb49d4e00a2fe6ecfb644c424dc8d88edc02590/src%2Ftransformers%2Fquantizers%2Fquantizer_eetq.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fquantizers%2Fquantizer_eetq.py?ref=4bb49d4e00a2fe6ecfb644c424dc8d88edc02590",
+            "patch": "@@ -161,8 +161,7 @@ def _process_model_before_weight_loading(\n \n         model.config.quantization_config = self.quantization_config\n \n-    @property\n-    def is_serializable(self):\n+    def is_serializable(self, safe_serialization=None):\n         return True\n \n     @property"
+        },
+        {
+            "sha": "07d5ce87ef6cc16977762cf8671b8fba7fe24f8c",
+            "filename": "src/transformers/quantizers/quantizer_fbgemm_fp8.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/huggingface/transformers/blob/4bb49d4e00a2fe6ecfb644c424dc8d88edc02590/src%2Ftransformers%2Fquantizers%2Fquantizer_fbgemm_fp8.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/4bb49d4e00a2fe6ecfb644c424dc8d88edc02590/src%2Ftransformers%2Fquantizers%2Fquantizer_fbgemm_fp8.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fquantizers%2Fquantizer_fbgemm_fp8.py?ref=4bb49d4e00a2fe6ecfb644c424dc8d88edc02590",
+            "patch": "@@ -196,8 +196,7 @@ def update_missing_keys(self, model, missing_keys: List[str], prefix: str) -> Li\n                         not_missing_keys.append(missing)\n         return [k for k in missing_keys if k not in not_missing_keys]\n \n-    @property\n-    def is_serializable(self):\n+    def is_serializable(self, safe_serialization=None):\n         return True\n \n     @property"
+        },
+        {
+            "sha": "233a5279d3f90ed1c8a3a6765e4f5ec910cc79d0",
+            "filename": "src/transformers/quantizers/quantizer_gptq.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/huggingface/transformers/blob/4bb49d4e00a2fe6ecfb644c424dc8d88edc02590/src%2Ftransformers%2Fquantizers%2Fquantizer_gptq.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/4bb49d4e00a2fe6ecfb644c424dc8d88edc02590/src%2Ftransformers%2Fquantizers%2Fquantizer_gptq.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fquantizers%2Fquantizer_gptq.py?ref=4bb49d4e00a2fe6ecfb644c424dc8d88edc02590",
+            "patch": "@@ -89,6 +89,5 @@ def _process_model_after_weight_loading(self, model: \"PreTrainedModel\", **kwargs\n     def is_trainable(self, model: Optional[\"PreTrainedModel\"] = None):\n         return True\n \n-    @property\n-    def is_serializable(self):\n+    def is_serializable(self, safe_serialization=None):\n         return True"
+        },
+        {
+            "sha": "cd32a99c00acdaacab5779b9c5279ea38a53045b",
+            "filename": "src/transformers/quantizers/quantizer_hqq.py",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 3,
+            "changes": 5,
+            "blob_url": "https://github.com/huggingface/transformers/blob/4bb49d4e00a2fe6ecfb644c424dc8d88edc02590/src%2Ftransformers%2Fquantizers%2Fquantizer_hqq.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/4bb49d4e00a2fe6ecfb644c424dc8d88edc02590/src%2Ftransformers%2Fquantizers%2Fquantizer_hqq.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fquantizers%2Fquantizer_hqq.py?ref=4bb49d4e00a2fe6ecfb644c424dc8d88edc02590",
+            "patch": "@@ -188,11 +188,10 @@ def _process_model_before_weight_loading(\n \n     def _process_model_after_weight_loading(self, model: \"PreTrainedModel\", **kwargs):\n         model.is_hqq_quantized = True\n-        model.is_hqq_serializable = self.is_serializable\n+        model.is_hqq_serializable = self.is_serializable()\n         return model\n \n-    @property\n-    def is_serializable(self):\n+    def is_serializable(self, safe_serialization=None):\n         return False\n \n     @property"
+        },
+        {
+            "sha": "ae113f714acb6900b8e0e6bb95b3d47e3dea3a66",
+            "filename": "src/transformers/quantizers/quantizer_quanto.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/huggingface/transformers/blob/4bb49d4e00a2fe6ecfb644c424dc8d88edc02590/src%2Ftransformers%2Fquantizers%2Fquantizer_quanto.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/4bb49d4e00a2fe6ecfb644c424dc8d88edc02590/src%2Ftransformers%2Fquantizers%2Fquantizer_quanto.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fquantizers%2Fquantizer_quanto.py?ref=4bb49d4e00a2fe6ecfb644c424dc8d88edc02590",
+            "patch": "@@ -195,6 +195,5 @@ def _process_model_after_weight_loading(self, model):\n     def is_trainable(self, model: Optional[\"PreTrainedModel\"] = None):\n         return False\n \n-    @property\n-    def is_serializable(self):\n+    def is_serializable(self, safe_serialization=None):\n         return False"
+        },
+        {
+            "sha": "f6bf431aa028d453f01b379863517e57f574333c",
+            "filename": "src/transformers/quantizers/quantizer_torchao.py",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 3,
+            "changes": 16,
+            "blob_url": "https://github.com/huggingface/transformers/blob/4bb49d4e00a2fe6ecfb644c424dc8d88edc02590/src%2Ftransformers%2Fquantizers%2Fquantizer_torchao.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/4bb49d4e00a2fe6ecfb644c424dc8d88edc02590/src%2Ftransformers%2Fquantizers%2Fquantizer_torchao.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fquantizers%2Fquantizer_torchao.py?ref=4bb49d4e00a2fe6ecfb644c424dc8d88edc02590",
+            "patch": "@@ -160,9 +160,19 @@ def _process_model_after_weight_loading(self, model):\n         \"\"\"No process required for torchao quantized model\"\"\"\n         return\n \n-    @property\n-    def is_serializable(self):\n-        return False\n+    def is_serializable(self, safe_serialization=None):\n+        if safe_serialization:\n+            logger.warning(\n+                \"torchao quantized model does not support safe serialization, \"\n+                \"please set `safe_serialization` to False\"\n+            )\n+            return False\n+        _is_torchao_serializable = version.parse(importlib.metadata.version(\"huggingface_hub\")) >= version.parse(\n+            \"0.25.0\"\n+        )\n+        if not _is_torchao_serializable:\n+            logger.warning(\"torchao quantized model is only serializable after huggingface_hub >= 0.25.0 \")\n+        return _is_torchao_serializable\n \n     @property\n     def is_trainable(self):"
+        },
+        {
+            "sha": "19166f9ed92aa4056807ae8e7d5575b6104b59ac",
+            "filename": "src/transformers/utils/quantization_config.py",
+            "status": "modified",
+            "additions": 29,
+            "deletions": 23,
+            "changes": 52,
+            "blob_url": "https://github.com/huggingface/transformers/blob/4bb49d4e00a2fe6ecfb644c424dc8d88edc02590/src%2Ftransformers%2Futils%2Fquantization_config.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/4bb49d4e00a2fe6ecfb644c424dc8d88edc02590/src%2Ftransformers%2Futils%2Fquantization_config.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Futils%2Fquantization_config.py?ref=4bb49d4e00a2fe6ecfb644c424dc8d88edc02590",
+            "patch": "@@ -95,7 +95,6 @@ def from_dict(cls, config_dict, return_unused_kwargs=False, **kwargs):\n         Returns:\n             [`QuantizationConfigMixin`]: The configuration object instantiated from those parameters.\n         \"\"\"\n-\n         config = cls(**config_dict)\n \n         to_remove = []\n@@ -1235,24 +1234,11 @@ def __init__(self, quant_type: str, modules_to_not_convert: Optional[List] = Non\n         self.quant_method = QuantizationMethod.TORCHAO\n         self.quant_type = quant_type\n         self.modules_to_not_convert = modules_to_not_convert\n-        self.kwargs = kwargs\n-        self._STR_TO_METHOD = {}\n-        if is_torchao_available():\n-            from torchao.quantization import (\n-                int4_weight_only,\n-                int8_dynamic_activation_int8_weight,\n-                int8_weight_only,\n-            )\n-\n-            self._STR_TO_METHOD = {\n-                \"int4_weight_only\": int4_weight_only,\n-                \"int8_weight_only\": int8_weight_only,\n-                \"int8_dynamic_activation_int8_weight\": int8_dynamic_activation_int8_weight,\n-            }\n+        # when we load from serailized config, \"quant_type_kwargs\" will be the key\n+        if \"quant_type_kwargs\" in kwargs:\n+            self.quant_type_kwargs = kwargs[\"quant_type_kwargs\"]\n         else:\n-            raise ValueError(\n-                \"TorchAoConfig requires torchao to be installed, please install with `pip install torchao`\"\n-            )\n+            self.quant_type_kwargs = kwargs\n \n         self.post_init()\n \n@@ -1263,26 +1249,46 @@ def post_init(self):\n         if not version.parse(importlib.metadata.version(\"torchao\")) >= version.parse(\"0.4.0\"):\n             raise ValueError(\"Requires torchao 0.4.0 version and above\")\n \n-        if self.quant_type not in self._STR_TO_METHOD.keys():\n+        _STR_TO_METHOD = self._get_torchao_quant_type_to_method()\n+        if self.quant_type not in _STR_TO_METHOD.keys():\n             raise ValueError(\n                 f\"Requested quantization type: {self.quant_type} is not supported yet, please add support in TorchAoConfig and TorchAoHfQuantizer.\"\n             )\n \n-        method = self._STR_TO_METHOD[self.quant_type]\n+        method = _STR_TO_METHOD[self.quant_type]\n         sig = signature(method)\n         all_kwargs = [\n             param.name\n             for param in sig.parameters.values()\n             if param.kind in [Parameter.KEYWORD_ONLY, Parameter.POSITIONAL_OR_KEYWORD]\n         ]\n-        for k in self.kwargs:\n+        for k in self.quant_type_kwargs:\n             if k not in all_kwargs:\n                 raise ValueError(\n                     f\"Unexpected keyword arg: {k} for API: {method}, accepted keyword args are: {all_kwargs}\"\n                 )\n \n+    def _get_torchao_quant_type_to_method(self):\n+        if is_torchao_available():\n+            from torchao.quantization import (\n+                int4_weight_only,\n+                int8_dynamic_activation_int8_weight,\n+                int8_weight_only,\n+            )\n+\n+            return {\n+                \"int4_weight_only\": int4_weight_only,\n+                \"int8_weight_only\": int8_weight_only,\n+                \"int8_dynamic_activation_int8_weight\": int8_dynamic_activation_int8_weight,\n+            }\n+        else:\n+            raise ValueError(\n+                \"TorchAoConfig requires torchao to be installed, please install with `pip install torchao`\"\n+            )\n+\n     def get_apply_tensor_subclass(self):\n-        return self._STR_TO_METHOD[self.quant_type](**self.kwargs)\n+        _STR_TO_METHOD = self._get_torchao_quant_type_to_method()\n+        return _STR_TO_METHOD[self.quant_type](**self.quant_type_kwargs)\n \n     def __repr__(self):\n-        return f\"{self.quant_type}({', '.join(str(k) + '=' + str(v) for k, v in self.kwargs.items())})\"\n+        return f\"{self.quant_type}({', '.join(str(k) + '=' + str(v) for k, v in self.quant_type_kwargs.items())})\""
+        }
+    ],
+    "stats": {
+        "total": 198,
+        "additions": 134,
+        "deletions": 64
+    }
+}

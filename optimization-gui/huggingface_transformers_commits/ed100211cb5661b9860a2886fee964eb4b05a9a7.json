@@ -1,0 +1,96 @@
+{
+    "author": "gante",
+    "message": "[generate] `PromptLookupCandidateGenerator` won't generate forbidden tokens (#40726)\n\n* no longer flaky :)\n\n* PR comments\n\n* any token-blocking logits processor works\n\n* ?\n\n* default\n\n* -_-\n\n* create fake tensors once",
+    "sha": "ed100211cb5661b9860a2886fee964eb4b05a9a7",
+    "files": [
+        {
+            "sha": "9f62e4dd01583d752d4c8d417f892d23eee4ec67",
+            "filename": "src/transformers/generation/candidate_generator.py",
+            "status": "modified",
+            "additions": 54,
+            "deletions": 11,
+            "changes": 65,
+            "blob_url": "https://github.com/huggingface/transformers/blob/ed100211cb5661b9860a2886fee964eb4b05a9a7/src%2Ftransformers%2Fgeneration%2Fcandidate_generator.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/ed100211cb5661b9860a2886fee964eb4b05a9a7/src%2Ftransformers%2Fgeneration%2Fcandidate_generator.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fgeneration%2Fcandidate_generator.py?ref=ed100211cb5661b9860a2886fee964eb4b05a9a7",
+            "patch": "@@ -1004,26 +1004,39 @@ class PromptLookupCandidateGenerator(CandidateGenerator):\n     Read the following blog post for more information: https://github.com/apoorvumang/prompt-lookup-decoding\n \n     Args:\n-        max_matching_ngram_size (`int`):\n-            The maximum ngram size to be considered for matching in the prompt\n-        num_output_tokens (`int`):\n+        eos_token_id (`torch.Tensor`, *optional*):\n+            The token id of the end of sequence token.\n+        num_output_tokens (`int`, *optional*, defaults to 10):\n             The number of tokens to be output as candidate tokens.\n-        max_length (`int`):\n-            The number of total maximum tokens that can be generated. For decoder-only models that includes the prompt length.\n-            Defaults to 20, which is the max length used as default in generation config.\n+        max_matching_ngram_size (`int`, *optional*, defaults to 2):\n+            The maximum ngram size to be considered for matching in the prompt\n+        max_length (`int`, *optional*, defaults to 20):\n+            The number of total maximum tokens that can be generated. For decoder-only models that includes the\n+            prompt length. Defaults to 20, which is the max length used as default in generation config.\n+        logits_processor (`LogitsProcessorList`, *optional*):\n+            An instance of [`LogitsProcessorList`]. List of instances of class derived from [`LogitsProcessor`]\n+            used to modify the prediction scores of the language modeling head applied at each generation step. In\n+            prompt lookup assisted generation, they are not used to manipulate probabilities, but rather to find\n+            forbidden tokens (p = -inf) and block them from being valid candidates.\n+        vocab_size (`int`, *optional*):\n+            The size of the vocabulary. Required if `logits_processor` is provided.\n     \"\"\"\n \n     def __init__(\n         self,\n         eos_token_id: Optional[torch.Tensor] = None,\n         num_output_tokens: int = 10,\n-        max_matching_ngram_size: Optional[int] = None,\n+        max_matching_ngram_size: int = 2,\n         max_length: int = 20,\n+        logits_processor: Optional[\"LogitsProcessorList\"] = None,\n+        vocab_size: Optional[int] = None,\n     ):\n         self.num_output_tokens = num_output_tokens\n-        self.max_matching_ngram_size = max_matching_ngram_size if max_matching_ngram_size else 2\n+        self.max_matching_ngram_size = max_matching_ngram_size\n         self.max_length = max_length\n         self.eos_token_id = eos_token_id\n+        self.logits_processor = logits_processor\n+        self.vocab_size = vocab_size\n \n         if self.max_matching_ngram_size <= 0 or self.num_output_tokens <= 0:\n             raise ValueError(\"Invalid max_matching_ngram_size or num_output_tokens\")\n@@ -1039,7 +1052,7 @@ def get_candidates(self, input_ids: torch.LongTensor) -> tuple[torch.LongTensor,\n         Return:\n             `torch.LongTensor` of shape `(num_candidates, candidate_length)`: The candidate sequences to be tried.\n         \"\"\"\n-        input_length = input_ids.size(1)\n+        bsz, input_length = input_ids.shape\n \n         # Don't generate more than `max_length - 1` candidates since the target model generates one extra token.\n         if self.max_length == input_length + 1:\n@@ -1061,13 +1074,43 @@ def get_candidates(self, input_ids: torch.LongTensor) -> tuple[torch.LongTensor,\n             match_indices = matches.nonzero(as_tuple=True)[1]\n \n             # Iterate through match indices to find a valid continuation\n+            # TODO (joao): this finds the first valid candidates (left to right), but perhaps we should find the\n+            # longest valid candidates?\n             for idx in match_indices:\n                 start_idx = idx + ngram_size\n                 end_idx = start_idx + self.num_output_tokens\n                 end_idx = min(end_idx, input_length, self.max_length)\n \n                 if start_idx < end_idx:\n                     chosen_ids = input_ids[0, start_idx:end_idx]\n+\n+                    # Check if the each new candidate token is forbidden according to the logits processor. If all\n+                    # tokens are allowed, we keep `chosen_ids` as is.\n+                    # 1. create random logits.\n+                    # 2. apply the logits processor to get output logits for the next token, using the arbitrary\n+                    #    logits as input.\n+                    # 3. compare the output logits with the next candidate token. If they are -inf, then the next\n+                    #    candidate token is forbidden and we don't want to generate it.\n+                    if self.logits_processor is not None:\n+                        sequence_with_candidate = input_ids\n+                        fake_input_logits = torch.ones(\n+                            (bsz, self.vocab_size), device=input_ids.device, dtype=torch.float32\n+                        )\n+                        for candidate_idx, new_candidate_token in enumerate(chosen_ids):\n+                            fake_output_logits = self.logits_processor(sequence_with_candidate, fake_input_logits)\n+                            fake_candidate_logits = fake_output_logits[0, new_candidate_token]\n+                            # next candidate token is forbidden -> crop chosen_ids accordingly\n+                            if fake_candidate_logits in (-float(\"Inf\"), torch.finfo(fake_candidate_logits.dtype).min):\n+                                chosen_ids = chosen_ids[:candidate_idx]\n+                                break\n+                            else:\n+                                sequence_with_candidate = torch.cat(\n+                                    (input_ids, chosen_ids[: candidate_idx + 1].unsqueeze(0)), dim=1\n+                                )\n+                        # no valid candidate tokens -> look for a different match\n+                        if chosen_ids.shape[0] == 0:\n+                            continue\n+\n                     match_found = True\n \n                     # remove remaining candidate ids if an \"eos\" token is found, otherwise the target model may\n@@ -1082,8 +1125,8 @@ def get_candidates(self, input_ids: torch.LongTensor) -> tuple[torch.LongTensor,\n             if match_found:\n                 break\n \n-        if chosen_ids is None or len(chosen_ids) == 0:\n-            # In case we didn't find a match return the input sequence unchanged, reverts back to autoregressive decoding\n+        # In case we didn't find a match return the input sequence unchanged, reverts back to autoregressive decoding\n+        if not match_found or len(chosen_ids) == 0:\n             return input_ids, None\n \n         # Now need extend input_ids with chosen_ids"
+        },
+        {
+            "sha": "6ccee604f2714215dc5e14efef16709118a31461",
+            "filename": "src/transformers/generation/utils.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 1,
+            "changes": 4,
+            "blob_url": "https://github.com/huggingface/transformers/blob/ed100211cb5661b9860a2886fee964eb4b05a9a7/src%2Ftransformers%2Fgeneration%2Futils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/ed100211cb5661b9860a2886fee964eb4b05a9a7/src%2Ftransformers%2Fgeneration%2Futils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fgeneration%2Futils.py?ref=ed100211cb5661b9860a2886fee964eb4b05a9a7",
+            "patch": "@@ -1036,8 +1036,10 @@ def _get_candidate_generator(\n             candidate_generator = PromptLookupCandidateGenerator(\n                 eos_token_id=generation_config._eos_token_tensor,\n                 num_output_tokens=generation_config.prompt_lookup_num_tokens,\n-                max_matching_ngram_size=generation_config.max_matching_ngram_size,\n+                max_matching_ngram_size=generation_config.max_matching_ngram_size or 2,\n                 max_length=generation_config.max_length,\n+                logits_processor=logits_processor,\n+                vocab_size=self.config.get_text_config().vocab_size,\n             )\n         elif different_tokenizers:\n             if generation_config.do_sample is True:"
+        },
+        {
+            "sha": "1f7354b8ce806db011c8ff9baa15aff82d7fd308",
+            "filename": "tests/generation/test_utils.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 23,
+            "changes": 26,
+            "blob_url": "https://github.com/huggingface/transformers/blob/ed100211cb5661b9860a2886fee964eb4b05a9a7/tests%2Fgeneration%2Ftest_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/ed100211cb5661b9860a2886fee964eb4b05a9a7/tests%2Fgeneration%2Ftest_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fgeneration%2Ftest_utils.py?ref=ed100211cb5661b9860a2886fee964eb4b05a9a7",
+            "patch": "@@ -779,27 +779,6 @@ def test_prompt_lookup_decoding_matches_greedy_search(self):\n                     \"blip2\",  # overridden `generate()` for all BLIP models\n                     \"instructblip\",\n                     \"instructblipvideo\",\n-                    # TODO: The list is growing huge 🙃! Let's try to check if the config has any of audio/image/video token id and skip the test!\n-                    # All models below: shouldn't suggest image tokens. Can be fixed by passing `suppress_ids` to candidate generator: @joaa @raushan\n-                    \"llava\",\n-                    \"idefics2\",\n-                    \"idefics3\",\n-                    \"mllama\",\n-                    \"paligemma\",\n-                    \"emu3\",\n-                    \"gotocr2\",\n-                    \"qwen2vl\",\n-                    \"qwen2_5_vl\",\n-                    \"ayavision\",\n-                    \"janus\",\n-                    \"gemma3\",\n-                    \"mistral3\",\n-                    \"chameleon\",\n-                    \"internvl\",\n-                    \"qwen2_5omni\",  # the file is named `qwen2_5_omni`, but the model class is `Qwen2_5Omni`,\n-                    # All models below: shouldn't suggest audio tokens. Can be fixed by passing `suppress_ids` to candidate generator: @joaa @raushan\n-                    \"voxtral\",\n-                    \"qwen2audio\",\n                 ]\n             ):\n                 self.skipTest(reason=\"May fix in the future: need model-specific fixes\")\n@@ -835,11 +814,12 @@ def test_prompt_lookup_decoding_matches_greedy_search(self):\n                 \"return_dict_in_generate\": True,\n                 \"use_cache\": True,\n             }\n+            logits_processor_kwargs = self._get_logits_processor_kwargs(config=model.config)\n \n-            output_greedy = model.generate(**generation_kwargs, **inputs_dict)\n+            output_greedy = model.generate(**generation_kwargs, **inputs_dict, **logits_processor_kwargs)\n \n             generation_kwargs.update({\"prompt_lookup_num_tokens\": 2})  # see b)\n-            output_prompt_lookup = model.generate(**generation_kwargs, **inputs_dict)\n+            output_prompt_lookup = model.generate(**generation_kwargs, **inputs_dict, **logits_processor_kwargs)\n \n             # The two outputs must match and their shape must be as expected\n             self.assertTrue(has_similar_generate_outputs(output_greedy, output_prompt_lookup))"
+        },
+        {
+            "sha": "a500d8bf49467abc06374066464245094f88af42",
+            "filename": "tests/models/idefics2/test_modeling_idefics2.py",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 6,
+            "changes": 6,
+            "blob_url": "https://github.com/huggingface/transformers/blob/ed100211cb5661b9860a2886fee964eb4b05a9a7/tests%2Fmodels%2Fidefics2%2Ftest_modeling_idefics2.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/ed100211cb5661b9860a2886fee964eb4b05a9a7/tests%2Fmodels%2Fidefics2%2Ftest_modeling_idefics2.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fidefics2%2Ftest_modeling_idefics2.py?ref=ed100211cb5661b9860a2886fee964eb4b05a9a7",
+            "patch": "@@ -390,12 +390,6 @@ def test_flash_attn_2_generate_padding_right(self):\n     def test_flash_attn_2_inference_padding_right(self):\n         pass\n \n-    @unittest.skip(\n-        reason=\"Prompt lookup decoding needs a way to indicate `bad_word_ids` that should not be suggested as candidates\"\n-    )\n-    def test_prompt_lookup_decoding_matches_greedy_search(self):\n-        pass\n-\n     @pytest.mark.generate\n     @slow\n     @unittest.skip("
+        },
+        {
+            "sha": "b4434f34b81c6baac804bdcdf59bc5b74533e3f8",
+            "filename": "tests/models/idefics3/test_modeling_idefics3.py",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 6,
+            "changes": 6,
+            "blob_url": "https://github.com/huggingface/transformers/blob/ed100211cb5661b9860a2886fee964eb4b05a9a7/tests%2Fmodels%2Fidefics3%2Ftest_modeling_idefics3.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/ed100211cb5661b9860a2886fee964eb4b05a9a7/tests%2Fmodels%2Fidefics3%2Ftest_modeling_idefics3.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fidefics3%2Ftest_modeling_idefics3.py?ref=ed100211cb5661b9860a2886fee964eb4b05a9a7",
+            "patch": "@@ -351,12 +351,6 @@ def test_inputs_embeds():\n     def test_flash_attn_2_inference_padding_right(self):\n         pass\n \n-    @unittest.skip(\n-        reason=\"Prompt lookup decoding needs a way to indicate `bad_word_ids` that should not be suggested as candidates\"\n-    )\n-    def test_prompt_lookup_decoding_matches_greedy_search(self):\n-        pass\n-\n     @pytest.mark.generate\n     @slow\n     @unittest.skip("
+        },
+        {
+            "sha": "a105302a99529f1da2df9ab74d337703b934c1a4",
+            "filename": "tests/models/qwen2_5_vl/test_modeling_qwen2_5_vl.py",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 5,
+            "changes": 5,
+            "blob_url": "https://github.com/huggingface/transformers/blob/ed100211cb5661b9860a2886fee964eb4b05a9a7/tests%2Fmodels%2Fqwen2_5_vl%2Ftest_modeling_qwen2_5_vl.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/ed100211cb5661b9860a2886fee964eb4b05a9a7/tests%2Fmodels%2Fqwen2_5_vl%2Ftest_modeling_qwen2_5_vl.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fqwen2_5_vl%2Ftest_modeling_qwen2_5_vl.py?ref=ed100211cb5661b9860a2886fee964eb4b05a9a7",
+            "patch": "@@ -30,7 +30,6 @@\n from transformers.testing_utils import (\n     Expectations,\n     cleanup,\n-    is_flaky,\n     require_cv2,\n     require_flash_attn,\n     require_torch,\n@@ -446,10 +445,6 @@ def test_multi_gpu_data_parallel_forward(self):\n     def test_model_is_small(self):\n         pass\n \n-    @is_flaky()  # TODO (joao/raushan): Investigate why this test is flaky on this model\n-    def test_prompt_lookup_decoding_matches_greedy_search(self):\n-        super().test_prompt_lookup_decoding_matches_greedy_search()\n-\n \n @require_torch\n class Qwen2_5_VLIntegrationTest(unittest.TestCase):"
+        },
+        {
+            "sha": "6a3c8c5fa3460a6236adc6783f0ec71824b3ff4e",
+            "filename": "tests/models/smolvlm/test_modeling_smolvlm.py",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 6,
+            "changes": 6,
+            "blob_url": "https://github.com/huggingface/transformers/blob/ed100211cb5661b9860a2886fee964eb4b05a9a7/tests%2Fmodels%2Fsmolvlm%2Ftest_modeling_smolvlm.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/ed100211cb5661b9860a2886fee964eb4b05a9a7/tests%2Fmodels%2Fsmolvlm%2Ftest_modeling_smolvlm.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Fmodels%2Fsmolvlm%2Ftest_modeling_smolvlm.py?ref=ed100211cb5661b9860a2886fee964eb4b05a9a7",
+            "patch": "@@ -345,12 +345,6 @@ def setUp(self):\n     def test_flash_attn_2_inference_padding_right(self):\n         pass\n \n-    @unittest.skip(\n-        reason=\"Prompt lookup decoding needs a way to indicate `bad_word_ids` that should not be suggested as candidates\"\n-    )\n-    def test_prompt_lookup_decoding_matches_greedy_search(self):\n-        pass\n-\n     @pytest.mark.generate\n     @is_flaky(description=\"TODO: check why flaky\")\n     def test_generate_methods_with_logits_to_keep(self):"
+        }
+    ],
+    "stats": {
+        "total": 118,
+        "additions": 60,
+        "deletions": 58
+    }
+}

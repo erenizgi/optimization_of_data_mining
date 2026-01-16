@@ -1,0 +1,24 @@
+{
+    "author": "sokra",
+    "message": "Turbopack: parallel search_index in trace server (#78357)\n\n### What?\r\n\r\nImprove search performance in trace server by using parallelization.",
+    "sha": "e375e325ecd6cb909a3f5aafc8202cdad7be1fd6",
+    "files": [
+        {
+            "sha": "d80d983facb45386db77aee67f9013dd5e7b73da",
+            "filename": "turbopack/crates/turbopack-trace-server/src/span_ref.rs",
+            "status": "modified",
+            "additions": 62,
+            "deletions": 8,
+            "changes": 70,
+            "blob_url": "https://github.com/vercel/next.js/blob/e375e325ecd6cb909a3f5aafc8202cdad7be1fd6/turbopack%2Fcrates%2Fturbopack-trace-server%2Fsrc%2Fspan_ref.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/e375e325ecd6cb909a3f5aafc8202cdad7be1fd6/turbopack%2Fcrates%2Fturbopack-trace-server%2Fsrc%2Fspan_ref.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-trace-server%2Fsrc%2Fspan_ref.rs?ref=e375e325ecd6cb909a3f5aafc8202cdad7be1fd6",
+            "patch": "@@ -6,7 +6,7 @@ use std::{\n };\n \n use hashbrown::HashMap;\n-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};\n+use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};\n use rustc_hash::FxHashSet;\n \n use crate::{\n@@ -417,10 +417,28 @@ impl<'a> SpanRef<'a> {\n \n     fn search_index(&self) -> &HashMap<String, Vec<SpanIndex>> {\n         self.extra().search_index.get_or_init(|| {\n-            let mut index: HashMap<String, Vec<SpanIndex>> = HashMap::default();\n-            let mut queue = VecDeque::with_capacity(8);\n-            queue.push_back(*self);\n-            while let Some(span) = queue.pop_front() {\n+            let mut all_spans = Vec::new();\n+            all_spans.push(self.index);\n+            let mut i = 0;\n+            while i < all_spans.len() {\n+                let index = all_spans[i];\n+                let span = SpanRef {\n+                    span: &self.store.spans[index],\n+                    store: self.store,\n+                    index,\n+                };\n+                for child in span.children() {\n+                    all_spans.push(child.index);\n+                }\n+                i += 1;\n+            }\n+\n+            enum SpanOrMap<'a> {\n+                Span(SpanRef<'a>),\n+                Map(HashMap<String, Vec<SpanIndex>>),\n+            }\n+\n+            fn add_span_to_map<'a>(index: &mut HashMap<String, Vec<SpanIndex>>, span: SpanRef<'a>) {\n                 if !span.is_root() {\n                     let (cat, name) = span.nice_name();\n                     if !cat.is_empty() {\n@@ -453,11 +471,47 @@ impl<'a> SpanRef<'a> {\n                             .or_insert_with(|| (name.to_string(), vec![span.index()]));\n                     }\n                 }\n-                for child in span.children() {\n-                    queue.push_back(child);\n+            }\n+\n+            let result = all_spans\n+                .into_par_iter()\n+                .map(|index| {\n+                    SpanOrMap::Span(SpanRef {\n+                        span: &self.store.spans[index],\n+                        store: self.store,\n+                        index,\n+                    })\n+                })\n+                .reduce(\n+                    || SpanOrMap::Map(HashMap::default()),\n+                    |a, b| {\n+                        let mut map = match a {\n+                            SpanOrMap::Span(span) => {\n+                                let mut map = HashMap::default();\n+                                add_span_to_map(&mut map, span);\n+                                map\n+                            }\n+                            SpanOrMap::Map(map) => map,\n+                        };\n+                        match b {\n+                            SpanOrMap::Span(span) => {\n+                                add_span_to_map(&mut map, span);\n+                            }\n+                            SpanOrMap::Map(other_map) => {\n+                                map.extend(other_map);\n+                            }\n+                        }\n+                        SpanOrMap::Map(map)\n+                    },\n+                );\n+            match result {\n+                SpanOrMap::Span(span) => {\n+                    let mut map = HashMap::default();\n+                    add_span_to_map(&mut map, span);\n+                    map\n                 }\n+                SpanOrMap::Map(map) => map,\n             }\n-            index\n         })\n     }\n }"
+        }
+    ],
+    "stats": {
+        "total": 70,
+        "additions": 62,
+        "deletions": 8
+    }
+}

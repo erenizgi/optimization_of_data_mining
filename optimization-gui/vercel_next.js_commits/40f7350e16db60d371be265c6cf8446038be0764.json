@@ -1,0 +1,96 @@
+{
+    "author": "SyMind",
+    "message": "feat: in Rspack using native fn implemented by us using SWC to replace load module (#80342)\n\nRspack currently lacks support for `loadModule` in loader contexts.\n\nAs an alternative solution, we can using native fn implemented by us\nusing SWC to replace load module.\n\n---------\n\nCo-authored-by: Benjamin Woodruff <benjamin.woodruff@vercel.com>",
+    "sha": "40f7350e16db60d371be265c6cf8446038be0764",
+    "files": [
+        {
+            "sha": "8544f38045644defa078668efdb4196a7efea5ec",
+            "filename": "crates/napi/src/lib.rs",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/40f7350e16db60d371be265c6cf8446038be0764/crates%2Fnapi%2Fsrc%2Flib.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/40f7350e16db60d371be265c6cf8446038be0764/crates%2Fnapi%2Fsrc%2Flib.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/crates%2Fnapi%2Fsrc%2Flib.rs?ref=40f7350e16db60d371be265c6cf8446038be0764",
+            "patch": "@@ -51,6 +51,7 @@ pub mod minify;\n pub mod next_api;\n pub mod parse;\n pub mod react_compiler;\n+pub mod rspack;\n pub mod transform;\n #[cfg(not(target_arch = \"wasm32\"))]\n pub mod turbo_trace_server;"
+        },
+        {
+            "sha": "673adcb026472172e171fc5f115df4ecca17a252",
+            "filename": "crates/napi/src/rspack.rs",
+            "status": "added",
+            "additions": 174,
+            "deletions": 0,
+            "changes": 174,
+            "blob_url": "https://github.com/vercel/next.js/blob/40f7350e16db60d371be265c6cf8446038be0764/crates%2Fnapi%2Fsrc%2Frspack.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/40f7350e16db60d371be265c6cf8446038be0764/crates%2Fnapi%2Fsrc%2Frspack.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/crates%2Fnapi%2Fsrc%2Frspack.rs?ref=40f7350e16db60d371be265c6cf8446038be0764",
+            "patch": "@@ -0,0 +1,174 @@\n+use std::{fs, path::PathBuf, sync::Arc};\n+\n+use napi::bindgen_prelude::*;\n+use swc_core::{\n+    base::{\n+        config::{IsModule, ParseOptions},\n+        try_with_handler,\n+    },\n+    common::{\n+        FileName, FilePathMapping, GLOBALS, SourceMap, comments::Comments, errors::ColorConfig,\n+    },\n+    ecma::{\n+        ast::{Decl, EsVersion, Id},\n+        atoms::Atom,\n+        parser::{EsSyntax, Syntax, TsSyntax},\n+        utils::find_pat_ids,\n+        visit::{Visit, VisitWith},\n+    },\n+    node::MapErr,\n+};\n+\n+struct Finder {\n+    pub named_exports: Vec<Atom>,\n+}\n+\n+impl Visit for Finder {\n+    fn visit_export_decl(&mut self, node: &swc_core::ecma::ast::ExportDecl) {\n+        match &node.decl {\n+            Decl::Class(class_decl) => {\n+                self.named_exports.push(class_decl.ident.sym.clone());\n+            }\n+            Decl::Fn(fn_decl) => {\n+                self.named_exports.push(fn_decl.ident.sym.clone());\n+            }\n+            Decl::Var(var_decl) => {\n+                let ids: Vec<Id> = find_pat_ids(&var_decl.decls);\n+                for id in ids {\n+                    self.named_exports.push(id.0);\n+                }\n+            }\n+            _ => {}\n+        }\n+    }\n+\n+    fn visit_export_named_specifier(&mut self, node: &swc_core::ecma::ast::ExportNamedSpecifier) {\n+        let named_export = if let Some(exported) = &node.exported {\n+            exported.atom().clone()\n+        } else {\n+            node.orig.atom().clone()\n+        };\n+        self.named_exports.push(named_export);\n+    }\n+\n+    fn visit_export_namespace_specifier(\n+        &mut self,\n+        node: &swc_core::ecma::ast::ExportNamespaceSpecifier,\n+    ) {\n+        self.named_exports.push(node.name.atom().clone());\n+    }\n+}\n+\n+pub struct FinderTask {\n+    pub resource_path: Option<String>,\n+}\n+\n+impl Task for FinderTask {\n+    type Output = Vec<Atom>;\n+    type JsValue = Array;\n+\n+    fn compute(&mut self) -> napi::Result<Self::Output> {\n+        let resource_path = PathBuf::from(self.resource_path.take().unwrap());\n+        let src = fs::read_to_string(&resource_path)\n+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;\n+\n+        let syntax = match resource_path\n+            .extension()\n+            .map(|os_str| os_str.to_string_lossy())\n+        {\n+            Some(ext) if matches!(ext.as_ref(), \"ts\" | \"mts\" | \"cts\") => {\n+                Syntax::Typescript(TsSyntax {\n+                    tsx: false,\n+                    decorators: true,\n+                    dts: false,\n+                    no_early_errors: true,\n+                    disallow_ambiguous_jsx_like: false,\n+                })\n+            }\n+            Some(ext) if matches!(ext.as_ref(), \"tsx\" | \"mtsx\" | \"ctsx\") => {\n+                Syntax::Typescript(TsSyntax {\n+                    tsx: true,\n+                    decorators: true,\n+                    dts: false,\n+                    no_early_errors: true,\n+                    disallow_ambiguous_jsx_like: false,\n+                })\n+            }\n+            _ => Syntax::Es(EsSyntax {\n+                jsx: true,\n+                fn_bind: true,\n+                decorators: true,\n+                decorators_before_export: true,\n+                export_default_from: true,\n+                import_attributes: true,\n+                allow_super_outside_method: true,\n+                allow_return_outside_function: true,\n+                auto_accessors: true,\n+                explicit_resource_management: true,\n+            }),\n+        };\n+\n+        GLOBALS.set(&Default::default(), || {\n+            let c =\n+                swc_core::base::Compiler::new(Arc::new(SourceMap::new(FilePathMapping::empty())));\n+\n+            let options = ParseOptions {\n+                comments: false,\n+                syntax,\n+                is_module: IsModule::Unknown,\n+                target: EsVersion::default(),\n+            };\n+            let comments = c.comments().clone();\n+            let comments: Option<&dyn Comments> = if options.comments {\n+                Some(&comments)\n+            } else {\n+                None\n+            };\n+            let fm =\n+                c.cm.new_source_file(Arc::new(FileName::Real(resource_path)), src);\n+            let program = try_with_handler(\n+                c.cm.clone(),\n+                swc_core::base::HandlerOpts {\n+                    color: ColorConfig::Never,\n+                    skip_filename: false,\n+                },\n+                |handler| {\n+                    c.parse_js(\n+                        fm,\n+                        handler,\n+                        options.target,\n+                        options.syntax,\n+                        options.is_module,\n+                        comments,\n+                    )\n+                },\n+            )\n+            .map_err(|e| e.to_pretty_error())\n+            .convert_err()?;\n+\n+            let mut visitor = Finder {\n+                named_exports: Vec::new(),\n+            };\n+            // Visit the AST to find named exports\n+            program.visit_with(&mut visitor);\n+\n+            Ok(visitor.named_exports)\n+        })\n+    }\n+\n+    fn resolve(&mut self, env: Env, result: Self::Output) -> napi::Result<Self::JsValue> {\n+        let mut array = env.create_array(result.len() as u32)?;\n+        for (i, name) in result.iter().enumerate() {\n+            let js_val = env.create_string(name.as_str())?;\n+            array.set(i as u32, js_val)?;\n+        }\n+        Ok(array)\n+    }\n+}\n+\n+#[napi(ts_return_type = \"Promise<string[]>\")]\n+pub fn get_module_named_exports(resource_path: String) -> AsyncTask<FinderTask> {\n+    AsyncTask::new(FinderTask {\n+        resource_path: Some(resource_path),\n+    })\n+}"
+        },
+        {
+            "sha": "fcf94f6ec614aaa35d7b90535d387b3e569ee981",
+            "filename": "packages/next/errors.json",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/40f7350e16db60d371be265c6cf8446038be0764/packages%2Fnext%2Ferrors.json",
+            "raw_url": "https://github.com/vercel/next.js/raw/40f7350e16db60d371be265c6cf8446038be0764/packages%2Fnext%2Ferrors.json",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Ferrors.json?ref=40f7350e16db60d371be265c6cf8446038be0764",
+            "patch": "@@ -706,5 +706,6 @@\n   \"705\": \"Route is configured with dynamic = error that cannot be statically generated.\",\n   \"706\": \"Invariant: static responses cannot be streamed %s\",\n   \"707\": \"Invariant app-page handler received invalid cache entry %s\",\n-  \"708\": \"Failed to persist Chrome DevTools workspace UUID. The Chrome DevTools Workspace needs to be reconnected after the next page reload.\"\n+  \"708\": \"Failed to persist Chrome DevTools workspace UUID. The Chrome DevTools Workspace needs to be reconnected after the next page reload.\",\n+  \"709\": \"`rspack.getModuleNamedExports` is not supported by the wasm bindings.\"\n }"
+        },
+        {
+            "sha": "7aad7ea6e733d89de128ba439096f016a75b0799",
+            "filename": "packages/next/src/build/swc/generated-native.d.ts",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/40f7350e16db60d371be265c6cf8446038be0764/packages%2Fnext%2Fsrc%2Fbuild%2Fswc%2Fgenerated-native.d.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/40f7350e16db60d371be265c6cf8446038be0764/packages%2Fnext%2Fsrc%2Fbuild%2Fswc%2Fgenerated-native.d.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Fswc%2Fgenerated-native.d.ts?ref=40f7350e16db60d371be265c6cf8446038be0764",
+            "patch": "@@ -389,6 +389,9 @@ export declare function isReactCompilerRequired(\n   filename: string,\n   signal?: AbortSignal | undefined | null\n ): Promise<boolean>\n+export declare function getModuleNamedExports(\n+  resourcePath: string\n+): Promise<string[]>\n export declare function transform(\n   src: string | Buffer | undefined,\n   isModule: boolean,"
+        },
+        {
+            "sha": "d9a50b3d486a90543e5b7e05b359c983d479145e",
+            "filename": "packages/next/src/build/swc/index.ts",
+            "status": "modified",
+            "additions": 23,
+            "deletions": 0,
+            "changes": 23,
+            "blob_url": "https://github.com/vercel/next.js/blob/40f7350e16db60d371be265c6cf8446038be0764/packages%2Fnext%2Fsrc%2Fbuild%2Fswc%2Findex.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/40f7350e16db60d371be265c6cf8446038be0764/packages%2Fnext%2Fsrc%2Fbuild%2Fswc%2Findex.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Fswc%2Findex.ts?ref=40f7350e16db60d371be265c6cf8446038be0764",
+            "patch": "@@ -1151,6 +1151,15 @@ async function loadWasm(importPath = '') {\n             return Promise.resolve(true)\n           },\n         },\n+        rspack: {\n+          getModuleNamedExports: function (\n+            _resourcePath: string\n+          ): Promise<string[]> {\n+            throw new Error(\n+              '`rspack.getModuleNamedExports` is not supported by the wasm bindings.'\n+            )\n+          },\n+        },\n       }\n       return wasmBindings\n     } catch (e: any) {\n@@ -1327,6 +1336,13 @@ function loadNative(importPath?: string) {\n           return bindings.isReactCompilerRequired(filename)\n         },\n       },\n+      rspack: {\n+        getModuleNamedExports: function (\n+          resourcePath: string\n+        ): Promise<string[]> {\n+          return bindings.getModuleNamedExports(resourcePath)\n+        },\n+      },\n     }\n     return nativeBindings\n   }\n@@ -1443,3 +1459,10 @@ export const teardownTraceSubscriber = once(() => {\n     // Suppress exceptions, this fn allows to fail to load native bindings\n   }\n })\n+\n+export async function getModuleNamedExports(\n+  resourcePath: string\n+): Promise<string[]> {\n+  const bindings = await loadBindings()\n+  return bindings.rspack.getModuleNamedExports(resourcePath)\n+}"
+        },
+        {
+            "sha": "7d78bc4b928dfe819306a80d113fb7355da5c51e",
+            "filename": "packages/next/src/build/swc/types.ts",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/vercel/next.js/blob/40f7350e16db60d371be265c6cf8446038be0764/packages%2Fnext%2Fsrc%2Fbuild%2Fswc%2Ftypes.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/40f7350e16db60d371be265c6cf8446038be0764/packages%2Fnext%2Fsrc%2Fbuild%2Fswc%2Ftypes.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Fswc%2Ftypes.ts?ref=40f7350e16db60d371be265c6cf8446038be0764",
+            "patch": "@@ -43,6 +43,10 @@ export interface Binding {\n   reactCompiler: {\n     isReactCompilerRequired(filename: string): Promise<boolean>\n   }\n+\n+  rspack: {\n+    getModuleNamedExports(resourcePath: string): Promise<string[]>\n+  }\n }\n \n export type StyledString ="
+        },
+        {
+            "sha": "df5d865c7a32a623d2527303019a815751ecc1a7",
+            "filename": "packages/next/src/build/webpack/loaders/utils.ts",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/vercel/next.js/blob/40f7350e16db60d371be265c6cf8446038be0764/packages%2Fnext%2Fsrc%2Fbuild%2Fwebpack%2Floaders%2Futils.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/40f7350e16db60d371be265c6cf8446038be0764/packages%2Fnext%2Fsrc%2Fbuild%2Fwebpack%2Floaders%2Futils.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Fwebpack%2Floaders%2Futils.ts?ref=40f7350e16db60d371be265c6cf8446038be0764",
+            "patch": "@@ -55,6 +55,13 @@ export async function getLoaderModuleNamedExports(\n   resourcePath: string,\n   context: webpack.LoaderContext<any>\n ): Promise<string[]> {\n+  if (process.env.NEXT_RSPACK) {\n+    // Currently, the loadModule method is not supported in Rspack.\n+    // Use getModuleNamedExports (implemented by us using SWC) to extract named exports from the module.\n+    const binding = require('../../swc') as typeof import('../../swc')\n+    return binding.getModuleNamedExports(resourcePath)\n+  }\n+\n   const mod = await new Promise<webpack.NormalModule>((res, rej) => {\n     context.loadModule(\n       resourcePath,"
+        }
+    ],
+    "stats": {
+        "total": 215,
+        "additions": 214,
+        "deletions": 1
+    }
+}

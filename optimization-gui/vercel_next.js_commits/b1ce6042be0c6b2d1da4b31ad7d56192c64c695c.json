@@ -1,0 +1,120 @@
+{
+    "author": "ztanner",
+    "message": "add compilation error for taint when not enabled (#88173)\n\nUsing `taint` APIs from React without enabling `experimental.taint` will\nerror at runtime because it needs to bundle experimental React, making\nit hard to catch and potentially leading to downtime. This updates our\ntransform to throw an error if we detect that it's imported but `taint`\nisn't enabled.\n\nFixes NAR-690",
+    "sha": "b1ce6042be0c6b2d1da4b31ad7d56192c64c695c",
+    "files": [
+        {
+            "sha": "0cccc589994d456a79fd9888f1c147b0d8f415dd",
+            "filename": "crates/next-core/src/next_shared/transforms/next_react_server_components.rs",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/vercel/next.js/blob/b1ce6042be0c6b2d1da4b31ad7d56192c64c695c/crates%2Fnext-core%2Fsrc%2Fnext_shared%2Ftransforms%2Fnext_react_server_components.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/b1ce6042be0c6b2d1da4b31ad7d56192c64c695c/crates%2Fnext-core%2Fsrc%2Fnext_shared%2Ftransforms%2Fnext_react_server_components.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/crates%2Fnext-core%2Fsrc%2Fnext_shared%2Ftransforms%2Fnext_react_server_components.rs?ref=b1ce6042be0c6b2d1da4b31ad7d56192c64c695c",
+            "patch": "@@ -36,11 +36,13 @@ pub async fn get_next_react_server_components_transform_rule(\n     let enable_mdx_rs = next_config.mdx_rs().await?.is_some();\n     let cache_components_enabled = *next_config.enable_cache_components().await?;\n     let use_cache_enabled = *next_config.enable_use_cache().await?;\n+    let taint_enabled = *next_config.enable_taint().await?;\n     Ok(get_ecma_transform_rule(\n         Box::new(NextJsReactServerComponents::new(\n             is_react_server_layer,\n             cache_components_enabled,\n             use_cache_enabled,\n+            taint_enabled,\n             app_dir,\n         )),\n         enable_mdx_rs,\n@@ -53,6 +55,7 @@ struct NextJsReactServerComponents {\n     is_react_server_layer: bool,\n     cache_components_enabled: bool,\n     use_cache_enabled: bool,\n+    taint_enabled: bool,\n     app_dir: Option<FileSystemPath>,\n }\n \n@@ -61,12 +64,14 @@ impl NextJsReactServerComponents {\n         is_react_server_layer: bool,\n         cache_components_enabled: bool,\n         use_cache_enabled: bool,\n+        taint_enabled: bool,\n         app_dir: Option<FileSystemPath>,\n     ) -> Self {\n         Self {\n             is_react_server_layer,\n             cache_components_enabled,\n             use_cache_enabled,\n+            taint_enabled,\n             app_dir,\n         }\n     }\n@@ -88,6 +93,7 @@ impl CustomTransformer for NextJsReactServerComponents {\n                 is_react_server_layer: self.is_react_server_layer,\n                 cache_components_enabled: self.cache_components_enabled,\n                 use_cache_enabled: self.use_cache_enabled,\n+                taint_enabled: self.taint_enabled,\n             }),\n             self.app_dir.as_ref().map(|path| path.path.clone().into()),\n         );"
+        },
+        {
+            "sha": "bcb50605126fce434d1e6f22bd4cc590f9d7167d",
+            "filename": "crates/next-custom-transforms/src/transforms/react_server_components.rs",
+            "status": "modified",
+            "additions": 62,
+            "deletions": 0,
+            "changes": 62,
+            "blob_url": "https://github.com/vercel/next.js/blob/b1ce6042be0c6b2d1da4b31ad7d56192c64c695c/crates%2Fnext-custom-transforms%2Fsrc%2Ftransforms%2Freact_server_components.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/b1ce6042be0c6b2d1da4b31ad7d56192c64c695c/crates%2Fnext-custom-transforms%2Fsrc%2Ftransforms%2Freact_server_components.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/crates%2Fnext-custom-transforms%2Fsrc%2Ftransforms%2Freact_server_components.rs?ref=b1ce6042be0c6b2d1da4b31ad7d56192c64c695c",
+            "patch": "@@ -53,6 +53,8 @@ pub struct Options {\n     pub is_react_server_layer: bool,\n     pub cache_components_enabled: bool,\n     pub use_cache_enabled: bool,\n+    #[serde(default)]\n+    pub taint_enabled: bool,\n }\n \n /// A visitor that transforms given module to use module proxy if it's a React\n@@ -63,6 +65,7 @@ struct ReactServerComponents<C: Comments> {\n     is_react_server_layer: bool,\n     cache_components_enabled: bool,\n     use_cache_enabled: bool,\n+    taint_enabled: bool,\n     filepath: String,\n     app_dir: Option<PathBuf>,\n     comments: C,\n@@ -96,6 +99,7 @@ enum RSCErrorKind {\n     NextRscErrDeprecatedApi((String, String, Span)),\n     NextSsrDynamicFalseNotAllowed(Span),\n     NextRscErrIncompatibleRouteSegmentConfig(Span, String, NextConfigProperty),\n+    NextRscErrTaintWithoutConfig((String, Span)),\n }\n \n #[derive(Clone, Debug, Copy)]\n@@ -128,6 +132,7 @@ impl<C: Comments> VisitMut for ReactServerComponents<C> {\n             self.is_react_server_layer,\n             self.cache_components_enabled,\n             self.use_cache_enabled,\n+            self.taint_enabled,\n             self.filepath.clone(),\n             self.app_dir.clone(),\n         );\n@@ -356,6 +361,12 @@ fn report_error(app_dir: &Option<PathBuf>, filepath: &str, error_kind: RSCErrorK\n             format!(\"Route segment config \\\"{segment}\\\" is not compatible with `nextConfig.{property}`. Please remove it.\"),\n             vec![span],\n         ),\n+        RSCErrorKind::NextRscErrTaintWithoutConfig((api_name, span)) => (\n+            format!(\n+                \"You're importing `{api_name}` from React which requires `experimental.taint: true` in your Next.js config. Learn more: https://nextjs.org/docs/app/api-reference/config/next-config-js/taint\"\n+            ),\n+            vec![span],\n+        ),\n     };\n \n     HANDLER.with(|handler| handler.struct_span_err(spans, msg.as_str()).emit())\n@@ -576,13 +587,16 @@ struct ReactServerComponentValidator {\n     is_react_server_layer: bool,\n     cache_components_enabled: bool,\n     use_cache_enabled: bool,\n+    taint_enabled: bool,\n     filepath: String,\n     app_dir: Option<PathBuf>,\n     invalid_server_imports: Vec<Wtf8Atom>,\n     invalid_server_lib_apis_mapping: FxHashMap<Wtf8Atom, Vec<&'static str>>,\n     deprecated_apis_mapping: FxHashMap<Wtf8Atom, Vec<&'static str>>,\n     invalid_client_imports: Vec<Wtf8Atom>,\n     invalid_client_lib_apis_mapping: FxHashMap<Wtf8Atom, Vec<&'static str>>,\n+    /// React taint APIs that require `experimental.taint` config\n+    react_taint_apis: Vec<&'static str>,\n     pub module_directive: Option<ModuleDirective>,\n     pub export_names: Vec<Atom>,\n     imports: ImportMap,\n@@ -593,13 +607,15 @@ impl ReactServerComponentValidator {\n         is_react_server_layer: bool,\n         cache_components_enabled: bool,\n         use_cache_enabled: bool,\n+        taint_enabled: bool,\n         filename: String,\n         app_dir: Option<PathBuf>,\n     ) -> Self {\n         Self {\n             is_react_server_layer,\n             cache_components_enabled,\n             use_cache_enabled,\n+            taint_enabled,\n             filepath: filename,\n             app_dir,\n             module_directive: None,\n@@ -689,6 +705,10 @@ impl ReactServerComponentValidator {\n                     ],\n                 ),\n             ]),\n+            react_taint_apis: vec![\n+                \"experimental_taintObjectReference\",\n+                \"experimental_taintUniqueValue\",\n+            ],\n             imports: ImportMap::default(),\n         }\n     }\n@@ -741,6 +761,35 @@ impl ReactServerComponentValidator {\n         }\n     }\n \n+    /// Check for React taint API imports when taint is not enabled\n+    fn assert_react_taint_apis(&self, imports: &[ModuleImports]) {\n+        // Skip check if taint is enabled or if file is from node_modules\n+        if self.taint_enabled || self.is_from_node_modules(&self.filepath) {\n+            return;\n+        }\n+\n+        for import in imports {\n+            let source = &import.source.0;\n+            // Only check imports from 'react'\n+            if source.as_str() != Some(\"react\") {\n+                continue;\n+            }\n+\n+            for specifier in &import.specifiers {\n+                if self.react_taint_apis.contains(&specifier.0.as_str()) {\n+                    report_error(\n+                        &self.app_dir,\n+                        &self.filepath,\n+                        RSCErrorKind::NextRscErrTaintWithoutConfig((\n+                            specifier.0.to_string(),\n+                            specifier.1,\n+                        )),\n+                    );\n+                }\n+            }\n+        }\n+    }\n+\n     fn assert_server_graph(&self, imports: &[ModuleImports], module: &Module) {\n         // If the\n         if self.is_from_node_modules(&self.filepath) {\n@@ -1043,6 +1092,9 @@ impl Visit for ReactServerComponentValidator {\n         self.module_directive = directive;\n         self.export_names = export_names;\n \n+        // Check for taint API usage without config (runs for all files)\n+        self.assert_react_taint_apis(&imports);\n+\n         if self.is_react_server_layer {\n             if directive == Some(ModuleDirective::UseClient) {\n                 return;\n@@ -1094,6 +1146,10 @@ pub fn server_components_assert(\n         Config::WithOptions(x) => x.use_cache_enabled,\n         _ => false,\n     };\n+    let taint_enabled: bool = match &config {\n+        Config::WithOptions(x) => x.taint_enabled,\n+        _ => false,\n+    };\n     let filename = match filename {\n         FileName::Custom(path) => format!(\"<{path}>\"),\n         _ => filename.to_string(),\n@@ -1102,6 +1158,7 @@ pub fn server_components_assert(\n         is_react_server_layer,\n         cache_components_enabled,\n         use_cache_enabled,\n+        taint_enabled,\n         filename,\n         app_dir,\n     )\n@@ -1127,10 +1184,15 @@ pub fn server_components<C: Comments>(\n         Config::WithOptions(x) => x.use_cache_enabled,\n         _ => false,\n     };\n+    let taint_enabled: bool = match &config {\n+        Config::WithOptions(x) => x.taint_enabled,\n+        _ => false,\n+    };\n     visit_mut_pass(ReactServerComponents {\n         is_react_server_layer,\n         cache_components_enabled,\n         use_cache_enabled,\n+        taint_enabled,\n         comments,\n         filepath: match &*filename {\n             FileName::Custom(path) => format!(\"<{path}>\"),"
+        },
+        {
+            "sha": "ed0b15e263724fe9702ef88740c73e8ecbf74ddb",
+            "filename": "crates/next-custom-transforms/tests/errors.rs",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/vercel/next.js/blob/b1ce6042be0c6b2d1da4b31ad7d56192c64c695c/crates%2Fnext-custom-transforms%2Ftests%2Ferrors.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/b1ce6042be0c6b2d1da4b31ad7d56192c64c695c/crates%2Fnext-custom-transforms%2Ftests%2Ferrors.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/crates%2Fnext-custom-transforms%2Ftests%2Ferrors.rs?ref=b1ce6042be0c6b2d1da4b31ad7d56192c64c695c",
+            "patch": "@@ -97,6 +97,7 @@ fn react_server_components_errors(input: PathBuf) {\n     let is_react_server_layer = input.iter().any(|s| s.to_str() == Some(\"server-graph\"));\n     let cache_components_enabled = input.iter().any(|s| s.to_str() == Some(\"cache-components\"));\n     let use_cache_enabled = input.iter().any(|s| s.to_str() == Some(\"use-cache\"));\n+    let taint_enabled = input.iter().any(|s| s.to_str() == Some(\"taint-enabled\"));\n \n     let app_dir = input\n         .iter()\n@@ -113,6 +114,7 @@ fn react_server_components_errors(input: PathBuf) {\n                     is_react_server_layer,\n                     cache_components_enabled,\n                     use_cache_enabled,\n+                    taint_enabled,\n                 }),\n                 tr.comments.as_ref().clone(),\n                 app_dir.clone(),\n@@ -170,6 +172,7 @@ fn react_server_actions_errors(input: PathBuf) {\n                         is_react_server_layer,\n                         cache_components_enabled: true,\n                         use_cache_enabled: true,\n+                        taint_enabled: true,\n                     }),\n                     tr.comments.as_ref().clone(),\n                     None,\n@@ -236,6 +239,7 @@ fn use_cache_not_allowed(input: PathBuf) {\n                         is_react_server_layer: true,\n                         cache_components_enabled: false,\n                         use_cache_enabled: false,\n+                        taint_enabled: true,\n                     }),\n                     tr.comments.as_ref().clone(),\n                     None,"
+        },
+        {
+            "sha": "1fa790e6dc235c45501f7f51c5e43f0889235a0f",
+            "filename": "crates/next-custom-transforms/tests/errors/react-server-components/server-graph/taint-without-config/input.js",
+            "status": "added",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/vercel/next.js/blob/b1ce6042be0c6b2d1da4b31ad7d56192c64c695c/crates%2Fnext-custom-transforms%2Ftests%2Ferrors%2Freact-server-components%2Fserver-graph%2Ftaint-without-config%2Finput.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/b1ce6042be0c6b2d1da4b31ad7d56192c64c695c/crates%2Fnext-custom-transforms%2Ftests%2Ferrors%2Freact-server-components%2Fserver-graph%2Ftaint-without-config%2Finput.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/crates%2Fnext-custom-transforms%2Ftests%2Ferrors%2Freact-server-components%2Fserver-graph%2Ftaint-without-config%2Finput.js?ref=b1ce6042be0c6b2d1da4b31ad7d56192c64c695c",
+            "patch": "@@ -0,0 +1,7 @@\n+import { experimental_taintObjectReference } from 'react'\n+\n+import { experimental_taintUniqueValue } from 'react'\n+\n+export default function Page() {\n+  return null\n+}"
+        },
+        {
+            "sha": "1499b57c18ba570a973c292292fb4232e248fdec",
+            "filename": "crates/next-custom-transforms/tests/errors/react-server-components/server-graph/taint-without-config/output.js",
+            "status": "added",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/b1ce6042be0c6b2d1da4b31ad7d56192c64c695c/crates%2Fnext-custom-transforms%2Ftests%2Ferrors%2Freact-server-components%2Fserver-graph%2Ftaint-without-config%2Foutput.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/b1ce6042be0c6b2d1da4b31ad7d56192c64c695c/crates%2Fnext-custom-transforms%2Ftests%2Ferrors%2Freact-server-components%2Fserver-graph%2Ftaint-without-config%2Foutput.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/crates%2Fnext-custom-transforms%2Ftests%2Ferrors%2Freact-server-components%2Fserver-graph%2Ftaint-without-config%2Foutput.js?ref=b1ce6042be0c6b2d1da4b31ad7d56192c64c695c",
+            "patch": "@@ -0,0 +1,5 @@\n+import { experimental_taintObjectReference } from 'react';\n+import { experimental_taintUniqueValue } from 'react';\n+export default function Page() {\n+    return null;\n+}"
+        },
+        {
+            "sha": "384a585b5f39d1ee44a65b93f9a79208d5ce58d7",
+            "filename": "crates/next-custom-transforms/tests/errors/react-server-components/server-graph/taint-without-config/output.stderr",
+            "status": "added",
+            "additions": 13,
+            "deletions": 0,
+            "changes": 13,
+            "blob_url": "https://github.com/vercel/next.js/blob/b1ce6042be0c6b2d1da4b31ad7d56192c64c695c/crates%2Fnext-custom-transforms%2Ftests%2Ferrors%2Freact-server-components%2Fserver-graph%2Ftaint-without-config%2Foutput.stderr",
+            "raw_url": "https://github.com/vercel/next.js/raw/b1ce6042be0c6b2d1da4b31ad7d56192c64c695c/crates%2Fnext-custom-transforms%2Ftests%2Ferrors%2Freact-server-components%2Fserver-graph%2Ftaint-without-config%2Foutput.stderr",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/crates%2Fnext-custom-transforms%2Ftests%2Ferrors%2Freact-server-components%2Fserver-graph%2Ftaint-without-config%2Foutput.stderr?ref=b1ce6042be0c6b2d1da4b31ad7d56192c64c695c",
+            "patch": "@@ -0,0 +1,13 @@\n+  x You're importing `experimental_taintObjectReference` from React which requires `experimental.taint: true` in your Next.js config. Learn more: https://nextjs.org/docs/app/api-reference/config/\n+  | next-config-js/taint\n+   ,-[input.js:1:1]\n+ 1 | import { experimental_taintObjectReference } from 'react'\n+   :          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n+   `----\n+  x You're importing `experimental_taintUniqueValue` from React which requires `experimental.taint: true` in your Next.js config. Learn more: https://nextjs.org/docs/app/api-reference/config/next-\n+  | config-js/taint\n+   ,-[input.js:3:1]\n+ 2 | \n+ 3 | import { experimental_taintUniqueValue } from 'react'\n+   :          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n+   `----"
+        },
+        {
+            "sha": "88046bf96cca00107f4c12a9a1b9825de52caf46",
+            "filename": "crates/next-custom-transforms/tests/fixture.rs",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/b1ce6042be0c6b2d1da4b31ad7d56192c64c695c/crates%2Fnext-custom-transforms%2Ftests%2Ffixture.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/b1ce6042be0c6b2d1da4b31ad7d56192c64c695c/crates%2Fnext-custom-transforms%2Ftests%2Ffixture.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/crates%2Fnext-custom-transforms%2Ftests%2Ffixture.rs?ref=b1ce6042be0c6b2d1da4b31ad7d56192c64c695c",
+            "patch": "@@ -453,6 +453,7 @@ fn react_server_components_typescript(input: PathBuf) {\n                     is_react_server_layer: true,\n                     cache_components_enabled: false,\n                     use_cache_enabled: false,\n+                    taint_enabled: true,\n                 }),\n                 tr.comments.as_ref().clone(),\n                 None,\n@@ -485,6 +486,7 @@ fn react_server_components_fixture(input: PathBuf) {\n                         is_react_server_layer,\n                         cache_components_enabled: false,\n                         use_cache_enabled: false,\n+                        taint_enabled: true,\n                     }),\n                     tr.comments.as_ref().clone(),\n                     None,"
+        },
+        {
+            "sha": "1b652f6d5344076268e04ab06a48ea75a16f7745",
+            "filename": "packages/next/src/build/swc/options.ts",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/vercel/next.js/blob/b1ce6042be0c6b2d1da4b31ad7d56192c64c695c/packages%2Fnext%2Fsrc%2Fbuild%2Fswc%2Foptions.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/b1ce6042be0c6b2d1da4b31ad7d56192c64c695c/packages%2Fnext%2Fsrc%2Fbuild%2Fswc%2Foptions.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Fswc%2Foptions.ts?ref=b1ce6042be0c6b2d1da4b31ad7d56192c64c695c",
+            "patch": "@@ -73,6 +73,7 @@ function getBaseSWCOptions({\n   isCacheComponents,\n   cacheHandlers,\n   useCacheEnabled,\n+  taintEnabled,\n   trackDynamicImports,\n }: {\n   filename: string\n@@ -94,6 +95,7 @@ function getBaseSWCOptions({\n   isCacheComponents?: boolean\n   cacheHandlers?: NextConfig['cacheHandlers']\n   useCacheEnabled?: boolean\n+  taintEnabled?: boolean\n   trackDynamicImports?: boolean\n }) {\n   const isReactServerLayer = shouldUseReactServerCondition(bundleLayer)\n@@ -217,6 +219,7 @@ function getBaseSWCOptions({\n             isReactServerLayer,\n             cacheComponentsEnabled: isCacheComponents,\n             useCacheEnabled,\n+            taintEnabled,\n           }\n         : undefined,\n     serverActions:\n@@ -387,6 +390,7 @@ export function getLoaderSWCOptions({\n   esm,\n   cacheHandlers,\n   useCacheEnabled,\n+  taintEnabled,\n   trackDynamicImports,\n }: {\n   filename: string\n@@ -414,6 +418,7 @@ export function getLoaderSWCOptions({\n   bundleLayer?: WebpackLayerName\n   cacheHandlers: NextConfig['cacheHandlers']\n   useCacheEnabled?: boolean\n+  taintEnabled?: boolean\n   trackDynamicImports?: boolean\n }) {\n   let baseOptions: any = getBaseSWCOptions({\n@@ -435,6 +440,7 @@ export function getLoaderSWCOptions({\n     isCacheComponents,\n     cacheHandlers,\n     useCacheEnabled,\n+    taintEnabled,\n     trackDynamicImports,\n   })\n   baseOptions.fontLoaders = {"
+        },
+        {
+            "sha": "8a90c134a3304e7872b77bae735c97a910527463",
+            "filename": "packages/next/src/build/webpack/loaders/next-swc-loader.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/vercel/next.js/blob/b1ce6042be0c6b2d1da4b31ad7d56192c64c695c/packages%2Fnext%2Fsrc%2Fbuild%2Fwebpack%2Floaders%2Fnext-swc-loader.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/b1ce6042be0c6b2d1da4b31ad7d56192c64c695c/packages%2Fnext%2Fsrc%2Fbuild%2Fwebpack%2Floaders%2Fnext-swc-loader.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Fwebpack%2Floaders%2Fnext-swc-loader.ts?ref=b1ce6042be0c6b2d1da4b31ad7d56192c64c695c",
+            "patch": "@@ -167,6 +167,7 @@ async function loaderTransform(\n     esm,\n     cacheHandlers: nextConfig.cacheHandlers,\n     useCacheEnabled: nextConfig.experimental?.useCache,\n+    taintEnabled: nextConfig.experimental?.taint,\n     trackDynamicImports,\n   })\n "
+        }
+    ],
+    "stats": {
+        "total": 106,
+        "additions": 106,
+        "deletions": 0
+    }
+}

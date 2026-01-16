@@ -1,0 +1,180 @@
+{
+    "author": "bgw",
+    "message": "fix(turbopack-tests): Ignore or clean up empty snapshot test directories, fix non-nextest execution testing (#81479)\n\nThis PR fixes two bugs I ran into while trying to add a test case.\n\n## Empty Snapshot Tests With No Input\n\nGit tracks files, not directories, so it doesn't track or delete empty directories. This can lead to broken behavior in our test cases:\n\n1. Somebody deletes a test case, git no longer has any files in that directory to track. They push this to canary.\n2. Somebody else runs `git pull` and git deletes the files, but leaves behind a directory structure.\n3. Later, they run the snapshot tests with `UPDATE=1`. The snapshot test script sees the directory and tries running the test.\n4. There's no input files, so it just tries to do a compilation with no files, which of course fails, but generates some output of the failure.\n5. We accumulate these broken tests with an output directory but no input directory.\n\n## Tracing Subscriber Init in Execution Tests\n\n- You can only call tracing-subscriber's `init()` once per-process as it sets global state.\n- We need each tracing-subscriber to be configured with a different output directory.\n- `cargo test` runs multiple tests in parallel inside the same process.\n\nTherefore, our use of `tracing-subscriber` is unfortunately incompatible with `cargo test`.\n\nIn contrast, `cargo nextest` runs every test case in an isolated process.\n\nThe use of `tracing-subscriber` here is just as a debugging tool (we don't commit these traces), so only enable it when we're running under `cargo nextest`.\n\nI tested running the execution tests with both `cargo test` and `cargo nextest` and observed the trace file was written out only when using `nextest`.",
+    "sha": "2f43b359dfc0f3afb6fbab03867d3f8a2fa4ea66",
+    "files": [
+        {
+            "sha": "961c9cd20c74b9037a88331d15e6fb24e5b32bc9",
+            "filename": "turbopack/crates/turbopack-tests/tests/execution.rs",
+            "status": "modified",
+            "additions": 30,
+            "deletions": 18,
+            "changes": 48,
+            "blob_url": "https://github.com/vercel/next.js/blob/2f43b359dfc0f3afb6fbab03867d3f8a2fa4ea66/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/2f43b359dfc0f3afb6fbab03867d3f8a2fa4ea66/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fexecution.rs?ref=2f43b359dfc0f3afb6fbab03867d3f8a2fa4ea66",
+            "patch": "@@ -5,7 +5,7 @@\n \n mod util;\n \n-use std::path::PathBuf;\n+use std::{env, path::PathBuf, sync::Once};\n \n use anyhow::{Context, Result};\n use dunce::canonicalize;\n@@ -170,7 +170,8 @@ fn get_messages(js_results: JsResult) -> Vec<String> {\n \n #[tokio::main(flavor = \"current_thread\")]\n async fn run(resource: PathBuf, snapshot_mode: IssueSnapshotMode) -> Result<JsResult> {\n-    register();\n+    static REGISTER_ONCE: Once = Once::new();\n+    REGISTER_ONCE.call_once(register);\n \n     // Clean up old output files.\n     let output_path = resource.join(\"output\");\n@@ -186,12 +187,27 @@ async fn run(resource: PathBuf, snapshot_mode: IssueSnapshotMode) -> Result<JsRe\n     std::fs::create_dir_all(&output_path)\n         .context(\"Unable to create output directory\")\n         .unwrap();\n-    let trace_file = output_path.join(\"trace-turbopack\");\n-    let trace_writer = std::fs::File::create(trace_file.clone()).unwrap();\n-    let (trace_writer, trace_writer_guard) = TraceWriter::new(trace_writer);\n-    let subscriber = subscriber.with(RawTraceLayer::new(trace_writer));\n \n-    subscriber.init();\n+    // Set up a `tracing_subscriber` for debugging -- We can only do this when using nextest, as\n+    // `cargo test` runs all execution test cases in the same process.\n+    //\n+    // Configuring `tracing_subscriber` requires proces-global side-effects. We can't use a\n+    // thread-local subscriber because we're not fully single-threaded, even with the\n+    // `current_thread` tokio executor.\n+    //\n+    // https://nexte.st/docs/configuration/env-vars/#environment-variables-nextest-sets\n+    let _trace_writer_guard = if env::var_os(\"NEXTEST\").is_some() {\n+        let trace_file = output_path.join(\"trace-turbopack\");\n+        let trace_writer = std::fs::File::create(trace_file.clone()).unwrap();\n+        let (trace_writer, trace_writer_guard) = TraceWriter::new(trace_writer);\n+        let subscriber = subscriber.with(RawTraceLayer::new(trace_writer));\n+\n+        subscriber.init();\n+\n+        Some(trace_writer_guard)\n+    } else {\n+        None\n+    };\n \n     let tt = TurboTasks::new(TurboTasksBackend::new(\n         BackendOptions {\n@@ -201,19 +217,15 @@ async fn run(resource: PathBuf, snapshot_mode: IssueSnapshotMode) -> Result<JsRe\n         },\n         noop_backing_storage(),\n     ));\n-    let result = tt\n-        .run_once(async move {\n-            let emit_op = run_inner_operation(resource.to_str().unwrap().into(), snapshot_mode);\n-            let result = emit_op.read_strongly_consistent().owned().await?;\n-            apply_effects(emit_op).await?;\n \n-            Ok(result)\n-        })\n-        .await;\n+    tt.run_once(async move {\n+        let emit_op = run_inner_operation(resource.to_str().unwrap().into(), snapshot_mode);\n+        let result = emit_op.read_strongly_consistent().owned().await?;\n+        apply_effects(emit_op).await?;\n \n-    drop(trace_writer_guard);\n-\n-    result\n+        Ok(result)\n+    })\n+    .await\n }\n \n #[turbo_tasks::function(operation)]"
+        },
+        {
+            "sha": "0455414282382964b561340937be38dbdf6f2e29",
+            "filename": "turbopack/crates/turbopack-tests/tests/snapshot.rs",
+            "status": "modified",
+            "additions": 41,
+            "deletions": 2,
+            "changes": 43,
+            "blob_url": "https://github.com/vercel/next.js/blob/2f43b359dfc0f3afb6fbab03867d3f8a2fa4ea66/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot.rs",
+            "raw_url": "https://github.com/vercel/next.js/raw/2f43b359dfc0f3afb6fbab03867d3f8a2fa4ea66/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot.rs",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot.rs?ref=2f43b359dfc0f3afb6fbab03867d3f8a2fa4ea66",
+            "patch": "@@ -3,7 +3,7 @@\n \n mod util;\n \n-use std::{collections::VecDeque, fs, path::PathBuf};\n+use std::{collections::VecDeque, fs, io, path::PathBuf, sync::Once};\n \n use anyhow::{Context, Result, bail};\n use dunce::canonicalize;\n@@ -152,17 +152,56 @@ fn default_runtime_type() -> RuntimeType {\n     RuntimeType::Dummy\n }\n \n+fn is_empty_dir_tree(dir_entries: impl IntoIterator<Item = io::Result<fs::DirEntry>>) -> bool {\n+    for entry in dir_entries.into_iter() {\n+        let entry = entry.unwrap();\n+        if !entry.file_type().unwrap().is_dir()\n+            || !is_empty_dir_tree(fs::read_dir(entry.path()).unwrap())\n+        {\n+            return false;\n+        }\n+    }\n+    true\n+}\n+\n #[testing::fixture(\"tests/snapshot/*/*/\", exclude(\"node_modules\"))]\n fn test(resource: PathBuf) {\n     let resource = canonicalize(resource).unwrap();\n+\n+    let mut has_output_dir = false;\n+    let contents = fs::read_dir(&resource)\n+        .unwrap()\n+        .filter(|entry| {\n+            if entry.as_ref().unwrap().file_name() == \"output\" {\n+                has_output_dir = true;\n+                false\n+            } else {\n+                true\n+            }\n+        })\n+        .collect::<Vec<_>>();\n+    if is_empty_dir_tree(contents) {\n+        // a directory without input or config is invalid\n+        if *UPDATE {\n+            fs::remove_dir_all(&resource).unwrap();\n+        } else if has_output_dir {\n+            let output_dir = resource.join(\"output\");\n+            if !is_empty_dir_tree(fs::read_dir(output_dir).unwrap()) {\n+                panic!(\"{resource:?} contains a non-empty output directory, but no input files\");\n+            }\n+        }\n+        return;\n+    }\n+\n     // Separating this into a different function fixes my IDE's types for some\n     // reason...\n     run(resource).unwrap();\n }\n \n #[tokio::main(flavor = \"current_thread\")]\n async fn run(resource: PathBuf) -> Result<()> {\n-    register();\n+    static REGISTER_ONCE: Once = Once::new();\n+    REGISTER_ONCE.call_once(register);\n \n     let tt = TurboTasks::new(TurboTasksBackend::new(\n         BackendOptions {"
+        },
+        {
+            "sha": "9f8f905add332a0c8fb1c7be09d34d47436a9a66",
+            "filename": "turbopack/crates/turbopack-tests/tests/snapshot/comptime/unreachable/output/4e721_crates_turbopack-tests_tests_snapshot_comptime_unreachable_input_index_6be1ccbb.js",
+            "status": "removed",
+            "additions": 0,
+            "deletions": 6,
+            "changes": 6,
+            "blob_url": "https://github.com/vercel/next.js/blob/1781abd7d4a7e48e1fbd1b121d79ae26f8935645/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fcomptime%2Funreachable%2Foutput%2F4e721_crates_turbopack-tests_tests_snapshot_comptime_unreachable_input_index_6be1ccbb.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/1781abd7d4a7e48e1fbd1b121d79ae26f8935645/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fcomptime%2Funreachable%2Foutput%2F4e721_crates_turbopack-tests_tests_snapshot_comptime_unreachable_input_index_6be1ccbb.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fcomptime%2Funreachable%2Foutput%2F4e721_crates_turbopack-tests_tests_snapshot_comptime_unreachable_input_index_6be1ccbb.js?ref=1781abd7d4a7e48e1fbd1b121d79ae26f8935645",
+            "patch": "@@ -1,6 +0,0 @@\n-(globalThis.TURBOPACK = globalThis.TURBOPACK || []).push([\n-    \"output/4e721_crates_turbopack-tests_tests_snapshot_comptime_unreachable_input_index_6be1ccbb.js\",\n-    {},\n-    {\"otherChunks\":[\"output/4e721_crates_turbopack-tests_tests_snapshot_comptime_unreachable_input_index_9022a405.js\"],\"runtimeModuleIds\":[\"[project]/turbopack/crates/turbopack-tests/tests/snapshot/comptime/unreachable/input/index.js [test] (ecmascript)\"]}\n-]);\n-// Dummy runtime\n\\ No newline at end of file"
+        },
+        {
+            "sha": "c15d7ec00382d3604310ddb8b53cbdb90d9e1942",
+            "filename": "turbopack/crates/turbopack-tests/tests/snapshot/comptime/unreachable/output/4e721_crates_turbopack-tests_tests_snapshot_comptime_unreachable_input_index_6be1ccbb.js.map",
+            "status": "removed",
+            "additions": 0,
+            "deletions": 5,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/1781abd7d4a7e48e1fbd1b121d79ae26f8935645/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fcomptime%2Funreachable%2Foutput%2F4e721_crates_turbopack-tests_tests_snapshot_comptime_unreachable_input_index_6be1ccbb.js.map",
+            "raw_url": "https://github.com/vercel/next.js/raw/1781abd7d4a7e48e1fbd1b121d79ae26f8935645/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fcomptime%2Funreachable%2Foutput%2F4e721_crates_turbopack-tests_tests_snapshot_comptime_unreachable_input_index_6be1ccbb.js.map",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fcomptime%2Funreachable%2Foutput%2F4e721_crates_turbopack-tests_tests_snapshot_comptime_unreachable_input_index_6be1ccbb.js.map?ref=1781abd7d4a7e48e1fbd1b121d79ae26f8935645",
+            "patch": "@@ -1,5 +0,0 @@\n-{\n-  \"version\": 3,\n-  \"sources\": [],\n-  \"sections\": []\n-}\n\\ No newline at end of file"
+        },
+        {
+            "sha": "8e546009084c2711d8f75d44b500694bc2011826",
+            "filename": "turbopack/crates/turbopack-tests/tests/snapshot/comptime/unreachable/output/4e721_crates_turbopack-tests_tests_snapshot_comptime_unreachable_input_index_9022a405.js",
+            "status": "removed",
+            "additions": 0,
+            "deletions": 11,
+            "changes": 11,
+            "blob_url": "https://github.com/vercel/next.js/blob/1781abd7d4a7e48e1fbd1b121d79ae26f8935645/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fcomptime%2Funreachable%2Foutput%2F4e721_crates_turbopack-tests_tests_snapshot_comptime_unreachable_input_index_9022a405.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/1781abd7d4a7e48e1fbd1b121d79ae26f8935645/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fcomptime%2Funreachable%2Foutput%2F4e721_crates_turbopack-tests_tests_snapshot_comptime_unreachable_input_index_9022a405.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fcomptime%2Funreachable%2Foutput%2F4e721_crates_turbopack-tests_tests_snapshot_comptime_unreachable_input_index_9022a405.js?ref=1781abd7d4a7e48e1fbd1b121d79ae26f8935645",
+            "patch": "@@ -1,11 +0,0 @@\n-(globalThis.TURBOPACK = globalThis.TURBOPACK || []).push([\"output/4e721_crates_turbopack-tests_tests_snapshot_comptime_unreachable_input_index_9022a405.js\", {\n-\n-\"[project]/turbopack/crates/turbopack-tests/tests/snapshot/comptime/unreachable/input/index.js [test] (ecmascript)\": ((__turbopack_context__) => {\n-\n-var { m: module, e: exports } = __turbopack_context__;\n-{\n-const e = new Error(\"Could not parse module '[project]/turbopack/crates/turbopack-tests/tests/snapshot/comptime/unreachable/input/index.js'\");\n-e.code = 'MODULE_UNPARSABLE';\n-throw e;\n-}}),\n-}]);\n\\ No newline at end of file"
+        },
+        {
+            "sha": "c15d7ec00382d3604310ddb8b53cbdb90d9e1942",
+            "filename": "turbopack/crates/turbopack-tests/tests/snapshot/comptime/unreachable/output/4e721_crates_turbopack-tests_tests_snapshot_comptime_unreachable_input_index_9022a405.js.map",
+            "status": "removed",
+            "additions": 0,
+            "deletions": 5,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/1781abd7d4a7e48e1fbd1b121d79ae26f8935645/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fcomptime%2Funreachable%2Foutput%2F4e721_crates_turbopack-tests_tests_snapshot_comptime_unreachable_input_index_9022a405.js.map",
+            "raw_url": "https://github.com/vercel/next.js/raw/1781abd7d4a7e48e1fbd1b121d79ae26f8935645/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fcomptime%2Funreachable%2Foutput%2F4e721_crates_turbopack-tests_tests_snapshot_comptime_unreachable_input_index_9022a405.js.map",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fcomptime%2Funreachable%2Foutput%2F4e721_crates_turbopack-tests_tests_snapshot_comptime_unreachable_input_index_9022a405.js.map?ref=1781abd7d4a7e48e1fbd1b121d79ae26f8935645",
+            "patch": "@@ -1,5 +0,0 @@\n-{\n-  \"version\": 3,\n-  \"sources\": [],\n-  \"sections\": []\n-}\n\\ No newline at end of file"
+        },
+        {
+            "sha": "50bfb8667c9a845d9fc3190c6a8e61ef930da45e",
+            "filename": "turbopack/crates/turbopack-tests/tests/snapshot/mdx/error/output/turbopack_crates_turbopack-tests_tests_snapshot_mdx_error_input_index_c71b8497.js",
+            "status": "removed",
+            "additions": 0,
+            "deletions": 6,
+            "changes": 6,
+            "blob_url": "https://github.com/vercel/next.js/blob/1781abd7d4a7e48e1fbd1b121d79ae26f8935645/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fmdx%2Ferror%2Foutput%2Fturbopack_crates_turbopack-tests_tests_snapshot_mdx_error_input_index_c71b8497.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/1781abd7d4a7e48e1fbd1b121d79ae26f8935645/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fmdx%2Ferror%2Foutput%2Fturbopack_crates_turbopack-tests_tests_snapshot_mdx_error_input_index_c71b8497.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fmdx%2Ferror%2Foutput%2Fturbopack_crates_turbopack-tests_tests_snapshot_mdx_error_input_index_c71b8497.js?ref=1781abd7d4a7e48e1fbd1b121d79ae26f8935645",
+            "patch": "@@ -1,6 +0,0 @@\n-(globalThis.TURBOPACK = globalThis.TURBOPACK || []).push([\n-    \"output/turbopack_crates_turbopack-tests_tests_snapshot_mdx_error_input_index_c71b8497.js\",\n-    {},\n-    {\"otherChunks\":[\"output/turbopack_crates_turbopack-tests_tests_snapshot_mdx_error_input_index_e6acdd0c.js\"],\"runtimeModuleIds\":[\"[project]/turbopack/crates/turbopack-tests/tests/snapshot/mdx/error/input/index.js [test] (ecmascript)\"]}\n-]);\n-// Dummy runtime\n\\ No newline at end of file"
+        },
+        {
+            "sha": "c15d7ec00382d3604310ddb8b53cbdb90d9e1942",
+            "filename": "turbopack/crates/turbopack-tests/tests/snapshot/mdx/error/output/turbopack_crates_turbopack-tests_tests_snapshot_mdx_error_input_index_c71b8497.js.map",
+            "status": "removed",
+            "additions": 0,
+            "deletions": 5,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/1781abd7d4a7e48e1fbd1b121d79ae26f8935645/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fmdx%2Ferror%2Foutput%2Fturbopack_crates_turbopack-tests_tests_snapshot_mdx_error_input_index_c71b8497.js.map",
+            "raw_url": "https://github.com/vercel/next.js/raw/1781abd7d4a7e48e1fbd1b121d79ae26f8935645/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fmdx%2Ferror%2Foutput%2Fturbopack_crates_turbopack-tests_tests_snapshot_mdx_error_input_index_c71b8497.js.map",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fmdx%2Ferror%2Foutput%2Fturbopack_crates_turbopack-tests_tests_snapshot_mdx_error_input_index_c71b8497.js.map?ref=1781abd7d4a7e48e1fbd1b121d79ae26f8935645",
+            "patch": "@@ -1,5 +0,0 @@\n-{\n-  \"version\": 3,\n-  \"sources\": [],\n-  \"sections\": []\n-}\n\\ No newline at end of file"
+        },
+        {
+            "sha": "99cc1453491793bab25040d8bfae683084baea38",
+            "filename": "turbopack/crates/turbopack-tests/tests/snapshot/mdx/error/output/turbopack_crates_turbopack-tests_tests_snapshot_mdx_error_input_index_e6acdd0c.js",
+            "status": "removed",
+            "additions": 0,
+            "deletions": 11,
+            "changes": 11,
+            "blob_url": "https://github.com/vercel/next.js/blob/1781abd7d4a7e48e1fbd1b121d79ae26f8935645/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fmdx%2Ferror%2Foutput%2Fturbopack_crates_turbopack-tests_tests_snapshot_mdx_error_input_index_e6acdd0c.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/1781abd7d4a7e48e1fbd1b121d79ae26f8935645/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fmdx%2Ferror%2Foutput%2Fturbopack_crates_turbopack-tests_tests_snapshot_mdx_error_input_index_e6acdd0c.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fmdx%2Ferror%2Foutput%2Fturbopack_crates_turbopack-tests_tests_snapshot_mdx_error_input_index_e6acdd0c.js?ref=1781abd7d4a7e48e1fbd1b121d79ae26f8935645",
+            "patch": "@@ -1,11 +0,0 @@\n-(globalThis.TURBOPACK = globalThis.TURBOPACK || []).push([\"output/turbopack_crates_turbopack-tests_tests_snapshot_mdx_error_input_index_e6acdd0c.js\", {\n-\n-\"[project]/turbopack/crates/turbopack-tests/tests/snapshot/mdx/error/input/index.js [test] (ecmascript)\": ((__turbopack_context__) => {\n-\n-var { m: module, e: exports } = __turbopack_context__;\n-{\n-const e = new Error(\"Could not parse module '[project]/turbopack/crates/turbopack-tests/tests/snapshot/mdx/error/input/index.js'\");\n-e.code = 'MODULE_UNPARSABLE';\n-throw e;\n-}}),\n-}]);\n\\ No newline at end of file"
+        },
+        {
+            "sha": "c15d7ec00382d3604310ddb8b53cbdb90d9e1942",
+            "filename": "turbopack/crates/turbopack-tests/tests/snapshot/mdx/error/output/turbopack_crates_turbopack-tests_tests_snapshot_mdx_error_input_index_e6acdd0c.js.map",
+            "status": "removed",
+            "additions": 0,
+            "deletions": 5,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/1781abd7d4a7e48e1fbd1b121d79ae26f8935645/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fmdx%2Ferror%2Foutput%2Fturbopack_crates_turbopack-tests_tests_snapshot_mdx_error_input_index_e6acdd0c.js.map",
+            "raw_url": "https://github.com/vercel/next.js/raw/1781abd7d4a7e48e1fbd1b121d79ae26f8935645/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fmdx%2Ferror%2Foutput%2Fturbopack_crates_turbopack-tests_tests_snapshot_mdx_error_input_index_e6acdd0c.js.map",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fmdx%2Ferror%2Foutput%2Fturbopack_crates_turbopack-tests_tests_snapshot_mdx_error_input_index_e6acdd0c.js.map?ref=1781abd7d4a7e48e1fbd1b121d79ae26f8935645",
+            "patch": "@@ -1,5 +0,0 @@\n-{\n-  \"version\": 3,\n-  \"sources\": [],\n-  \"sections\": []\n-}\n\\ No newline at end of file"
+        },
+        {
+            "sha": "736b9c22faf0d27dfe47f49d4c431398269dbe29",
+            "filename": "turbopack/crates/turbopack-tests/tests/snapshot/node/pack-3279/output/4e721_crates_turbopack-tests_tests_snapshot_node_pack-3279_input_index_1caaec18.js",
+            "status": "removed",
+            "additions": 0,
+            "deletions": 11,
+            "changes": 11,
+            "blob_url": "https://github.com/vercel/next.js/blob/1781abd7d4a7e48e1fbd1b121d79ae26f8935645/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fnode%2Fpack-3279%2Foutput%2F4e721_crates_turbopack-tests_tests_snapshot_node_pack-3279_input_index_1caaec18.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/1781abd7d4a7e48e1fbd1b121d79ae26f8935645/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fnode%2Fpack-3279%2Foutput%2F4e721_crates_turbopack-tests_tests_snapshot_node_pack-3279_input_index_1caaec18.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fnode%2Fpack-3279%2Foutput%2F4e721_crates_turbopack-tests_tests_snapshot_node_pack-3279_input_index_1caaec18.js?ref=1781abd7d4a7e48e1fbd1b121d79ae26f8935645",
+            "patch": "@@ -1,11 +0,0 @@\n-(globalThis.TURBOPACK = globalThis.TURBOPACK || []).push([\"output/4e721_crates_turbopack-tests_tests_snapshot_node_pack-3279_input_index_1caaec18.js\", {\n-\n-\"[project]/turbopack/crates/turbopack-tests/tests/snapshot/node/pack-3279/input/index.js [test] (ecmascript)\": ((__turbopack_context__) => {\n-\n-var { m: module, e: exports } = __turbopack_context__;\n-{\n-const e = new Error(\"Could not parse module '[project]/turbopack/crates/turbopack-tests/tests/snapshot/node/pack-3279/input/index.js'\");\n-e.code = 'MODULE_UNPARSABLE';\n-throw e;\n-}}),\n-}]);\n\\ No newline at end of file"
+        },
+        {
+            "sha": "c15d7ec00382d3604310ddb8b53cbdb90d9e1942",
+            "filename": "turbopack/crates/turbopack-tests/tests/snapshot/node/pack-3279/output/4e721_crates_turbopack-tests_tests_snapshot_node_pack-3279_input_index_1caaec18.js.map",
+            "status": "removed",
+            "additions": 0,
+            "deletions": 5,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/1781abd7d4a7e48e1fbd1b121d79ae26f8935645/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fnode%2Fpack-3279%2Foutput%2F4e721_crates_turbopack-tests_tests_snapshot_node_pack-3279_input_index_1caaec18.js.map",
+            "raw_url": "https://github.com/vercel/next.js/raw/1781abd7d4a7e48e1fbd1b121d79ae26f8935645/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fnode%2Fpack-3279%2Foutput%2F4e721_crates_turbopack-tests_tests_snapshot_node_pack-3279_input_index_1caaec18.js.map",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fnode%2Fpack-3279%2Foutput%2F4e721_crates_turbopack-tests_tests_snapshot_node_pack-3279_input_index_1caaec18.js.map?ref=1781abd7d4a7e48e1fbd1b121d79ae26f8935645",
+            "patch": "@@ -1,5 +0,0 @@\n-{\n-  \"version\": 3,\n-  \"sources\": [],\n-  \"sections\": []\n-}\n\\ No newline at end of file"
+        },
+        {
+            "sha": "610762de484103ae2ab2a894be8a5a2db1ccdee1",
+            "filename": "turbopack/crates/turbopack-tests/tests/snapshot/node/pack-3279/output/4e721_crates_turbopack-tests_tests_snapshot_node_pack-3279_input_index_93fe9f72.js",
+            "status": "removed",
+            "additions": 0,
+            "deletions": 6,
+            "changes": 6,
+            "blob_url": "https://github.com/vercel/next.js/blob/1781abd7d4a7e48e1fbd1b121d79ae26f8935645/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fnode%2Fpack-3279%2Foutput%2F4e721_crates_turbopack-tests_tests_snapshot_node_pack-3279_input_index_93fe9f72.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/1781abd7d4a7e48e1fbd1b121d79ae26f8935645/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fnode%2Fpack-3279%2Foutput%2F4e721_crates_turbopack-tests_tests_snapshot_node_pack-3279_input_index_93fe9f72.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fnode%2Fpack-3279%2Foutput%2F4e721_crates_turbopack-tests_tests_snapshot_node_pack-3279_input_index_93fe9f72.js?ref=1781abd7d4a7e48e1fbd1b121d79ae26f8935645",
+            "patch": "@@ -1,6 +0,0 @@\n-(globalThis.TURBOPACK = globalThis.TURBOPACK || []).push([\n-    \"output/4e721_crates_turbopack-tests_tests_snapshot_node_pack-3279_input_index_93fe9f72.js\",\n-    {},\n-    {\"otherChunks\":[\"output/4e721_crates_turbopack-tests_tests_snapshot_node_pack-3279_input_index_1caaec18.js\"],\"runtimeModuleIds\":[\"[project]/turbopack/crates/turbopack-tests/tests/snapshot/node/pack-3279/input/index.js [test] (ecmascript)\"]}\n-]);\n-// Dummy runtime\n\\ No newline at end of file"
+        },
+        {
+            "sha": "c15d7ec00382d3604310ddb8b53cbdb90d9e1942",
+            "filename": "turbopack/crates/turbopack-tests/tests/snapshot/node/pack-3279/output/4e721_crates_turbopack-tests_tests_snapshot_node_pack-3279_input_index_93fe9f72.js.map",
+            "status": "removed",
+            "additions": 0,
+            "deletions": 5,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/1781abd7d4a7e48e1fbd1b121d79ae26f8935645/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fnode%2Fpack-3279%2Foutput%2F4e721_crates_turbopack-tests_tests_snapshot_node_pack-3279_input_index_93fe9f72.js.map",
+            "raw_url": "https://github.com/vercel/next.js/raw/1781abd7d4a7e48e1fbd1b121d79ae26f8935645/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fnode%2Fpack-3279%2Foutput%2F4e721_crates_turbopack-tests_tests_snapshot_node_pack-3279_input_index_93fe9f72.js.map",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/turbopack%2Fcrates%2Fturbopack-tests%2Ftests%2Fsnapshot%2Fnode%2Fpack-3279%2Foutput%2F4e721_crates_turbopack-tests_tests_snapshot_node_pack-3279_input_index_93fe9f72.js.map?ref=1781abd7d4a7e48e1fbd1b121d79ae26f8935645",
+            "patch": "@@ -1,5 +0,0 @@\n-{\n-  \"version\": 3,\n-  \"sources\": [],\n-  \"sections\": []\n-}\n\\ No newline at end of file"
+        }
+    ],
+    "stats": {
+        "total": 172,
+        "additions": 71,
+        "deletions": 101
+    }
+}

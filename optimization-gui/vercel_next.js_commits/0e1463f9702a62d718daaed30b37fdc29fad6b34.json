@@ -1,0 +1,36 @@
+{
+    "author": "wbinnssmith",
+    "message": "Telemetry: track failed builds and build bundler usage (#77943)\n\nThis:\n\n- Tracks build failures as a separate event, `NEXT_BUILD_FAILED`\n- Added `bundler` property to both `NEXT_BUILD_COMPLETED` and `NEXT_BUILD_FAILED`\n- Requires a server-side update\n\nAlternatives considered:\n\nConsidered adding a `success: boolean` property to the existing `EventBuildCompleted`. There are a few issues with this:\n\n- Expands the semantics of the existing event. This may have unintended consequences if we don’t change how we report on these events to filter success state\n- This event requires page paths and timing information from the compiler, neither of which are guaranteed to exist on failures\n\nTest Plan:\n- Added a syntax error to a module and built with `NEXT_TELEMETRY_DEBUG=1`. Verified the failure event is sent along with the bundler value\n- Verified bundler values are now sent for webpack, rspack, and Turbopack on build successes",
+    "sha": "0e1463f9702a62d718daaed30b37fdc29fad6b34",
+    "files": [
+        {
+            "sha": "805dec13f6a41db1b68945555aeb687fe0fec73c",
+            "filename": "packages/next/src/build/index.ts",
+            "status": "modified",
+            "additions": 48,
+            "deletions": 0,
+            "changes": 48,
+            "blob_url": "https://github.com/vercel/next.js/blob/0e1463f9702a62d718daaed30b37fdc29fad6b34/packages%2Fnext%2Fsrc%2Fbuild%2Findex.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/0e1463f9702a62d718daaed30b37fdc29fad6b34/packages%2Fnext%2Fsrc%2Fbuild%2Findex.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Findex.ts?ref=0e1463f9702a62d718daaed30b37fdc29fad6b34",
+            "patch": "@@ -107,6 +107,7 @@ import {\n   EVENT_BUILD_FEATURE_USAGE,\n   eventPackageUsedInGetServerSideProps,\n   eventBuildCompleted,\n+  eventBuildFailed,\n } from '../telemetry/events'\n import type { EventBuildFeatureUsage } from '../telemetry/events'\n import { Telemetry } from '../telemetry/storage'\n@@ -210,6 +211,8 @@ import { isPersistentCachingEnabled } from '../shared/lib/turbopack/utils'\n import { inlineStaticEnv } from '../lib/inline-static-env'\n import { populateStaticEnv } from '../lib/static-env'\n import { durationToString } from './duration-to-string'\n+import { traceGlobals } from '../trace/shared'\n+import { extractNextErrorCode } from '../lib/error-telemetry-utils'\n \n type Fallback = null | boolean | string\n \n@@ -826,6 +829,7 @@ export default async function build(\n   const isCompileMode = experimentalBuildMode === 'compile'\n   const isGenerateMode = experimentalBuildMode === 'generate'\n   NextBuildContext.isCompileMode = isCompileMode\n+  const buildStartTime = Date.now()\n \n   let loadedConfig: NextConfigComplete | undefined\n   try {\n@@ -1471,6 +1475,7 @@ export default async function build(\n \n           telemetry.record(\n             eventBuildCompleted(pagesPaths, {\n+              bundler: 'turbopack',\n               durationInSeconds: Math.round(compilerDuration),\n               totalAppPagesCount,\n             })\n@@ -1558,6 +1563,7 @@ export default async function build(\n \n             telemetry.record(\n               eventBuildCompleted(pagesPaths, {\n+                bundler: getBundlerForTelemetry(isTurbopack),\n                 durationInSeconds,\n                 totalAppPagesCount,\n               })\n@@ -1573,6 +1579,7 @@ export default async function build(\n \n             telemetry.record(\n               eventBuildCompleted(pagesPaths, {\n+                bundler: getBundlerForTelemetry(isTurbopack),\n                 durationInSeconds: compilerDuration,\n                 totalAppPagesCount,\n               })\n@@ -3705,6 +3712,18 @@ export default async function build(\n \n       await shutdownPromise\n     })\n+  } catch (e) {\n+    const telemetry: Telemetry | undefined = traceGlobals.get('telemetry')\n+    if (telemetry) {\n+      telemetry.record(\n+        eventBuildFailed({\n+          bundler: getBundlerForTelemetry(isTurbopack),\n+          errorCode: getErrorCodeForTelemetry(e),\n+          durationInSeconds: Math.floor((Date.now() - buildStartTime) / 1000),\n+        })\n+      )\n+    }\n+    throw e\n   } finally {\n     // Ensure we wait for lockfile patching if present\n     await lockfilePatchPromise.cur\n@@ -3751,3 +3770,32 @@ function warnAboutTurbopackBuilds(config?: NextConfigComplete) {\n \n   Log.warn(warningStr)\n }\n+\n+function getBundlerForTelemetry(isTurbopack: boolean) {\n+  if (isTurbopack) {\n+    return 'turbopack'\n+  }\n+\n+  if (process.env.NEXT_RSPACK) {\n+    return 'rspack'\n+  }\n+\n+  return 'webpack'\n+}\n+\n+function getErrorCodeForTelemetry(err: unknown) {\n+  const code = extractNextErrorCode(err)\n+  if (code != null) {\n+    return code\n+  }\n+\n+  if (err instanceof Error && 'code' in err && typeof err.code === 'string') {\n+    return err.code\n+  }\n+\n+  if (err instanceof Error) {\n+    return err.name\n+  }\n+\n+  return 'Unknown'\n+}"
+        },
+        {
+            "sha": "d7c3614e0cc03b88b5cd85625e4b801868931828",
+            "filename": "packages/next/src/telemetry/events/build.ts",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 0,
+            "changes": 15,
+            "blob_url": "https://github.com/vercel/next.js/blob/0e1463f9702a62d718daaed30b37fdc29fad6b34/packages%2Fnext%2Fsrc%2Ftelemetry%2Fevents%2Fbuild.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/0e1463f9702a62d718daaed30b37fdc29fad6b34/packages%2Fnext%2Fsrc%2Ftelemetry%2Fevents%2Fbuild.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Ftelemetry%2Fevents%2Fbuild.ts?ref=0e1463f9702a62d718daaed30b37fdc29fad6b34",
+            "patch": "@@ -54,6 +54,7 @@ export function eventLintCheckCompleted(event: EventLintCheckCompleted): {\n \n const EVENT_BUILD_COMPLETED = 'NEXT_BUILD_COMPLETED'\n type EventBuildCompleted = {\n+  bundler: 'webpack' | 'rspack' | 'turbopack'\n   durationInSeconds: number\n   totalPageCount: number\n   hasDunderPages: boolean\n@@ -85,6 +86,20 @@ export function eventBuildCompleted(\n   }\n }\n \n+const EVENT_BUILD_FAILED = 'NEXT_BUILD_FAILED'\n+type EventBuildFailed = {\n+  bundler: 'webpack' | 'rspack' | 'turbopack'\n+  errorCode: string\n+  durationInSeconds: number\n+}\n+\n+export function eventBuildFailed(event: EventBuildFailed) {\n+  return {\n+    eventName: EVENT_BUILD_FAILED,\n+    payload: event,\n+  }\n+}\n+\n const EVENT_BUILD_OPTIMIZED = 'NEXT_BUILD_OPTIMIZED'\n type EventBuildOptimized = {\n   durationInSeconds: number"
+        }
+    ],
+    "stats": {
+        "total": 63,
+        "additions": 63,
+        "deletions": 0
+    }
+}

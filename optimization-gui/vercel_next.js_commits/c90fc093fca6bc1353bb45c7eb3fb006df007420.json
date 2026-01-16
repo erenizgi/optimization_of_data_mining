@@ -1,0 +1,145 @@
+{
+    "author": "ijjk",
+    "message": "Externalize manifest loading in pages-api (#78358)\n\nCo-authored-by: Niklas Mischkulnig <4586894+mischnic@users.noreply.github.com>",
+    "sha": "c90fc093fca6bc1353bb45c7eb3fb006df007420",
+    "files": [
+        {
+            "sha": "cda03c0e89a479c1d16923e622b4e823f6bc5a92",
+            "filename": "packages/next/src/build/index.ts",
+            "status": "modified",
+            "additions": 18,
+            "deletions": 22,
+            "changes": 40,
+            "blob_url": "https://github.com/vercel/next.js/blob/c90fc093fca6bc1353bb45c7eb3fb006df007420/packages%2Fnext%2Fsrc%2Fbuild%2Findex.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/c90fc093fca6bc1353bb45c7eb3fb006df007420/packages%2Fnext%2Fsrc%2Fbuild%2Findex.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Findex.ts?ref=c90fc093fca6bc1353bb45c7eb3fb006df007420",
+            "patch": "@@ -387,13 +387,11 @@ export type RoutesManifest = {\n   pages404: boolean\n   basePath: string\n   redirects: Array<Redirect>\n-  rewrites?:\n-    | Array<ManifestRewriteRoute>\n-    | {\n-        beforeFiles: Array<ManifestRewriteRoute>\n-        afterFiles: Array<ManifestRewriteRoute>\n-        fallback: Array<ManifestRewriteRoute>\n-      }\n+  rewrites: {\n+    beforeFiles: Array<ManifestRewriteRoute>\n+    afterFiles: Array<ManifestRewriteRoute>\n+    fallback: Array<ManifestRewriteRoute>\n+  }\n   headers: Array<ManifestHeaderRoute>\n   staticRoutes: Array<ManifestRoute>\n   dynamicRoutes: Array<ManifestRoute>\n@@ -1345,6 +1343,11 @@ export default async function build(\n               pathHeader: NEXT_REWRITTEN_PATH_HEADER,\n               queryHeader: NEXT_REWRITTEN_QUERY_HEADER,\n             },\n+            rewrites: {\n+              beforeFiles: [],\n+              afterFiles: [],\n+              fallback: [],\n+            },\n             skipMiddlewareUrlNormalize: config.skipMiddlewareUrlNormalize,\n             ppr: isAppPPREnabled\n               ? {\n@@ -1358,23 +1361,16 @@ export default async function build(\n           } satisfies RoutesManifest\n         })\n \n-      if (rewrites.beforeFiles.length === 0 && rewrites.fallback.length === 0) {\n-        routesManifest.rewrites = rewrites.afterFiles.map((r) =>\n+      routesManifest.rewrites = {\n+        beforeFiles: rewrites.beforeFiles.map((r) =>\n           buildCustomRoute('rewrite', r)\n-        )\n-      } else {\n-        routesManifest.rewrites = {\n-          beforeFiles: rewrites.beforeFiles.map((r) =>\n-            buildCustomRoute('rewrite', r)\n-          ),\n-          afterFiles: rewrites.afterFiles.map((r) =>\n-            buildCustomRoute('rewrite', r)\n-          ),\n-          fallback: rewrites.fallback.map((r) =>\n-            buildCustomRoute('rewrite', r)\n-          ),\n-        }\n+        ),\n+        afterFiles: rewrites.afterFiles.map((r) =>\n+          buildCustomRoute('rewrite', r)\n+        ),\n+        fallback: rewrites.fallback.map((r) => buildCustomRoute('rewrite', r)),\n       }\n+\n       let clientRouterFilters:\n         | undefined\n         | ReturnType<typeof createClientRouterFilter>"
+        },
+        {
+            "sha": "2d9fbc5f263bc2b15275c09d8903d663f1456e99",
+            "filename": "packages/next/src/build/templates/pages-api.ts",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 46,
+            "changes": 62,
+            "blob_url": "https://github.com/vercel/next.js/blob/c90fc093fca6bc1353bb45c7eb3fb006df007420/packages%2Fnext%2Fsrc%2Fbuild%2Ftemplates%2Fpages-api.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/c90fc093fca6bc1353bb45c7eb3fb006df007420/packages%2Fnext%2Fsrc%2Fbuild%2Ftemplates%2Fpages-api.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Ftemplates%2Fpages-api.ts?ref=c90fc093fca6bc1353bb45c7eb3fb006df007420",
+            "patch": "@@ -1,12 +1,10 @@\n import type { NextApiResponse } from '../../types'\n import type { IncomingMessage, ServerResponse } from 'node:http'\n \n+import { parse } from 'node:url'\n import { RouteKind } from '../../server/route-kind'\n import { sendError } from '../../server/api-utils'\n import { PagesAPIRouteModule } from '../../server/route-modules/pages-api/module.compiled'\n-import fs from 'node:fs'\n-import path from 'node:path'\n-import { parse } from 'node:url'\n \n import { hoist } from './helpers'\n \n@@ -31,6 +29,7 @@ import {\n import { removePathPrefix } from '../../shared/lib/router/utils/remove-path-prefix'\n import { normalizeLocalePath } from '../../shared/lib/i18n/normalize-locale-path'\n import type { PrerenderManifest, RoutesManifest } from '..'\n+import { loadManifestFromRelativePath } from '../../server/load-manifest.external'\n \n // Re-export the handler (should be the default export).\n export default hoist(userland, 'default')\n@@ -51,51 +50,29 @@ const routeModule = new PagesAPIRouteModule({\n   userland,\n })\n \n-const loadedManifests = new Map<string, any>()\n-\n-async function loadManifest(key: string, loader: () => Promise<any>) {\n-  const cached = loadedManifests.get(key)\n-\n-  if (cached) {\n-    return cached\n-  }\n-  const currentManifest = await loader()\n-  loadedManifests.set(key, currentManifest)\n-  return currentManifest\n-}\n-\n export async function handler(\n   req: IncomingMessage,\n   res: ServerResponse,\n   ctx: {\n     waitUntil?: (prom: Promise<void>) => void\n   }\n ): Promise<void> {\n-  const dir =\n+  const projectDir =\n     routerServerGlobal[RouterServerContextSymbol]?.dir || process.cwd()\n   const distDir = process.env.__NEXT_RELATIVE_DIST_DIR || ''\n   const isDev = process.env.NODE_ENV === 'development'\n \n-  const routesManifest: RoutesManifest = await loadManifest(\n-    ROUTES_MANIFEST,\n-    async () =>\n-      JSON.parse(\n-        await fs.promises.readFile(\n-          path.join(dir, distDir, ROUTES_MANIFEST),\n-          'utf8'\n-        )\n-      )\n-  )\n-  const prerenderManifest: PrerenderManifest = await loadManifest(\n-    PRERENDER_MANIFEST,\n-    async () =>\n-      JSON.parse(\n-        await fs.promises.readFile(\n-          path.join(dir, distDir, PRERENDER_MANIFEST),\n-          'utf8'\n-        )\n-      )\n+  const routesManifest = await loadManifestFromRelativePath<RoutesManifest>(\n+    projectDir,\n+    distDir,\n+    ROUTES_MANIFEST\n   )\n+  const prerenderManifest =\n+    await loadManifestFromRelativePath<PrerenderManifest>(\n+      projectDir,\n+      distDir,\n+      PRERENDER_MANIFEST\n+    )\n   let srcPage = 'VAR_DEFINITION_PAGE'\n \n   // turbopack doesn't normalize `/index` in the page name\n@@ -131,13 +108,7 @@ export async function handler(\n     page: srcPage,\n     i18n,\n     basePath,\n-    rewrites: Array.isArray(rewrites)\n-      ? { beforeFiles: [], afterFiles: rewrites, fallback: [] }\n-      : rewrites || {\n-          beforeFiles: [],\n-          afterFiles: [],\n-          fallback: [],\n-        },\n+    rewrites,\n     pageIsDynamic,\n     trailingSlash: process.env.__NEXT_TRAILING_SLASH as any as boolean,\n     caseSensitive: Boolean(routesManifest.caseSensitive),\n@@ -171,8 +142,7 @@ export async function handler(\n \n   // ensure instrumentation is registered and pass\n   // onRequestError below\n-  const absoluteDistDir = path.join(dir, distDir)\n-  await ensureInstrumentationRegistered(absoluteDistDir)\n+  await ensureInstrumentationRegistered(projectDir, distDir)\n \n   try {\n     const method = req.method || 'GET'\n@@ -198,7 +168,7 @@ export async function handler(\n           page: 'VAR_DEFINITION_PAGE',\n \n           onError: (...args: Parameters<InstrumentationOnRequestError>) =>\n-            instrumentationOnRequestError(absoluteDistDir, ...args),\n+            instrumentationOnRequestError(projectDir, distDir, ...args),\n         })\n         .finally(() => {\n           if (!span) return"
+        },
+        {
+            "sha": "9e7967def0f934f16414dac184e564205f4fe9e6",
+            "filename": "packages/next/src/server/dev/require-cache.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/c90fc093fca6bc1353bb45c7eb3fb006df007420/packages%2Fnext%2Fsrc%2Fserver%2Fdev%2Frequire-cache.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/c90fc093fca6bc1353bb45c7eb3fb006df007420/packages%2Fnext%2Fsrc%2Fserver%2Fdev%2Frequire-cache.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fdev%2Frequire-cache.ts?ref=c90fc093fca6bc1353bb45c7eb3fb006df007420",
+            "patch": "@@ -1,6 +1,6 @@\n import isError from '../../lib/is-error'\n import { realpathSync } from '../../lib/realpath'\n-import { clearManifestCache } from '../load-manifest'\n+import { clearManifestCache } from '../load-manifest.external'\n \n export function deleteFromRequireCache(filePath: string) {\n   try {"
+        },
+        {
+            "sha": "fd78a673e6c9d6ebe355ecd6513d8c966aa60689",
+            "filename": "packages/next/src/server/lib/router-utils/instrumentation-globals.external.ts",
+            "status": "modified",
+            "additions": 19,
+            "deletions": 6,
+            "changes": 25,
+            "blob_url": "https://github.com/vercel/next.js/blob/c90fc093fca6bc1353bb45c7eb3fb006df007420/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Frouter-utils%2Finstrumentation-globals.external.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/c90fc093fca6bc1353bb45c7eb3fb006df007420/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Frouter-utils%2Finstrumentation-globals.external.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Flib%2Frouter-utils%2Finstrumentation-globals.external.ts?ref=c90fc093fca6bc1353bb45c7eb3fb006df007420",
+            "patch": "@@ -10,6 +10,7 @@ import { interopDefault } from '../../../lib/interop-default'\n let cachedInstrumentationModule: InstrumentationModule\n \n export async function getInstrumentationModule(\n+  projectDir: string,\n   distDir: string\n ): Promise<InstrumentationModule | undefined> {\n   if (cachedInstrumentationModule && process.env.NODE_ENV === 'production') {\n@@ -19,7 +20,12 @@ export async function getInstrumentationModule(\n   try {\n     cachedInstrumentationModule = interopDefault(\n       await require(\n-        path.join(distDir, 'server', `${INSTRUMENTATION_HOOK_FILENAME}.js`)\n+        path.join(\n+          projectDir,\n+          distDir,\n+          'server',\n+          `${INSTRUMENTATION_HOOK_FILENAME}.js`\n+        )\n       )\n     )\n     return cachedInstrumentationModule\n@@ -36,11 +42,11 @@ export async function getInstrumentationModule(\n }\n \n let instrumentationModulePromise: Promise<any> | null = null\n-async function registerInstrumentation(distDir: string) {\n+async function registerInstrumentation(projectDir: string, distDir: string) {\n   // Ensure registerInstrumentation is not called in production build\n   if (process.env.NEXT_PHASE === 'phase-production-build') return\n   if (!instrumentationModulePromise) {\n-    instrumentationModulePromise = getInstrumentationModule(distDir)\n+    instrumentationModulePromise = getInstrumentationModule(projectDir, distDir)\n   }\n   const instrumentation = await instrumentationModulePromise\n   if (instrumentation?.register) {\n@@ -54,10 +60,11 @@ async function registerInstrumentation(distDir: string) {\n }\n \n export async function instrumentationOnRequestError(\n+  projectDir: string,\n   distDir: string,\n   ...args: Parameters<InstrumentationOnRequestError>\n ) {\n-  const instrumentation = await getInstrumentationModule(distDir)\n+  const instrumentation = await getInstrumentationModule(projectDir, distDir)\n   try {\n     await instrumentation?.onRequestError?.(...args)\n   } catch (err) {\n@@ -67,9 +74,15 @@ export async function instrumentationOnRequestError(\n }\n \n let registerInstrumentationPromise: Promise<void> | null = null\n-export function ensureInstrumentationRegistered(distDir: string) {\n+export function ensureInstrumentationRegistered(\n+  projectDir: string,\n+  distDir: string\n+) {\n   if (!registerInstrumentationPromise) {\n-    registerInstrumentationPromise = registerInstrumentation(distDir)\n+    registerInstrumentationPromise = registerInstrumentation(\n+      projectDir,\n+      distDir\n+    )\n   }\n   return registerInstrumentationPromise\n }"
+        },
+        {
+            "sha": "83b9483e82eb8802e97ddc746d3c18cf44beb9e0",
+            "filename": "packages/next/src/server/load-components.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/c90fc093fca6bc1353bb45c7eb3fb006df007420/packages%2Fnext%2Fsrc%2Fserver%2Fload-components.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/c90fc093fca6bc1353bb45c7eb3fb006df007420/packages%2Fnext%2Fsrc%2Fserver%2Fload-components.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fload-components.ts?ref=c90fc093fca6bc1353bb45c7eb3fb006df007420",
+            "patch": "@@ -27,7 +27,7 @@ import { requirePage } from './require'\n import { interopDefault } from '../lib/interop-default'\n import { getTracer } from './lib/trace/tracer'\n import { LoadComponentsSpan } from './lib/trace/constants'\n-import { evalManifest, loadManifest } from './load-manifest'\n+import { evalManifest, loadManifest } from './load-manifest.external'\n import { wait } from '../lib/wait'\n import { setReferenceManifestsSingleton } from './app-render/encryption-utils'\n import { createServerModuleMap } from './app-render/action-utils'"
+        },
+        {
+            "sha": "652d031925a20e36760afa85b62ca71e2928bcc9",
+            "filename": "packages/next/src/server/load-manifest.external.ts",
+            "status": "renamed",
+            "additions": 19,
+            "deletions": 2,
+            "changes": 21,
+            "blob_url": "https://github.com/vercel/next.js/blob/c90fc093fca6bc1353bb45c7eb3fb006df007420/packages%2Fnext%2Fsrc%2Fserver%2Fload-manifest.external.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/c90fc093fca6bc1353bb45c7eb3fb006df007420/packages%2Fnext%2Fsrc%2Fserver%2Fload-manifest.external.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fload-manifest.external.ts?ref=c90fc093fca6bc1353bb45c7eb3fb006df007420",
+            "patch": "@@ -1,5 +1,6 @@\n import type { DeepReadonly } from '../shared/lib/deep-readonly'\n \n+import { join } from 'path'\n import { readFileSync } from 'fs'\n import { runInNewContext } from 'vm'\n import { deepFreeze } from '../shared/lib/deep-freeze'\n@@ -41,7 +42,9 @@ export function loadManifest<T extends object>(\n     return cached as T\n   }\n \n-  let manifest = JSON.parse(readFileSync(path, 'utf8'))\n+  let manifest = JSON.parse(\n+    readFileSync(/* turbopackIgnore: true */ path, 'utf8')\n+  )\n \n   // Freeze the manifest so it cannot be modified if we're caching it.\n   if (shouldCache) {\n@@ -79,7 +82,7 @@ export function evalManifest<T extends object>(\n     return cached as T\n   }\n \n-  const content = readFileSync(path, 'utf8')\n+  const content = readFileSync(/* turbopackIgnore: true */ path, 'utf8')\n   if (content.length === 0) {\n     throw new Error('Manifest file is empty')\n   }\n@@ -99,6 +102,20 @@ export function evalManifest<T extends object>(\n   return contextObject as T\n }\n \n+export function loadManifestFromRelativePath<T extends object>(\n+  projectDir: string,\n+  distDir: string,\n+  manifest: string,\n+  shouldCache = true,\n+  cache?: Map<string, unknown>\n+): DeepReadonly<T> {\n+  return loadManifest<T>(\n+    join(/* turbopackIgnore: true */ projectDir, distDir, manifest),\n+    shouldCache,\n+    cache\n+  )\n+}\n+\n export function clearManifestCache(path: string, cache = sharedCache): boolean {\n   return cache.delete(path)\n }",
+            "previous_filename": "packages/next/src/server/load-manifest.ts"
+        },
+        {
+            "sha": "5e79c061782aee3c5eed319d83dd8be31dc19970",
+            "filename": "packages/next/src/server/load-manifest.test.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/c90fc093fca6bc1353bb45c7eb3fb006df007420/packages%2Fnext%2Fsrc%2Fserver%2Fload-manifest.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/c90fc093fca6bc1353bb45c7eb3fb006df007420/packages%2Fnext%2Fsrc%2Fserver%2Fload-manifest.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fload-manifest.test.ts?ref=c90fc093fca6bc1353bb45c7eb3fb006df007420",
+            "patch": "@@ -1,4 +1,4 @@\n-import { loadManifest } from './load-manifest'\n+import { loadManifest } from './load-manifest.external'\n import { readFileSync } from 'fs'\n \n jest.mock('fs')"
+        },
+        {
+            "sha": "ab89dad6e3f5caeba50934a4c6c845b0ecd01cfb",
+            "filename": "packages/next/src/server/next-server.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/c90fc093fca6bc1353bb45c7eb3fb006df007420/packages%2Fnext%2Fsrc%2Fserver%2Fnext-server.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/c90fc093fca6bc1353bb45c7eb3fb006df007420/packages%2Fnext%2Fsrc%2Fserver%2Fnext-server.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fnext-server.ts?ref=c90fc093fca6bc1353bb45c7eb3fb006df007420",
+            "patch": "@@ -94,7 +94,7 @@ import { pipeToNodeResponse } from './pipe-readable'\n import { createRequestResponseMocks } from './lib/mock-request'\n import { NEXT_RSC_UNION_QUERY } from '../client/components/app-router-headers'\n import { signalFromNodeResponse } from './web/spec-extension/adapters/next-request'\n-import { loadManifest } from './load-manifest'\n+import { loadManifest } from './load-manifest.external'\n import { lazyRenderAppPage } from './route-modules/app-page/module.render'\n import { lazyRenderPagesPage } from './route-modules/pages/module.render'\n import { interopDefault } from '../lib/interop-default'"
+        },
+        {
+            "sha": "82f96fad6c3adc3f6aa42fc699b4c7ed81554fed",
+            "filename": "packages/next/src/server/require.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/vercel/next.js/blob/c90fc093fca6bc1353bb45c7eb3fb006df007420/packages%2Fnext%2Fsrc%2Fserver%2Frequire.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/c90fc093fca6bc1353bb45c7eb3fb006df007420/packages%2Fnext%2Fsrc%2Fserver%2Frequire.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Frequire.ts?ref=c90fc093fca6bc1353bb45c7eb3fb006df007420",
+            "patch": "@@ -10,7 +10,7 @@ import { denormalizePagePath } from '../shared/lib/page-path/denormalize-page-pa\n import type { PagesManifest } from '../build/webpack/plugins/pages-manifest-plugin'\n import { PageNotFoundError, MissingStaticPage } from '../shared/lib/utils'\n import { LRUCache } from '../server/lib/lru-cache'\n-import { loadManifest } from './load-manifest'\n+import { loadManifest } from './load-manifest.external'\n import { promises } from 'fs'\n \n const isDev = process.env.NODE_ENV === 'development'"
+        },
+        {
+            "sha": "3f24743a81d7f8809f3d669c9950eeee4da38cf5",
+            "filename": "packages/next/src/server/server-utils.ts",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 5,
+            "changes": 11,
+            "blob_url": "https://github.com/vercel/next.js/blob/c90fc093fca6bc1353bb45c7eb3fb006df007420/packages%2Fnext%2Fsrc%2Fserver%2Fserver-utils.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/c90fc093fca6bc1353bb45c7eb3fb006df007420/packages%2Fnext%2Fsrc%2Fserver%2Fserver-utils.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fserver%2Fserver-utils.ts?ref=c90fc093fca6bc1353bb45c7eb3fb006df007420",
+            "patch": "@@ -25,6 +25,7 @@ import {\n import { normalizeNextQueryParam } from './web/utils'\n import type { IncomingHttpHeaders } from 'http'\n import { decodeQueryPathParameter } from './lib/decode-query-path-parameter'\n+import type { DeepReadonly } from '../shared/lib/deep-readonly'\n \n export function normalizeCdnUrl(\n   req: BaseNextRequest,\n@@ -176,11 +177,11 @@ export function getUtils({\n   page: string\n   i18n?: NextConfig['i18n']\n   basePath: string\n-  rewrites: {\n+  rewrites: DeepReadonly<{\n     fallback?: ReadonlyArray<Rewrite>\n     afterFiles?: ReadonlyArray<Rewrite>\n     beforeFiles?: ReadonlyArray<Rewrite>\n-  }\n+  }>\n   pageIsDynamic: boolean\n   trailingSlash?: boolean\n   caseSensitive: boolean\n@@ -209,7 +210,7 @@ export function getUtils({\n       )\n     }\n \n-    const checkRewrite = (rewrite: Rewrite): boolean => {\n+    const checkRewrite = (rewrite: DeepReadonly<Rewrite>): boolean => {\n       const matcher = getPathMatch(\n         rewrite.source + (trailingSlash ? '(/)?' : ''),\n         {\n@@ -227,8 +228,8 @@ export function getUtils({\n         const hasParams = matchHas(\n           req,\n           parsedUrl.query,\n-          rewrite.has,\n-          rewrite.missing\n+          rewrite.has as Rewrite['has'],\n+          rewrite.missing as Rewrite['missing']\n         )\n \n         if (hasParams) {"
+        },
+        {
+            "sha": "b6be113ce580c1e9e43c751246ae3b33dee222ed",
+            "filename": "test/integration/dynamic-routing/test/index.test.js",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 1,
+            "changes": 6,
+            "blob_url": "https://github.com/vercel/next.js/blob/c90fc093fca6bc1353bb45c7eb3fb006df007420/test%2Fintegration%2Fdynamic-routing%2Ftest%2Findex.test.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/c90fc093fca6bc1353bb45c7eb3fb006df007420/test%2Fintegration%2Fdynamic-routing%2Ftest%2Findex.test.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fintegration%2Fdynamic-routing%2Ftest%2Findex.test.js?ref=c90fc093fca6bc1353bb45c7eb3fb006df007420",
+            "patch": "@@ -1256,7 +1256,11 @@ function runTests({ dev }) {\n         caseSensitive: false,\n         basePath: '',\n         headers: [],\n-        rewrites: [],\n+        rewrites: {\n+          beforeFiles: [],\n+          afterFiles: [],\n+          fallback: [],\n+        },\n         staticRoutes: [\n           {\n             namedRegex: '^/(?:/)?$',"
+        }
+    ],
+    "stats": {
+        "total": 175,
+        "additions": 88,
+        "deletions": 87
+    }
+}

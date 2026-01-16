@@ -1,0 +1,72 @@
+{
+    "author": "ztanner",
+    "message": "fix: invalid middleware configs should fail the build (#80221)\n\nIn #68638 we intended to fail the build if an invalid matcher\nconfiguration was provided by importing a shared constant from the\nstatic page analysis fn. This worked fine for segment validations for\npages/route handlers. However, the build would incorrectly succeed in\nthe case of an invalid middleware config, because we were checking too\nearly (the middleware is evaluated later). This is bad because it would\nactually ignore the invalid value, and instead fallback to a greedy\ncatch-all match, which would invoke middleware for any path.\n\nThis updates the return shape of the static page info to signal whether\nan invalid configuration was detected rather than relying on a shared\nconst, and adds errors to the appropriate places so that the build will\ncorrectly fail. This PR includes a test with invalid middleware to\nvalidate the behavior.",
+    "sha": "9155c8ac3cf6160e6140033d0cefa07fbc23abdc",
+    "files": [
+        {
+            "sha": "ff092f5edf68d7b2165e9b7f204e165ce1c64a58",
+            "filename": "packages/next/src/build/analysis/get-page-static-info.ts",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 1,
+            "changes": 8,
+            "blob_url": "https://github.com/vercel/next.js/blob/9155c8ac3cf6160e6140033d0cefa07fbc23abdc/packages%2Fnext%2Fsrc%2Fbuild%2Fanalysis%2Fget-page-static-info.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/9155c8ac3cf6160e6140033d0cefa07fbc23abdc/packages%2Fnext%2Fsrc%2Fbuild%2Fanalysis%2Fget-page-static-info.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Fanalysis%2Fget-page-static-info.ts?ref=9155c8ac3cf6160e6140033d0cefa07fbc23abdc",
+            "patch": "@@ -79,6 +79,7 @@ export interface AppPageStaticInfo {\n   runtime: AppSegmentConfig['runtime'] | undefined\n   preferredRegion: AppSegmentConfig['preferredRegion'] | undefined\n   maxDuration: number | undefined\n+  hadUnsupportedValue: boolean\n }\n \n export interface PagesPageStaticInfo {\n@@ -98,6 +99,7 @@ export interface PagesPageStaticInfo {\n   runtime: PagesSegmentConfig['runtime'] | undefined\n   preferredRegion: PagesSegmentConfigConfig['regions'] | undefined\n   maxDuration: number | undefined\n+  hadUnsupportedValue: boolean\n }\n \n export type PageStaticInfo = AppPageStaticInfo | PagesPageStaticInfo\n@@ -426,7 +428,7 @@ function warnAboutExperimentalEdge(apiRoute: string | null) {\n   apiRouteWarnings.set(apiRoute, 1)\n }\n \n-export let hadUnsupportedValue = false\n+let hadUnsupportedValue = false\n const warnedUnsupportedValueMap = new LRUCache<boolean>(250, () => 1)\n \n function warnAboutUnsupportedValue(\n@@ -487,6 +489,7 @@ export async function getAppPageStaticInfo({\n       runtime: undefined,\n       preferredRegion: undefined,\n       maxDuration: undefined,\n+      hadUnsupportedValue: false,\n     }\n   }\n \n@@ -552,6 +555,7 @@ export async function getAppPageStaticInfo({\n     runtime: config.runtime,\n     preferredRegion: config.preferredRegion,\n     maxDuration: config.maxDuration,\n+    hadUnsupportedValue,\n   }\n }\n \n@@ -569,6 +573,7 @@ export async function getPagesPageStaticInfo({\n       runtime: undefined,\n       preferredRegion: undefined,\n       maxDuration: undefined,\n+      hadUnsupportedValue: false,\n     }\n   }\n \n@@ -634,6 +639,7 @@ export async function getPagesPageStaticInfo({\n     runtime: resolvedRuntime,\n     preferredRegion: config.config?.regions,\n     maxDuration: config.maxDuration ?? config.config?.maxDuration,\n+    hadUnsupportedValue,\n   }\n }\n "
+        },
+        {
+            "sha": "6e1baa01a9d6eed3c10180e09dfff6b5e3f499f0",
+            "filename": "packages/next/src/build/index.ts",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 8,
+            "changes": 23,
+            "blob_url": "https://github.com/vercel/next.js/blob/9155c8ac3cf6160e6140033d0cefa07fbc23abdc/packages%2Fnext%2Fsrc%2Fbuild%2Findex.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/9155c8ac3cf6160e6140033d0cefa07fbc23abdc/packages%2Fnext%2Fsrc%2Fbuild%2Findex.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/packages%2Fnext%2Fsrc%2Fbuild%2Findex.ts?ref=9155c8ac3cf6160e6140033d0cefa07fbc23abdc",
+            "patch": "@@ -110,7 +110,6 @@ import {\n } from '../telemetry/events'\n import type { EventBuildFeatureUsage } from '../telemetry/events'\n import { Telemetry } from '../telemetry/storage'\n-import { hadUnsupportedValue } from './analysis/get-page-static-info'\n import {\n   createPagesMapping,\n   getStaticInfoIncludingLayouts,\n@@ -1869,6 +1868,10 @@ export default async function build(\n                     })\n                   : undefined\n \n+                if (staticInfo?.hadUnsupportedValue) {\n+                  errorFromUnsupportedSegmentConfig()\n+                }\n+\n                 // If there's any thing that would contribute to the functions\n                 // configuration, we need to add it to the manifest.\n                 if (\n@@ -2183,13 +2186,6 @@ export default async function build(\n             })\n         )\n \n-        if (hadUnsupportedValue) {\n-          Log.error(\n-            `Invalid config value exports detected, these can cause unexpected behavior from the configs not being applied. Please fix them to continue`\n-          )\n-          process.exit(1)\n-        }\n-\n         const errorPageResult = await errorPageStaticResult\n         const nonStaticErrorPage =\n           (await errorPageHasCustomGetInitialProps) ||\n@@ -2371,6 +2367,10 @@ export default async function build(\n           page: 'middleware',\n         })\n \n+        if (staticInfo.hadUnsupportedValue) {\n+          errorFromUnsupportedSegmentConfig()\n+        }\n+\n         if (staticInfo.runtime === 'nodejs') {\n           hasNodeMiddleware = true\n           functionsConfigManifest.functions['/_middleware'] = {\n@@ -3786,6 +3786,13 @@ export default async function build(\n   }\n }\n \n+function errorFromUnsupportedSegmentConfig(): never {\n+  Log.error(\n+    `Invalid segment configuration export detected. This can cause unexpected behavior from the configs not being applied. You should see the relevant failures in the logs above. Please fix them to continue.`\n+  )\n+  process.exit(1)\n+}\n+\n function warnAboutTurbopackBuilds(config?: NextConfigComplete) {\n   let warningStr =\n     `Support for Turbopack builds is experimental. ` +"
+        },
+        {
+            "sha": "33c3be62738f3a0de67a0a901061d23b64ac37cf",
+            "filename": "test/production/exported-runtimes-value-validation/index.test.ts",
+            "status": "modified",
+            "additions": 33,
+            "deletions": 1,
+            "changes": 34,
+            "blob_url": "https://github.com/vercel/next.js/blob/9155c8ac3cf6160e6140033d0cefa07fbc23abdc/test%2Fproduction%2Fexported-runtimes-value-validation%2Findex.test.ts",
+            "raw_url": "https://github.com/vercel/next.js/raw/9155c8ac3cf6160e6140033d0cefa07fbc23abdc/test%2Fproduction%2Fexported-runtimes-value-validation%2Findex.test.ts",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fproduction%2Fexported-runtimes-value-validation%2Findex.test.ts?ref=9155c8ac3cf6160e6140033d0cefa07fbc23abdc",
+            "patch": "@@ -16,7 +16,39 @@ describe('Exported runtimes value validation', () => {\n     })\n   })\n \n-  test('warns on unrecognized runtimes value', async () => {\n+  test('fails the build on invalid middleware matcher', async () => {\n+    const result = await nextBuild(\n+      path.resolve(__dirname, './invalid-middleware'),\n+      undefined,\n+      { stdout: true, stderr: true }\n+    )\n+\n+    // The build should fail to prevent unexpected behavior\n+    expect(result.code).toBe(1)\n+\n+    // TODO: Turbopack matches the error message but omits the routing & error information\n+    if (process.env.IS_TURBOPACK_TEST) {\n+      expect(result.stderr).toEqual(\n+        expect.stringContaining(\n+          \"Next.js can't recognize the exported `config` field in route\"\n+        )\n+      )\n+    } else {\n+      expect(result.stderr).toEqual(\n+        expect.stringContaining(\n+          'Next.js can\\'t recognize the exported `config` field in route \"/middleware\"'\n+        )\n+      )\n+\n+      expect(result.stderr).toEqual(\n+        expect.stringContaining(\n+          'Unknown identifier \"dynamicPath\" at \"config.matcher[1]\"'\n+        )\n+      )\n+    }\n+  })\n+\n+  test('fails the build on unrecognized runtimes value', async () => {\n     const result = await nextBuild(\n       path.resolve(__dirname, './unsupported-syntax/app'),\n       undefined,"
+        },
+        {
+            "sha": "8a3bd633aa3c3c03052cf9472499651413976353",
+            "filename": "test/production/exported-runtimes-value-validation/invalid-middleware/middleware.js",
+            "status": "added",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/vercel/next.js/blob/9155c8ac3cf6160e6140033d0cefa07fbc23abdc/test%2Fproduction%2Fexported-runtimes-value-validation%2Finvalid-middleware%2Fmiddleware.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/9155c8ac3cf6160e6140033d0cefa07fbc23abdc/test%2Fproduction%2Fexported-runtimes-value-validation%2Finvalid-middleware%2Fmiddleware.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fproduction%2Fexported-runtimes-value-validation%2Finvalid-middleware%2Fmiddleware.js?ref=9155c8ac3cf6160e6140033d0cefa07fbc23abdc",
+            "patch": "@@ -0,0 +1,5 @@\n+const dynamicPath = `/:foobar`\n+\n+export const config = {\n+  matcher: ['/foo', dynamicPath],\n+}"
+        },
+        {
+            "sha": "ff7159d9149feeb1eb8f4b7bbeadb2e26c20b053",
+            "filename": "test/production/exported-runtimes-value-validation/invalid-middleware/pages/index.js",
+            "status": "added",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/vercel/next.js/blob/9155c8ac3cf6160e6140033d0cefa07fbc23abdc/test%2Fproduction%2Fexported-runtimes-value-validation%2Finvalid-middleware%2Fpages%2Findex.js",
+            "raw_url": "https://github.com/vercel/next.js/raw/9155c8ac3cf6160e6140033d0cefa07fbc23abdc/test%2Fproduction%2Fexported-runtimes-value-validation%2Finvalid-middleware%2Fpages%2Findex.js",
+            "contents_url": "https://api.github.com/repos/vercel/next.js/contents/test%2Fproduction%2Fexported-runtimes-value-validation%2Finvalid-middleware%2Fpages%2Findex.js?ref=9155c8ac3cf6160e6140033d0cefa07fbc23abdc",
+            "patch": "@@ -0,0 +1,3 @@\n+export default function Page() {\n+  return <p>hello world</p>\n+}"
+        }
+    ],
+    "stats": {
+        "total": 73,
+        "additions": 63,
+        "deletions": 10
+    }
+}

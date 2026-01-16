@@ -1,0 +1,36 @@
+{
+    "author": "LysandreJik",
+    "message": "Fix failing conversion (#34010)\n\n* Fix\r\n\r\n* Tests\r\n\r\n* Typo\r\n\r\n* Typo",
+    "sha": "409dd2d19cd9316f2eb1226773c7d05bbdc8b7a2",
+    "files": [
+        {
+            "sha": "5c0179350ea2efdf93b35a6d1ba0cd365b68e7a6",
+            "filename": "src/transformers/safetensors_conversion.py",
+            "status": "modified",
+            "additions": 21,
+            "deletions": 27,
+            "changes": 48,
+            "blob_url": "https://github.com/huggingface/transformers/blob/409dd2d19cd9316f2eb1226773c7d05bbdc8b7a2/src%2Ftransformers%2Fsafetensors_conversion.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/409dd2d19cd9316f2eb1226773c7d05bbdc8b7a2/src%2Ftransformers%2Fsafetensors_conversion.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fsafetensors_conversion.py?ref=409dd2d19cd9316f2eb1226773c7d05bbdc8b7a2",
+            "patch": "@@ -1,5 +1,3 @@\n-import json\n-import uuid\n from typing import Optional\n \n import requests\n@@ -26,37 +24,33 @@ def spawn_conversion(token: str, private: bool, model_id: str):\n     logger.info(\"Attempting to convert .bin model on the fly to safetensors.\")\n \n     safetensors_convert_space_url = \"https://safetensors-convert.hf.space\"\n-    sse_url = f\"{safetensors_convert_space_url}/queue/join\"\n-    sse_data_url = f\"{safetensors_convert_space_url}/queue/data\"\n+    sse_url = f\"{safetensors_convert_space_url}/call/run\"\n \n-    # The `fn_index` is necessary to indicate to gradio that we will use the `run` method of the Space.\n-    hash_data = {\"fn_index\": 1, \"session_hash\": str(uuid.uuid4())}\n-\n-    def start(_sse_connection, payload):\n+    def start(_sse_connection):\n         for line in _sse_connection.iter_lines():\n             line = line.decode()\n-            if line.startswith(\"data:\"):\n-                resp = json.loads(line[5:])\n-                logger.debug(f\"Safetensors conversion status: {resp['msg']}\")\n-                if resp[\"msg\"] == \"queue_full\":\n-                    raise ValueError(\"Queue is full! Please try again.\")\n-                elif resp[\"msg\"] == \"send_data\":\n-                    event_id = resp[\"event_id\"]\n-                    response = requests.post(\n-                        sse_data_url,\n-                        stream=True,\n-                        params=hash_data,\n-                        json={\"event_id\": event_id, **payload, **hash_data},\n-                    )\n-                    response.raise_for_status()\n-                elif resp[\"msg\"] == \"process_completed\":\n+            if line.startswith(\"event:\"):\n+                status = line[7:]\n+                logger.debug(f\"Safetensors conversion status: {status}\")\n+\n+                if status == \"complete\":\n                     return\n+                elif status == \"heartbeat\":\n+                    logger.debug(\"Heartbeat\")\n+                else:\n+                    logger.debug(f\"Unknown status {status}\")\n+            else:\n+                logger.debug(line)\n+\n+    data = {\"data\": [model_id, private, token]}\n+\n+    result = requests.post(sse_url, stream=True, json=data).json()\n+    event_id = result[\"event_id\"]\n \n-    with requests.get(sse_url, stream=True, params=hash_data) as sse_connection:\n-        data = {\"data\": [model_id, private, token]}\n+    with requests.get(f\"{sse_url}/{event_id}\", stream=True) as sse_connection:\n         try:\n             logger.debug(\"Spawning safetensors automatic conversion.\")\n-            start(sse_connection, data)\n+            start(sse_connection)\n         except Exception as e:\n             logger.warning(f\"Error during conversion: {repr(e)}\")\n \n@@ -86,7 +80,7 @@ def get_conversion_pr_reference(api: HfApi, model_id: str, **kwargs):\n \n def auto_conversion(pretrained_model_name_or_path: str, ignore_errors_during_conversion=False, **cached_file_kwargs):\n     try:\n-        api = HfApi(token=cached_file_kwargs.get(\"token\"), headers=http_user_agent())\n+        api = HfApi(token=cached_file_kwargs.get(\"token\"), headers={\"user-agent\": http_user_agent()})\n         sha = get_conversion_pr_reference(api, pretrained_model_name_or_path, **cached_file_kwargs)\n \n         if sha is None:"
+        },
+        {
+            "sha": "8af47cde8e53150b1f87de8185abd9c37290f04e",
+            "filename": "tests/utils/test_modeling_utils.py",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 10,
+            "changes": 19,
+            "blob_url": "https://github.com/huggingface/transformers/blob/409dd2d19cd9316f2eb1226773c7d05bbdc8b7a2/tests%2Futils%2Ftest_modeling_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/409dd2d19cd9316f2eb1226773c7d05bbdc8b7a2/tests%2Futils%2Ftest_modeling_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/tests%2Futils%2Ftest_modeling_utils.py?ref=409dd2d19cd9316f2eb1226773c7d05bbdc8b7a2",
+            "patch": "@@ -2009,19 +2009,18 @@ def test_absence_of_safetensors_triggers_conversion(self):\n             if thread.name == \"Thread-autoconversion\":\n                 thread.join(timeout=10)\n \n-        with self.subTest(\"PR was open with the safetensors account\"):\n-            discussions = self.api.get_repo_discussions(self.repo_name)\n+        discussions = self.api.get_repo_discussions(self.repo_name)\n \n-            bot_opened_pr = None\n-            bot_opened_pr_title = None\n+        bot_opened_pr = None\n+        bot_opened_pr_title = None\n \n-            for discussion in discussions:\n-                if discussion.author == \"SFconvertbot\":\n-                    bot_opened_pr = True\n-                    bot_opened_pr_title = discussion.title\n+        for discussion in discussions:\n+            if discussion.author == \"SFconvertbot\":\n+                bot_opened_pr = True\n+                bot_opened_pr_title = discussion.title\n \n-            self.assertTrue(bot_opened_pr)\n-            self.assertEqual(bot_opened_pr_title, \"Adding `safetensors` variant of this model\")\n+        self.assertTrue(bot_opened_pr)\n+        self.assertEqual(bot_opened_pr_title, \"Adding `safetensors` variant of this model\")\n \n     @mock.patch(\"transformers.safetensors_conversion.spawn_conversion\")\n     def test_absence_of_safetensors_triggers_conversion_failed(self, spawn_conversion_mock):"
+        }
+    ],
+    "stats": {
+        "total": 67,
+        "additions": 30,
+        "deletions": 37
+    }
+}

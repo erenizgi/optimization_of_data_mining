@@ -1,0 +1,24 @@
+{
+    "author": "Cyrilvallez",
+    "message": "Load models much faster on accelerator devices!! (#36380)\n\n* caching allocator warmup\n\n* Update modeling_utils.py\n\n* reuse expanded map\n\n* style",
+    "sha": "4b5cf5496d50958c129516a848f1633fe76a9d81",
+    "files": [
+        {
+            "sha": "d7abc3bf7e222dc24f308efe63b7bc75618247dc",
+            "filename": "src/transformers/modeling_utils.py",
+            "status": "modified",
+            "additions": 32,
+            "deletions": 1,
+            "changes": 33,
+            "blob_url": "https://github.com/huggingface/transformers/blob/4b5cf5496d50958c129516a848f1633fe76a9d81/src%2Ftransformers%2Fmodeling_utils.py",
+            "raw_url": "https://github.com/huggingface/transformers/raw/4b5cf5496d50958c129516a848f1633fe76a9d81/src%2Ftransformers%2Fmodeling_utils.py",
+            "contents_url": "https://api.github.com/repos/huggingface/transformers/contents/src%2Ftransformers%2Fmodeling_utils.py?ref=4b5cf5496d50958c129516a848f1633fe76a9d81",
+            "patch": "@@ -21,11 +21,13 @@\n import inspect\n import itertools\n import json\n+import math\n import os\n import re\n import shutil\n import tempfile\n import warnings\n+from collections import defaultdict\n from contextlib import contextmanager\n from dataclasses import dataclass\n from enum import Enum\n@@ -4816,8 +4818,13 @@ def _find_mismatched_keys(\n             folder = os.path.sep.join(resolved_archive_file[0].split(os.path.sep)[:-1])\n         else:\n             folder = None\n+\n+        if device_map is not None:\n+            expanded_device_map = expand_device_map(device_map, original_loaded_keys, start_prefix)\n+            caching_allocator_warmup(model, expanded_device_map, dtype)\n+\n         if device_map is not None and is_safetensors:\n-            param_device_map = expand_device_map(device_map, original_loaded_keys, start_prefix)\n+            param_device_map = expanded_device_map\n             str_dtype = str(dtype).replace(\"torch.\", \"\") if dtype is not None else \"float32\"\n             if sharded_metadata is None:\n                 archive_file = (\n@@ -5795,6 +5802,30 @@ def expand_device_map(device_map, param_names, start_prefix):\n     return new_device_map\n \n \n+def caching_allocator_warmup(model: PreTrainedModel, expanded_device_map: Dict, dtype: torch.dtype) -> Dict:\n+    \"\"\"This function warm-ups the caching allocator based on the size of the model tensors that will reside on each\n+    device. It allows to have one large call to Malloc, instead of recursively calling it later when loading\n+    the model, which is actually the loading speed botteneck.\n+    Calling this function allows to cut the model loading time by a very large margin.\n+    \"\"\"\n+    # Remove disk and cpu devices, and cast to proper torch.device\n+    accelerator_device_map = {\n+        param: torch.device(device) for param, device in expanded_device_map.items() if device not in [\"cpu\", \"disk\"]\n+    }\n+    parameter_count = defaultdict(lambda: 0)\n+    for param_name, device in accelerator_device_map.items():\n+        try:\n+            param = model.get_parameter(param_name)\n+        except AttributeError:\n+            param = model.get_buffer(param_name)\n+        parameter_count[device] += math.prod(param.shape)\n+\n+    dtype = dtype if dtype is not None else torch.float32\n+    # This will kick off the caching allocator to avoid having to Malloc afterwards\n+    for device, param_count in parameter_count.items():\n+        _ = torch.empty(param_count, dtype=dtype, device=device, requires_grad=False)\n+\n+\n def get_disk_only_shard_files(device_map, sharded_metadata, start_prefix):\n     \"\"\"\n     Returns the list of shard files containing only weights offloaded to disk."
+        }
+    ],
+    "stats": {
+        "total": 33,
+        "additions": 32,
+        "deletions": 1
+    }
+}
