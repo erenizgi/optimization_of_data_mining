@@ -1,0 +1,48 @@
+{
+    "author": "addaleax",
+    "message": "stream: fix end-of-stream for HTTP/2\n\nHTTP/2 streams call `.end()` on themselves from their\n`.destroy()` method, which might be queued (e.g. due to network\ncongestion) and not processed before the stream itself is destroyed.\n\nIn that case, the `_writableState.ended` property could be set before\nthe stream emits its `'close'` event, and never actually emits the\n`'finished'` event, confusing the end-of-stream implementation so\nthat it wouldn’t call its callback.\n\nThis can be fixed by watching for the end events themselves using the\nexisting `'finish'` and `'end'` listeners rather than relying on the\n`.ended` properties of the `_...State` objects.\n\nThese properties still need to be checked to know whether stream\nclosure was premature – My understanding is that ideally, streams\nshould not emit `'close'` before `'end'` and/or `'finished'`, so this\nmight be another bug, but changing this would require modifying tests\nand almost certainly be a breaking change.\n\nFixes: https://github.com/nodejs/node/issues/24456\n\nPR-URL: https://github.com/nodejs/node/pull/24926\nReviewed-By: Rich Trott <rtrott@gmail.com>\nReviewed-By: Luigi Pinca <luigipinca@gmail.com>\nReviewed-By: Matteo Collina <matteo.collina@gmail.com>\nReviewed-By: Franziska Hinkelmann <franziska.hinkelmann@gmail.com>",
+    "sha": "83ec33b9335a7140c1f8b46357303ff7a8122a0d",
+    "files": [
+        {
+            "sha": "4ad7b93337f633b696a3b245d39c3645313d882c",
+            "filename": "lib/internal/streams/end-of-stream.js",
+            "status": "modified",
+            "additions": 14,
+            "deletions": 7,
+            "changes": 21,
+            "blob_url": "https://github.com/nodejs/node/blob/83ec33b9335a7140c1f8b46357303ff7a8122a0d/lib%2Finternal%2Fstreams%2Fend-of-stream.js",
+            "raw_url": "https://github.com/nodejs/node/raw/83ec33b9335a7140c1f8b46357303ff7a8122a0d/lib%2Finternal%2Fstreams%2Fend-of-stream.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fstreams%2Fend-of-stream.js?ref=83ec33b9335a7140c1f8b46357303ff7a8122a0d",
+            "patch": "@@ -36,22 +36,24 @@ function eos(stream, opts, callback) {\n \n   callback = once(callback);\n \n-  const ws = stream._writableState;\n-  const rs = stream._readableState;\n   let readable = opts.readable || (opts.readable !== false && stream.readable);\n   let writable = opts.writable || (opts.writable !== false && stream.writable);\n \n   const onlegacyfinish = () => {\n     if (!stream.writable) onfinish();\n   };\n \n+  var writableEnded = stream._writableState && stream._writableState.finished;\n   const onfinish = () => {\n     writable = false;\n+    writableEnded = true;\n     if (!readable) callback.call(stream);\n   };\n \n+  var readableEnded = stream._readableState && stream._readableState.endEmitted;\n   const onend = () => {\n     readable = false;\n+    readableEnded = true;\n     if (!writable) callback.call(stream);\n   };\n \n@@ -60,11 +62,16 @@ function eos(stream, opts, callback) {\n   };\n \n   const onclose = () => {\n-    if (readable && !(rs && rs.ended)) {\n-      return callback.call(stream, new ERR_STREAM_PREMATURE_CLOSE());\n+    let err;\n+    if (readable && !readableEnded) {\n+      if (!stream._readableState || !stream._readableState.ended)\n+        err = new ERR_STREAM_PREMATURE_CLOSE();\n+      return callback.call(stream, err);\n     }\n-    if (writable && !(ws && ws.ended)) {\n-      return callback.call(stream, new ERR_STREAM_PREMATURE_CLOSE());\n+    if (writable && !writableEnded) {\n+      if (!stream._writableState || !stream._writableState.ended)\n+        err = new ERR_STREAM_PREMATURE_CLOSE();\n+      return callback.call(stream, err);\n     }\n   };\n \n@@ -77,7 +84,7 @@ function eos(stream, opts, callback) {\n     stream.on('abort', onclose);\n     if (stream.req) onrequest();\n     else stream.on('request', onrequest);\n-  } else if (writable && !ws) { // legacy streams\n+  } else if (writable && !stream._writableState) { // legacy streams\n     stream.on('end', onlegacyfinish);\n     stream.on('close', onlegacyfinish);\n   }"
+        },
+        {
+            "sha": "b45e4448d97c06be808da6cdc1dd91b226f940d9",
+            "filename": "test/parallel/parallel.status",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 2,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/83ec33b9335a7140c1f8b46357303ff7a8122a0d/test%2Fparallel%2Fparallel.status",
+            "raw_url": "https://github.com/nodejs/node/raw/83ec33b9335a7140c1f8b46357303ff7a8122a0d/test%2Fparallel%2Fparallel.status",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Fparallel.status?ref=83ec33b9335a7140c1f8b46357303ff7a8122a0d",
+            "patch": "@@ -12,8 +12,6 @@ test-net-connect-options-port: PASS,FLAKY\n test-http2-pipe: PASS,FLAKY\n test-worker-syntax-error: PASS,FLAKY\n test-worker-syntax-error-file: PASS,FLAKY\n-# https://github.com/nodejs/node/issues/24456\n-test-stream-pipeline-http2: PASS,FLAKY\n \n [$system==linux]\n "
+        },
+        {
+            "sha": "d5e399ddda531bfbad5390d6857882c09233d38a",
+            "filename": "test/parallel/test-stream-pipeline-queued-end-in-destroy.js",
+            "status": "added",
+            "additions": 39,
+            "deletions": 0,
+            "changes": 39,
+            "blob_url": "https://github.com/nodejs/node/blob/83ec33b9335a7140c1f8b46357303ff7a8122a0d/test%2Fparallel%2Ftest-stream-pipeline-queued-end-in-destroy.js",
+            "raw_url": "https://github.com/nodejs/node/raw/83ec33b9335a7140c1f8b46357303ff7a8122a0d/test%2Fparallel%2Ftest-stream-pipeline-queued-end-in-destroy.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-stream-pipeline-queued-end-in-destroy.js?ref=83ec33b9335a7140c1f8b46357303ff7a8122a0d",
+            "patch": "@@ -0,0 +1,39 @@\n+'use strict';\n+const common = require('../common');\n+const assert = require('assert');\n+const { Readable, Duplex, pipeline } = require('stream');\n+\n+// Test that the callback for pipeline() is called even when the ._destroy()\n+// method of the stream places an .end() request to itself that does not\n+// get processed before the destruction of the stream (i.e. the 'close' event).\n+// Refs: https://github.com/nodejs/node/issues/24456\n+\n+const readable = new Readable({\n+  read: common.mustCall(() => {})\n+});\n+\n+const duplex = new Duplex({\n+  write(chunk, enc, cb) {\n+    // Simulate messages queueing up.\n+  },\n+  read() {},\n+  destroy(err, cb) {\n+    // Call end() from inside the destroy() method, like HTTP/2 streams\n+    // do at the time of writing.\n+    this.end();\n+    cb(err);\n+  }\n+});\n+\n+duplex.on('finished', common.mustNotCall());\n+\n+pipeline(readable, duplex, common.mustCall((err) => {\n+  assert.strictEqual(err.code, 'ERR_STREAM_PREMATURE_CLOSE');\n+}));\n+\n+// Write one chunk of data, and destroy the stream later.\n+// That should trigger the pipeline destruction.\n+readable.push('foo');\n+setImmediate(() => {\n+  readable.destroy();\n+});"
+        }
+    ],
+    "stats": {
+        "total": 62,
+        "additions": 53,
+        "deletions": 9
+    }
+}

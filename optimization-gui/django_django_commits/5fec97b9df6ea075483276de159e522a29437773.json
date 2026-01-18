@@ -1,0 +1,120 @@
+{
+    "author": "aaugustin",
+    "message": "Fixed #18194 -- Expiration of file-based sessions\n\n* Prevented stale session files from being loaded\n* Added removal of stale session files in django-admin.py clearsessions\n\nThanks ej for the report, crodjer and Elvard for their inputs.",
+    "sha": "5fec97b9df6ea075483276de159e522a29437773",
+    "files": [
+        {
+            "sha": "ff8ab7f6779f14aed5e4682367113a184ed563bd",
+            "filename": "django/contrib/sessions/backends/base.py",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 1,
+            "changes": 12,
+            "blob_url": "https://github.com/django/django/blob/5fec97b9df6ea075483276de159e522a29437773/django%2Fcontrib%2Fsessions%2Fbackends%2Fbase.py",
+            "raw_url": "https://github.com/django/django/raw/5fec97b9df6ea075483276de159e522a29437773/django%2Fcontrib%2Fsessions%2Fbackends%2Fbase.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fcontrib%2Fsessions%2Fbackends%2Fbase.py?ref=5fec97b9df6ea075483276de159e522a29437773",
+            "patch": "@@ -1,7 +1,6 @@\n from __future__ import unicode_literals\n \n import base64\n-import time\n from datetime import datetime, timedelta\n try:\n     from django.utils.six.moves import cPickle as pickle\n@@ -309,3 +308,14 @@ def load(self):\n         Loads the session data and returns a dictionary.\n         \"\"\"\n         raise NotImplementedError\n+\n+    @classmethod\n+    def clear_expired(cls):\n+        \"\"\"\n+        Remove expired sessions from the session store.\n+\n+        If this operation isn't possible on a given backend, it should raise\n+        NotImplementedError. If it isn't necessary, because the backend has\n+        a built-in expiration mechanism, it should be a no-op.\n+        \"\"\"\n+        raise NotImplementedError"
+        },
+        {
+            "sha": "0c7eb8d2cb3934f91ddc28156d2c2cfa9f07d206",
+            "filename": "django/contrib/sessions/backends/cache.py",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/django/django/blob/5fec97b9df6ea075483276de159e522a29437773/django%2Fcontrib%2Fsessions%2Fbackends%2Fcache.py",
+            "raw_url": "https://github.com/django/django/raw/5fec97b9df6ea075483276de159e522a29437773/django%2Fcontrib%2Fsessions%2Fbackends%2Fcache.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fcontrib%2Fsessions%2Fbackends%2Fcache.py?ref=5fec97b9df6ea075483276de159e522a29437773",
+            "patch": "@@ -65,3 +65,7 @@ def delete(self, session_key=None):\n                 return\n             session_key = self.session_key\n         self._cache.delete(KEY_PREFIX + session_key)\n+\n+    @classmethod\n+    def clear_expired(cls):\n+        pass"
+        },
+        {
+            "sha": "47e89b66e55c6c0ee3803fb65f266d965346f746",
+            "filename": "django/contrib/sessions/backends/db.py",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/django/django/blob/5fec97b9df6ea075483276de159e522a29437773/django%2Fcontrib%2Fsessions%2Fbackends%2Fdb.py",
+            "raw_url": "https://github.com/django/django/raw/5fec97b9df6ea075483276de159e522a29437773/django%2Fcontrib%2Fsessions%2Fbackends%2Fdb.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fcontrib%2Fsessions%2Fbackends%2Fdb.py?ref=5fec97b9df6ea075483276de159e522a29437773",
+            "patch": "@@ -71,6 +71,11 @@ def delete(self, session_key=None):\n         except Session.DoesNotExist:\n             pass\n \n+    @classmethod\n+    def clear_expired(cls):\n+        Session.objects.filter(expire_date__lt=timezone.now()).delete()\n+        transaction.commit_unless_managed()\n+\n \n # At bottom to avoid circular import\n from django.contrib.sessions.models import Session"
+        },
+        {
+            "sha": "f3a71f82719d8bb67e30073c5142241a17763523",
+            "filename": "django/contrib/sessions/backends/file.py",
+            "status": "modified",
+            "additions": 59,
+            "deletions": 12,
+            "changes": 71,
+            "blob_url": "https://github.com/django/django/blob/5fec97b9df6ea075483276de159e522a29437773/django%2Fcontrib%2Fsessions%2Fbackends%2Ffile.py",
+            "raw_url": "https://github.com/django/django/raw/5fec97b9df6ea075483276de159e522a29437773/django%2Fcontrib%2Fsessions%2Fbackends%2Ffile.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fcontrib%2Fsessions%2Fbackends%2Ffile.py?ref=5fec97b9df6ea075483276de159e522a29437773",
+            "patch": "@@ -1,31 +1,41 @@\n+import datetime\n import errno\n import os\n import tempfile\n \n from django.conf import settings\n from django.contrib.sessions.backends.base import SessionBase, CreateError\n from django.core.exceptions import SuspiciousOperation, ImproperlyConfigured\n-\n+from django.utils import timezone\n \n class SessionStore(SessionBase):\n     \"\"\"\n     Implements a file based session store.\n     \"\"\"\n     def __init__(self, session_key=None):\n-        self.storage_path = getattr(settings, \"SESSION_FILE_PATH\", None)\n-        if not self.storage_path:\n-            self.storage_path = tempfile.gettempdir()\n-\n-        # Make sure the storage path is valid.\n-        if not os.path.isdir(self.storage_path):\n-            raise ImproperlyConfigured(\n-                \"The session storage path %r doesn't exist. Please set your\"\n-                \" SESSION_FILE_PATH setting to an existing directory in which\"\n-                \" Django can store session data.\" % self.storage_path)\n-\n+        self.storage_path = type(self)._get_storage_path()\n         self.file_prefix = settings.SESSION_COOKIE_NAME\n         super(SessionStore, self).__init__(session_key)\n \n+    @classmethod\n+    def _get_storage_path(cls):\n+        try:\n+            return cls._storage_path\n+        except AttributeError:\n+            storage_path = getattr(settings, \"SESSION_FILE_PATH\", None)\n+            if not storage_path:\n+                storage_path = tempfile.gettempdir()\n+\n+            # Make sure the storage path is valid.\n+            if not os.path.isdir(storage_path):\n+                raise ImproperlyConfigured(\n+                    \"The session storage path %r doesn't exist. Please set your\"\n+                    \" SESSION_FILE_PATH setting to an existing directory in which\"\n+                    \" Django can store session data.\" % storage_path)\n+\n+            cls._storage_path = storage_path\n+            return storage_path\n+\n     VALID_KEY_CHARS = set(\"abcdef0123456789\")\n \n     def _key_to_file(self, session_key=None):\n@@ -44,6 +54,18 @@ def _key_to_file(self, session_key=None):\n \n         return os.path.join(self.storage_path, self.file_prefix + session_key)\n \n+    def _last_modification(self):\n+        \"\"\"\n+        Return the modification time of the file storing the session's content.\n+        \"\"\"\n+        modification = os.stat(self._key_to_file()).st_mtime\n+        if settings.USE_TZ:\n+            modification = datetime.datetime.utcfromtimestamp(modification)\n+            modification = modification.replace(tzinfo=timezone.utc)\n+        else:\n+            modification = datetime.datetime.fromtimestamp(modification)\n+        return modification\n+\n     def load(self):\n         session_data = {}\n         try:\n@@ -56,6 +78,15 @@ def load(self):\n                     session_data = self.decode(file_data)\n                 except (EOFError, SuspiciousOperation):\n                     self.create()\n+\n+                # Remove expired sessions.\n+                expiry_age = self.get_expiry_age(\n+                    modification=self._last_modification(),\n+                    expiry=session_data.get('_session_expiry'))\n+                if expiry_age < 0:\n+                    session_data = {}\n+                    self.delete()\n+                    self.create()\n         except IOError:\n             self.create()\n         return session_data\n@@ -142,3 +173,19 @@ def delete(self, session_key=None):\n \n     def clean(self):\n         pass\n+\n+    @classmethod\n+    def clear_expired(cls):\n+        storage_path = getattr(settings, \"SESSION_FILE_PATH\", tempfile.gettempdir())\n+        file_prefix = settings.SESSION_COOKIE_NAME\n+\n+        for session_file in os.listdir(storage_path):\n+            if not session_file.startswith(file_prefix):\n+                continue\n+            session_key = session_file[len(file_prefix):]\n+            session = cls(session_key)\n+            # When an expired session is loaded, its file is removed, and a\n+            # new file is immediately created. Prevent this by disabling\n+            # the create() method.\n+            session.create = lambda: None\n+            session.load()"
+        },
+        {
+            "sha": "c2b7a3123f5c77c4678445e9a8a838a18af6c74f",
+            "filename": "django/contrib/sessions/backends/signed_cookies.py",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/django/django/blob/5fec97b9df6ea075483276de159e522a29437773/django%2Fcontrib%2Fsessions%2Fbackends%2Fsigned_cookies.py",
+            "raw_url": "https://github.com/django/django/raw/5fec97b9df6ea075483276de159e522a29437773/django%2Fcontrib%2Fsessions%2Fbackends%2Fsigned_cookies.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fcontrib%2Fsessions%2Fbackends%2Fsigned_cookies.py?ref=5fec97b9df6ea075483276de159e522a29437773",
+            "patch": "@@ -92,3 +92,7 @@ def _get_session_key(self):\n         return signing.dumps(session_cache, compress=True,\n             salt='django.contrib.sessions.backends.signed_cookies',\n             serializer=PickleSerializer)\n+\n+    @classmethod\n+    def clear_expired(cls):\n+        pass"
+        },
+        {
+            "sha": "8eb23dfee017fb39833f98236906c77653a4798c",
+            "filename": "django/contrib/sessions/management/commands/clearsessions.py",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 5,
+            "changes": 14,
+            "blob_url": "https://github.com/django/django/blob/5fec97b9df6ea075483276de159e522a29437773/django%2Fcontrib%2Fsessions%2Fmanagement%2Fcommands%2Fclearsessions.py",
+            "raw_url": "https://github.com/django/django/raw/5fec97b9df6ea075483276de159e522a29437773/django%2Fcontrib%2Fsessions%2Fmanagement%2Fcommands%2Fclearsessions.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fcontrib%2Fsessions%2Fmanagement%2Fcommands%2Fclearsessions.py?ref=5fec97b9df6ea075483276de159e522a29437773",
+            "patch": "@@ -1,11 +1,15 @@\n+from django.conf import settings\n from django.core.management.base import NoArgsCommand\n-from django.utils import timezone\n+from django.utils.importlib import import_module\n+\n \n class Command(NoArgsCommand):\n     help = \"Can be run as a cronjob or directly to clean out expired sessions (only with the database backend at the moment).\"\n \n     def handle_noargs(self, **options):\n-        from django.db import transaction\n-        from django.contrib.sessions.models import Session\n-        Session.objects.filter(expire_date__lt=timezone.now()).delete()\n-        transaction.commit_unless_managed()\n+        engine = import_module(settings.SESSION_ENGINE)\n+        try:\n+            engine.SessionStore.clear_expired()\n+        except NotImplementedError:\n+            self.stderr.write(\"Session engine '%s' doesn't support clearing \"\n+                              \"expired sessions.\\n\" % settings.SESSION_ENGINE)"
+        },
+        {
+            "sha": "129cd217354dfa97d761610058228c0206e542b3",
+            "filename": "django/contrib/sessions/tests.py",
+            "status": "modified",
+            "additions": 61,
+            "deletions": 0,
+            "changes": 61,
+            "blob_url": "https://github.com/django/django/blob/5fec97b9df6ea075483276de159e522a29437773/django%2Fcontrib%2Fsessions%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/5fec97b9df6ea075483276de159e522a29437773/django%2Fcontrib%2Fsessions%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fcontrib%2Fsessions%2Ftests.py?ref=5fec97b9df6ea075483276de159e522a29437773",
+            "patch": "@@ -1,4 +1,5 @@\n from datetime import timedelta\n+import os\n import shutil\n import string\n import tempfile\n@@ -12,6 +13,7 @@\n from django.contrib.sessions.backends.signed_cookies import SessionStore as CookieSession\n from django.contrib.sessions.models import Session\n from django.contrib.sessions.middleware import SessionMiddleware\n+from django.core import management\n from django.core.cache import DEFAULT_CACHE_ALIAS\n from django.core.exceptions import ImproperlyConfigured, SuspiciousOperation\n from django.http import HttpResponse\n@@ -319,6 +321,30 @@ def test_sessionmanager_save(self):\n         del self.session._session_cache\n         self.assertEqual(self.session['y'], 2)\n \n+    @override_settings(SESSION_ENGINE=\"django.contrib.sessions.backends.db\")\n+    def test_clearsessions_command(self):\n+        \"\"\"\n+        Test clearsessions command for clearing expired sessions.\n+        \"\"\"\n+        self.assertEqual(0, Session.objects.count())\n+\n+        # One object in the future\n+        self.session['foo'] = 'bar'\n+        self.session.set_expiry(3600)\n+        self.session.save()\n+\n+        # One object in the past\n+        other_session = self.backend()\n+        other_session['foo'] = 'bar'\n+        other_session.set_expiry(-3600)\n+        other_session.save()\n+\n+        # Two sessions are in the database before clearsessions...\n+        self.assertEqual(2, Session.objects.count())\n+        management.call_command('clearsessions')\n+        # ... and one is deleted.\n+        self.assertEqual(1, Session.objects.count())\n+\n \n @override_settings(USE_TZ=True)\n class DatabaseSessionWithTimeZoneTests(DatabaseSessionTests):\n@@ -358,6 +384,9 @@ def setUp(self):\n         # Do file session tests in an isolated directory, and kill it after we're done.\n         self.original_session_file_path = settings.SESSION_FILE_PATH\n         self.temp_session_store = settings.SESSION_FILE_PATH = tempfile.mkdtemp()\n+        # Reset the file session backend's internal caches\n+        if hasattr(self.backend, '_storage_path'):\n+            del self.backend._storage_path\n         super(FileSessionTests, self).setUp()\n \n     def tearDown(self):\n@@ -368,6 +397,7 @@ def tearDown(self):\n     @override_settings(\n         SESSION_FILE_PATH=\"/if/this/directory/exists/you/have/a/weird/computer\")\n     def test_configuration_check(self):\n+        del self.backend._storage_path\n         # Make sure the file backend checks for a good storage dir\n         self.assertRaises(ImproperlyConfigured, self.backend)\n \n@@ -381,6 +411,37 @@ def test_invalid_key_forwardslash(self):\n         self.assertRaises(SuspiciousOperation,\n                           self.backend(\"a/b/c\").load)\n \n+    @override_settings(SESSION_ENGINE=\"django.contrib.sessions.backends.file\")\n+    def test_clearsessions_command(self):\n+        \"\"\"\n+        Test clearsessions command for clearing expired sessions.\n+        \"\"\"\n+        storage_path = self.backend._get_storage_path()\n+        file_prefix = settings.SESSION_COOKIE_NAME\n+\n+        def count_sessions():\n+            return len([session_file for session_file in os.listdir(storage_path)\n+                                     if session_file.startswith(file_prefix)])\n+\n+        self.assertEqual(0, count_sessions())\n+\n+        # One object in the future\n+        self.session['foo'] = 'bar'\n+        self.session.set_expiry(3600)\n+        self.session.save()\n+\n+        # One object in the past\n+        other_session = self.backend()\n+        other_session['foo'] = 'bar'\n+        other_session.set_expiry(-3600)\n+        other_session.save()\n+\n+        # Two sessions are in the filesystem before clearsessions...\n+        self.assertEqual(2, count_sessions())\n+        management.call_command('clearsessions')\n+        # ... and one is deleted.\n+        self.assertEqual(1, count_sessions())\n+\n \n class CacheSessionTests(SessionTestsMixin, unittest.TestCase):\n "
+        },
+        {
+            "sha": "e0b08450e9f989a21b43c522dd748832dc5ab04a",
+            "filename": "docs/ref/django-admin.txt",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 2,
+            "changes": 2,
+            "blob_url": "https://github.com/django/django/blob/5fec97b9df6ea075483276de159e522a29437773/docs%2Fref%2Fdjango-admin.txt",
+            "raw_url": "https://github.com/django/django/raw/5fec97b9df6ea075483276de159e522a29437773/docs%2Fref%2Fdjango-admin.txt",
+            "contents_url": "https://api.github.com/repos/django/django/contents/docs%2Fref%2Fdjango-admin.txt?ref=5fec97b9df6ea075483276de159e522a29437773",
+            "patch": "@@ -1200,8 +1200,6 @@ clearsessions\n \n Can be run as a cron job or directly to clean out expired sessions.\n \n-This is only supported by the database backend at the moment.\n-\n ``django.contrib.sitemaps``\n ---------------------------\n "
+        },
+        {
+            "sha": "d9c472d09241592fd54a1d0b57070ecf4d4b719d",
+            "filename": "docs/topics/http/sessions.txt",
+            "status": "modified",
+            "additions": 23,
+            "deletions": 9,
+            "changes": 32,
+            "blob_url": "https://github.com/django/django/blob/5fec97b9df6ea075483276de159e522a29437773/docs%2Ftopics%2Fhttp%2Fsessions.txt",
+            "raw_url": "https://github.com/django/django/raw/5fec97b9df6ea075483276de159e522a29437773/docs%2Ftopics%2Fhttp%2Fsessions.txt",
+            "contents_url": "https://api.github.com/repos/django/django/contents/docs%2Ftopics%2Fhttp%2Fsessions.txt?ref=5fec97b9df6ea075483276de159e522a29437773",
+            "patch": "@@ -272,6 +272,13 @@ You can edit it multiple times.\n       Returns either ``True`` or ``False``, depending on whether the user's\n       session cookie will expire when the user's Web browser is closed.\n \n+    .. method:: SessionBase.clear_expired\n+\n+      .. versionadded:: 1.5\n+\n+      Removes expired sessions from the session store. This class method is\n+      called by :djadmin:`clearsessions`.\n+\n Session object guidelines\n -------------------------\n \n@@ -458,22 +465,29 @@ This setting is a global default and can be overwritten at a per-session level\n by explicitly calling the :meth:`~backends.base.SessionBase.set_expiry` method\n of ``request.session`` as described above in `using sessions in views`_.\n \n-Clearing the session table\n+Clearing the session store\n ==========================\n \n-If you're using the database backend, note that session data can accumulate in\n-the ``django_session`` database table and Django does *not* provide automatic\n-purging. Therefore, it's your job to purge expired sessions on a regular basis.\n+As users create new sessions on your website, session data can accumulate in\n+your session store. If you're using the database backend, the\n+``django_session`` database table will grow. If you're using the file backend,\n+your temporary directory will contain an increasing number of files.\n \n-To understand this problem, consider what happens when a user uses a session.\n+To understand this problem, consider what happens with the database backend.\n When a user logs in, Django adds a row to the ``django_session`` database\n table. Django updates this row each time the session data changes. If the user\n logs out manually, Django deletes the row. But if the user does *not* log out,\n-the row never gets deleted.\n+the row never gets deleted. A similar process happens with the file backend.\n+\n+Django does *not* provide automatic purging of expired sessions. Therefore,\n+it's your job to purge expired sessions on a regular basis. Django provides a\n+clean-up management command for this purpose: :djadmin:`clearsessions`. It's\n+recommended to call this command on a regular basis, for example as a daily\n+cron job.\n \n-Django provides a sample clean-up script: ``django-admin.py clearsessions``.\n-That script deletes any session in the session table whose ``expire_date`` is\n-in the past -- but your application may have different requirements.\n+Note that the cache backend isn't vulnerable to this problem, because caches\n+automatically delete stale data. Neither is the cookie backend, because the\n+session data is stored by the users' browsers.\n \n Settings\n ========"
+        }
+    ],
+    "stats": {
+        "total": 205,
+        "additions": 176,
+        "deletions": 29
+    }
+}

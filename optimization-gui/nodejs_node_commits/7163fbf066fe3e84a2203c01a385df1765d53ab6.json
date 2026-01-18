@@ -1,0 +1,156 @@
+{
+    "author": "joyeecheung",
+    "message": "process: move eval and exception bootstrap ito process/execution.js\n\nThis patch:\n\n- Moves `tryGetCwd`, `evalScript` and `fatalException` from\n  `bootstrap/node.js` into `process/execution.js` so that\n  they do have to be passed into the worker thread\n  setup function, instead the worker code can require them\n  when necessary.\n- Moves `setUncaughtExceptionCaptureCallback` and\n  `hasUncaughtExceptionCaptureCallback` along with the two\n  global state `exceptionHandlerState` and\n  `shouldAbortOnUncaughtToggle` info `process.execution.js`\n  as those are only used by the fatalException and these\n  two accessors as one self-contained unit.\n\nPR-URL: https://github.com/nodejs/node/pull/25199\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "7163fbf066fe3e84a2203c01a385df1765d53ab6",
+    "files": [
+        {
+            "sha": "4de951ca549c7346aac4f629152d8c96c6157ec4",
+            "filename": "lib/internal/bootstrap/node.js",
+            "status": "modified",
+            "additions": 26,
+            "deletions": 103,
+            "changes": 129,
+            "blob_url": "https://github.com/nodejs/node/blob/7163fbf066fe3e84a2203c01a385df1765d53ab6/lib%2Finternal%2Fbootstrap%2Fnode.js",
+            "raw_url": "https://github.com/nodejs/node/raw/7163fbf066fe3e84a2203c01a385df1765d53ab6/lib%2Finternal%2Fbootstrap%2Fnode.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fbootstrap%2Fnode.js?ref=7163fbf066fe3e84a2203c01a385df1765d53ab6",
+            "patch": "@@ -18,16 +18,30 @@\n \n const { internalBinding, NativeModule } = loaderExports;\n \n-const exceptionHandlerState = { captureFn: null };\n let getOptionValue;\n \n function startup() {\n   setupTraceCategoryState();\n \n   setupProcessObject();\n \n-  // Do this good and early, since it handles errors.\n-  setupProcessFatal();\n+  // TODO(joyeecheung): this does not have to done so early, any fatal errors\n+  // thrown before user code execution should simply crash the process\n+  // and we do not care about any clean up at that point. We don't care\n+  // about emitting any events if the process crash upon bootstrap either.\n+  {\n+    const {\n+      fatalException,\n+      setUncaughtExceptionCaptureCallback,\n+      hasUncaughtExceptionCaptureCallback\n+    } = NativeModule.require('internal/process/execution');\n+\n+    process._fatalException = fatalException;\n+    process.setUncaughtExceptionCaptureCallback =\n+      setUncaughtExceptionCaptureCallback;\n+    process.hasUncaughtExceptionCaptureCallback =\n+      hasUncaughtExceptionCaptureCallback;\n+  }\n \n   setupGlobalVariables();\n \n@@ -83,20 +97,14 @@ function startup() {\n     process.reallyExit = rawMethods.reallyExit;\n     process._kill = rawMethods._kill;\n \n-    const wrapped = perThreadSetup.wrapProcessMethods(\n-      rawMethods, exceptionHandlerState\n-    );\n+    const wrapped = perThreadSetup.wrapProcessMethods(rawMethods);\n     process._rawDebug = wrapped._rawDebug;\n     process.hrtime = wrapped.hrtime;\n     process.hrtime.bigint = wrapped.hrtimeBigInt;\n     process.cpuUsage = wrapped.cpuUsage;\n     process.memoryUsage = wrapped.memoryUsage;\n     process.kill = wrapped.kill;\n     process.exit = wrapped.exit;\n-    process.setUncaughtExceptionCaptureCallback =\n-      wrapped.setUncaughtExceptionCaptureCallback;\n-    process.hasUncaughtExceptionCaptureCallback =\n-      wrapped.hasUncaughtExceptionCaptureCallback;\n   }\n \n   NativeModule.require('internal/process/warning').setup();\n@@ -305,7 +313,7 @@ function startExecution() {\n   // This means we are in a Worker context, and any script execution\n   // will be directed by the worker module.\n   if (internalBinding('worker').getEnvMessagePort() !== undefined) {\n-    NativeModule.require('internal/worker').setupChild(evalScript);\n+    NativeModule.require('internal/worker').setupChild();\n     return;\n   }\n \n@@ -376,7 +384,9 @@ function executeUserCode() {\n       addBuiltinLibsToObject\n     } = NativeModule.require('internal/modules/cjs/helpers');\n     addBuiltinLibsToObject(global);\n-    evalScript('[eval]', wrapForBreakOnFirstLine(getOptionValue('--eval')));\n+    const source = getOptionValue('--eval');\n+    const { evalScript } = NativeModule.require('internal/process/execution');\n+    evalScript('[eval]', source, process._breakFirstLine);\n     return;\n   }\n \n@@ -430,7 +440,8 @@ function executeUserCode() {\n \n     // User passed '-e' or '--eval' along with `-i` or `--interactive`\n     if (process._eval != null) {\n-      evalScript('[eval]', wrapForBreakOnFirstLine(process._eval));\n+      const { evalScript } = NativeModule.require('internal/process/execution');\n+      evalScript('[eval]', process._eval, process._breakFirstLine);\n     }\n     return;\n   }\n@@ -452,7 +463,8 @@ function readAndExecuteStdin() {\n       checkScriptSyntax(code, '[stdin]');\n     } else {\n       process._eval = code;\n-      evalScript('[stdin]', wrapForBreakOnFirstLine(process._eval));\n+      const { evalScript } = NativeModule.require('internal/process/execution');\n+      evalScript('[stdin]', process._eval, process._breakFirstLine);\n     }\n   });\n }\n@@ -656,95 +668,6 @@ function setupDOMException() {\n   registerDOMException(DOMException);\n }\n \n-function noop() {}\n-\n-function setupProcessFatal() {\n-  const {\n-    executionAsyncId,\n-    clearDefaultTriggerAsyncId,\n-    clearAsyncIdStack,\n-    hasAsyncIdStack,\n-    afterHooksExist,\n-    emitAfter\n-  } = NativeModule.require('internal/async_hooks');\n-\n-  process._fatalException = (er) => {\n-    // It's possible that defaultTriggerAsyncId was set for a constructor\n-    // call that threw and was never cleared. So clear it now.\n-    clearDefaultTriggerAsyncId();\n-\n-    if (exceptionHandlerState.captureFn !== null) {\n-      exceptionHandlerState.captureFn(er);\n-    } else if (!process.emit('uncaughtException', er)) {\n-      // If someone handled it, then great.  otherwise, die in C++ land\n-      // since that means that we'll exit the process, emit the 'exit' event.\n-      try {\n-        if (!process._exiting) {\n-          process._exiting = true;\n-          process.exitCode = 1;\n-          process.emit('exit', 1);\n-        }\n-      } catch {\n-        // Nothing to be done about it at this point.\n-      }\n-      try {\n-        const { kExpandStackSymbol } = NativeModule.require('internal/util');\n-        if (typeof er[kExpandStackSymbol] === 'function')\n-          er[kExpandStackSymbol]();\n-      } catch {\n-        // Nothing to be done about it at this point.\n-      }\n-      return false;\n-    }\n-\n-    // If we handled an error, then make sure any ticks get processed\n-    // by ensuring that the next Immediate cycle isn't empty.\n-    NativeModule.require('timers').setImmediate(noop);\n-\n-    // Emit the after() hooks now that the exception has been handled.\n-    if (afterHooksExist()) {\n-      do {\n-        emitAfter(executionAsyncId());\n-      } while (hasAsyncIdStack());\n-    // Or completely empty the id stack.\n-    } else {\n-      clearAsyncIdStack();\n-    }\n-\n-    return true;\n-  };\n-}\n-\n-function wrapForBreakOnFirstLine(source) {\n-  if (!process._breakFirstLine)\n-    return source;\n-  const fn = `function() {\\n\\n${source};\\n\\n}`;\n-  return `process.binding('inspector').callAndPauseOnStart(${fn}, {})`;\n-}\n-\n-function evalScript(name, body) {\n-  const CJSModule = NativeModule.require('internal/modules/cjs/loader');\n-  const path = NativeModule.require('path');\n-  const { tryGetCwd } = NativeModule.require('internal/util');\n-  const cwd = tryGetCwd(path);\n-\n-  const module = new CJSModule(name);\n-  module.filename = path.join(cwd, name);\n-  module.paths = CJSModule._nodeModulePaths(cwd);\n-  const script = `global.__filename = ${JSON.stringify(name)};\\n` +\n-                  'global.exports = exports;\\n' +\n-                  'global.module = module;\\n' +\n-                  'global.__dirname = __dirname;\\n' +\n-                  'global.require = require;\\n' +\n-                  'return require(\"vm\").runInThisContext(' +\n-                  `${JSON.stringify(body)}, { filename: ` +\n-                  `${JSON.stringify(name)}, displayErrors: true });\\n`;\n-  const result = module._compile(script, `${name}-wrapper`);\n-  if (getOptionValue('--print')) console.log(result);\n-  // Handle any nextTicks added in the first tick of the program.\n-  process._tickCallback();\n-}\n-\n function checkScriptSyntax(source, filename) {\n   const CJSModule = NativeModule.require('internal/modules/cjs/loader');\n   const vm = NativeModule.require('vm');"
+        },
+        {
+            "sha": "3dbc68a193db533096bd1016f72f79feabc46aae",
+            "filename": "lib/internal/console/inspector.js",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 3,
+            "changes": 5,
+            "blob_url": "https://github.com/nodejs/node/blob/7163fbf066fe3e84a2203c01a385df1765d53ab6/lib%2Finternal%2Fconsole%2Finspector.js",
+            "raw_url": "https://github.com/nodejs/node/raw/7163fbf066fe3e84a2203c01a385df1765d53ab6/lib%2Finternal%2Fconsole%2Finspector.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fconsole%2Finspector.js?ref=7163fbf066fe3e84a2203c01a385df1765d53ab6",
+            "patch": "@@ -1,15 +1,14 @@\n 'use strict';\n \n-const path = require('path');\n const CJSModule = require('internal/modules/cjs/loader');\n const { makeRequireFunction } = require('internal/modules/cjs/helpers');\n-const { tryGetCwd } = require('internal/util');\n+const { tryGetCwd } = require('internal/process/execution');\n const { addCommandLineAPI, consoleCall } = internalBinding('inspector');\n \n // Wrap a console implemented by Node.js with features from the VM inspector\n function addInspectorApis(consoleFromNode, consoleFromVM) {\n   // Setup inspector command line API.\n-  const cwd = tryGetCwd(path);\n+  const cwd = tryGetCwd();\n   const consoleAPIModule = new CJSModule('<inspector console>');\n   consoleAPIModule.paths =\n       CJSModule._nodeModulePaths(cwd).concat(CJSModule.globalPaths);"
+        },
+        {
+            "sha": "607829544a91154c64d38d3640c95b413c818e69",
+            "filename": "lib/internal/process/execution.js",
+            "status": "added",
+            "additions": 149,
+            "deletions": 0,
+            "changes": 149,
+            "blob_url": "https://github.com/nodejs/node/blob/7163fbf066fe3e84a2203c01a385df1765d53ab6/lib%2Finternal%2Fprocess%2Fexecution.js",
+            "raw_url": "https://github.com/nodejs/node/raw/7163fbf066fe3e84a2203c01a385df1765d53ab6/lib%2Finternal%2Fprocess%2Fexecution.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fprocess%2Fexecution.js?ref=7163fbf066fe3e84a2203c01a385df1765d53ab6",
+            "patch": "@@ -0,0 +1,149 @@\n+'use strict';\n+\n+const path = require('path');\n+\n+const {\n+  codes: {\n+    ERR_INVALID_ARG_TYPE,\n+    ERR_UNCAUGHT_EXCEPTION_CAPTURE_ALREADY_SET\n+  }\n+} = require('internal/errors');\n+\n+const {\n+  executionAsyncId,\n+  clearDefaultTriggerAsyncId,\n+  clearAsyncIdStack,\n+  hasAsyncIdStack,\n+  afterHooksExist,\n+  emitAfter\n+} = require('internal/async_hooks');\n+\n+// shouldAbortOnUncaughtToggle is a typed array for faster\n+// communication with JS.\n+const { shouldAbortOnUncaughtToggle } = internalBinding('util');\n+\n+function tryGetCwd() {\n+  try {\n+    return process.cwd();\n+  } catch {\n+    // getcwd(3) can fail if the current working directory has been deleted.\n+    // Fall back to the directory name of the (absolute) executable path.\n+    // It's not really correct but what are the alternatives?\n+    return path.dirname(process.execPath);\n+  }\n+}\n+\n+function evalScript(name, body, breakFristLine) {\n+  const CJSModule = require('internal/modules/cjs/loader');\n+  if (breakFristLine) {\n+    const fn = `function() {\\n\\n${body};\\n\\n}`;\n+    body = `process.binding('inspector').callAndPauseOnStart(${fn}, {})`;\n+  }\n+\n+  const cwd = tryGetCwd();\n+\n+  const module = new CJSModule(name);\n+  module.filename = path.join(cwd, name);\n+  module.paths = CJSModule._nodeModulePaths(cwd);\n+  const script = `global.__filename = ${JSON.stringify(name)};\\n` +\n+                  'global.exports = exports;\\n' +\n+                  'global.module = module;\\n' +\n+                  'global.__dirname = __dirname;\\n' +\n+                  'global.require = require;\\n' +\n+                  'return require(\"vm\").runInThisContext(' +\n+                  `${JSON.stringify(body)}, { filename: ` +\n+                  `${JSON.stringify(name)}, displayErrors: true });\\n`;\n+  const result = module._compile(script, `${name}-wrapper`);\n+  if (require('internal/options').getOptionValue('--print')) {\n+    console.log(result);\n+  }\n+  // Handle any nextTicks added in the first tick of the program.\n+  process._tickCallback();\n+}\n+\n+const exceptionHandlerState = { captureFn: null };\n+\n+function setUncaughtExceptionCaptureCallback(fn) {\n+  if (fn === null) {\n+    exceptionHandlerState.captureFn = fn;\n+    shouldAbortOnUncaughtToggle[0] = 1;\n+    return;\n+  }\n+  if (typeof fn !== 'function') {\n+    throw new ERR_INVALID_ARG_TYPE('fn', ['Function', 'null'], fn);\n+  }\n+  if (exceptionHandlerState.captureFn !== null) {\n+    throw new ERR_UNCAUGHT_EXCEPTION_CAPTURE_ALREADY_SET();\n+  }\n+  exceptionHandlerState.captureFn = fn;\n+  shouldAbortOnUncaughtToggle[0] = 0;\n+}\n+\n+function hasUncaughtExceptionCaptureCallback() {\n+  return exceptionHandlerState.captureFn !== null;\n+}\n+\n+function noop() {}\n+\n+// XXX(joyeecheung): for some reason this cannot be defined at the top-level\n+// and exported to be written to process._fatalException, it has to be\n+// returned as an *anonymous function* wrapped inside a factory function,\n+// otherwise it breaks the test-timers.setInterval async hooks test -\n+// this may indicate that node::FatalException should fix up the callback scope\n+// before calling into process._fatalException, or this function should\n+// take extra care of the async hooks before it schedules a setImmediate.\n+function createFatalException() {\n+  return (er) => {\n+    // It's possible that defaultTriggerAsyncId was set for a constructor\n+    // call that threw and was never cleared. So clear it now.\n+    clearDefaultTriggerAsyncId();\n+\n+    if (exceptionHandlerState.captureFn !== null) {\n+      exceptionHandlerState.captureFn(er);\n+    } else if (!process.emit('uncaughtException', er)) {\n+      // If someone handled it, then great.  otherwise, die in C++ land\n+      // since that means that we'll exit the process, emit the 'exit' event.\n+      try {\n+        if (!process._exiting) {\n+          process._exiting = true;\n+          process.exitCode = 1;\n+          process.emit('exit', 1);\n+        }\n+      } catch {\n+        // Nothing to be done about it at this point.\n+      }\n+      try {\n+        const { kExpandStackSymbol } = require('internal/util');\n+        if (typeof er[kExpandStackSymbol] === 'function')\n+          er[kExpandStackSymbol]();\n+      } catch {\n+        // Nothing to be done about it at this point.\n+      }\n+      return false;\n+    }\n+\n+    // If we handled an error, then make sure any ticks get processed\n+    // by ensuring that the next Immediate cycle isn't empty.\n+    require('timers').setImmediate(noop);\n+\n+    // Emit the after() hooks now that the exception has been handled.\n+    if (afterHooksExist()) {\n+      do {\n+        emitAfter(executionAsyncId());\n+      } while (hasAsyncIdStack());\n+    // Or completely empty the id stack.\n+    } else {\n+      clearAsyncIdStack();\n+    }\n+\n+    return true;\n+  };\n+}\n+\n+module.exports = {\n+  tryGetCwd,\n+  evalScript,\n+  fatalException: createFatalException(),\n+  setUncaughtExceptionCaptureCallback,\n+  hasUncaughtExceptionCaptureCallback\n+};"
+        },
+        {
+            "sha": "efa736fa6193871b7901443a024a5126ff484701",
+            "filename": "lib/internal/process/per_thread.js",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 28,
+            "changes": 30,
+            "blob_url": "https://github.com/nodejs/node/blob/7163fbf066fe3e84a2203c01a385df1765d53ab6/lib%2Finternal%2Fprocess%2Fper_thread.js",
+            "raw_url": "https://github.com/nodejs/node/raw/7163fbf066fe3e84a2203c01a385df1765d53ab6/lib%2Finternal%2Fprocess%2Fper_thread.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fprocess%2Fper_thread.js?ref=7163fbf066fe3e84a2203c01a385df1765d53ab6",
+            "patch": "@@ -12,7 +12,6 @@ const {\n     ERR_INVALID_ARG_TYPE,\n     ERR_INVALID_OPT_VALUE,\n     ERR_OUT_OF_RANGE,\n-    ERR_UNCAUGHT_EXCEPTION_CAPTURE_ALREADY_SET,\n     ERR_UNKNOWN_SIGNAL\n   }\n } = require('internal/errors');\n@@ -24,7 +23,7 @@ function assert(x, msg) {\n }\n \n // The execution of this function itself should not cause any side effects.\n-function wrapProcessMethods(binding, exceptionHandlerState) {\n+function wrapProcessMethods(binding) {\n   const {\n     hrtime: _hrtime,\n     hrtimeBigInt: _hrtimeBigInt,\n@@ -185,29 +184,6 @@ function wrapProcessMethods(binding, exceptionHandlerState) {\n     return true;\n   }\n \n-  // shouldAbortOnUncaughtToggle is a typed array for faster\n-  // communication with JS.\n-  const { shouldAbortOnUncaughtToggle } = binding;\n-\n-  function setUncaughtExceptionCaptureCallback(fn) {\n-    if (fn === null) {\n-      exceptionHandlerState.captureFn = fn;\n-      shouldAbortOnUncaughtToggle[0] = 1;\n-      return;\n-    }\n-    if (typeof fn !== 'function') {\n-      throw new ERR_INVALID_ARG_TYPE('fn', ['Function', 'null'], fn);\n-    }\n-    if (exceptionHandlerState.captureFn !== null) {\n-      throw new ERR_UNCAUGHT_EXCEPTION_CAPTURE_ALREADY_SET();\n-    }\n-    exceptionHandlerState.captureFn = fn;\n-    shouldAbortOnUncaughtToggle[0] = 0;\n-  }\n-\n-  function hasUncaughtExceptionCaptureCallback() {\n-    return exceptionHandlerState.captureFn !== null;\n-  }\n \n   return {\n     _rawDebug,\n@@ -216,9 +192,7 @@ function wrapProcessMethods(binding, exceptionHandlerState) {\n     cpuUsage,\n     memoryUsage,\n     kill,\n-    exit,\n-    setUncaughtExceptionCaptureCallback,\n-    hasUncaughtExceptionCaptureCallback\n+    exit\n   };\n }\n "
+        },
+        {
+            "sha": "81bc78bb94185e68b69e3f4abddf2d2ed20cdc48",
+            "filename": "lib/internal/util.js",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 12,
+            "changes": 12,
+            "blob_url": "https://github.com/nodejs/node/blob/7163fbf066fe3e84a2203c01a385df1765d53ab6/lib%2Finternal%2Futil.js",
+            "raw_url": "https://github.com/nodejs/node/raw/7163fbf066fe3e84a2203c01a385df1765d53ab6/lib%2Finternal%2Futil.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Futil.js?ref=7163fbf066fe3e84a2203c01a385df1765d53ab6",
+            "patch": "@@ -387,17 +387,6 @@ function once(callback) {\n   };\n }\n \n-function tryGetCwd(path) {\n-  try {\n-    return process.cwd();\n-  } catch {\n-    // getcwd(3) can fail if the current working directory has been deleted.\n-    // Fall back to the directory name of the (absolute) executable path.\n-    // It's not really correct but what are the alternatives?\n-    return path.dirname(process.execPath);\n-  }\n-}\n-\n module.exports = {\n   assertCrypto,\n   cachedResult,\n@@ -417,7 +406,6 @@ module.exports = {\n   once,\n   promisify,\n   spliceOne,\n-  tryGetCwd,\n   removeColors,\n \n   // Symbol used to customize promisify conversion"
+        },
+        {
+            "sha": "c079afbeb1928c8836bcecb2e15e72e5e31c839d",
+            "filename": "lib/internal/worker.js",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/nodejs/node/blob/7163fbf066fe3e84a2203c01a385df1765d53ab6/lib%2Finternal%2Fworker.js",
+            "raw_url": "https://github.com/nodejs/node/raw/7163fbf066fe3e84a2203c01a385df1765d53ab6/lib%2Finternal%2Fworker.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fworker.js?ref=7163fbf066fe3e84a2203c01a385df1765d53ab6",
+            "patch": "@@ -432,7 +432,7 @@ if (!isMainThread) {\n \n let originalFatalException;\n \n-function setupChild(evalScript) {\n+function setupChild() {\n   // Called during bootstrap to set up worker script execution.\n   debug(`[${threadId}] is setting up worker child environment`);\n   const port = getEnvMessagePort();\n@@ -453,6 +453,7 @@ function setupChild(evalScript) {\n       port.unref();\n       port.postMessage({ type: messageTypes.UP_AND_RUNNING });\n       if (doEval) {\n+        const { evalScript } = require('internal/process/execution');\n         evalScript('[worker eval]', filename);\n       } else {\n         process.argv[1] = filename; // script filename"
+        },
+        {
+            "sha": "8db51f68572fd6a9e09a060d4e3a069bc5faec3c",
+            "filename": "node.gyp",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/7163fbf066fe3e84a2203c01a385df1765d53ab6/node.gyp",
+            "raw_url": "https://github.com/nodejs/node/raw/7163fbf066fe3e84a2203c01a385df1765d53ab6/node.gyp",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/node.gyp?ref=7163fbf066fe3e84a2203c01a385df1765d53ab6",
+            "patch": "@@ -142,6 +142,7 @@\n       'lib/internal/print_help.js',\n       'lib/internal/priority_queue.js',\n       'lib/internal/process/esm_loader.js',\n+      'lib/internal/process/execution.js',\n       'lib/internal/process/main_thread_only.js',\n       'lib/internal/process/next_tick.js',\n       'lib/internal/process/per_thread.js',"
+        },
+        {
+            "sha": "867d08916a258bbd0370a335d529f0de9ba20808",
+            "filename": "src/node_process.cc",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 8,
+            "changes": 8,
+            "blob_url": "https://github.com/nodejs/node/blob/7163fbf066fe3e84a2203c01a385df1765d53ab6/src%2Fnode_process.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/7163fbf066fe3e84a2203c01a385df1765d53ab6/src%2Fnode_process.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_process.cc?ref=7163fbf066fe3e84a2203c01a385df1765d53ab6",
+            "patch": "@@ -458,14 +458,6 @@ static void InitializeProcessMethods(Local<Object> target,\n   env->SetMethod(target, \"dlopen\", binding::DLOpen);\n   env->SetMethod(target, \"reallyExit\", Exit);\n   env->SetMethodNoSideEffect(target, \"uptime\", Uptime);\n-\n-  Local<String> should_abort_on_uncaught_toggle =\n-      FIXED_ONE_BYTE_STRING(env->isolate(), \"shouldAbortOnUncaughtToggle\");\n-  CHECK(target\n-            ->Set(env->context(),\n-                  should_abort_on_uncaught_toggle,\n-                  env->should_abort_on_uncaught_toggle().GetJSArray())\n-            .FromJust());\n }\n \n }  // namespace node"
+        },
+        {
+            "sha": "ba81d9d6e7f7638afff1b1b20a447aadc7153c61",
+            "filename": "src/node_util.cc",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 0,
+            "changes": 8,
+            "blob_url": "https://github.com/nodejs/node/blob/7163fbf066fe3e84a2203c01a385df1765d53ab6/src%2Fnode_util.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/7163fbf066fe3e84a2203c01a385df1765d53ab6/src%2Fnode_util.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_util.cc?ref=7163fbf066fe3e84a2203c01a385df1765d53ab6",
+            "patch": "@@ -233,6 +233,14 @@ void Initialize(Local<Object> target,\n   target->Set(context,\n               FIXED_ONE_BYTE_STRING(env->isolate(), \"propertyFilter\"),\n               constants).FromJust();\n+\n+  Local<String> should_abort_on_uncaught_toggle =\n+      FIXED_ONE_BYTE_STRING(env->isolate(), \"shouldAbortOnUncaughtToggle\");\n+  CHECK(target\n+            ->Set(env->context(),\n+                  should_abort_on_uncaught_toggle,\n+                  env->should_abort_on_uncaught_toggle().GetJSArray())\n+            .FromJust());\n }\n \n }  // namespace util"
+        },
+        {
+            "sha": "6bfca9ea32d044cbb6a834aecac4e8631091f65f",
+            "filename": "test/message/eval_messages.out",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 4,
+            "changes": 8,
+            "blob_url": "https://github.com/nodejs/node/blob/7163fbf066fe3e84a2203c01a385df1765d53ab6/test%2Fmessage%2Feval_messages.out",
+            "raw_url": "https://github.com/nodejs/node/raw/7163fbf066fe3e84a2203c01a385df1765d53ab6/test%2Fmessage%2Feval_messages.out",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fmessage%2Feval_messages.out?ref=7163fbf066fe3e84a2203c01a385df1765d53ab6",
+            "patch": "@@ -8,7 +8,7 @@ SyntaxError: Strict mode code may not include a with statement\n     at Object.runInThisContext (vm.js:*:*)\n     at Object.<anonymous> ([eval]-wrapper:*:*)\n     at Module._compile (internal/modules/cjs/loader.js:*:*)\n-    at evalScript (internal/bootstrap/node.js:*:*)\n+    at evalScript (internal/process/execution.js:*:*)\n     at executeUserCode (internal/bootstrap/node.js:*:*)\n     at startExecution (internal/bootstrap/node.js:*:*)\n     at startup (internal/bootstrap/node.js:*:*)\n@@ -25,7 +25,7 @@ Error: hello\n     at Object.runInThisContext (vm.js:*:*)\n     at Object.<anonymous> ([eval]-wrapper:*:*)\n     at Module._compile (internal/modules/cjs/loader.js:*:*)\n-    at evalScript (internal/bootstrap/node.js:*:*)\n+    at evalScript (internal/process/execution.js:*:*)\n     at executeUserCode (internal/bootstrap/node.js:*:*)\n     at startExecution (internal/bootstrap/node.js:*:*)\n     at startup (internal/bootstrap/node.js:*:*)\n@@ -41,7 +41,7 @@ Error: hello\n     at Object.runInThisContext (vm.js:*:*)\n     at Object.<anonymous> ([eval]-wrapper:*:*)\n     at Module._compile (internal/modules/cjs/loader.js:*:*)\n-    at evalScript (internal/bootstrap/node.js:*:*)\n+    at evalScript (internal/process/execution.js:*:*)\n     at executeUserCode (internal/bootstrap/node.js:*:*)\n     at startExecution (internal/bootstrap/node.js:*:*)\n     at startup (internal/bootstrap/node.js:*:*)\n@@ -57,7 +57,7 @@ ReferenceError: y is not defined\n     at Object.runInThisContext (vm.js:*:*)\n     at Object.<anonymous> ([eval]-wrapper:*:*)\n     at Module._compile (internal/modules/cjs/loader.js:*:*)\n-    at evalScript (internal/bootstrap/node.js:*:*)\n+    at evalScript (internal/process/execution.js:*:*)\n     at executeUserCode (internal/bootstrap/node.js:*:*)\n     at startExecution (internal/bootstrap/node.js:*:*)\n     at startup (internal/bootstrap/node.js:*:*)"
+        },
+        {
+            "sha": "ac1a4df02816df73972f599a027154f2b15107b3",
+            "filename": "test/message/stdin_messages.out",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 4,
+            "changes": 8,
+            "blob_url": "https://github.com/nodejs/node/blob/7163fbf066fe3e84a2203c01a385df1765d53ab6/test%2Fmessage%2Fstdin_messages.out",
+            "raw_url": "https://github.com/nodejs/node/raw/7163fbf066fe3e84a2203c01a385df1765d53ab6/test%2Fmessage%2Fstdin_messages.out",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fmessage%2Fstdin_messages.out?ref=7163fbf066fe3e84a2203c01a385df1765d53ab6",
+            "patch": "@@ -8,7 +8,7 @@ SyntaxError: Strict mode code may not include a with statement\n     at Object.runInThisContext (vm.js:*)\n     at Object.<anonymous> ([stdin]-wrapper:*:*)\n     at Module._compile (internal/modules/cjs/loader.js:*:*)\n-    at evalScript (internal/bootstrap/node.js:*:*)\n+    at evalScript (internal/process/execution.js:*:*)\n     at Socket.process.stdin.on (internal/bootstrap/node.js:*:*)\n     at Socket.emit (events.js:*:*)\n     at endReadableNT (_stream_readable.js:*:*)\n@@ -25,7 +25,7 @@ Error: hello\n     at Object.runInThisContext (vm.js:*)\n     at Object.<anonymous> ([stdin]-wrapper:*:*)\n     at Module._compile (internal/modules/cjs/loader.js:*:*)\n-    at evalScript (internal/bootstrap/node.js:*:*)\n+    at evalScript (internal/process/execution.js:*:*)\n     at Socket.process.stdin.on (internal/bootstrap/node.js:*:*)\n     at Socket.emit (events.js:*:*)\n     at endReadableNT (_stream_readable.js:*:*)\n@@ -40,7 +40,7 @@ Error: hello\n     at Object.runInThisContext (vm.js:*)\n     at Object.<anonymous> ([stdin]-wrapper:*:*)\n     at Module._compile (internal/modules/cjs/loader.js:*:*)\n-    at evalScript (internal/bootstrap/node.js:*:*)\n+    at evalScript (internal/process/execution.js:*:*)\n     at Socket.process.stdin.on (internal/bootstrap/node.js:*:*)\n     at Socket.emit (events.js:*:*)\n     at endReadableNT (_stream_readable.js:*:*)\n@@ -56,7 +56,7 @@ ReferenceError: y is not defined\n     at Object.runInThisContext (vm.js:*)\n     at Object.<anonymous> ([stdin]-wrapper:*:*)\n     at Module._compile (internal/modules/cjs/loader.js:*:*)\n-    at evalScript (internal/bootstrap/node.js:*:*)\n+    at evalScript (internal/process/execution.js:*:*)\n     at Socket.process.stdin.on (internal/bootstrap/node.js:*:*)\n     at Socket.emit (events.js:*:*)\n     at endReadableNT (_stream_readable.js:*:*)"
+        },
+        {
+            "sha": "1fa5a643f6e308ffdcb88fda98c70e0a896c88ea",
+            "filename": "test/parallel/test-bootstrap-modules.js",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/7163fbf066fe3e84a2203c01a385df1765d53ab6/test%2Fparallel%2Ftest-bootstrap-modules.js",
+            "raw_url": "https://github.com/nodejs/node/raw/7163fbf066fe3e84a2203c01a385df1765d53ab6/test%2Fparallel%2Ftest-bootstrap-modules.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-bootstrap-modules.js?ref=7163fbf066fe3e84a2203c01a385df1765d53ab6",
+            "patch": "@@ -9,7 +9,7 @@ const common = require('../common');\n const assert = require('assert');\n \n const isMainThread = common.isMainThread;\n-const kMaxModuleCount = isMainThread ? 62 : 84;\n+const kMaxModuleCount = isMainThread ? 63 : 85;\n \n assert(list.length <= kMaxModuleCount,\n        `Total length: ${list.length}\\n` + list.join('\\n')"
+        }
+    ],
+    "stats": {
+        "total": 363,
+        "additions": 199,
+        "deletions": 164
+    }
+}

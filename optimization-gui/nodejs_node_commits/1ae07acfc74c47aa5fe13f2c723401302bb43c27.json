@@ -1,0 +1,24 @@
+{
+    "author": "addaleax",
+    "message": "inspector: make sure timer handles are cleaned up\n\nIt is not obvious that timer handles are cleaned up properly\nwhen the current `Environment` exits, nor that the `Environment`\nknows to keep track of the closing handles.\n\nThis change may not be necessary, because timer handles\nclose without non-trivial delay (i.e. at the end of the current\nevent loop term), and JS-based inspector sessions (which are\nthe only ones we can easily test) are destroyed when cleaning up,\nclosing the timers as a result. I don’t know what happens\nfor other kinds of inspector sessions, though.\n\nPR-URL: https://github.com/nodejs/node/pull/26088\nReviewed-By: Eugene Ostroukhov <eostroukhov@google.com>\nReviewed-By: Daniel Bevenius <daniel.bevenius@gmail.com>\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Jeremiah Senkpiel <fishrock123@rocketmail.com>",
+    "sha": "1ae07acfc74c47aa5fe13f2c723401302bb43c27",
+    "files": [
+        {
+            "sha": "ef5646eb56695f53f1ab46cf3919aebd2fe01a96",
+            "filename": "src/inspector_agent.cc",
+            "status": "modified",
+            "additions": 21,
+            "deletions": 8,
+            "changes": 29,
+            "blob_url": "https://github.com/nodejs/node/blob/1ae07acfc74c47aa5fe13f2c723401302bb43c27/src%2Finspector_agent.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/1ae07acfc74c47aa5fe13f2c723401302bb43c27/src%2Finspector_agent.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Finspector_agent.cc?ref=1ae07acfc74c47aa5fe13f2c723401302bb43c27",
+            "patch": "@@ -301,22 +301,30 @@ class ChannelImpl final : public v8_inspector::V8Inspector::Channel,\n \n class InspectorTimer {\n  public:\n-  InspectorTimer(uv_loop_t* loop,\n+  InspectorTimer(Environment* env,\n                  double interval_s,\n                  V8InspectorClient::TimerCallback callback,\n-                 void* data) : timer_(),\n+                 void* data) : env_(env),\n                                callback_(callback),\n                                data_(data) {\n-    uv_timer_init(loop, &timer_);\n+    uv_timer_init(env->event_loop(), &timer_);\n     int64_t interval_ms = 1000 * interval_s;\n     uv_timer_start(&timer_, OnTimer, interval_ms, interval_ms);\n+    timer_.data = this;\n+\n+    env->AddCleanupHook(CleanupHook, this);\n   }\n \n   InspectorTimer(const InspectorTimer&) = delete;\n \n   void Stop() {\n-    uv_timer_stop(&timer_);\n-    uv_close(reinterpret_cast<uv_handle_t*>(&timer_), TimerClosedCb);\n+    env_->RemoveCleanupHook(CleanupHook, this);\n+\n+    if (timer_.data == this) {\n+      timer_.data = nullptr;\n+      uv_timer_stop(&timer_);\n+      env_->CloseHandle(reinterpret_cast<uv_handle_t*>(&timer_), TimerClosedCb);\n+    }\n   }\n \n  private:\n@@ -325,6 +333,10 @@ class InspectorTimer {\n     timer->callback_(timer->data_);\n   }\n \n+  static void CleanupHook(void* data) {\n+    static_cast<InspectorTimer*>(data)->Stop();\n+  }\n+\n   static void TimerClosedCb(uv_handle_t* uvtimer) {\n     std::unique_ptr<InspectorTimer> timer(\n         node::ContainerOf(&InspectorTimer::timer_,\n@@ -334,6 +346,7 @@ class InspectorTimer {\n \n   ~InspectorTimer() {}\n \n+  Environment* env_;\n   uv_timer_t timer_;\n   V8InspectorClient::TimerCallback callback_;\n   void* data_;\n@@ -343,9 +356,9 @@ class InspectorTimer {\n \n class InspectorTimerHandle {\n  public:\n-  InspectorTimerHandle(uv_loop_t* loop, double interval_s,\n+  InspectorTimerHandle(Environment* env, double interval_s,\n                        V8InspectorClient::TimerCallback callback, void* data) {\n-    timer_ = new InspectorTimer(loop, interval_s, callback, data);\n+    timer_ = new InspectorTimer(env, interval_s, callback, data);\n   }\n \n   InspectorTimerHandle(const InspectorTimerHandle&) = delete;\n@@ -540,7 +553,7 @@ class NodeInspectorClient : public V8InspectorClient {\n                            TimerCallback callback,\n                            void* data) override {\n     timers_.emplace(std::piecewise_construct, std::make_tuple(data),\n-                    std::make_tuple(env_->event_loop(), interval_s, callback,\n+                    std::make_tuple(env_, interval_s, callback,\n                                     data));\n   }\n "
+        }
+    ],
+    "stats": {
+        "total": 29,
+        "additions": 21,
+        "deletions": 8
+    }
+}

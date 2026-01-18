@@ -1,0 +1,48 @@
+{
+    "author": "akaariai",
+    "message": "Fixed qs.order_by() join promotion for already existing joins\n\nWhen order_by causes new joins to be added to the query, the joins must\nbe LEFT OUTER joins for nullable relations, otherwise the order_by\ncould cause the results to be altered. This commit fixes the logic to\nonly promote new joins, previously all joins in the order_by lookup\npath were promoted.\n\nThanks to Bruno Desthuilliers for spotting this corner case.",
+    "sha": "8c72aa237918e31a525022f72b22cac75451af86",
+    "files": [
+        {
+            "sha": "5801b2f42804732703ad2fcbd183d98b8431fd75",
+            "filename": "django/db/models/sql/compiler.py",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 2,
+            "changes": 8,
+            "blob_url": "https://github.com/django/django/blob/8c72aa237918e31a525022f72b22cac75451af86/django%2Fdb%2Fmodels%2Fsql%2Fcompiler.py",
+            "raw_url": "https://github.com/django/django/raw/8c72aa237918e31a525022f72b22cac75451af86/django%2Fdb%2Fmodels%2Fsql%2Fcompiler.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fmodels%2Fsql%2Fcompiler.py?ref=8c72aa237918e31a525022f72b22cac75451af86",
+            "patch": "@@ -455,6 +455,9 @@ def _setup_joins(self, pieces, opts, alias):\n             alias = self.query.get_initial_alias()\n         field, target, opts, joins, _, _ = self.query.setup_joins(pieces,\n                 opts, alias, False)\n+        # We will later on need to promote those joins that were added to the\n+        # query afresh above.\n+        joins_to_promote = [j for j in joins if self.query.alias_refcount[j] < 2]\n         alias = joins[-1]\n         col = target.column\n         if not field.rel:\n@@ -466,8 +469,9 @@ def _setup_joins(self, pieces, opts, alias):\n         # Must use left outer joins for nullable fields and their relations.\n         # Ordering or distinct must not affect the returned set, and INNER\n         # JOINS for nullable fields could do this.\n-        self.query.promote_alias_chain(joins,\n-            self.query.alias_map[joins[0]].join_type == self.query.LOUTER)\n+        if joins_to_promote:\n+            self.query.promote_alias_chain(joins_to_promote,\n+                self.query.alias_map[joins_to_promote[0]].join_type == self.query.LOUTER)\n         return field, col, alias, joins, opts\n \n     def _final_join_removal(self, col, alias):"
+        },
+        {
+            "sha": "e4ce9d7b60c49d1bb96c56869f7709496685bfd2",
+            "filename": "tests/regressiontests/queries/models.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/django/django/blob/8c72aa237918e31a525022f72b22cac75451af86/tests%2Fregressiontests%2Fqueries%2Fmodels.py",
+            "raw_url": "https://github.com/django/django/raw/8c72aa237918e31a525022f72b22cac75451af86/tests%2Fregressiontests%2Fqueries%2Fmodels.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fqueries%2Fmodels.py?ref=8c72aa237918e31a525022f72b22cac75451af86",
+            "patch": "@@ -264,7 +264,7 @@ def __unicode__(self):\n         return self.name\n \n class RelatedObject(models.Model):\n-    single = models.ForeignKey(SingleObject)\n+    single = models.ForeignKey(SingleObject, null=True)\n \n     class Meta:\n         ordering = ['single']"
+        },
+        {
+            "sha": "28aa63328eabc731a8520b2c2b12da8d6ef1e496",
+            "filename": "tests/regressiontests/queries/tests.py",
+            "status": "modified",
+            "additions": 24,
+            "deletions": 2,
+            "changes": 26,
+            "blob_url": "https://github.com/django/django/blob/8c72aa237918e31a525022f72b22cac75451af86/tests%2Fregressiontests%2Fqueries%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/8c72aa237918e31a525022f72b22cac75451af86/tests%2Fregressiontests%2Fqueries%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fqueries%2Ftests.py?ref=8c72aa237918e31a525022f72b22cac75451af86",
+            "patch": "@@ -19,7 +19,8 @@\n     ManagedModel, Member, NamedCategory, Note, Number, Plaything, PointerA,\n     Ranking, Related, Report, ReservedName, Tag, TvChef, Valid, X, Food, Eaten,\n     Node, ObjectA, ObjectB, ObjectC, CategoryItem, SimpleCategory,\n-    SpecialCategory, OneToOneCategory, NullableName, ProxyCategory)\n+    SpecialCategory, OneToOneCategory, NullableName, ProxyCategory,\n+    SingleObject, RelatedObject)\n \n \n class BaseQuerysetTest(TestCase):\n@@ -1321,12 +1322,33 @@ class NullableRelOrderingTests(TestCase):\n     def test_ticket10028(self):\n         # Ordering by model related to nullable relations(!) should use outer\n         # joins, so that all results are included.\n-        _ = Plaything.objects.create(name=\"p1\")\n+        Plaything.objects.create(name=\"p1\")\n         self.assertQuerysetEqual(\n             Plaything.objects.all(),\n             ['<Plaything: p1>']\n         )\n \n+    def test_join_already_in_query(self):\n+        # Ordering by model related to nullable relations should not change\n+        # the join type of already existing joins.\n+        Plaything.objects.create(name=\"p1\")\n+        s = SingleObject.objects.create(name='s')\n+        r = RelatedObject.objects.create(single=s)\n+        Plaything.objects.create(name=\"p2\", others=r)\n+        qs = Plaything.objects.all().filter(others__isnull=False).order_by('pk')\n+        self.assertTrue('INNER' in str(qs.query))\n+        qs = qs.order_by('others__single__name')\n+        # The ordering by others__single__pk will add one new join (to single)\n+        # and that join must be LEFT join. The already existing join to related\n+        # objects must be kept INNER. So, we have both a INNER and a LEFT join\n+        # in the query.\n+        self.assertTrue('LEFT' in str(qs.query))\n+        self.assertTrue('INNER' in str(qs.query))\n+        self.assertQuerysetEqual(\n+            qs,\n+            ['<Plaything: p2>']\n+        )\n+\n \n class DisjunctiveFilterTests(TestCase):\n     def setUp(self):"
+        }
+    ],
+    "stats": {
+        "total": 36,
+        "additions": 31,
+        "deletions": 5
+    }
+}

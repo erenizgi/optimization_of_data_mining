@@ -1,0 +1,36 @@
+{
+    "author": "gireeshpunathil",
+    "message": "src: add GetLoadedLibraries routine\n\nAdd a static function GetLoadedLibraries under\nNativeSymbolDebuggingContext abstraction that provides a list of\nshared objects - either the current process depended on or loaded.\n\nPR-URL: https://github.com/nodejs/node/pull/24825\nReviewed-By: Anna Henningsen <anna@addaleax.net>\nReviewed-By: Ben Noordhuis <info@bnoordhuis.nl>\nReviewed-By: Joyee Cheung <joyeec9h3@gmail.com>",
+    "sha": "1c52dccc54da29fa787bafdc44986f1fadd1273f",
+    "files": [
+        {
+            "sha": "4f086106b66ca758e86029c8088ad587e9285fcb",
+            "filename": "src/debug_utils.cc",
+            "status": "modified",
+            "additions": 123,
+            "deletions": 0,
+            "changes": 123,
+            "blob_url": "https://github.com/nodejs/node/blob/1c52dccc54da29fa787bafdc44986f1fadd1273f/src%2Fdebug_utils.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/1c52dccc54da29fa787bafdc44986f1fadd1273f/src%2Fdebug_utils.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fdebug_utils.cc?ref=1c52dccc54da29fa787bafdc44986f1fadd1273f",
+            "patch": "@@ -30,6 +30,27 @@\n \n #endif  // __POSIX__\n \n+#if defined(__linux__) || defined(__sun)\n+#include <link.h>\n+#endif  // (__linux__) || defined(__sun)\n+\n+#ifdef __APPLE__\n+#include <mach-o/dyld.h>  // _dyld_get_image_name()\n+#endif                    // __APPLE__\n+\n+#ifdef _AIX\n+#include <sys/ldr.h>  // ld_info structure\n+#endif                // _AIX\n+\n+#ifdef _WIN32\n+#include <Lm.h>\n+#include <Windows.h>\n+#include <dbghelp.h>\n+#include <process.h>\n+#include <psapi.h>\n+#include <tchar.h>\n+#endif  // _WIN32\n+\n namespace node {\n \n #ifdef __POSIX__\n@@ -299,6 +320,108 @@ void CheckedUvLoopClose(uv_loop_t* loop) {\n   CHECK(0 && \"uv_loop_close() while having open handles\");\n }\n \n+std::vector<std::string> NativeSymbolDebuggingContext::GetLoadedLibraries() {\n+  std::vector<std::string> list;\n+#ifdef __linux__\n+  dl_iterate_phdr(\n+      [](struct dl_phdr_info* info, size_t size, void* data) {\n+        auto list = static_cast<std::vector<std::string>*>(data);\n+        if (*info->dlpi_name != '\\0') {\n+          list->push_back(info->dlpi_name);\n+        }\n+        return 0;\n+      },\n+      &list);\n+#elif __APPLE__\n+  uint32_t i = 0;\n+  for (const char* name = _dyld_get_image_name(i); name != nullptr;\n+       name = _dyld_get_image_name(++i)) {\n+    list.push_back(name);\n+  }\n+\n+#elif _AIX\n+  // We can't tell in advance how large the buffer needs to be.\n+  // Retry until we reach too large a size (1Mb).\n+  const unsigned int kBufferGrowStep = 4096;\n+  MallocedBuffer<char> buffer(kBufferGrowStep);\n+  int rc = -1;\n+  do {\n+    rc = loadquery(L_GETINFO, buffer.data, buffer.size);\n+    if (rc == 0) break;\n+    buffer = MallocedBuffer<char>(buffer.size + kBufferGrowStep);\n+  } while (buffer.size < 1024 * 1024);\n+\n+  if (rc == 0) {\n+    char* buf = buffer.data;\n+    ld_info* cur_info = nullptr;\n+    do {\n+      std::ostringstream str;\n+      cur_info = reinterpret_cast<ld_info*>(buf);\n+      char* member_name = cur_info->ldinfo_filename +\n+          strlen(cur_info->ldinfo_filename) + 1;\n+      if (*member_name != '\\0') {\n+        str << cur_info->ldinfo_filename << \"(\" << member_name << \")\";\n+        list.push_back(str.str());\n+        str.str(\"\");\n+      } else {\n+        list.push_back(cur_info->ldinfo_filename);\n+      }\n+      buf += cur_info->ldinfo_next;\n+    } while (cur_info->ldinfo_next != 0);\n+  }\n+#elif __sun\n+  Link_map* p;\n+\n+  if (dlinfo(RTLD_SELF, RTLD_DI_LINKMAP, &p) != -1) {\n+    for (Link_map* l = p; l != nullptr; l = l->l_next) {\n+      list.push_back(l->l_name);\n+    }\n+  }\n+\n+#elif _WIN32\n+  // Windows implementation - get a handle to the process.\n+  HANDLE process_handle = OpenProcess(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ,\n+                                      FALSE, GetCurrentProcessId());\n+  if (process_handle == nullptr) {\n+    // Cannot proceed, return an empty list.\n+    return list;\n+  }\n+  // Get a list of all the modules in this process\n+  DWORD size_1 = 0;\n+  DWORD size_2 = 0;\n+  // First call to get the size of module array needed\n+  if (EnumProcessModules(process_handle, nullptr, 0, &size_1)) {\n+    MallocedBuffer<HMODULE> modules(size_1);\n+\n+    // Second call to populate the module array\n+    if (EnumProcessModules(process_handle, modules.data, size_1, &size_2)) {\n+      for (DWORD i = 0;\n+           i < (size_1 / sizeof(HMODULE)) && i < (size_2 / sizeof(HMODULE));\n+           i++) {\n+        WCHAR module_name[MAX_PATH];\n+        // Obtain and report the full pathname for each module\n+        if (GetModuleFileNameExW(process_handle,\n+                                 modules.data[i],\n+                                 module_name,\n+                                 arraysize(module_name) / sizeof(WCHAR))) {\n+          DWORD size = WideCharToMultiByte(\n+              CP_UTF8, 0, module_name, -1, nullptr, 0, nullptr, nullptr);\n+          char* str = new char[size];\n+          WideCharToMultiByte(\n+              CP_UTF8, 0, module_name, -1, str, size, nullptr, nullptr);\n+          list.push_back(str);\n+        }\n+      }\n+    }\n+  }\n+\n+  // Release the handle to the process.\n+  CloseHandle(process_handle);\n+#endif\n+  return list;\n+}\n+\n+\n }  // namespace node\n \n extern \"C\" void __DumpBacktrace(FILE* fp) {"
+        },
+        {
+            "sha": "034d8a9ab331dcccce434ffdf0da50cdb45a4aad",
+            "filename": "src/debug_utils.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/1c52dccc54da29fa787bafdc44986f1fadd1273f/src%2Fdebug_utils.h",
+            "raw_url": "https://github.com/nodejs/node/raw/1c52dccc54da29fa787bafdc44986f1fadd1273f/src%2Fdebug_utils.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fdebug_utils.h?ref=1c52dccc54da29fa787bafdc44986f1fadd1273f",
+            "patch": "@@ -113,6 +113,7 @@ class NativeSymbolDebuggingContext {\n     = delete;\n   NativeSymbolDebuggingContext operator=(NativeSymbolDebuggingContext&&)\n     = delete;\n+  static std::vector<std::string> GetLoadedLibraries();\n };\n \n // Variant of `uv_loop_close` that tries to be as helpful as possible"
+        }
+    ],
+    "stats": {
+        "total": 124,
+        "additions": 124,
+        "deletions": 0
+    }
+}

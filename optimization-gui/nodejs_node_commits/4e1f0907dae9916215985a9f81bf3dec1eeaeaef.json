@@ -1,0 +1,60 @@
+{
+    "author": "targos",
+    "message": "inspector: migrate errors from C++ to JS\n\nAssign a code to a user-facing error.\nTurn other internal-only errors to checks.\n\nPR-URL: https://github.com/nodejs/node/pull/19387\nReviewed-By: Franziska Hinkelmann <franziska.hinkelmann@gmail.com>\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Eugene Ostroukhov <eostroukhov@google.com>\nReviewed-By: Richard Lau <riclau@uk.ibm.com>\nReviewed-By: Ruben Bridgewater <ruben@bridgewater.de>",
+    "sha": "4e1f0907dae9916215985a9f81bf3dec1eeaeaef",
+    "files": [
+        {
+            "sha": "3285c1040a71327572f95ac1d5442a7a49920620",
+            "filename": "lib/inspector.js",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 3,
+            "changes": 10,
+            "blob_url": "https://github.com/nodejs/node/blob/4e1f0907dae9916215985a9f81bf3dec1eeaeaef/lib%2Finspector.js",
+            "raw_url": "https://github.com/nodejs/node/raw/4e1f0907dae9916215985a9f81bf3dec1eeaeaef/lib%2Finspector.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finspector.js?ref=4e1f0907dae9916215985a9f81bf3dec1eeaeaef",
+            "patch": "@@ -30,9 +30,13 @@ class Session extends EventEmitter {\n \n   connect() {\n     if (this[connectionSymbol])\n-      throw new ERR_INSPECTOR_ALREADY_CONNECTED();\n-    this[connectionSymbol] =\n-        new Connection((message) => this[onMessageSymbol](message));\n+      throw new ERR_INSPECTOR_ALREADY_CONNECTED('The inspector session');\n+    const connection =\n+      new Connection((message) => this[onMessageSymbol](message));\n+    if (connection.sessionAttached) {\n+      throw new ERR_INSPECTOR_ALREADY_CONNECTED('Another inspector session');\n+    }\n+    this[connectionSymbol] = connection;\n   }\n \n   [onMessageSymbol](message) {"
+        },
+        {
+            "sha": "ee7b78b66b87425f4cc0a6ed1baa99d66fcc9826",
+            "filename": "lib/internal/errors.js",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/nodejs/node/blob/4e1f0907dae9916215985a9f81bf3dec1eeaeaef/lib%2Finternal%2Ferrors.js",
+            "raw_url": "https://github.com/nodejs/node/raw/4e1f0907dae9916215985a9f81bf3dec1eeaeaef/lib%2Finternal%2Ferrors.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Ferrors.js?ref=4e1f0907dae9916215985a9f81bf3dec1eeaeaef",
+            "patch": "@@ -739,8 +739,7 @@ E('ERR_HTTP_INVALID_STATUS_CODE', 'Invalid status code: %s', RangeError);\n E('ERR_HTTP_TRAILER_INVALID',\n   'Trailers are invalid with this transfer encoding', Error);\n E('ERR_INDEX_OUT_OF_RANGE', 'Index out of range', RangeError);\n-E('ERR_INSPECTOR_ALREADY_CONNECTED',\n-  'The inspector is already connected', Error);\n+E('ERR_INSPECTOR_ALREADY_CONNECTED', '%s is already connected', Error);\n E('ERR_INSPECTOR_CLOSED', 'Session was closed', Error);\n E('ERR_INSPECTOR_NOT_AVAILABLE', 'Inspector is not available', Error);\n E('ERR_INSPECTOR_NOT_CONNECTED', 'Session is not connected', Error);"
+        },
+        {
+            "sha": "ac6d6ba738cf75c317b14bd4037223f3c4c60cfb",
+            "filename": "src/inspector_js_api.cc",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 13,
+            "changes": 24,
+            "blob_url": "https://github.com/nodejs/node/blob/4e1f0907dae9916215985a9f81bf3dec1eeaeaef/src%2Finspector_js_api.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/4e1f0907dae9916215985a9f81bf3dec1eeaeaef/src%2Finspector_js_api.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Finspector_js_api.cc?ref=4e1f0907dae9916215985a9f81bf3dec1eeaeaef",
+            "patch": "@@ -9,6 +9,7 @@ namespace node {\n namespace inspector {\n namespace {\n \n+using v8::Boolean;\n using v8::Context;\n using v8::Function;\n using v8::FunctionCallbackInfo;\n@@ -78,7 +79,11 @@ class JSBindingsConnection : public AsyncWrap {\n \n     Agent* inspector = env->inspector_agent();\n     if (inspector->delegate() != nullptr) {\n-      env->ThrowTypeError(\"Session is already attached\");\n+      // This signals JS code that it has to throw an error.\n+      Local<String> session_attached =\n+          FIXED_ONE_BYTE_STRING(env->isolate(), \"sessionAttached\");\n+      wrap->Set(env->context(), session_attached,\n+                Boolean::New(env->isolate(), true)).ToChecked();\n       return;\n     }\n     inspector->Connect(&delegate_);\n@@ -95,10 +100,7 @@ class JSBindingsConnection : public AsyncWrap {\n \n   static void New(const FunctionCallbackInfo<Value>& info) {\n     Environment* env = Environment::GetCurrent(info);\n-    if (!info[0]->IsFunction()) {\n-      env->ThrowTypeError(\"Message callback is required\");\n-      return;\n-    }\n+    CHECK(info[0]->IsFunction());\n     Local<Function> callback = info[0].As<Function>();\n     new JSBindingsConnection(env, info.This(), callback);\n   }\n@@ -121,10 +123,7 @@ class JSBindingsConnection : public AsyncWrap {\n     Environment* env = Environment::GetCurrent(info);\n     JSBindingsConnection* session;\n     ASSIGN_OR_RETURN_UNWRAP(&session, info.Holder());\n-    if (!info[0]->IsString()) {\n-      env->ThrowTypeError(\"Inspector message must be a string\");\n-      return;\n-    }\n+    CHECK(info[0]->IsString());\n \n     session->CheckIsCurrent();\n     Agent* inspector = env->inspector_agent();\n@@ -143,10 +142,9 @@ void AddCommandLineAPI(const FunctionCallbackInfo<Value>& info) {\n   auto env = Environment::GetCurrent(info);\n   Local<Context> context = env->context();\n \n-  if (info.Length() != 2 || !info[0]->IsString()) {\n-    return env->ThrowTypeError(\"inspector.addCommandLineAPI takes \"\n-        \"exactly 2 arguments: a string and a value.\");\n-  }\n+  // inspector.addCommandLineAPI takes 2 arguments: a string and a value.\n+  CHECK_EQ(info.Length(), 2);\n+  CHECK(info[0]->IsString());\n \n   Local<Object> console_api = env->inspector_console_api_object();\n   console_api->Set(context, info[0], info[1]).FromJust();"
+        },
+        {
+            "sha": "2435347e79824872436ad9c433828042893e19b6",
+            "filename": "test/sequential/test-inspector-module.js",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 1,
+            "changes": 12,
+            "blob_url": "https://github.com/nodejs/node/blob/4e1f0907dae9916215985a9f81bf3dec1eeaeaef/test%2Fsequential%2Ftest-inspector-module.js",
+            "raw_url": "https://github.com/nodejs/node/raw/4e1f0907dae9916215985a9f81bf3dec1eeaeaef/test%2Fsequential%2Ftest-inspector-module.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fsequential%2Ftest-inspector-module.js?ref=4e1f0907dae9916215985a9f81bf3dec1eeaeaef",
+            "patch": "@@ -51,7 +51,17 @@ common.expectsError(\n   {\n     code: 'ERR_INSPECTOR_ALREADY_CONNECTED',\n     type: Error,\n-    message: 'The inspector is already connected'\n+    message: 'The inspector session is already connected'\n+  }\n+);\n+\n+const session2 = new Session();\n+common.expectsError(\n+  () => session2.connect(),\n+  {\n+    code: 'ERR_INSPECTOR_ALREADY_CONNECTED',\n+    type: Error,\n+    message: 'Another inspector session is already connected'\n   }\n );\n "
+        }
+    ],
+    "stats": {
+        "total": 49,
+        "additions": 30,
+        "deletions": 19
+    }
+}

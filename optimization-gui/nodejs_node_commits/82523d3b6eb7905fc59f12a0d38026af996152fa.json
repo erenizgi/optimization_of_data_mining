@@ -1,0 +1,48 @@
+{
+    "author": "joyeecheung",
+    "message": "fs: throw fs.utimesSync errors in JS land\n\nPR-URL: https://github.com/nodejs/node/pull/18871\nRefs: https://github.com/nodejs/node/issues/18106\nReviewed-By: Michaël Zasso <targos@protonmail.com>\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Ruben Bridgewater <ruben@bridgewater.de>",
+    "sha": "82523d3b6eb7905fc59f12a0d38026af996152fa",
+    "files": [
+        {
+            "sha": "49b4d434e8181c989d8d50226aa9817fb43eaf1f",
+            "filename": "lib/fs.js",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 2,
+            "changes": 6,
+            "blob_url": "https://github.com/nodejs/node/blob/82523d3b6eb7905fc59f12a0d38026af996152fa/lib%2Ffs.js",
+            "raw_url": "https://github.com/nodejs/node/raw/82523d3b6eb7905fc59f12a0d38026af996152fa/lib%2Ffs.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Ffs.js?ref=82523d3b6eb7905fc59f12a0d38026af996152fa",
+            "patch": "@@ -1148,9 +1148,11 @@ fs.utimes = function(path, atime, mtime, callback) {\n fs.utimesSync = function(path, atime, mtime) {\n   path = getPathFromURL(path);\n   validatePath(path);\n+  const ctx = { path };\n   binding.utimes(pathModule.toNamespacedPath(path),\n-                 toUnixTimestamp(atime),\n-                 toUnixTimestamp(mtime));\n+                 toUnixTimestamp(atime), toUnixTimestamp(mtime),\n+                 undefined, ctx);\n+  handleErrorFromBinding(ctx);\n };\n \n fs.futimes = function(fd, atime, mtime, callback) {"
+        },
+        {
+            "sha": "3152d2067c110be6248909a24bd79687a0494fae",
+            "filename": "src/node_file.cc",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 8,
+            "changes": 21,
+            "blob_url": "https://github.com/nodejs/node/blob/82523d3b6eb7905fc59f12a0d38026af996152fa/src%2Fnode_file.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/82523d3b6eb7905fc59f12a0d38026af996152fa/src%2Fnode_file.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_file.cc?ref=82523d3b6eb7905fc59f12a0d38026af996152fa",
+            "patch": "@@ -1561,22 +1561,27 @@ static void FChown(const FunctionCallbackInfo<Value>& args) {\n static void UTimes(const FunctionCallbackInfo<Value>& args) {\n   Environment* env = Environment::GetCurrent(args);\n \n-  CHECK_GE(args.Length(), 3);\n-  CHECK(args[1]->IsNumber());\n-  CHECK(args[2]->IsNumber());\n+  const int argc = args.Length();\n+  CHECK_GE(argc, 3);\n \n   BufferValue path(env->isolate(), args[0]);\n   CHECK_NE(*path, nullptr);\n \n-  const double atime = static_cast<double>(args[1]->NumberValue());\n-  const double mtime = static_cast<double>(args[2]->NumberValue());\n+  CHECK(args[1]->IsNumber());\n+  const double atime = args[1].As<Number>()->Value();\n+\n+  CHECK(args[2]->IsNumber());\n+  const double mtime = args[2].As<Number>()->Value();\n \n   FSReqBase* req_wrap = GetReqWrap(env, args[3]);\n-  if (req_wrap != nullptr) {\n+  if (req_wrap != nullptr) {  // utimes(path, atime, mtime, req)\n     AsyncCall(env, req_wrap, args, \"utime\", UTF8, AfterNoArgs,\n               uv_fs_utime, *path, atime, mtime);\n-  } else {\n-    SYNC_CALL(utime, *path, *path, atime, mtime);\n+  } else {  // utimes(path, atime, mtime, undefined, ctx)\n+    CHECK_EQ(argc, 5);\n+    fs_req_wrap req_wrap;\n+    SyncCall(env, args[4], &req_wrap, \"utime\",\n+             uv_fs_utime, *path, atime, mtime);\n   }\n }\n "
+        },
+        {
+            "sha": "5ded7d234054d4259f71b4c9fe42455c8c079420",
+            "filename": "test/parallel/test-fs-error-messages.js",
+            "status": "modified",
+            "additions": 22,
+            "deletions": 0,
+            "changes": 22,
+            "blob_url": "https://github.com/nodejs/node/blob/82523d3b6eb7905fc59f12a0d38026af996152fa/test%2Fparallel%2Ftest-fs-error-messages.js",
+            "raw_url": "https://github.com/nodejs/node/raw/82523d3b6eb7905fc59f12a0d38026af996152fa/test%2Fparallel%2Ftest-fs-error-messages.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-fs-error-messages.js?ref=82523d3b6eb7905fc59f12a0d38026af996152fa",
+            "patch": "@@ -585,3 +585,25 @@ if (!common.isWindows) {\n     validateError\n   );\n }\n+\n+// utimes\n+if (!common.isAIX) {\n+  const validateError = (err) => {\n+    assert.strictEqual(nonexistentFile, err.path);\n+    assert.strictEqual(\n+      err.message,\n+      `ENOENT: no such file or directory, utime '${nonexistentFile}'`);\n+    assert.strictEqual(err.errno, uv.UV_ENOENT);\n+    assert.strictEqual(err.code, 'ENOENT');\n+    assert.strictEqual(err.syscall, 'utime');\n+    return true;\n+  };\n+\n+  fs.utimes(nonexistentFile, new Date(), new Date(),\n+            common.mustCall(validateError));\n+\n+  assert.throws(\n+    () => fs.utimesSync(nonexistentFile, new Date(), new Date()),\n+    validateError\n+  );\n+}"
+        }
+    ],
+    "stats": {
+        "total": 49,
+        "additions": 39,
+        "deletions": 10
+    }
+}

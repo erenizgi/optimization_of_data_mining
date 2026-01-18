@@ -1,0 +1,48 @@
+{
+    "author": "joyeecheung",
+    "message": "fs: throw writeSync errors in JS\n\nPR-URL: https://github.com/nodejs/node/pull/19041\nReviewed-By: Michaël Zasso <targos@protonmail.com>\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "994320b07be5da33e98785a7dab4bd2bb7cb8f12",
+    "files": [
+        {
+            "sha": "2c96b08144bc038f436cd99d275d779b3b8eedac",
+            "filename": "lib/fs.js",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 6,
+            "changes": 19,
+            "blob_url": "https://github.com/nodejs/node/blob/994320b07be5da33e98785a7dab4bd2bb7cb8f12/lib%2Ffs.js",
+            "raw_url": "https://github.com/nodejs/node/raw/994320b07be5da33e98785a7dab4bd2bb7cb8f12/lib%2Ffs.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Ffs.js?ref=994320b07be5da33e98785a7dab4bd2bb7cb8f12",
+            "patch": "@@ -635,6 +635,8 @@ Object.defineProperty(fs.write, internalUtil.customPromisifyArgs,\n //  fs.writeSync(fd, string[, position[, encoding]]);\n fs.writeSync = function(fd, buffer, offset, length, position) {\n   validateUint32(fd, 'fd');\n+  const ctx = {};\n+  let result;\n   if (isUint8Array(buffer)) {\n     if (position === undefined)\n       position = null;\n@@ -643,13 +645,18 @@ fs.writeSync = function(fd, buffer, offset, length, position) {\n     if (typeof length !== 'number')\n       length = buffer.length - offset;\n     validateOffsetLengthWrite(offset, length, buffer.byteLength);\n-    return binding.writeBuffer(fd, buffer, offset, length, position);\n+    result = binding.writeBuffer(fd, buffer, offset, length, position,\n+                                 undefined, ctx);\n+  } else {\n+    if (typeof buffer !== 'string')\n+      buffer += '';\n+    if (offset === undefined)\n+      offset = null;\n+    result = binding.writeString(fd, buffer, offset, length,\n+                                 undefined, ctx);\n   }\n-  if (typeof buffer !== 'string')\n-    buffer += '';\n-  if (offset === undefined)\n-    offset = null;\n-  return binding.writeString(fd, buffer, offset, length, position);\n+  handleErrorFromBinding(ctx);\n+  return result;\n };\n \n fs.rename = function(oldPath, newPath, callback) {"
+        },
+        {
+            "sha": "bf036bc309e974fe0e737ce2dccd1acf0f6a07be",
+            "filename": "src/node_file.cc",
+            "status": "modified",
+            "additions": 39,
+            "deletions": 24,
+            "changes": 63,
+            "blob_url": "https://github.com/nodejs/node/blob/994320b07be5da33e98785a7dab4bd2bb7cb8f12/src%2Fnode_file.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/994320b07be5da33e98785a7dab4bd2bb7cb8f12/src%2Fnode_file.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_file.cc?ref=994320b07be5da33e98785a7dab4bd2bb7cb8f12",
+            "patch": "@@ -1270,35 +1270,43 @@ static void CopyFile(const FunctionCallbackInfo<Value>& args) {\n static void WriteBuffer(const FunctionCallbackInfo<Value>& args) {\n   Environment* env = Environment::GetCurrent(args);\n \n+  const int argc = args.Length();\n+  CHECK_GE(argc, 4);\n+\n   CHECK(args[0]->IsInt32());\n-  CHECK(Buffer::HasInstance(args[1]));\n+  const int fd = args[0].As<Int32>()->Value();\n \n-  int fd = args[0]->Int32Value();\n-  Local<Object> obj = args[1].As<Object>();\n-  const char* buf = Buffer::Data(obj);\n-  size_t buffer_length = Buffer::Length(obj);\n-  size_t off = args[2]->Uint32Value();\n-  size_t len = args[3]->Uint32Value();\n-  int64_t pos = GET_OFFSET(args[4]);\n+  CHECK(Buffer::HasInstance(args[1]));\n+  Local<Object> buffer_obj = args[1].As<Object>();\n+  char* buffer_data = Buffer::Data(buffer_obj);\n+  size_t buffer_length = Buffer::Length(buffer_obj);\n \n+  CHECK(args[2]->IsInt32());\n+  const size_t off = static_cast<size_t>(args[2].As<Int32>()->Value());\n   CHECK_LE(off, buffer_length);\n+\n+  CHECK(args[3]->IsInt32());\n+  const size_t len = static_cast<size_t>(args[3].As<Int32>()->Value());\n+  CHECK(Buffer::IsWithinBounds(off, len, buffer_length));\n   CHECK_LE(len, buffer_length);\n   CHECK_GE(off + len, off);\n-  CHECK(Buffer::IsWithinBounds(off, len, buffer_length));\n \n-  buf += off;\n+  const int64_t pos = GET_OFFSET(args[4]);\n \n+  char* buf = buffer_data + off;\n   uv_buf_t uvbuf = uv_buf_init(const_cast<char*>(buf), len);\n \n   FSReqBase* req_wrap = GetReqWrap(env, args[5]);\n-  if (req_wrap != nullptr) {\n+  if (req_wrap != nullptr) {  // write(fd, buffer, off, len, pos, req)\n     AsyncCall(env, req_wrap, args, \"write\", UTF8, AfterInteger,\n               uv_fs_write, fd, &uvbuf, 1, pos);\n-    return;\n+  } else {  // write(fd, buffer, off, len, pos, undefined, ctx)\n+    CHECK_EQ(argc, 7);\n+    fs_req_wrap req_wrap;\n+    int bytesWritten = SyncCall(env, args[6], &req_wrap, \"write\",\n+                                uv_fs_write, fd, &uvbuf, 1, pos);\n+    args.GetReturnValue().Set(bytesWritten);\n   }\n-\n-  SYNC_CALL(write, nullptr, fd, &uvbuf, 1, pos)\n-  args.GetReturnValue().Set(SYNC_RESULT);\n }\n \n \n@@ -1350,19 +1358,23 @@ static void WriteBuffers(const FunctionCallbackInfo<Value>& args) {\n static void WriteString(const FunctionCallbackInfo<Value>& args) {\n   Environment* env = Environment::GetCurrent(args);\n \n+  const int argc = args.Length();\n+  CHECK_GE(argc, 4);\n+\n   CHECK(args[0]->IsInt32());\n+  const int fd = args[0].As<Int32>()->Value();\n+\n+  const int64_t pos = GET_OFFSET(args[2]);\n+\n+  const auto enc = ParseEncoding(env->isolate(), args[3], UTF8);\n \n   std::unique_ptr<char[]> delete_on_return;\n-  Local<Value> req;\n   Local<Value> value = args[1];\n-  int fd = args[0]->Int32Value();\n   char* buf = nullptr;\n   size_t len;\n-  const int64_t pos = GET_OFFSET(args[2]);\n-  const auto enc = ParseEncoding(env->isolate(), args[3], UTF8);\n \n   FSReqBase* req_wrap = GetReqWrap(env, args[4]);\n-  const auto is_async = req_wrap != nullptr;\n+  const bool is_async = req_wrap != nullptr;\n \n   // Avoid copying the string when it is externalized but only when:\n   // 1. The target encoding is compatible with the string's encoding, and\n@@ -1396,12 +1408,15 @@ static void WriteString(const FunctionCallbackInfo<Value>& args) {\n \n   uv_buf_t uvbuf = uv_buf_init(buf, len);\n \n-  if (req_wrap != nullptr) {\n+  if (is_async) {  // write(fd, string, pos, enc, req)\n     AsyncCall(env, req_wrap, args, \"write\", UTF8, AfterInteger,\n               uv_fs_write, fd, &uvbuf, 1, pos);\n-  } else {\n-    SYNC_CALL(write, nullptr, fd, &uvbuf, 1, pos)\n-    return args.GetReturnValue().Set(SYNC_RESULT);\n+  } else {  // write(fd, string, pos, enc, undefined, ctx)\n+    CHECK_EQ(argc, 6);\n+    fs_req_wrap req_wrap;\n+    int bytesWritten = SyncCall(env, args[5], &req_wrap, \"write\",\n+                                uv_fs_write, fd, &uvbuf, 1, pos);\n+    args.GetReturnValue().Set(bytesWritten);\n   }\n }\n "
+        },
+        {
+            "sha": "27533f122fc5f5616957137e6fa96b3dc5aab913",
+            "filename": "test/parallel/test-fs-error-messages.js",
+            "status": "modified",
+            "additions": 41,
+            "deletions": 0,
+            "changes": 41,
+            "blob_url": "https://github.com/nodejs/node/blob/994320b07be5da33e98785a7dab4bd2bb7cb8f12/test%2Fparallel%2Ftest-fs-error-messages.js",
+            "raw_url": "https://github.com/nodejs/node/raw/994320b07be5da33e98785a7dab4bd2bb7cb8f12/test%2Fparallel%2Ftest-fs-error-messages.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-fs-error-messages.js?ref=994320b07be5da33e98785a7dab4bd2bb7cb8f12",
+            "patch": "@@ -770,3 +770,44 @@ if (!common.isWindows) {\n     );\n   });\n }\n+\n+// write buffer\n+{\n+  const validateError = (err) => {\n+    assert.strictEqual(err.message, 'EBADF: bad file descriptor, write');\n+    assert.strictEqual(err.errno, uv.UV_EBADF);\n+    assert.strictEqual(err.code, 'EBADF');\n+    assert.strictEqual(err.syscall, 'write');\n+    return true;\n+  };\n+\n+  common.runWithInvalidFD((fd) => {\n+    const buf = Buffer.alloc(5);\n+    fs.write(fd, buf, 0, 1, 1, common.mustCall(validateError));\n+\n+    assert.throws(\n+      () => fs.writeSync(fd, buf, 0, 1, 1),\n+      validateError\n+    );\n+  });\n+}\n+\n+// write string\n+{\n+  const validateError = (err) => {\n+    assert.strictEqual(err.message, 'EBADF: bad file descriptor, write');\n+    assert.strictEqual(err.errno, uv.UV_EBADF);\n+    assert.strictEqual(err.code, 'EBADF');\n+    assert.strictEqual(err.syscall, 'write');\n+    return true;\n+  };\n+\n+  common.runWithInvalidFD((fd) => {\n+    fs.write(fd, 'test', 1, common.mustCall(validateError));\n+\n+    assert.throws(\n+      () => fs.writeSync(fd, 'test', 1),\n+      validateError\n+    );\n+  });\n+}"
+        }
+    ],
+    "stats": {
+        "total": 123,
+        "additions": 93,
+        "deletions": 30
+    }
+}

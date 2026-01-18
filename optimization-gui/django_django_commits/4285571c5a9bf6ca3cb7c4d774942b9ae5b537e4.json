@@ -1,0 +1,155 @@
+{
+    "author": "unknown",
+    "message": "Fixed #5805 -- it is now possible to specify multi-column indexes. Thanks to jgelens for the original patch.",
+    "sha": "4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4",
+    "files": [
+        {
+            "sha": "32e7181dab9819c18ef759249f3c34ac2186b4e7",
+            "filename": "django/core/management/validation.py",
+            "status": "modified",
+            "additions": 25,
+            "deletions": 10,
+            "changes": 35,
+            "blob_url": "https://github.com/django/django/blob/4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4/django%2Fcore%2Fmanagement%2Fvalidation.py",
+            "raw_url": "https://github.com/django/django/raw/4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4/django%2Fcore%2Fmanagement%2Fvalidation.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fcore%2Fmanagement%2Fvalidation.py?ref=4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4",
+            "patch": "@@ -1,3 +1,4 @@\n+import collections\n import sys\n \n from django.conf import settings\n@@ -327,15 +328,29 @@ def get_validation_errors(outfile, app=None):\n \n         # Check unique_together.\n         for ut in opts.unique_together:\n-            for field_name in ut:\n-                try:\n-                    f = opts.get_field(field_name, many_to_many=True)\n-                except models.FieldDoesNotExist:\n-                    e.add(opts, '\"unique_together\" refers to %s, a field that doesn\\'t exist. Check your syntax.' % field_name)\n-                else:\n-                    if isinstance(f.rel, models.ManyToManyRel):\n-                        e.add(opts, '\"unique_together\" refers to %s. ManyToManyFields are not supported in unique_together.' % f.name)\n-                    if f not in opts.local_fields:\n-                        e.add(opts, '\"unique_together\" refers to %s. This is not in the same model as the unique_together statement.' % f.name)\n+            validate_local_fields(e, opts, \"unique_together\", ut)\n+        if not isinstance(opts.index_together, collections.Sequence):\n+            e.add(opts, '\"index_together\" must a sequence')\n+        else:\n+            for it in opts.index_together:\n+                validate_local_fields(e, opts, \"index_together\", it)\n \n     return len(e.errors)\n+\n+\n+def validate_local_fields(e, opts, field_name, fields):\n+    from django.db import models\n+\n+    if not isinstance(fields, collections.Sequence):\n+        e.add(opts, 'all %s elements must be sequences' % field_name)\n+    else:\n+        for field in fields:\n+            try:\n+                f = opts.get_field(field, many_to_many=True)\n+            except models.FieldDoesNotExist:\n+                e.add(opts, '\"%s\" refers to %s, a field that doesn\\'t exist.' % (field_name, field))\n+            else:\n+                if isinstance(f.rel, models.ManyToManyRel):\n+                    e.add(opts, '\"%s\" refers to %s. ManyToManyFields are not supported in %s.' % (field_name, f.name, field_name))\n+                if f not in opts.local_fields:\n+                    e.add(opts, '\"%s\" refers to %s. This is not in the same model as the %s statement.' % (field_name, f.name, field_name))"
+        },
+        {
+            "sha": "4c4cf4d044f1e3fe13f23bddf83a9997519539ed",
+            "filename": "django/db/backends/creation.py",
+            "status": "modified",
+            "additions": 32,
+            "deletions": 19,
+            "changes": 51,
+            "blob_url": "https://github.com/django/django/blob/4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4/django%2Fdb%2Fbackends%2Fcreation.py",
+            "raw_url": "https://github.com/django/django/raw/4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4/django%2Fdb%2Fbackends%2Fcreation.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fbackends%2Fcreation.py?ref=4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4",
+            "patch": "@@ -177,34 +177,47 @@ def sql_indexes_for_model(self, model, style):\n         output = []\n         for f in model._meta.local_fields:\n             output.extend(self.sql_indexes_for_field(model, f, style))\n+        for fs in model._meta.index_together:\n+            fields = [model._meta.get_field_by_name(f)[0] for f in fs]\n+            output.extend(self.sql_indexes_for_fields(model, fields, style))\n         return output\n \n     def sql_indexes_for_field(self, model, f, style):\n         \"\"\"\n         Return the CREATE INDEX SQL statements for a single model field.\n         \"\"\"\n+        if f.db_index and not f.unique:\n+            return self.sql_indexes_for_fields(model, [f], style)\n+        else:\n+            return []\n+\n+    def sql_indexes_for_fields(self, model, fields, style):\n         from django.db.backends.util import truncate_name\n \n-        if f.db_index and not f.unique:\n-            qn = self.connection.ops.quote_name\n-            tablespace = f.db_tablespace or model._meta.db_tablespace\n-            if tablespace:\n-                tablespace_sql = self.connection.ops.tablespace_sql(tablespace)\n-                if tablespace_sql:\n-                    tablespace_sql = ' ' + tablespace_sql\n-            else:\n-                tablespace_sql = ''\n-            i_name = '%s_%s' % (model._meta.db_table, self._digest(f.column))\n-            output = [style.SQL_KEYWORD('CREATE INDEX') + ' ' +\n-                style.SQL_TABLE(qn(truncate_name(\n-                    i_name, self.connection.ops.max_name_length()))) + ' ' +\n-                style.SQL_KEYWORD('ON') + ' ' +\n-                style.SQL_TABLE(qn(model._meta.db_table)) + ' ' +\n-                \"(%s)\" % style.SQL_FIELD(qn(f.column)) +\n-                \"%s;\" % tablespace_sql]\n+        if len(fields) == 1 and fields[0].db_tablespace:\n+            tablespace_sql = self.connection.ops.tablespace_sql(fields[0].db_tablespace)\n+        elif model._meta.db_tablespace:\n+            tablespace_sql = self.connection.ops.tablespace_sql(model._meta.db_tablespace)\n         else:\n-            output = []\n-        return output\n+            tablespace_sql = \"\"\n+        if tablespace_sql:\n+            tablespace_sql = \" \" + tablespace_sql\n+\n+        field_names = []\n+        qn = self.connection.ops.quote_name\n+        for f in fields:\n+            field_names.append(style.SQL_FIELD(qn(f.column)))\n+\n+        index_name = \"%s_%s\" % (model._meta.db_table, self._digest([f.name for f in fields]))\n+\n+        return [\n+            style.SQL_KEYWORD(\"CREATE INDEX\") + \" \" +\n+            style.SQL_TABLE(qn(truncate_name(index_name, self.connection.ops.max_name_length()))) + \" \" +\n+            style.SQL_KEYWORD(\"ON\") + \" \" +\n+            style.SQL_TABLE(qn(model._meta.db_table)) + \" \" +\n+            \"(%s)\" % style.SQL_FIELD(\", \".join(field_names)) +\n+            \"%s;\" % tablespace_sql,\n+        ]\n \n     def sql_destroy_model(self, model, references_to_delete, style):\n         \"\"\""
+        },
+        {
+            "sha": "b04f3d4c2dc9ed2777369e6b60138f828497a129",
+            "filename": "django/db/models/options.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 1,
+            "changes": 4,
+            "blob_url": "https://github.com/django/django/blob/4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4/django%2Fdb%2Fmodels%2Foptions.py",
+            "raw_url": "https://github.com/django/django/raw/4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4/django%2Fdb%2Fmodels%2Foptions.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fmodels%2Foptions.py?ref=4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4",
+            "patch": "@@ -21,7 +21,8 @@\n DEFAULT_NAMES = ('verbose_name', 'verbose_name_plural', 'db_table', 'ordering',\n                  'unique_together', 'permissions', 'get_latest_by',\n                  'order_with_respect_to', 'app_label', 'db_tablespace',\n-                 'abstract', 'managed', 'proxy', 'swappable', 'auto_created')\n+                 'abstract', 'managed', 'proxy', 'swappable', 'auto_created',\n+                 'index_together')\n \n \n @python_2_unicode_compatible\n@@ -34,6 +35,7 @@ def __init__(self, meta, app_label=None):\n         self.db_table = ''\n         self.ordering = []\n         self.unique_together = []\n+        self.index_together = []\n         self.permissions = []\n         self.object_name, self.app_label = None, app_label\n         self.get_latest_by = None"
+        },
+        {
+            "sha": "ab944d7ddaa62eb42e2007315b8a9093a0e1a4ad",
+            "filename": "docs/ref/models/options.txt",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 0,
+            "changes": 15,
+            "blob_url": "https://github.com/django/django/blob/4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4/docs%2Fref%2Fmodels%2Foptions.txt",
+            "raw_url": "https://github.com/django/django/raw/4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4/docs%2Fref%2Fmodels%2Foptions.txt",
+            "contents_url": "https://api.github.com/repos/django/django/contents/docs%2Fref%2Fmodels%2Foptions.txt?ref=4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4",
+            "patch": "@@ -261,6 +261,21 @@ Django quotes column and table names behind the scenes.\n     :class:`~django.db.models.ManyToManyField`, try using a signal or\n     an explicit :attr:`through <ManyToManyField.through>` model.\n \n+``index_together``\n+\n+.. versionadded:: 1.5\n+\n+.. attribute:: Options.index_together\n+\n+    Sets of field names that, taken together, are indexed::\n+\n+        index_together = [\n+            [\"pub_date\", \"deadline\"],\n+        ]\n+\n+    This list of fields will be indexed together (i.e. the appropriate\n+    ``CREATE INDEX`` statement will be issued.)\n+\n ``verbose_name``\n ----------------\n "
+        },
+        {
+            "sha": "3c21e1ddb8d547e817ec45457450b0cdd76189a0",
+            "filename": "tests/modeltests/invalid_models/invalid_models/models.py",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 0,
+            "changes": 8,
+            "blob_url": "https://github.com/django/django/blob/4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4/tests%2Fmodeltests%2Finvalid_models%2Finvalid_models%2Fmodels.py",
+            "raw_url": "https://github.com/django/django/raw/4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4/tests%2Fmodeltests%2Finvalid_models%2Finvalid_models%2Fmodels.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fmodeltests%2Finvalid_models%2Finvalid_models%2Fmodels.py?ref=4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4",
+            "patch": "@@ -356,6 +356,13 @@ class HardReferenceModel(models.Model):\n     m2m_4 = models.ManyToManyField('invalid_models.SwappedModel', related_name='m2m_hardref4')\n \n \n+class BadIndexTogether1(models.Model):\n+    class Meta:\n+        index_together = [\n+            [\"field_that_does_not_exist\"],\n+        ]\n+\n+\n model_errors = \"\"\"invalid_models.fielderrors: \"charfield\": CharFields require a \"max_length\" attribute that is a positive integer.\n invalid_models.fielderrors: \"charfield2\": CharFields require a \"max_length\" attribute that is a positive integer.\n invalid_models.fielderrors: \"charfield3\": CharFields require a \"max_length\" attribute that is a positive integer.\n@@ -470,6 +477,7 @@ class HardReferenceModel(models.Model):\n invalid_models.hardreferencemodel: 'm2m_4' defines a relation with the model 'invalid_models.SwappedModel', which has been swapped out. Update the relation to point at settings.TEST_SWAPPED_MODEL.\n invalid_models.badswappablevalue: TEST_SWAPPED_MODEL_BAD_VALUE is not of the form 'app_label.app_name'.\n invalid_models.badswappablemodel: Model has been swapped out for 'not_an_app.Target' which has not been installed or is abstract.\n+invalid_models.badindextogether1: \"index_together\" refers to field_that_does_not_exist, a field that doesn't exist.\n \"\"\"\n \n if not connection.features.interprets_empty_strings_as_nulls:"
+        },
+        {
+            "sha": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+            "filename": "tests/regressiontests/indexes/__init__.py",
+            "status": "added",
+            "additions": 0,
+            "deletions": 0,
+            "changes": 0,
+            "blob_url": "https://github.com/django/django/blob/4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4/tests%2Fregressiontests%2Findexes%2F__init__.py",
+            "raw_url": "https://github.com/django/django/raw/4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4/tests%2Fregressiontests%2Findexes%2F__init__.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Findexes%2F__init__.py?ref=4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4"
+        },
+        {
+            "sha": "9758377f99aa49358177c67296298661dd999a59",
+            "filename": "tests/regressiontests/indexes/models.py",
+            "status": "added",
+            "additions": 11,
+            "deletions": 0,
+            "changes": 11,
+            "blob_url": "https://github.com/django/django/blob/4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4/tests%2Fregressiontests%2Findexes%2Fmodels.py",
+            "raw_url": "https://github.com/django/django/raw/4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4/tests%2Fregressiontests%2Findexes%2Fmodels.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Findexes%2Fmodels.py?ref=4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4",
+            "patch": "@@ -0,0 +1,11 @@\n+from django.db import models\n+\n+\n+class Article(models.Model):\n+    headline = models.CharField(max_length=100)\n+    pub_date = models.DateTimeField()\n+\n+    class Meta:\n+        index_together = [\n+            [\"headline\", \"pub_date\"],\n+        ]"
+        },
+        {
+            "sha": "0dac881fa95993914f5a6b9b2331f3128b138ee7",
+            "filename": "tests/regressiontests/indexes/tests.py",
+            "status": "added",
+            "additions": 12,
+            "deletions": 0,
+            "changes": 12,
+            "blob_url": "https://github.com/django/django/blob/4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4/tests%2Fregressiontests%2Findexes%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4/tests%2Fregressiontests%2Findexes%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Findexes%2Ftests.py?ref=4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4",
+            "patch": "@@ -0,0 +1,12 @@\n+from django.core.management.color import no_style\n+from django.db import connections, DEFAULT_DB_ALIAS\n+from django.test import TestCase\n+\n+from .models import Article\n+\n+\n+class IndexesTests(TestCase):\n+    def test_index_together(self):\n+        connection = connections[DEFAULT_DB_ALIAS]\n+        index_sql = connection.creation.sql_indexes_for_model(Article, no_style())\n+        self.assertEqual(len(index_sql), 1)"
+        },
+        {
+            "sha": "39d8921061defd9c906e7da6ff5078363a08c72a",
+            "filename": "tests/regressiontests/initial_sql_regress/tests.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 4,
+            "changes": 7,
+            "blob_url": "https://github.com/django/django/blob/4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4/tests%2Fregressiontests%2Finitial_sql_regress%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4/tests%2Fregressiontests%2Finitial_sql_regress%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Finitial_sql_regress%2Ftests.py?ref=4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4",
+            "patch": "@@ -1,3 +1,6 @@\n+from django.core.management.color import no_style\n+from django.core.management.sql import custom_sql_for_model\n+from django.db import connections, DEFAULT_DB_ALIAS\n from django.test import TestCase\n \n from .models import Simple\n@@ -15,10 +18,6 @@ def test_initial_sql(self):\n         self.assertEqual(Simple.objects.count(), 0)\n \n     def test_custom_sql(self):\n-        from django.core.management.sql import custom_sql_for_model\n-        from django.core.management.color import no_style\n-        from django.db import connections, DEFAULT_DB_ALIAS\n-\n         # Simulate the custom SQL loading by syncdb\n         connection = connections[DEFAULT_DB_ALIAS]\n         custom_sql = custom_sql_for_model(Simple, no_style(), connection)"
+        },
+        {
+            "sha": "4de82e47e72e09aca4d08308f6d636e5a52297cd",
+            "filename": "tests/regressiontests/introspection/models.py",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/django/django/blob/4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4/tests%2Fregressiontests%2Fintrospection%2Fmodels.py",
+            "raw_url": "https://github.com/django/django/raw/4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4/tests%2Fregressiontests%2Fintrospection%2Fmodels.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fintrospection%2Fmodels.py?ref=4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4",
+            "patch": "@@ -17,6 +17,7 @@ class Meta:\n     def __str__(self):\n         return \"%s %s\" % (self.first_name, self.last_name)\n \n+\n @python_2_unicode_compatible\n class Article(models.Model):\n     headline = models.CharField(max_length=100)\n@@ -28,3 +29,6 @@ def __str__(self):\n \n     class Meta:\n         ordering = ('headline',)\n+        index_together = [\n+            [\"headline\", \"pub_date\"],\n+        ]"
+        },
+        {
+            "sha": "2df946d874c3d2d20a73c5c8dd3be61911a10ec1",
+            "filename": "tests/regressiontests/introspection/tests.py",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 5,
+            "changes": 12,
+            "blob_url": "https://github.com/django/django/blob/4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4/tests%2Fregressiontests%2Fintrospection%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4/tests%2Fregressiontests%2Fintrospection%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fintrospection%2Ftests.py?ref=4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4",
+            "patch": "@@ -1,4 +1,4 @@\n-from __future__ import absolute_import,unicode_literals\n+from __future__ import absolute_import, unicode_literals\n \n from functools import update_wrapper\n \n@@ -13,7 +13,7 @@\n else:\n     expectedFailureOnOracle = lambda f: f\n \n-#\n+\n # The introspection module is optional, so methods tested here might raise\n # NotImplementedError. This is perfectly acceptable behavior for the backend\n # in question, but the tests need to handle this without failing. Ideally we'd\n@@ -23,7 +23,7 @@\n # wrapper that ignores the exception.\n #\n # The metaclass is just for fun.\n-#\n+\n \n def ignore_not_implemented(func):\n     def _inner(*args, **kwargs):\n@@ -34,15 +34,16 @@ def _inner(*args, **kwargs):\n     update_wrapper(_inner, func)\n     return _inner\n \n+\n class IgnoreNotimplementedError(type):\n     def __new__(cls, name, bases, attrs):\n-        for k,v in attrs.items():\n+        for k, v in attrs.items():\n             if k.startswith('test'):\n                 attrs[k] = ignore_not_implemented(v)\n         return type.__new__(cls, name, bases, attrs)\n \n-class IntrospectionTests(six.with_metaclass(IgnoreNotimplementedError, TestCase)):\n \n+class IntrospectionTests(six.with_metaclass(IgnoreNotimplementedError, TestCase)):\n     def test_table_names(self):\n         tl = connection.introspection.table_names()\n         self.assertEqual(tl, sorted(tl))\n@@ -163,6 +164,7 @@ def test_get_indexes_multicol(self):\n         self.assertNotIn('first_name', indexes)\n         self.assertIn('id', indexes)\n \n+\n def datatype(dbtype, description):\n     \"\"\"Helper to convert a data type into a string.\"\"\"\n     dt = connection.introspection.get_field_type(dbtype, description)"
+        },
+        {
+            "sha": "90e2dc2d65f4dd3a582c6544fdf1d294cbed8aa4",
+            "filename": "tests/runtests.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/django/django/blob/4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4/tests%2Fruntests.py",
+            "raw_url": "https://github.com/django/django/raw/4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4/tests%2Fruntests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fruntests.py?ref=4285571c5a9bf6ca3cb7c4d774942b9ae5b537e4",
+            "patch": "@@ -277,7 +277,7 @@ def paired_tests(paired_test, options, test_labels):\n     usage = \"%prog [options] [module module module ...]\"\n     parser = OptionParser(usage=usage)\n     parser.add_option(\n-        '-v','--verbosity', action='store', dest='verbosity', default='1',\n+        '-v', '--verbosity', action='store', dest='verbosity', default='1',\n         type='choice', choices=['0', '1', '2', '3'],\n         help='Verbosity level; 0=minimal output, 1=normal output, 2=all '\n              'output')"
+        }
+    ],
+    "stats": {
+        "total": 161,
+        "additions": 121,
+        "deletions": 40
+    }
+}

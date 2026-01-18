@@ -1,0 +1,48 @@
+{
+    "author": "josephperrott",
+    "message": "feat(dev-infra): write outputs of command runs to ng-dev log file (#38599)\n\nCreates infrastructure to write outputs of command runs to ng-dev log file.\nAdditionally, on commands which fail with an exit code greater than 1, an\nerror log file is created with the posix timestamp of the commands run time\nas an identifier.\n\nPR Close #38599",
+    "sha": "3487b549fd1245f17e66722e36f9e3cc60798002",
+    "files": [
+        {
+            "sha": "5901dd9fe1759d153f8a5ff66365b442c3fcd577",
+            "filename": "dev-infra/cli.ts",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/angular/angular/blob/3487b549fd1245f17e66722e36f9e3cc60798002/dev-infra%2Fcli.ts",
+            "raw_url": "https://github.com/angular/angular/raw/3487b549fd1245f17e66722e36f9e3cc60798002/dev-infra%2Fcli.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/dev-infra%2Fcli.ts?ref=3487b549fd1245f17e66722e36f9e3cc60798002",
+            "patch": "@@ -13,8 +13,10 @@ import {buildCommitMessageParser} from './commit-message/cli';\n import {buildFormatParser} from './format/cli';\n import {buildReleaseParser} from './release/cli';\n import {buildPrParser} from './pr/cli';\n+import {captureLogOutputForCommand} from './utils/console';\n \n yargs.scriptName('ng-dev')\n+    .middleware(captureLogOutputForCommand)\n     .demandCommand()\n     .recommendCommands()\n     .command('commit-message <command>', '', buildCommitMessageParser)"
+        },
+        {
+            "sha": "8bbddafe10e67a29bd836f15d11f566ffcc840a6",
+            "filename": "dev-infra/utils/BUILD.bazel",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/angular/angular/blob/3487b549fd1245f17e66722e36f9e3cc60798002/dev-infra%2Futils%2FBUILD.bazel",
+            "raw_url": "https://github.com/angular/angular/raw/3487b549fd1245f17e66722e36f9e3cc60798002/dev-infra%2Futils%2FBUILD.bazel",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/dev-infra%2Futils%2FBUILD.bazel?ref=3487b549fd1245f17e66722e36f9e3cc60798002",
+            "patch": "@@ -12,14 +12,18 @@ ts_library(\n         \"@npm//@octokit/graphql\",\n         \"@npm//@octokit/rest\",\n         \"@npm//@octokit/types\",\n+        \"@npm//@types/fs-extra\",\n         \"@npm//@types/inquirer\",\n         \"@npm//@types/node\",\n         \"@npm//@types/shelljs\",\n+        \"@npm//@types/yargs\",\n         \"@npm//chalk\",\n+        \"@npm//fs-extra\",\n         \"@npm//inquirer\",\n         \"@npm//inquirer-autocomplete-prompt\",\n         \"@npm//shelljs\",\n         \"@npm//tslib\",\n         \"@npm//typed-graphqlify\",\n+        \"@npm//yargs\",\n     ],\n )"
+        },
+        {
+            "sha": "d8676c48c41e852912a44165c9ec827a7dc4340c",
+            "filename": "dev-infra/utils/console.ts",
+            "status": "modified",
+            "additions": 58,
+            "deletions": 0,
+            "changes": 58,
+            "blob_url": "https://github.com/angular/angular/blob/3487b549fd1245f17e66722e36f9e3cc60798002/dev-infra%2Futils%2Fconsole.ts",
+            "raw_url": "https://github.com/angular/angular/raw/3487b549fd1245f17e66722e36f9e3cc60798002/dev-infra%2Futils%2Fconsole.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/dev-infra%2Futils%2Fconsole.ts?ref=3487b549fd1245f17e66722e36f9e3cc60798002",
+            "patch": "@@ -7,9 +7,13 @@\n  */\n \n import chalk from 'chalk';\n+import {writeFileSync} from 'fs-extra';\n import {createPromptModule, ListChoiceOptions, prompt} from 'inquirer';\n import * as inquirerAutocomplete from 'inquirer-autocomplete-prompt';\n+import {join} from 'path';\n+import {Arguments} from 'yargs';\n \n+import {getRepoBaseDir} from './config';\n \n /** Reexport of chalk colors for convenient access. */\n export const red: typeof chalk = chalk.red;\n@@ -140,6 +144,7 @@ function runConsoleCommand(loadCommand: () => Function, logLevel: LOG_LEVELS, ..\n   if (getLogLevel() >= logLevel) {\n     loadCommand()(...text);\n   }\n+  printToLogFile(logLevel, ...text);\n }\n \n /**\n@@ -155,3 +160,56 @@ function getLogLevel() {\n   }\n   return logLevel;\n }\n+\n+/** All text to write to the log file. */\n+let LOGGED_TEXT = '';\n+/** Whether file logging as been enabled. */\n+let FILE_LOGGING_ENABLED = false;\n+/**\n+ * The number of columns used in the prepended log level information on each line of the logging\n+ * output file.\n+ */\n+const LOG_LEVEL_COLUMNS = 7;\n+\n+/**\n+ * Enable writing the logged outputs to the log file on process exit, sets initial lines from the\n+ * command execution, containing information about the timing and command parameters.\n+ *\n+ * This is expected to be called only once during a command run, and should be called by the\n+ * middleware of yargs to enable the file logging before the rest of the command parsing and\n+ * response is executed.\n+ */\n+export function captureLogOutputForCommand(argv: Arguments) {\n+  if (FILE_LOGGING_ENABLED) {\n+    throw Error('`captureLogOutputForCommand` cannot be called multiple times');\n+  }\n+  /** The date time used for timestamping when the command was invoked. */\n+  const now = new Date();\n+  /** Header line to separate command runs in log files. */\n+  const headerLine = Array(100).fill('#').join('');\n+  LOGGED_TEXT += `${headerLine}\\nCommand: ${argv.$0} ${argv._.join(' ')}\\nRan at: ${now}\\n`;\n+\n+  // On process exit, write the logged output to the appropriate log files\n+  process.on('exit', (code: number) => {\n+    LOGGED_TEXT += `Command ran in ${new Date().getTime() - now.getTime()}ms`;\n+    /** Path to the log file location. */\n+    const logFilePath = join(getRepoBaseDir(), '.ng-dev.log');\n+\n+    writeFileSync(logFilePath, LOGGED_TEXT);\n+\n+    // For failure codes greater than 1, the new logged lines should be written to a specific log\n+    // file for the command run failure.\n+    if (code > 1) {\n+      writeFileSync(join(getRepoBaseDir(), `.ng-dev.err-${now.getTime()}.log`), LOGGED_TEXT);\n+    }\n+  });\n+\n+  // Mark file logging as enabled to prevent the function from executing multiple times.\n+  FILE_LOGGING_ENABLED = true;\n+}\n+\n+/** Write the provided text to the log file, prepending each line with the log level.  */\n+function printToLogFile(logLevel: LOG_LEVELS, ...text: string[]) {\n+  const logLevelText = `${LOG_LEVELS[logLevel]}:`.padEnd(LOG_LEVEL_COLUMNS);\n+  LOGGED_TEXT += text.join(' ').split('\\n').map(l => `${logLevelText} ${l}\\n`).join('');\n+}"
+        }
+    ],
+    "stats": {
+        "total": 64,
+        "additions": 64,
+        "deletions": 0
+    }
+}

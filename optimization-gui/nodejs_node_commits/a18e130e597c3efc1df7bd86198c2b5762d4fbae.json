@@ -1,0 +1,168 @@
+{
+    "author": "joyeecheung",
+    "message": "lib: mask mode_t type of arguments with 0o777\n\n- Introduce the `validateAndMaskMode` validator that\n  validates `mode_t` arguments and mask them with 0o777\n  if they are 32-bit unsigned integer or octal string\n  to be more consistent with POSIX APIs.\n- Use the validator in fs APIs and process.umask for\n  consistency.\n- Add tests for 32-bit unsigned modes larger than 0o777.\n\nPR-URL: https://github.com/nodejs/node/pull/20636\nFixes: https://github.com/nodejs/node/issues/20498\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Anatoli Papirovski <apapirovski@mac.com>",
+    "sha": "a18e130e597c3efc1df7bd86198c2b5762d4fbae",
+    "files": [
+        {
+            "sha": "dee437c59660f60289a9df922d5d0576b9f40e89",
+            "filename": "lib/fs.js",
+            "status": "modified",
+            "additions": 31,
+            "deletions": 32,
+            "changes": 63,
+            "blob_url": "https://github.com/nodejs/node/blob/a18e130e597c3efc1df7bd86198c2b5762d4fbae/lib%2Ffs.js",
+            "raw_url": "https://github.com/nodejs/node/raw/a18e130e597c3efc1df7bd86198c2b5762d4fbae/lib%2Ffs.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Ffs.js?ref=a18e130e597c3efc1df7bd86198c2b5762d4fbae",
+            "patch": "@@ -52,7 +52,6 @@ const internalUtil = require('internal/util');\n const {\n   copyObject,\n   getOptions,\n-  modeNum,\n   nullCheck,\n   preprocessSymlinkDestination,\n   Stats,\n@@ -71,6 +70,7 @@ const {\n } = require('internal/constants');\n const {\n   isUint32,\n+  validateAndMaskMode,\n   validateInt32,\n   validateUint32\n } = require('internal/validators');\n@@ -531,32 +531,36 @@ fs.closeSync = function(fd) {\n   handleErrorFromBinding(ctx);\n };\n \n-fs.open = function(path, flags, mode, callback_) {\n-  var callback = makeCallback(arguments[arguments.length - 1]);\n-  mode = modeNum(mode, 0o666);\n-\n+fs.open = function(path, flags, mode, callback) {\n   path = getPathFromURL(path);\n   validatePath(path);\n-  validateUint32(mode, 'mode');\n+  const flagsNumber = stringToFlags(flags);\n+  if (arguments.length < 4) {\n+    callback = makeCallback(mode);\n+    mode = 0o666;\n+  } else {\n+    mode = validateAndMaskMode(mode, 'mode', 0o666);\n+    callback = makeCallback(callback);\n+  }\n \n   const req = new FSReqWrap();\n   req.oncomplete = callback;\n \n   binding.open(pathModule.toNamespacedPath(path),\n-               stringToFlags(flags),\n+               flagsNumber,\n                mode,\n                req);\n };\n \n fs.openSync = function(path, flags, mode) {\n-  mode = modeNum(mode, 0o666);\n   path = getPathFromURL(path);\n   validatePath(path);\n-  validateUint32(mode, 'mode');\n+  const flagsNumber = stringToFlags(flags);\n+  mode = validateAndMaskMode(mode, 'mode', 0o666);\n \n   const ctx = { path };\n   const result = binding.open(pathModule.toNamespacedPath(path),\n-                              stringToFlags(flags), mode,\n+                              flagsNumber, mode,\n                               undefined, ctx);\n   handleErrorFromBinding(ctx);\n   return result;\n@@ -834,12 +838,16 @@ fs.fsyncSync = function(fd) {\n };\n \n fs.mkdir = function(path, mode, callback) {\n-  if (typeof mode === 'function') callback = mode;\n-  callback = makeCallback(callback);\n   path = getPathFromURL(path);\n   validatePath(path);\n-  mode = modeNum(mode, 0o777);\n-  validateUint32(mode, 'mode');\n+\n+  if (arguments.length < 3) {\n+    callback = makeCallback(mode);\n+    mode = 0o777;\n+  } else {\n+    callback = makeCallback(callback);\n+    mode = validateAndMaskMode(mode, 'mode', 0o777);\n+  }\n \n   const req = new FSReqWrap();\n   req.oncomplete = callback;\n@@ -849,8 +857,7 @@ fs.mkdir = function(path, mode, callback) {\n fs.mkdirSync = function(path, mode) {\n   path = getPathFromURL(path);\n   validatePath(path);\n-  mode = modeNum(mode, 0o777);\n-  validateUint32(mode, 'mode');\n+  mode = validateAndMaskMode(mode, 'mode', 0o777);\n   const ctx = { path };\n   binding.mkdir(pathModule.toNamespacedPath(path), mode, undefined, ctx);\n   handleErrorFromBinding(ctx);\n@@ -1032,25 +1039,18 @@ fs.unlinkSync = function(path) {\n };\n \n fs.fchmod = function(fd, mode, callback) {\n-  mode = modeNum(mode);\n   validateUint32(fd, 'fd');\n-  validateUint32(mode, 'mode');\n-  // Values for mode < 0 are already checked via the validateUint32 function\n-  if (mode > 0o777)\n-    throw new ERR_OUT_OF_RANGE('mode', undefined, mode);\n+  mode = validateAndMaskMode(mode, 'mode');\n+  callback = makeCallback(callback);\n \n   const req = new FSReqWrap();\n-  req.oncomplete = makeCallback(callback);\n+  req.oncomplete = callback;\n   binding.fchmod(fd, mode, req);\n };\n \n fs.fchmodSync = function(fd, mode) {\n-  mode = modeNum(mode);\n   validateUint32(fd, 'fd');\n-  validateUint32(mode, 'mode');\n-  // Values for mode < 0 are already checked via the validateUint32 function\n-  if (mode > 0o777)\n-    throw new ERR_OUT_OF_RANGE('mode', undefined, mode);\n+  mode = validateAndMaskMode(mode, 'mode');\n   const ctx = {};\n   binding.fchmod(fd, mode, undefined, ctx);\n   handleErrorFromBinding(ctx);\n@@ -1091,11 +1091,10 @@ if (constants.O_SYMLINK !== undefined) {\n \n \n fs.chmod = function(path, mode, callback) {\n-  callback = makeCallback(callback);\n   path = getPathFromURL(path);\n   validatePath(path);\n-  mode = modeNum(mode);\n-  validateUint32(mode, 'mode');\n+  mode = validateAndMaskMode(mode, 'mode');\n+  callback = makeCallback(callback);\n \n   const req = new FSReqWrap();\n   req.oncomplete = callback;\n@@ -1105,8 +1104,8 @@ fs.chmod = function(path, mode, callback) {\n fs.chmodSync = function(path, mode) {\n   path = getPathFromURL(path);\n   validatePath(path);\n-  mode = modeNum(mode);\n-  validateUint32(mode, 'mode');\n+  mode = validateAndMaskMode(mode, 'mode');\n+\n   const ctx = { path };\n   binding.chmod(pathModule.toNamespacedPath(path), mode, undefined, ctx);\n   handleErrorFromBinding(ctx);"
+        },
+        {
+            "sha": "ee985761acb5aa7fbe09231aed93fbab8a48f960",
+            "filename": "lib/internal/fs/promises.js",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 13,
+            "changes": 19,
+            "blob_url": "https://github.com/nodejs/node/blob/a18e130e597c3efc1df7bd86198c2b5762d4fbae/lib%2Finternal%2Ffs%2Fpromises.js",
+            "raw_url": "https://github.com/nodejs/node/raw/a18e130e597c3efc1df7bd86198c2b5762d4fbae/lib%2Finternal%2Ffs%2Fpromises.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Ffs%2Fpromises.js?ref=a18e130e597c3efc1df7bd86198c2b5762d4fbae",
+            "patch": "@@ -12,16 +12,14 @@ const { Buffer, kMaxLength } = require('buffer');\n const {\n   ERR_FS_FILE_TOO_LARGE,\n   ERR_INVALID_ARG_TYPE,\n-  ERR_METHOD_NOT_IMPLEMENTED,\n-  ERR_OUT_OF_RANGE\n+  ERR_METHOD_NOT_IMPLEMENTED\n } = require('internal/errors').codes;\n const { getPathFromURL } = require('internal/url');\n const { isUint8Array } = require('internal/util/types');\n const {\n   copyObject,\n   getOptions,\n   getStatsFromBinding,\n-  modeNum,\n   nullCheck,\n   preprocessSymlinkDestination,\n   stringToFlags,\n@@ -34,6 +32,7 @@ const {\n } = require('internal/fs/utils');\n const {\n   isUint32,\n+  validateAndMaskMode,\n   validateInt32,\n   validateUint32\n } = require('internal/validators');\n@@ -191,10 +190,9 @@ async function copyFile(src, dest, flags) {\n // Note that unlike fs.open() which uses numeric file descriptors,\n // fsPromises.open() uses the fs.FileHandle class.\n async function open(path, flags, mode) {\n-  mode = modeNum(mode, 0o666);\n   path = getPathFromURL(path);\n   validatePath(path);\n-  validateUint32(mode, 'mode');\n+  mode = validateAndMaskMode(mode, 'mode', 0o666);\n   return new FileHandle(\n     await binding.openFileHandle(pathModule.toNamespacedPath(path),\n                                  stringToFlags(flags),\n@@ -287,10 +285,9 @@ async function fsync(handle) {\n }\n \n async function mkdir(path, mode) {\n-  mode = modeNum(mode, 0o777);\n   path = getPathFromURL(path);\n   validatePath(path);\n-  validateUint32(mode, 'mode');\n+  mode = validateAndMaskMode(mode, 'mode', 0o777);\n   return binding.mkdir(pathModule.toNamespacedPath(path), mode, kUsePromises);\n }\n \n@@ -361,19 +358,15 @@ async function unlink(path) {\n }\n \n async function fchmod(handle, mode) {\n-  mode = modeNum(mode);\n   validateFileHandle(handle);\n-  validateUint32(mode, 'mode');\n-  if (mode > 0o777)\n-    throw new ERR_OUT_OF_RANGE('mode', undefined, mode);\n+  mode = validateAndMaskMode(mode, 'mode');\n   return binding.fchmod(handle.fd, mode, kUsePromises);\n }\n \n async function chmod(path, mode) {\n   path = getPathFromURL(path);\n   validatePath(path);\n-  mode = modeNum(mode);\n-  validateUint32(mode, 'mode');\n+  mode = validateAndMaskMode(mode, 'mode');\n   return binding.chmod(pathModule.toNamespacedPath(path), mode, kUsePromises);\n }\n "
+        },
+        {
+            "sha": "46b3a97f7415723b166cbdda01d80e7c5d038a99",
+            "filename": "lib/internal/fs/utils.js",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 16,
+            "changes": 16,
+            "blob_url": "https://github.com/nodejs/node/blob/a18e130e597c3efc1df7bd86198c2b5762d4fbae/lib%2Finternal%2Ffs%2Futils.js",
+            "raw_url": "https://github.com/nodejs/node/raw/a18e130e597c3efc1df7bd86198c2b5762d4fbae/lib%2Finternal%2Ffs%2Futils.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Ffs%2Futils.js?ref=a18e130e597c3efc1df7bd86198c2b5762d4fbae",
+            "patch": "@@ -70,21 +70,6 @@ function getOptions(options, defaultOptions) {\n   return options;\n }\n \n-function modeNum(m, def) {\n-  if (typeof m === 'number')\n-    return m;\n-  if (typeof m === 'string') {\n-    const parsed = parseInt(m, 8);\n-    if (Number.isNaN(parsed))\n-      return m;\n-    return parsed;\n-  }\n-  // TODO(BridgeAR): Only return `def` in case `m == null`\n-  if (def !== undefined)\n-    return def;\n-  return m;\n-}\n-\n // Check if the path contains null types if it is a string nor Uint8Array,\n // otherwise return silently.\n function nullCheck(path, propName, throwError = true) {\n@@ -391,7 +376,6 @@ module.exports = {\n   assertEncoding,\n   copyObject,\n   getOptions,\n-  modeNum,\n   nullCheck,\n   preprocessSymlinkDestination,\n   realpathCacheKey: Symbol('realpathCacheKey'),"
+        },
+        {
+            "sha": "7ed993728dbd52310ae50d41593d691f115b9cb0",
+            "filename": "lib/internal/process/methods.js",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 21,
+            "changes": 26,
+            "blob_url": "https://github.com/nodejs/node/blob/a18e130e597c3efc1df7bd86198c2b5762d4fbae/lib%2Finternal%2Fprocess%2Fmethods.js",
+            "raw_url": "https://github.com/nodejs/node/raw/a18e130e597c3efc1df7bd86198c2b5762d4fbae/lib%2Finternal%2Fprocess%2Fmethods.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fprocess%2Fmethods.js?ref=a18e130e597c3efc1df7bd86198c2b5762d4fbae",
+            "patch": "@@ -2,10 +2,10 @@\n \n const {\n   ERR_INVALID_ARG_TYPE,\n-  ERR_INVALID_ARG_VALUE,\n   ERR_UNKNOWN_CREDENTIAL\n } = require('internal/errors').codes;\n const {\n+  validateAndMaskMode,\n   validateUint32\n } = require('internal/validators');\n \n@@ -30,29 +30,13 @@ function setupProcessMethods() {\n     return _chdir(directory);\n   }\n \n-  const octalReg = /^[0-7]+$/;\n   function umask(mask) {\n-    if (typeof mask === 'undefined') {\n+    if (mask === undefined) {\n+      // Get the mask\n       return _umask(mask);\n     }\n-\n-    if (typeof mask === 'number') {\n-      validateUint32(mask, 'mask');\n-      return _umask(mask);\n-    }\n-\n-    if (typeof mask === 'string') {\n-      if (!octalReg.test(mask)) {\n-        throw new ERR_INVALID_ARG_VALUE('mask', mask,\n-                                        'must be an octal string');\n-      }\n-      const octal = Number.parseInt(mask, 8);\n-      validateUint32(octal, 'mask');\n-      return _umask(octal);\n-    }\n-\n-    throw new ERR_INVALID_ARG_TYPE('mask', ['number', 'string', 'undefined'],\n-                                   mask);\n+    mask = validateAndMaskMode(mask, 'mask');\n+    return _umask(mask);\n   }\n }\n "
+        },
+        {
+            "sha": "21017ffc5ab791488f3f523d429665c251f16e17",
+            "filename": "lib/internal/validators.js",
+            "status": "modified",
+            "additions": 36,
+            "deletions": 0,
+            "changes": 36,
+            "blob_url": "https://github.com/nodejs/node/blob/a18e130e597c3efc1df7bd86198c2b5762d4fbae/lib%2Finternal%2Fvalidators.js",
+            "raw_url": "https://github.com/nodejs/node/raw/a18e130e597c3efc1df7bd86198c2b5762d4fbae/lib%2Finternal%2Fvalidators.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fvalidators.js?ref=a18e130e597c3efc1df7bd86198c2b5762d4fbae",
+            "patch": "@@ -2,6 +2,7 @@\n \n const {\n   ERR_INVALID_ARG_TYPE,\n+  ERR_INVALID_ARG_VALUE,\n   ERR_OUT_OF_RANGE\n } = require('internal/errors').codes;\n \n@@ -13,6 +14,40 @@ function isUint32(value) {\n   return value === (value >>> 0);\n }\n \n+const octalReg = /^[0-7]+$/;\n+const modeDesc = 'must be a 32-bit unsigned integer or an octal string';\n+// Validator for mode_t (the S_* constants). Valid numbers or octal strings\n+// will be masked with 0o777 to be consistent with the behavior in POSIX APIs.\n+function validateAndMaskMode(value, name, def) {\n+  if (isUint32(value)) {\n+    return value & 0o777;\n+  }\n+\n+  if (typeof value === 'number') {\n+    if (!Number.isInteger(value)) {\n+      throw new ERR_OUT_OF_RANGE(name, 'an integer', value);\n+    } else {\n+      // 2 ** 32 === 4294967296\n+      throw new ERR_OUT_OF_RANGE(name, '>= 0 && < 4294967296', value);\n+    }\n+  }\n+\n+  if (typeof value === 'string') {\n+    if (!octalReg.test(value)) {\n+      throw new ERR_INVALID_ARG_VALUE(name, value, modeDesc);\n+    }\n+    const parsed = parseInt(value, 8);\n+    return parsed & 0o777;\n+  }\n+\n+  // TODO(BridgeAR): Only return `def` in case `value == null`\n+  if (def !== undefined) {\n+    return def;\n+  }\n+\n+  throw new ERR_INVALID_ARG_VALUE(name, value, modeDesc);\n+}\n+\n function validateInt32(value, name) {\n   if (!isInt32(value)) {\n     let err;\n@@ -53,6 +88,7 @@ function validateUint32(value, name, positive) {\n module.exports = {\n   isInt32,\n   isUint32,\n+  validateAndMaskMode,\n   validateInt32,\n   validateUint32\n };"
+        },
+        {
+            "sha": "5f3a8d5ab8286493f332920e633224ee31faa402",
+            "filename": "test/parallel/test-fs-chmod-mask.js",
+            "status": "added",
+            "additions": 95,
+            "deletions": 0,
+            "changes": 95,
+            "blob_url": "https://github.com/nodejs/node/blob/a18e130e597c3efc1df7bd86198c2b5762d4fbae/test%2Fparallel%2Ftest-fs-chmod-mask.js",
+            "raw_url": "https://github.com/nodejs/node/raw/a18e130e597c3efc1df7bd86198c2b5762d4fbae/test%2Fparallel%2Ftest-fs-chmod-mask.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-fs-chmod-mask.js?ref=a18e130e597c3efc1df7bd86198c2b5762d4fbae",
+            "patch": "@@ -0,0 +1,95 @@\n+'use strict';\n+\n+// This tests that mode > 0o777 will be masked off with 0o777 in fs APIs.\n+\n+const common = require('../common');\n+const assert = require('assert');\n+const path = require('path');\n+const fs = require('fs');\n+\n+let mode;\n+// On Windows chmod is only able to manipulate write permission\n+if (common.isWindows) {\n+  mode = 0o444;  // read-only\n+} else {\n+  mode = 0o777;\n+}\n+\n+const maskToIgnore = 0o10000;\n+\n+const tmpdir = require('../common/tmpdir');\n+tmpdir.refresh();\n+\n+function test(mode, asString) {\n+  const suffix = asString ? 'str' : 'num';\n+  const input = asString ?\n+    (mode | maskToIgnore).toString(8) : (mode | maskToIgnore);\n+\n+  {\n+    const file = path.join(tmpdir.path, `chmod-async-${suffix}.txt`);\n+    fs.writeFileSync(file, 'test', 'utf-8');\n+\n+    fs.chmod(file, input, common.mustCall((err) => {\n+      assert.ifError(err);\n+      assert.strictEqual(fs.statSync(file).mode & 0o777, mode);\n+    }));\n+  }\n+\n+  {\n+    const file = path.join(tmpdir.path, `chmodSync-${suffix}.txt`);\n+    fs.writeFileSync(file, 'test', 'utf-8');\n+\n+    fs.chmodSync(file, input);\n+    assert.strictEqual(fs.statSync(file).mode & 0o777, mode);\n+  }\n+\n+  {\n+    const file = path.join(tmpdir.path, `fchmod-async-${suffix}.txt`);\n+    fs.writeFileSync(file, 'test', 'utf-8');\n+    fs.open(file, 'w', common.mustCall((err, fd) => {\n+      assert.ifError(err);\n+\n+      fs.fchmod(fd, input, common.mustCall((err) => {\n+        assert.ifError(err);\n+        assert.strictEqual(fs.fstatSync(fd).mode & 0o777, mode);\n+        fs.close(fd, assert.ifError);\n+      }));\n+    }));\n+  }\n+\n+  {\n+    const file = path.join(tmpdir.path, `fchmodSync-${suffix}.txt`);\n+    fs.writeFileSync(file, 'test', 'utf-8');\n+    const fd = fs.openSync(file, 'w');\n+\n+    fs.fchmodSync(fd, input);\n+    assert.strictEqual(fs.fstatSync(fd).mode & 0o777, mode);\n+\n+    fs.close(fd, assert.ifError);\n+  }\n+\n+  if (fs.lchmod) {\n+    const link = path.join(tmpdir.path, `lchmod-src-${suffix}`);\n+    const file = path.join(tmpdir.path, `lchmod-dest-${suffix}`);\n+    fs.writeFileSync(file, 'test', 'utf-8');\n+    fs.symlinkSync(file, link);\n+\n+    fs.lchmod(link, input, common.mustCall((err) => {\n+      assert.ifError(err);\n+      assert.strictEqual(fs.lstatSync(link).mode & 0o777, mode);\n+    }));\n+  }\n+\n+  if (fs.lchmodSync) {\n+    const link = path.join(tmpdir.path, `lchmodSync-src-${suffix}`);\n+    const file = path.join(tmpdir.path, `lchmodSync-dest-${suffix}`);\n+    fs.writeFileSync(file, 'test', 'utf-8');\n+    fs.symlinkSync(file, link);\n+\n+    fs.lchmodSync(link, input);\n+    assert.strictEqual(fs.lstatSync(link).mode & 0o777, mode);\n+  }\n+}\n+\n+test(mode, true);\n+test(mode, false);"
+        },
+        {
+            "sha": "ed5919ce887bc88bd54092b66926c6db97456c3b",
+            "filename": "test/parallel/test-fs-chmod.js",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 4,
+            "changes": 8,
+            "blob_url": "https://github.com/nodejs/node/blob/a18e130e597c3efc1df7bd86198c2b5762d4fbae/test%2Fparallel%2Ftest-fs-chmod.js",
+            "raw_url": "https://github.com/nodejs/node/raw/a18e130e597c3efc1df7bd86198c2b5762d4fbae/test%2Fparallel%2Ftest-fs-chmod.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-fs-chmod.js?ref=a18e130e597c3efc1df7bd86198c2b5762d4fbae",
+            "patch": "@@ -62,7 +62,7 @@ function closeSync() {\n }\n \n \n-// On Windows chmod is only able to manipulate read-only bit\n+// On Windows chmod is only able to manipulate write permission\n if (common.isWindows) {\n   mode_async = 0o400;   // read-only\n   mode_sync = 0o600;    // read-write\n@@ -112,10 +112,10 @@ fs.open(file2, 'w', common.mustCall((err, fd) => {\n     common.expectsError(\n       () => fs.fchmod(fd, {}),\n       {\n-        code: 'ERR_INVALID_ARG_TYPE',\n+        code: 'ERR_INVALID_ARG_VALUE',\n         type: TypeError,\n-        message: 'The \"mode\" argument must be of type number. ' +\n-                 'Received type object'\n+        message: 'The argument \\'mode\\' must be a 32-bit unsigned integer ' +\n+                 'or an octal string. Received {}'\n       }\n     );\n "
+        },
+        {
+            "sha": "df7748538a5cc4aef6560c6729d8c0c2ada32364",
+            "filename": "test/parallel/test-fs-fchmod.js",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 26,
+            "changes": 38,
+            "blob_url": "https://github.com/nodejs/node/blob/a18e130e597c3efc1df7bd86198c2b5762d4fbae/test%2Fparallel%2Ftest-fs-fchmod.js",
+            "raw_url": "https://github.com/nodejs/node/raw/a18e130e597c3efc1df7bd86198c2b5762d4fbae/test%2Fparallel%2Ftest-fs-fchmod.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-fs-fchmod.js?ref=a18e130e597c3efc1df7bd86198c2b5762d4fbae",
+            "patch": "@@ -1,6 +1,7 @@\n 'use strict';\n-const common = require('../common');\n+require('../common');\n const assert = require('assert');\n+const util = require('util');\n const fs = require('fs');\n \n // This test ensures that input for fchmod is valid, testing for valid\n@@ -16,7 +17,16 @@ const fs = require('fs');\n   };\n   assert.throws(() => fs.fchmod(input), errObj);\n   assert.throws(() => fs.fchmodSync(input), errObj);\n-  errObj.message = errObj.message.replace('fd', 'mode');\n+});\n+\n+\n+[false, null, undefined, {}, [], '', '123x'].forEach((input) => {\n+  const errObj = {\n+    code: 'ERR_INVALID_ARG_VALUE',\n+    name: 'TypeError [ERR_INVALID_ARG_VALUE]',\n+    message: 'The argument \\'mode\\' must be a 32-bit unsigned integer or an ' +\n+             `octal string. Received ${util.inspect(input)}`\n+  };\n   assert.throws(() => fs.fchmod(1, input), errObj);\n   assert.throws(() => fs.fchmodSync(1, input), errObj);\n });\n@@ -62,27 +72,3 @@ const fs = require('fs');\n   assert.throws(() => fs.fchmod(1, input), errObj);\n   assert.throws(() => fs.fchmodSync(1, input), errObj);\n });\n-\n-// Check for mode values range\n-const modeUpperBoundaryValue = 0o777;\n-fs.fchmod(1, modeUpperBoundaryValue, common.mustCall());\n-fs.fchmodSync(1, modeUpperBoundaryValue);\n-\n-// umask of 0o777 is equal to 775\n-const modeOutsideUpperBoundValue = 776;\n-assert.throws(\n-  () => fs.fchmod(1, modeOutsideUpperBoundValue),\n-  {\n-    code: 'ERR_OUT_OF_RANGE',\n-    name: 'RangeError [ERR_OUT_OF_RANGE]',\n-    message: 'The value of \"mode\" is out of range. Received 776'\n-  }\n-);\n-assert.throws(\n-  () => fs.fchmodSync(1, modeOutsideUpperBoundValue),\n-  {\n-    code: 'ERR_OUT_OF_RANGE',\n-    name: 'RangeError [ERR_OUT_OF_RANGE]',\n-    message: 'The value of \"mode\" is out of range. Received 776'\n-  }\n-);"
+        },
+        {
+            "sha": "e4e8a4234833761e7e1343437cc9a903df641681",
+            "filename": "test/parallel/test-fs-mkdir-mode-mask.js",
+            "status": "added",
+            "additions": 45,
+            "deletions": 0,
+            "changes": 45,
+            "blob_url": "https://github.com/nodejs/node/blob/a18e130e597c3efc1df7bd86198c2b5762d4fbae/test%2Fparallel%2Ftest-fs-mkdir-mode-mask.js",
+            "raw_url": "https://github.com/nodejs/node/raw/a18e130e597c3efc1df7bd86198c2b5762d4fbae/test%2Fparallel%2Ftest-fs-mkdir-mode-mask.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-fs-mkdir-mode-mask.js?ref=a18e130e597c3efc1df7bd86198c2b5762d4fbae",
+            "patch": "@@ -0,0 +1,45 @@\n+'use strict';\n+\n+// This tests that mode > 0o777 will be masked off with 0o777 in fs.mkdir().\n+\n+const common = require('../common');\n+const assert = require('assert');\n+const path = require('path');\n+const fs = require('fs');\n+\n+let mode;\n+\n+if (common.isWindows) {\n+  common.skip('mode is not supported in mkdir on Windows');\n+  return;\n+} else {\n+  mode = 0o644;\n+}\n+\n+const maskToIgnore = 0o10000;\n+\n+const tmpdir = require('../common/tmpdir');\n+tmpdir.refresh();\n+\n+function test(mode, asString) {\n+  const suffix = asString ? 'str' : 'num';\n+  const input = asString ?\n+    (mode | maskToIgnore).toString(8) : (mode | maskToIgnore);\n+\n+  {\n+    const dir = path.join(tmpdir.path, `mkdirSync-${suffix}`);\n+    fs.mkdirSync(dir, input);\n+    assert.strictEqual(fs.statSync(dir).mode & 0o777, mode);\n+  }\n+\n+  {\n+    const dir = path.join(tmpdir.path, `mkdir-${suffix}`);\n+    fs.mkdir(dir, input, common.mustCall((err) => {\n+      assert.ifError(err);\n+      assert.strictEqual(fs.statSync(dir).mode & 0o777, mode);\n+    }));\n+  }\n+}\n+\n+test(mode, true);\n+test(mode, false);"
+        },
+        {
+            "sha": "4db41864af099c26a34610bae0463befa5f90dd7",
+            "filename": "test/parallel/test-fs-open-mode-mask.js",
+            "status": "added",
+            "additions": 48,
+            "deletions": 0,
+            "changes": 48,
+            "blob_url": "https://github.com/nodejs/node/blob/a18e130e597c3efc1df7bd86198c2b5762d4fbae/test%2Fparallel%2Ftest-fs-open-mode-mask.js",
+            "raw_url": "https://github.com/nodejs/node/raw/a18e130e597c3efc1df7bd86198c2b5762d4fbae/test%2Fparallel%2Ftest-fs-open-mode-mask.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-fs-open-mode-mask.js?ref=a18e130e597c3efc1df7bd86198c2b5762d4fbae",
+            "patch": "@@ -0,0 +1,48 @@\n+'use strict';\n+\n+// This tests that mode > 0o777 will be masked off with 0o777 in fs.open().\n+\n+const common = require('../common');\n+const assert = require('assert');\n+const path = require('path');\n+const fs = require('fs');\n+\n+let mode;\n+\n+if (common.isWindows) {\n+  mode = 0o444;\n+} else {\n+  mode = 0o644;\n+}\n+\n+const maskToIgnore = 0o10000;\n+\n+const tmpdir = require('../common/tmpdir');\n+tmpdir.refresh();\n+\n+function test(mode, asString) {\n+  const suffix = asString ? 'str' : 'num';\n+  const input = asString ?\n+    (mode | maskToIgnore).toString(8) : (mode | maskToIgnore);\n+\n+  {\n+    const file = path.join(tmpdir.path, `openSync-${suffix}.txt`);\n+    const fd = fs.openSync(file, 'w+', input);\n+    assert.strictEqual(fs.fstatSync(fd).mode & 0o777, mode);\n+    fs.closeSync(fd);\n+    assert.strictEqual(fs.statSync(file).mode & 0o777, mode);\n+  }\n+\n+  {\n+    const file = path.join(tmpdir.path, `open-${suffix}.txt`);\n+    fs.open(file, 'w+', input, common.mustCall((err, fd) => {\n+      assert.ifError(err);\n+      assert.strictEqual(fs.fstatSync(fd).mode & 0o777, mode);\n+      fs.closeSync(fd);\n+      assert.strictEqual(fs.statSync(file).mode & 0o777, mode);\n+    }));\n+  }\n+}\n+\n+test(mode, true);\n+test(mode, false);"
+        },
+        {
+            "sha": "ea779e499e5fef79429a8f5b2439016a1a11aec5",
+            "filename": "test/parallel/test-fs-promises.js",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 22,
+            "changes": 26,
+            "blob_url": "https://github.com/nodejs/node/blob/a18e130e597c3efc1df7bd86198c2b5762d4fbae/test%2Fparallel%2Ftest-fs-promises.js",
+            "raw_url": "https://github.com/nodejs/node/raw/a18e130e597c3efc1df7bd86198c2b5762d4fbae/test%2Fparallel%2Ftest-fs-promises.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-fs-promises.js?ref=a18e130e597c3efc1df7bd86198c2b5762d4fbae",
+            "patch": "@@ -113,28 +113,10 @@ function verifyStatObject(stat) {\n     await fchmod(handle, 0o666);\n     await handle.chmod(0o666);\n \n-    // `mode` can't be > 0o777\n-    assert.rejects(\n-      async () => chmod(handle, (0o777 + 1)),\n-      {\n-        code: 'ERR_INVALID_ARG_TYPE',\n-        name: 'TypeError [ERR_INVALID_ARG_TYPE]'\n-      }\n-    );\n-    assert.rejects(\n-      async () => fchmod(handle, (0o777 + 1)),\n-      {\n-        code: 'ERR_OUT_OF_RANGE',\n-        name: 'RangeError [ERR_OUT_OF_RANGE]'\n-      }\n-    );\n-    assert.rejects(\n-      async () => handle.chmod(handle, (0o777 + 1)),\n-      {\n-        code: 'ERR_INVALID_ARG_TYPE',\n-        name: 'TypeError [ERR_INVALID_ARG_TYPE]'\n-      }\n-    );\n+    // Mode larger than 0o777 should be masked off.\n+    await chmod(dest, (0o777 + 1));\n+    await fchmod(handle, 0o777 + 1);\n+    await handle.chmod(0o777 + 1);\n \n     await utimes(dest, new Date(), new Date());\n "
+        },
+        {
+            "sha": "c312c061d2b76a2ca38e449ed12a7008bb73a1c1",
+            "filename": "test/parallel/test-process-umask-mask.js",
+            "status": "added",
+            "additions": 29,
+            "deletions": 0,
+            "changes": 29,
+            "blob_url": "https://github.com/nodejs/node/blob/a18e130e597c3efc1df7bd86198c2b5762d4fbae/test%2Fparallel%2Ftest-process-umask-mask.js",
+            "raw_url": "https://github.com/nodejs/node/raw/a18e130e597c3efc1df7bd86198c2b5762d4fbae/test%2Fparallel%2Ftest-process-umask-mask.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-process-umask-mask.js?ref=a18e130e597c3efc1df7bd86198c2b5762d4fbae",
+            "patch": "@@ -0,0 +1,29 @@\n+'use strict';\n+\n+// This tests that mask > 0o777 will be masked off with 0o777 in\n+// process.umask()\n+\n+const common = require('../common');\n+const assert = require('assert');\n+\n+let mask;\n+\n+if (common.isWindows) {\n+  mask = 0o600;\n+} else {\n+  mask = 0o664;\n+}\n+\n+const maskToIgnore = 0o10000;\n+\n+const old = process.umask();\n+\n+function test(input, output) {\n+  process.umask(input);\n+  assert.strictEqual(process.umask(), output);\n+\n+  process.umask(old);\n+}\n+\n+test(mask | maskToIgnore, mask);\n+test((mask | maskToIgnore).toString(8), mask);"
+        },
+        {
+            "sha": "1d496f05ef5027470df3665285c41278ba7d89ff",
+            "filename": "test/parallel/test-process-umask.js",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 7,
+            "changes": 15,
+            "blob_url": "https://github.com/nodejs/node/blob/a18e130e597c3efc1df7bd86198c2b5762d4fbae/test%2Fparallel%2Ftest-process-umask.js",
+            "raw_url": "https://github.com/nodejs/node/raw/a18e130e597c3efc1df7bd86198c2b5762d4fbae/test%2Fparallel%2Ftest-process-umask.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-process-umask.js?ref=a18e130e597c3efc1df7bd86198c2b5762d4fbae",
+            "patch": "@@ -33,27 +33,28 @@ if (common.isWindows) {\n \n const old = process.umask(mask);\n \n-assert.strictEqual(parseInt(mask, 8), process.umask(old));\n+assert.strictEqual(process.umask(old), parseInt(mask, 8));\n \n // confirm reading the umask does not modify it.\n // 1. If the test fails, this call will succeed, but the mask will be set to 0\n-assert.strictEqual(old, process.umask());\n+assert.strictEqual(process.umask(), old);\n // 2. If the test fails, process.umask() will return 0\n-assert.strictEqual(old, process.umask());\n+assert.strictEqual(process.umask(), old);\n \n assert.throws(() => {\n   process.umask({});\n }, {\n-  code: 'ERR_INVALID_ARG_TYPE',\n-  message: 'The \"mask\" argument must be one of type number, string, or ' +\n-    'undefined. Received type object'\n+  code: 'ERR_INVALID_ARG_VALUE',\n+  message: 'The argument \\'mask\\' must be a 32-bit unsigned integer ' +\n+           'or an octal string. Received {}'\n });\n \n ['123x', 'abc', '999'].forEach((value) => {\n   assert.throws(() => {\n     process.umask(value);\n   }, {\n     code: 'ERR_INVALID_ARG_VALUE',\n-    message: `The argument 'mask' must be an octal string. Received '${value}'`\n+    message: 'The argument \\'mask\\' must be a 32-bit unsigned integer ' +\n+             `or an octal string. Received '${value}'`\n   });\n });"
+        }
+    ],
+    "stats": {
+        "total": 464,
+        "additions": 323,
+        "deletions": 141
+    }
+}

@@ -1,0 +1,72 @@
+{
+    "author": "alxhub",
+    "message": "fix(compiler-cli): better detect classes that are indirectly exported (#42207)\n\nThe compiler flag `compileNonExportedClasses` allows the Angular compiler to\nprocess classes which are not exported at the top level of a source file.\nThis is often used to allow for AOT compilation of test classes inside\n`it()` test blocks, for example.\n\nPreviously, the compiler would identify exported classes by looking for an\n`export` modifier on the class declaration itself. This works for the\ntrivial case, but fails for indirectly exported classes:\n\n```typescript\n// Component is declared unexported.\n@Component({...})\nclass FooCmp {...}\n\n// Indirect export of FooCmp\nexport {FooCmp};\n```\n\nThis is not an immediate problem for most application builds, since the\ndefault value for `compileNonExportedClasses` is `true` and therefore such\nclasses get compiled regardless.\n\nHowever, in the Angular Language Service now, `compileNonExportedClasses` is\nforcibly overridden to `false`. That's because the tsconfig used by the IDE\nand Language Service is often far broader than the application build's\nconfiguration, and pulls in test files that can contain unexported classes\nnot designed with AOT compilation in mind.\n\nTherefore, the Language Service has trouble working with such structures.\n\nIn this commit, the `ReflectionHost` gains a new API for detecting whether a\nclass is exported. The implementation of this method now not only considers\nthe `export` modifier, but also scans the `ts.SourceFile` for indirect\nexports like the example above. This ensures the above case will be\nprocessed directly in the Language Service.\n\nThis new operation is cached using an expando symbol on the `ts.SourceFile`,\nensuring good performance even when scanning large source files with lots of\nexports (e.g. a FESM file under `ngcc`).\n\nFixes #42184.\n\nPR Close #42207",
+    "sha": "e039075a2837b0decf17cfbd5382d675c331bbeb",
+    "files": [
+        {
+            "sha": "8352520f59c76eab431a3bb840e9d731398d1d1d",
+            "filename": "packages/compiler-cli/ngcc/src/host/delegating_host.ts",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/angular/angular/blob/e039075a2837b0decf17cfbd5382d675c331bbeb/packages%2Fcompiler-cli%2Fngcc%2Fsrc%2Fhost%2Fdelegating_host.ts",
+            "raw_url": "https://github.com/angular/angular/raw/e039075a2837b0decf17cfbd5382d675c331bbeb/packages%2Fcompiler-cli%2Fngcc%2Fsrc%2Fhost%2Fdelegating_host.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fngcc%2Fsrc%2Fhost%2Fdelegating_host.ts?ref=e039075a2837b0decf17cfbd5382d675c331bbeb",
+            "patch": "@@ -161,4 +161,8 @@ export class DelegatingReflectionHost implements NgccReflectionHost {\n   detectKnownDeclaration<T extends Declaration>(decl: T): T {\n     return this.ngccHost.detectKnownDeclaration(decl);\n   }\n+\n+  isStaticallyExported(clazz: ClassDeclaration): boolean {\n+    return this.ngccHost.isStaticallyExported(clazz);\n+  }\n }"
+        },
+        {
+            "sha": "851880f5ef3aa66d074973de7a309d40634bff38",
+            "filename": "packages/compiler-cli/src/ngtsc/reflection/src/host.ts",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 0,
+            "changes": 10,
+            "blob_url": "https://github.com/angular/angular/blob/e039075a2837b0decf17cfbd5382d675c331bbeb/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Freflection%2Fsrc%2Fhost.ts",
+            "raw_url": "https://github.com/angular/angular/raw/e039075a2837b0decf17cfbd5382d675c331bbeb/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Freflection%2Fsrc%2Fhost.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Freflection%2Fsrc%2Fhost.ts?ref=e039075a2837b0decf17cfbd5382d675c331bbeb",
+            "patch": "@@ -856,4 +856,14 @@ export interface ReflectionHost {\n    * have a different name than it does externally.\n    */\n   getAdjacentNameOfClass(clazz: ClassDeclaration): ts.Identifier;\n+\n+  /**\n+   * Returns `true` if a class is exported from the module in which it's defined.\n+   *\n+   * Not all mechanisms by which a class is exported can be statically detected, especially when\n+   * processing already compiled JavaScript. A `false` result does not indicate that the class is\n+   * never visible outside its module, only that it was not exported via one of the export\n+   * mechanisms that the `ReflectionHost` is capable of statically checking.\n+   */\n+  isStaticallyExported(clazz: ClassDeclaration): boolean;\n }"
+        },
+        {
+            "sha": "3fa26367903335e303c7b39c6355adc61b89dbe0",
+            "filename": "packages/compiler-cli/src/ngtsc/reflection/src/typescript.ts",
+            "status": "modified",
+            "additions": 104,
+            "deletions": 0,
+            "changes": 104,
+            "blob_url": "https://github.com/angular/angular/blob/e039075a2837b0decf17cfbd5382d675c331bbeb/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Freflection%2Fsrc%2Ftypescript.ts",
+            "raw_url": "https://github.com/angular/angular/raw/e039075a2837b0decf17cfbd5382d675c331bbeb/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Freflection%2Fsrc%2Ftypescript.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Freflection%2Fsrc%2Ftypescript.ts?ref=e039075a2837b0decf17cfbd5382d675c331bbeb",
+            "patch": "@@ -199,6 +199,35 @@ export class TypeScriptReflectionHost implements ReflectionHost {\n     return clazz.name;\n   }\n \n+  isStaticallyExported(clazz: ClassDeclaration): boolean {\n+    // First check if there's an `export` modifier directly on the class declaration.\n+    let topLevel: ts.Node = clazz;\n+    if (ts.isVariableDeclaration(clazz) && ts.isVariableDeclarationList(clazz.parent)) {\n+      topLevel = clazz.parent.parent;\n+    }\n+    if (topLevel.modifiers !== undefined &&\n+        topLevel.modifiers.some(modifier => modifier.kind === ts.SyntaxKind.ExportKeyword)) {\n+      // The node is part of a declaration that's directly exported.\n+      return true;\n+    }\n+\n+    // If `topLevel` is not directly exported via a modifier, then it might be indirectly exported,\n+    // e.g.:\n+    //\n+    // class Foo {}\n+    // export {Foo};\n+    //\n+    // The only way to check this is to look at the module level for exports of the class. As a\n+    // performance optimization, this check is only performed if the class is actually declared at\n+    // the top level of the file and thus eligible for exporting in the first place.\n+    if (topLevel.parent === undefined || !ts.isSourceFile(topLevel.parent)) {\n+      return false;\n+    }\n+\n+    const localExports = this.getLocalExportedClassesOfSourceFile(clazz.getSourceFile());\n+    return localExports.has(clazz);\n+  }\n+\n   protected getDirectImportOfIdentifier(id: ts.Identifier): Import|null {\n     const symbol = this.checker.getSymbolAtLocation(id);\n \n@@ -413,6 +442,58 @@ export class TypeScriptReflectionHost implements ReflectionHost {\n       isStatic,\n     };\n   }\n+\n+  /**\n+   * Get the set of classes declared in `file` which are exported.\n+   */\n+  private getLocalExportedClassesOfSourceFile(file: ts.SourceFile): Set<ClassDeclaration> {\n+    const cacheSf: SourceFileWithCachedExports = file as SourceFileWithCachedExports;\n+    if (cacheSf[LocalExportedClasses] !== undefined) {\n+      // TS does not currently narrow symbol-keyed fields, hence the non-null assert is needed.\n+      return cacheSf[LocalExportedClasses]!;\n+    }\n+\n+    const exportSet = new Set<ClassDeclaration>();\n+    cacheSf[LocalExportedClasses] = exportSet;\n+\n+    const sfSymbol = this.checker.getSymbolAtLocation(cacheSf);\n+\n+    if (sfSymbol === undefined || sfSymbol.exports === undefined) {\n+      return exportSet;\n+    }\n+\n+    // Scan the exported symbol of the `ts.SourceFile` for the original `symbol` of the class\n+    // declaration.\n+    //\n+    // Note: when checking multiple classes declared in the same file, this repeats some operations.\n+    // In theory, this could be expensive if run in the context of a massive input file (like a\n+    // large FESM in ngcc). If performance does become an issue here, it should be possible to\n+    // create a `Set<>`\n+\n+    // Unfortunately, `ts.Iterator` doesn't implement the iterator protocol, so iteration here is\n+    // done manually.\n+    const iter = sfSymbol.exports.values();\n+    let item = iter.next();\n+    while (item.done !== true) {\n+      let exportedSymbol = item.value;\n+\n+      // If this exported symbol comes from an `export {Foo}` statement, then the symbol is actually\n+      // for the export declaration, not the original declaration. Such a symbol will be an alias,\n+      // so unwrap aliasing if necessary.\n+      if (exportedSymbol.flags & ts.SymbolFlags.Alias) {\n+        exportedSymbol = this.checker.getAliasedSymbol(exportedSymbol);\n+      }\n+\n+      if (exportedSymbol.valueDeclaration !== undefined &&\n+          exportedSymbol.valueDeclaration.getSourceFile() === file &&\n+          this.isClass(exportedSymbol.valueDeclaration)) {\n+        exportSet.add(exportedSymbol.valueDeclaration);\n+      }\n+      item = iter.next();\n+    }\n+\n+    return exportSet;\n+  }\n }\n \n export function reflectNameOfDeclaration(decl: ts.Declaration): string|null {\n@@ -593,3 +674,26 @@ function getExportedName(decl: ts.Declaration, originalId: ts.Identifier): strin\n       (decl.propertyName !== undefined ? decl.propertyName : decl.name).text :\n       originalId.text;\n }\n+\n+const LocalExportedClasses = Symbol('LocalExportedClasses');\n+\n+/**\n+ * A `ts.SourceFile` expando which includes a cached `Set` of local `ClassDeclarations` that are\n+ * exported either directly (`export class ...`) or indirectly (via `export {...}`).\n+ *\n+ * This cache does not cause memory leaks as:\n+ *\n+ *  1. The only references cached here are local to the `ts.SourceFile`, and thus also available in\n+ *     `this.statements`.\n+ *\n+ *  2. The only way this `Set` could change is if the source file itself was changed, which would\n+ *     invalidate the entire `ts.SourceFile` object in favor of a new version. Thus, changing the\n+ *     source file also invalidates this cache.\n+ */\n+interface SourceFileWithCachedExports extends ts.SourceFile {\n+  /**\n+   * Cached `Set` of `ClassDeclaration`s which are locally declared in this file and are exported\n+   * either directly or indirectly.\n+   */\n+  [LocalExportedClasses]?: Set<ClassDeclaration>;\n+}"
+        },
+        {
+            "sha": "6c8ba0da9ccfcb87208795fcae62fc33245b0e95",
+            "filename": "packages/compiler-cli/src/ngtsc/transform/src/compilation.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/angular/angular/blob/e039075a2837b0decf17cfbd5382d675c331bbeb/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftransform%2Fsrc%2Fcompilation.ts",
+            "raw_url": "https://github.com/angular/angular/raw/e039075a2837b0decf17cfbd5382d675c331bbeb/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftransform%2Fsrc%2Fcompilation.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftransform%2Fsrc%2Fcompilation.ts?ref=e039075a2837b0decf17cfbd5382d675c331bbeb",
+            "patch": "@@ -211,7 +211,7 @@ export class TraitCompiler implements ProgramTypeCheckAdapter {\n \n   private scanClassForTraits(clazz: ClassDeclaration):\n       PendingTrait<unknown, unknown, SemanticSymbol|null, unknown>[]|null {\n-    if (!this.compileNonExportedClasses && !isExported(clazz)) {\n+    if (!this.compileNonExportedClasses && !this.reflector.isStaticallyExported(clazz)) {\n       return null;\n     }\n "
+        },
+        {
+            "sha": "c0bb4429fcebfa8d5577419173c3a329c958a0c5",
+            "filename": "packages/compiler-cli/test/ngtsc/ngtsc_spec.ts",
+            "status": "modified",
+            "additions": 18,
+            "deletions": 0,
+            "changes": 18,
+            "blob_url": "https://github.com/angular/angular/blob/e039075a2837b0decf17cfbd5382d675c331bbeb/packages%2Fcompiler-cli%2Ftest%2Fngtsc%2Fngtsc_spec.ts",
+            "raw_url": "https://github.com/angular/angular/raw/e039075a2837b0decf17cfbd5382d675c331bbeb/packages%2Fcompiler-cli%2Ftest%2Fngtsc%2Fngtsc_spec.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Ftest%2Fngtsc%2Fngtsc_spec.ts?ref=e039075a2837b0decf17cfbd5382d675c331bbeb",
+            "patch": "@@ -7405,6 +7405,24 @@ export const Foo = Foo__PRE_R3__;\n         expect(jsContents).not.toContain('defineNgModule(');\n         expect(jsContents).toContain('NgModule({');\n       });\n+\n+      it('should still compile a class that is indirectly exported', () => {\n+        env.write('test.ts', `\n+          import {Component} from '@angular/core';\n+\n+          @Component({\n+            selector: 'test-cmp',\n+            template: 'Test Cmp',\n+          })\n+          class TestCmp {}\n+\n+          export {TestCmp};\n+        `);\n+        env.driveMain();\n+        const jsContents = env.getContents('test.js');\n+\n+        expect(jsContents).toContain('defineComponent');\n+      });\n     });\n \n     describe('undecorated providers', () => {"
+        }
+    ],
+    "stats": {
+        "total": 138,
+        "additions": 137,
+        "deletions": 1
+    }
+}

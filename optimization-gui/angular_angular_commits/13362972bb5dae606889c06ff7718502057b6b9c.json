@@ -1,0 +1,84 @@
+{
+    "author": "JoostK",
+    "message": "perf(common): code size reduction of `ngFor` directive (#44315)\n\nThis commit makes several changes to the implementation of `NgForOf` to\nreduce its code size in production builds:\n\n1. The tailor-made message for an unsupported differ is fully\n   tree-shaken in production builds, in favor of the exception from the\n   differ factory itself.\n2. The private `_perViewChange` method was changed into a free-standing\n   function, to allow its name to be minimized.\n3. The need for an intermediate `RecordViewTuple` was avoided by\n   applying the operation in-place, instead of collecting all insertions\n   into a buffer first. This is safe as the `_perViewChange` operation\n   that used to be done on each `RecordViewTuple` is entirely local to\n   the tuple itself. Hence, it is invariant to execution ordering which\n   means that the `_perViewChange` can be executed directly during the\n   `forEachOperation` loop.\n\nPR Close #44315",
+    "sha": "13362972bb5dae606889c06ff7718502057b6b9c",
+    "files": [
+        {
+            "sha": "cee26e9cfacccb2b66cd2855ee33f34effad1eb0",
+            "filename": "goldens/size-tracking/aio-payloads.json",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/angular/angular/blob/13362972bb5dae606889c06ff7718502057b6b9c/goldens%2Fsize-tracking%2Faio-payloads.json",
+            "raw_url": "https://github.com/angular/angular/raw/13362972bb5dae606889c06ff7718502057b6b9c/goldens%2Fsize-tracking%2Faio-payloads.json",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/goldens%2Fsize-tracking%2Faio-payloads.json?ref=13362972bb5dae606889c06ff7718502057b6b9c",
+            "patch": "@@ -15,7 +15,7 @@\n     \"master\": {\n       \"uncompressed\": {\n         \"runtime\": 4436,\n-        \"main\": 459047,\n+        \"main\": 458504,\n         \"polyfills\": 37271,\n         \"styles\": 70719,\n         \"light-theme\": 77717,"
+        },
+        {
+            "sha": "02eadfeb770586d1f455cf8a6ad84f1650abe07b",
+            "filename": "goldens/size-tracking/integration-payloads.json",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/angular/angular/blob/13362972bb5dae606889c06ff7718502057b6b9c/goldens%2Fsize-tracking%2Fintegration-payloads.json",
+            "raw_url": "https://github.com/angular/angular/raw/13362972bb5dae606889c06ff7718502057b6b9c/goldens%2Fsize-tracking%2Fintegration-payloads.json",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/goldens%2Fsize-tracking%2Fintegration-payloads.json?ref=13362972bb5dae606889c06ff7718502057b6b9c",
+            "patch": "@@ -3,7 +3,7 @@\n     \"master\": {\n       \"uncompressed\": {\n         \"runtime\": 1083,\n-        \"main\": 138491,\n+        \"main\": 138071,\n         \"polyfills\": 36964\n       }\n     }\n@@ -52,7 +52,7 @@\n     \"master\": {\n       \"uncompressed\": {\n         \"runtime\": 1063,\n-        \"main\": 163342,\n+        \"main\": 162474,\n         \"polyfills\": 36975\n       }\n     }"
+        },
+        {
+            "sha": "fccbb1c95d55221b8b12401aa7ff8debe1f9ac55",
+            "filename": "packages/common/src/directives/ng_for_of.ts",
+            "status": "modified",
+            "additions": 31,
+            "deletions": 34,
+            "changes": 65,
+            "blob_url": "https://github.com/angular/angular/blob/13362972bb5dae606889c06ff7718502057b6b9c/packages%2Fcommon%2Fsrc%2Fdirectives%2Fng_for_of.ts",
+            "raw_url": "https://github.com/angular/angular/raw/13362972bb5dae606889c06ff7718502057b6b9c/packages%2Fcommon%2Fsrc%2Fdirectives%2Fng_for_of.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcommon%2Fsrc%2Fdirectives%2Fng_for_of.ts?ref=13362972bb5dae606889c06ff7718502057b6b9c",
+            "patch": "@@ -208,11 +208,19 @@ export class NgForOf<T, U extends NgIterable<T> = NgIterable<T>> implements DoCh\n       // React on ngForOf changes only once all inputs have been initialized\n       const value = this._ngForOf;\n       if (!this._differ && value) {\n-        try {\n+        if (typeof ngDevMode === 'undefined' || ngDevMode) {\n+          try {\n+            // CAUTION: this logic is duplicated for production mode below, as the try-catch\n+            // is only present in development builds.\n+            this._differ = this._differs.find(value).create(this.ngForTrackBy);\n+          } catch {\n+            throw new Error(`Cannot find a differ supporting object '${value}' of type '${\n+                getTypeName(value)}'. NgFor only supports binding to Iterables such as Arrays.`);\n+          }\n+        } else {\n+          // CAUTION: this logic is duplicated for development mode above, as the try-catch\n+          // is only present in development builds.\n           this._differ = this._differs.find(value).create(this.ngForTrackBy);\n-        } catch {\n-          throw new Error(`Cannot find a differ supporting object '${value}' of type '${\n-              getTypeName(value)}'. NgFor only supports binding to Iterables such as Arrays.`);\n         }\n       }\n     }\n@@ -223,53 +231,41 @@ export class NgForOf<T, U extends NgIterable<T> = NgIterable<T>> implements DoCh\n   }\n \n   private _applyChanges(changes: IterableChanges<T>) {\n-    const insertTuples: RecordViewTuple<T, U>[] = [];\n+    const viewContainer = this._viewContainer;\n     changes.forEachOperation(\n-        (item: IterableChangeRecord<any>, adjustedPreviousIndex: number|null,\n+        (item: IterableChangeRecord<T>, adjustedPreviousIndex: number|null,\n          currentIndex: number|null) => {\n           if (item.previousIndex == null) {\n             // NgForOf is never \"null\" or \"undefined\" here because the differ detected\n             // that a new item needs to be inserted from the iterable. This implies that\n             // there is an iterable value for \"_ngForOf\".\n-            const view = this._viewContainer.createEmbeddedView(\n-                this._template, new NgForOfContext<T, U>(null!, this._ngForOf!, -1, -1),\n+            viewContainer.createEmbeddedView(\n+                this._template, new NgForOfContext<T, U>(item.item, this._ngForOf!, -1, -1),\n                 currentIndex === null ? undefined : currentIndex);\n-            const tuple = new RecordViewTuple<T, U>(item, view);\n-            insertTuples.push(tuple);\n           } else if (currentIndex == null) {\n-            this._viewContainer.remove(\n+            viewContainer.remove(\n                 adjustedPreviousIndex === null ? undefined : adjustedPreviousIndex);\n           } else if (adjustedPreviousIndex !== null) {\n-            const view = this._viewContainer.get(adjustedPreviousIndex)!;\n-            this._viewContainer.move(view, currentIndex);\n-            const tuple = new RecordViewTuple(item, <EmbeddedViewRef<NgForOfContext<T, U>>>view);\n-            insertTuples.push(tuple);\n+            const view = viewContainer.get(adjustedPreviousIndex)!;\n+            viewContainer.move(view, currentIndex);\n+            applyViewChange(view as EmbeddedViewRef<NgForOfContext<T, U>>, item);\n           }\n         });\n \n-    for (let i = 0; i < insertTuples.length; i++) {\n-      this._perViewChange(insertTuples[i].view, insertTuples[i].record);\n-    }\n-\n-    for (let i = 0, ilen = this._viewContainer.length; i < ilen; i++) {\n-      const viewRef = <EmbeddedViewRef<NgForOfContext<T, U>>>this._viewContainer.get(i);\n-      viewRef.context.index = i;\n-      viewRef.context.count = ilen;\n-      viewRef.context.ngForOf = this._ngForOf!;\n+    for (let i = 0, ilen = viewContainer.length; i < ilen; i++) {\n+      const viewRef = <EmbeddedViewRef<NgForOfContext<T, U>>>viewContainer.get(i);\n+      const context = viewRef.context;\n+      context.index = i;\n+      context.count = ilen;\n+      context.ngForOf = this._ngForOf!;\n     }\n \n     changes.forEachIdentityChange((record: any) => {\n-      const viewRef =\n-          <EmbeddedViewRef<NgForOfContext<T, U>>>this._viewContainer.get(record.currentIndex);\n-      viewRef.context.$implicit = record.item;\n+      const viewRef = <EmbeddedViewRef<NgForOfContext<T, U>>>viewContainer.get(record.currentIndex);\n+      applyViewChange(viewRef, record);\n     });\n   }\n \n-  private _perViewChange(\n-      view: EmbeddedViewRef<NgForOfContext<T, U>>, record: IterableChangeRecord<any>) {\n-    view.context.$implicit = record.item;\n-  }\n-\n   /**\n    * Asserts the correct type of the context for the template that `NgForOf` will render.\n    *\n@@ -282,8 +278,9 @@ export class NgForOf<T, U extends NgIterable<T> = NgIterable<T>> implements DoCh\n   }\n }\n \n-class RecordViewTuple<T, U extends NgIterable<T>> {\n-  constructor(public record: any, public view: EmbeddedViewRef<NgForOfContext<T, U>>) {}\n+function applyViewChange<T>(\n+    view: EmbeddedViewRef<NgForOfContext<T>>, record: IterableChangeRecord<T>) {\n+  view.context.$implicit = record.item;\n }\n \n function getTypeName(type: any): string {"
+        },
+        {
+            "sha": "a17ba0d3551a0849abd31fc09d736d3ff2b90328",
+            "filename": "packages/core/test/bundling/forms_reactive/bundle.golden_symbols.json",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 3,
+            "changes": 6,
+            "blob_url": "https://github.com/angular/angular/blob/13362972bb5dae606889c06ff7718502057b6b9c/packages%2Fcore%2Ftest%2Fbundling%2Fforms_reactive%2Fbundle.golden_symbols.json",
+            "raw_url": "https://github.com/angular/angular/raw/13362972bb5dae606889c06ff7718502057b6b9c/packages%2Fcore%2Ftest%2Fbundling%2Fforms_reactive%2Fbundle.golden_symbols.json",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcore%2Ftest%2Fbundling%2Fforms_reactive%2Fbundle.golden_symbols.json?ref=13362972bb5dae606889c06ff7718502057b6b9c",
+            "patch": "@@ -434,9 +434,6 @@\n   {\n     \"name\": \"ReactiveFormsModule\"\n   },\n-  {\n-    \"name\": \"RecordViewTuple\"\n-  },\n   {\n     \"name\": \"RefCountOperator\"\n   },\n@@ -656,6 +653,9 @@\n   {\n     \"name\": \"applyView\"\n   },\n+  {\n+    \"name\": \"applyViewChange\"\n+  },\n   {\n     \"name\": \"attachInjectFlag\"\n   },"
+        },
+        {
+            "sha": "38d2524eadddc6506bddf897cb06c2b9cbb45ea3",
+            "filename": "packages/core/test/bundling/forms_template_driven/bundle.golden_symbols.json",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 3,
+            "changes": 6,
+            "blob_url": "https://github.com/angular/angular/blob/13362972bb5dae606889c06ff7718502057b6b9c/packages%2Fcore%2Ftest%2Fbundling%2Fforms_template_driven%2Fbundle.golden_symbols.json",
+            "raw_url": "https://github.com/angular/angular/raw/13362972bb5dae606889c06ff7718502057b6b9c/packages%2Fcore%2Ftest%2Fbundling%2Fforms_template_driven%2Fbundle.golden_symbols.json",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcore%2Ftest%2Fbundling%2Fforms_template_driven%2Fbundle.golden_symbols.json?ref=13362972bb5dae606889c06ff7718502057b6b9c",
+            "patch": "@@ -419,9 +419,6 @@\n   {\n     \"name\": \"RadioControlRegistryModule\"\n   },\n-  {\n-    \"name\": \"RecordViewTuple\"\n-  },\n   {\n     \"name\": \"RefCountOperator\"\n   },\n@@ -644,6 +641,9 @@\n   {\n     \"name\": \"applyView\"\n   },\n+  {\n+    \"name\": \"applyViewChange\"\n+  },\n   {\n     \"name\": \"attachInjectFlag\"\n   },"
+        },
+        {
+            "sha": "17a815f4c227fb5f016024fcd72a793e91b2ffad",
+            "filename": "packages/core/test/bundling/todo/bundle.golden_symbols.json",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 3,
+            "changes": 6,
+            "blob_url": "https://github.com/angular/angular/blob/13362972bb5dae606889c06ff7718502057b6b9c/packages%2Fcore%2Ftest%2Fbundling%2Ftodo%2Fbundle.golden_symbols.json",
+            "raw_url": "https://github.com/angular/angular/raw/13362972bb5dae606889c06ff7718502057b6b9c/packages%2Fcore%2Ftest%2Fbundling%2Ftodo%2Fbundle.golden_symbols.json",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcore%2Ftest%2Fbundling%2Ftodo%2Fbundle.golden_symbols.json?ref=13362972bb5dae606889c06ff7718502057b6b9c",
+            "patch": "@@ -101,9 +101,6 @@\n   {\n     \"name\": \"R3ViewContainerRef\"\n   },\n-  {\n-    \"name\": \"RecordViewTuple\"\n-  },\n   {\n     \"name\": \"RendererFactory2\"\n   },\n@@ -236,6 +233,9 @@\n   {\n     \"name\": \"applyView\"\n   },\n+  {\n+    \"name\": \"applyViewChange\"\n+  },\n   {\n     \"name\": \"assertTemplate\"\n   },"
+        }
+    ],
+    "stats": {
+        "total": 89,
+        "additions": 43,
+        "deletions": 46
+    }
+}

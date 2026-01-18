@@ -1,0 +1,60 @@
+{
+    "author": "addaleax",
+    "message": "src: give StreamBases the capability to ask for data\n\nAdd a `OnStreamWantsWrite()` event that allows streams to\nask for more input data if they want some.\n\nPR-URL: https://github.com/nodejs/node/pull/18936\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Matteo Collina <matteo.collina@gmail.com>",
+    "sha": "f734b3eb04c0d355ef7ab893ed5869b867d35642",
+    "files": [
+        {
+            "sha": "8dd222a692a52cf5453049b32270d1b5b7586658",
+            "filename": "src/node_http2.cc",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/nodejs/node/blob/f734b3eb04c0d355ef7ab893ed5869b867d35642/src%2Fnode_http2.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/f734b3eb04c0d355ef7ab893ed5869b867d35642/src%2Fnode_http2.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_http2.cc?ref=f734b3eb04c0d355ef7ab893ed5869b867d35642",
+            "patch": "@@ -2219,6 +2219,11 @@ ssize_t Http2Stream::Provider::Stream::OnRead(nghttp2_session* handle,\n   if (amount == 0 && stream->IsWritable()) {\n     CHECK(stream->queue_.empty());\n     DEBUG_HTTP2SESSION2(session, \"deferring stream %d\", id);\n+    stream->EmitWantsWrite(length);\n+    if (stream->available_outbound_length_ > 0 || !stream->IsWritable()) {\n+      // EmitWantsWrite() did something interesting synchronously, restart:\n+      return OnRead(handle, id, buf, length, flags, source, user_data);\n+    }\n     return NGHTTP2_ERR_DEFERRED;\n   }\n "
+        },
+        {
+            "sha": "2d55989fd7d2e7cc2de61408f367fd3f9511d873",
+            "filename": "src/node_http2.h",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/f734b3eb04c0d355ef7ab893ed5869b867d35642/src%2Fnode_http2.h",
+            "raw_url": "https://github.com/nodejs/node/raw/f734b3eb04c0d355ef7ab893ed5869b867d35642/src%2Fnode_http2.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_http2.h?ref=f734b3eb04c0d355ef7ab893ed5869b867d35642",
+            "patch": "@@ -573,6 +573,8 @@ class Http2Stream : public AsyncWrap,\n   // Required for StreamBase\n   int DoShutdown(ShutdownWrap* req_wrap) override;\n \n+  bool HasWantsWrite() const override { return true; }\n+\n   // Initiate a response on this stream.\n   inline int SubmitResponse(nghttp2_nv* nva,\n                             size_t len,"
+        },
+        {
+            "sha": "f0d522a7b06b6c2e25fb2803566ea2efd9080e49",
+            "filename": "src/stream_base-inl.h",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/nodejs/node/blob/f734b3eb04c0d355ef7ab893ed5869b867d35642/src%2Fstream_base-inl.h",
+            "raw_url": "https://github.com/nodejs/node/raw/f734b3eb04c0d355ef7ab893ed5869b867d35642/src%2Fstream_base-inl.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fstream_base-inl.h?ref=f734b3eb04c0d355ef7ab893ed5869b867d35642",
+            "patch": "@@ -136,6 +136,13 @@ inline void StreamResource::EmitAfterShutdown(ShutdownWrap* w, int status) {\n   listener_->OnStreamAfterShutdown(w, status);\n }\n \n+inline void StreamResource::EmitWantsWrite(size_t suggested_size) {\n+#ifdef DEBUG\n+  v8::SealHandleScope handle_scope(v8::Isolate::GetCurrent());\n+#endif\n+  listener_->OnStreamWantsWrite(suggested_size);\n+}\n+\n inline StreamBase::StreamBase(Environment* env) : env_(env) {\n   PushStreamListener(&default_listener_);\n }"
+        },
+        {
+            "sha": "96a7787e5bb41ccbe1ef49ac052c03067d6c4d97",
+            "filename": "src/stream_base.h",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 0,
+            "changes": 12,
+            "blob_url": "https://github.com/nodejs/node/blob/f734b3eb04c0d355ef7ab893ed5869b867d35642/src%2Fstream_base.h",
+            "raw_url": "https://github.com/nodejs/node/raw/f734b3eb04c0d355ef7ab893ed5869b867d35642/src%2Fstream_base.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fstream_base.h?ref=f734b3eb04c0d355ef7ab893ed5869b867d35642",
+            "patch": "@@ -131,6 +131,13 @@ class StreamListener {\n   // (and raises an assertion if there is none).\n   virtual void OnStreamAfterShutdown(ShutdownWrap* w, int status);\n \n+  // This is called by the stream if it determines that it wants more data\n+  // to be written to it. Not all streams support this.\n+  // This callback will not be called as long as there are active writes.\n+  // It is not supported by all streams; `stream->HasWantsWrite()` returns\n+  // true if it is supported by a stream.\n+  virtual void OnStreamWantsWrite(size_t suggested_size) {}\n+\n   // This is called immediately before the stream is destroyed.\n   virtual void OnStreamDestroy() {}\n \n@@ -199,6 +206,9 @@ class StreamResource {\n                       size_t count,\n                       uv_stream_t* send_handle) = 0;\n \n+  // Returns true if the stream supports the `OnStreamWantsWrite()` interface.\n+  virtual bool HasWantsWrite() const { return false; }\n+\n   // Optionally, this may provide an error message to be used for\n   // failing writes.\n   virtual const char* Error() const;\n@@ -222,6 +232,8 @@ class StreamResource {\n   void EmitAfterWrite(WriteWrap* w, int status);\n   // Call the current listener's OnStreamAfterShutdown() method.\n   void EmitAfterShutdown(ShutdownWrap* w, int status);\n+  // Call the current listener's OnStreamWantsWrite() method.\n+  void EmitWantsWrite(size_t suggested_size);\n \n   StreamListener* listener_ = nullptr;\n   uint64_t bytes_read_ = 0;"
+        }
+    ],
+    "stats": {
+        "total": 26,
+        "additions": 26,
+        "deletions": 0
+    }
+}

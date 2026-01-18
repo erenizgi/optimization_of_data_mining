@@ -1,0 +1,108 @@
+{
+    "author": "mcollina",
+    "message": "http,https: protect against slow headers attack\n\nCVE-2018-12122\n\nAn attacker can send a char/s within headers and exahust the resources\n(file descriptors) of a system even with a tight max header length\nprotection. This PR destroys a socket if it has not received the headers\nin 40s.\n\nPR-URL: https://github.com/nodejs-private/node-private/pull/144\nReviewed-By: Sam Roberts <vieuxtech@gmail.com>\nReviewed-By: Ben Noordhuis <info@bnoordhuis.nl>\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "ee618a7ab239c98d945c723a4e225bc409151736",
+    "files": [
+        {
+            "sha": "13373debb4049ee5042ba91a93a33f361e2ed32e",
+            "filename": "doc/api/http.md",
+            "status": "modified",
+            "additions": 20,
+            "deletions": 0,
+            "changes": 20,
+            "blob_url": "https://github.com/nodejs/node/blob/ee618a7ab239c98d945c723a4e225bc409151736/doc%2Fapi%2Fhttp.md",
+            "raw_url": "https://github.com/nodejs/node/raw/ee618a7ab239c98d945c723a4e225bc409151736/doc%2Fapi%2Fhttp.md",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/doc%2Fapi%2Fhttp.md?ref=ee618a7ab239c98d945c723a4e225bc409151736",
+            "patch": "@@ -958,6 +958,26 @@ added: v0.7.0\n \n Limits maximum incoming headers count. If set to 0, no limit will be applied.\n \n+### server.headersTimeout\n+<!-- YAML\n+added: REPLACEME\n+-->\n+\n+* {number} **Default:** `40000`\n+\n+Limit the amount of time the parser will wait to receive the complete HTTP\n+headers.\n+\n+In case of inactivity, the rules defined in [server.timeout][] apply. However,\n+that inactivity based timeout would still allow the connection to be kept open\n+if the headers are being sent very slowly (by default, up to a byte per 2\n+minutes). In order to prevent this, whenever header data arrives an additional\n+check is made that more than `server.headersTimeout` milliseconds has not\n+passed since the connection was established. If the check fails, a `'timeout'`\n+event is emitted on the server object, and (by default) the socket is destroyed.\n+See [server.timeout][] for more information on how timeout behaviour can be\n+customised.\n+\n ### server.setTimeout([msecs][, callback])\n <!-- YAML\n added: v0.9.12"
+        },
+        {
+            "sha": "81a5bcce934e8f08481a3a9d15ba61be9a984ea6",
+            "filename": "doc/api/https.md",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/nodejs/node/blob/ee618a7ab239c98d945c723a4e225bc409151736/doc%2Fapi%2Fhttps.md",
+            "raw_url": "https://github.com/nodejs/node/raw/ee618a7ab239c98d945c723a4e225bc409151736/doc%2Fapi%2Fhttps.md",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/doc%2Fapi%2Fhttps.md?ref=ee618a7ab239c98d945c723a4e225bc409151736",
+            "patch": "@@ -44,6 +44,12 @@ This method is identical to [`server.listen()`][] from [`net.Server`][].\n \n See [`http.Server#maxHeadersCount`][].\n \n+### server.headersTimeout\n+\n+- {number} **Default:** `40000`\n+\n+See [`http.Server#headersTimeout`][].\n+\n ### server.setTimeout([msecs][, callback])\n <!-- YAML\n added: v0.11.2\n@@ -363,6 +369,7 @@ headers: max-age=0; pin-sha256=\"WoiWRyIOVNa9ihaBciRSC7XHjliYS9VwUGOIud4PB18=\"; p\n [`http.Agent`]: http.html#http_class_http_agent\n [`http.Server#keepAliveTimeout`]: http.html#http_server_keepalivetimeout\n [`http.Server#maxHeadersCount`]: http.html#http_server_maxheaderscount\n+[`http.Server#headersTimeout`]: http.html#http_server_headerstimeout\n [`http.Server#setTimeout()`]: http.html#http_server_settimeout_msecs_callback\n [`http.Server#timeout`]: http.html#http_server_timeout\n [`http.Server`]: http.html#http_class_http_server"
+        },
+        {
+            "sha": "c171b1d3e78a4184d1caaa43cdc252fe8f701cad",
+            "filename": "lib/_http_server.js",
+            "status": "modified",
+            "additions": 21,
+            "deletions": 1,
+            "changes": 22,
+            "blob_url": "https://github.com/nodejs/node/blob/ee618a7ab239c98d945c723a4e225bc409151736/lib%2F_http_server.js",
+            "raw_url": "https://github.com/nodejs/node/raw/ee618a7ab239c98d945c723a4e225bc409151736/lib%2F_http_server.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2F_http_server.js?ref=ee618a7ab239c98d945c723a4e225bc409151736",
+            "patch": "@@ -37,7 +37,7 @@ const {\n   _checkInvalidHeaderChar: checkInvalidHeaderChar\n } = require('_http_common');\n const { OutgoingMessage } = require('_http_outgoing');\n-const { outHeadersKey, ondrain } = require('internal/http');\n+const { outHeadersKey, ondrain, nowDate } = require('internal/http');\n const {\n   defaultTriggerAsyncIdScope,\n   getOrSetAsyncId\n@@ -306,6 +306,7 @@ function Server(options, requestListener) {\n   this.keepAliveTimeout = 5000;\n   this._pendingResponseData = 0;\n   this.maxHeadersCount = null;\n+  this.headersTimeout = 40 * 1000; // 40 seconds\n }\n util.inherits(Server, net.Server);\n \n@@ -344,6 +345,9 @@ function connectionListenerInternal(server, socket) {\n   var parser = parsers.alloc();\n   parser.reinitialize(HTTPParser.REQUEST, parser[is_reused_symbol]);\n   parser.socket = socket;\n+\n+  // We are starting to wait for our headers.\n+  parser.parsingHeadersStart = nowDate();\n   socket.parser = parser;\n \n   // Propagate headers limit from server instance to parser\n@@ -481,7 +485,20 @@ function socketOnData(server, socket, parser, state, d) {\n \n function onParserExecute(server, socket, parser, state, ret) {\n   socket._unrefTimer();\n+  const start = parser.parsingHeadersStart;\n   debug('SERVER socketOnParserExecute %d', ret);\n+\n+  // If we have not parsed the headers, destroy the socket\n+  // after server.headersTimeout to protect from DoS attacks.\n+  // start === 0 means that we have parsed headers.\n+  if (start !== 0 && nowDate() - start > server.headersTimeout) {\n+    const serverTimeout = server.emit('timeout', socket);\n+\n+    if (!serverTimeout)\n+      socket.destroy();\n+    return;\n+  }\n+\n   onParserExecuteCommon(server, socket, parser, state, ret, undefined);\n }\n \n@@ -598,6 +615,9 @@ function emitCloseNT(self) {\n function parserOnIncoming(server, socket, state, req, keepAlive) {\n   resetSocketTimeout(server, socket, state);\n \n+  // Set to zero to communicate that we have finished parsing.\n+  socket.parser.parsingHeadersStart = 0;\n+\n   if (req.upgrade) {\n     req.upgrade = req.method === 'CONNECT' ||\n                   server.listenerCount('upgrade') > 0;"
+        },
+        {
+            "sha": "0854c3d440577a2d779e16a6ddf74a6278b48b40",
+            "filename": "lib/https.js",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/ee618a7ab239c98d945c723a4e225bc409151736/lib%2Fhttps.js",
+            "raw_url": "https://github.com/nodejs/node/raw/ee618a7ab239c98d945c723a4e225bc409151736/lib%2Fhttps.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Fhttps.js?ref=ee618a7ab239c98d945c723a4e225bc409151736",
+            "patch": "@@ -74,6 +74,7 @@ function Server(opts, requestListener) {\n   this.timeout = 2 * 60 * 1000;\n   this.keepAliveTimeout = 5000;\n   this.maxHeadersCount = null;\n+  this.headersTimeout = 40 * 1000; // 40 seconds\n }\n inherits(Server, tls.Server);\n "
+        },
+        {
+            "sha": "47a51fb73949476aeaf669c527b8ed94fe1a0291",
+            "filename": "lib/internal/http.js",
+            "status": "modified",
+            "additions": 19,
+            "deletions": 8,
+            "changes": 27,
+            "blob_url": "https://github.com/nodejs/node/blob/ee618a7ab239c98d945c723a4e225bc409151736/lib%2Finternal%2Fhttp.js",
+            "raw_url": "https://github.com/nodejs/node/raw/ee618a7ab239c98d945c723a4e225bc409151736/lib%2Finternal%2Fhttp.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fhttp.js?ref=ee618a7ab239c98d945c723a4e225bc409151736",
+            "patch": "@@ -2,19 +2,29 @@\n \n const { setUnrefTimeout } = require('internal/timers');\n \n-var dateCache;\n+var nowCache;\n+var utcCache;\n+\n+function nowDate() {\n+  if (!nowCache) cache();\n+  return nowCache;\n+}\n+\n function utcDate() {\n-  if (!dateCache) {\n-    const d = new Date();\n-    dateCache = d.toUTCString();\n+  if (!utcCache) cache();\n+  return utcCache;\n+}\n \n-    setUnrefTimeout(resetCache, 1000 - d.getMilliseconds());\n-  }\n-  return dateCache;\n+function cache() {\n+  const d = new Date();\n+  nowCache = d.valueOf();\n+  utcCache = d.toUTCString();\n+  setUnrefTimeout(resetCache, 1000 - d.getMilliseconds());\n }\n \n function resetCache() {\n-  dateCache = undefined;\n+  nowCache = undefined;\n+  utcCache = undefined;\n }\n \n function ondrain() {\n@@ -24,5 +34,6 @@ function ondrain() {\n module.exports = {\n   outHeadersKey: Symbol('outHeadersKey'),\n   ondrain,\n+  nowDate,\n   utcDate\n };"
+        },
+        {
+            "sha": "3461974ef9c47714a319d4054e9463b609dbf623",
+            "filename": "test/async-hooks/test-graph.http.js",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/ee618a7ab239c98d945c723a4e225bc409151736/test%2Fasync-hooks%2Ftest-graph.http.js",
+            "raw_url": "https://github.com/nodejs/node/raw/ee618a7ab239c98d945c723a4e225bc409151736/test%2Fasync-hooks%2Ftest-graph.http.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fasync-hooks%2Ftest-graph.http.js?ref=ee618a7ab239c98d945c723a4e225bc409151736",
+            "patch": "@@ -45,7 +45,7 @@ process.on('exit', function() {\n         triggerAsyncId: 'tcp:2' },\n       { type: 'Timeout',\n         id: 'timeout:2',\n-        triggerAsyncId: 'httpparser:2' },\n+        triggerAsyncId: 'tcp:2' },\n       { type: 'SHUTDOWNWRAP',\n         id: 'shutdown:1',\n         triggerAsyncId: 'tcp:2' } ]"
+        },
+        {
+            "sha": "6da11465dac17b74f34b509383836bd25761c3a4",
+            "filename": "test/parallel/test-http-slow-headers.js",
+            "status": "added",
+            "additions": 50,
+            "deletions": 0,
+            "changes": 50,
+            "blob_url": "https://github.com/nodejs/node/blob/ee618a7ab239c98d945c723a4e225bc409151736/test%2Fparallel%2Ftest-http-slow-headers.js",
+            "raw_url": "https://github.com/nodejs/node/raw/ee618a7ab239c98d945c723a4e225bc409151736/test%2Fparallel%2Ftest-http-slow-headers.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-http-slow-headers.js?ref=ee618a7ab239c98d945c723a4e225bc409151736",
+            "patch": "@@ -0,0 +1,50 @@\n+'use strict';\n+\n+const common = require('../common');\n+const assert = require('assert');\n+const { createServer } = require('http');\n+const { connect } = require('net');\n+const { finished } = require('stream');\n+\n+// This test validates that the 'timeout' event fires\n+// after server.headersTimeout.\n+\n+const headers =\n+  'GET / HTTP/1.1\\r\\n' +\n+  'Host: localhost\\r\\n' +\n+  'Agent: node\\r\\n';\n+\n+const server = createServer(common.mustNotCall());\n+let sendCharEvery = 1000;\n+\n+// 40 seconds is the default\n+assert.strictEqual(server.headersTimeout, 40 * 1000);\n+\n+// Pass a REAL env variable to shortening up the default\n+// value which is 40s otherwise this is useful for manual\n+// testing\n+if (!process.env.REAL) {\n+  sendCharEvery = common.platformTimeout(10);\n+  server.headersTimeout = 2 * sendCharEvery;\n+}\n+\n+server.once('timeout', common.mustCall((socket) => {\n+  socket.destroy();\n+}));\n+\n+server.listen(0, common.mustCall(() => {\n+  const client = connect(server.address().port);\n+  client.write(headers);\n+  client.write('X-CRASH: ');\n+\n+  const interval = setInterval(() => {\n+    client.write('a');\n+  }, sendCharEvery);\n+\n+  client.resume();\n+\n+  finished(client, common.mustCall((err) => {\n+    clearInterval(interval);\n+    server.close();\n+  }));\n+}));"
+        },
+        {
+            "sha": "2a55850b5de847800ae08722164e6a25dbf9156d",
+            "filename": "test/parallel/test-https-slow-headers.js",
+            "status": "added",
+            "additions": 63,
+            "deletions": 0,
+            "changes": 63,
+            "blob_url": "https://github.com/nodejs/node/blob/ee618a7ab239c98d945c723a4e225bc409151736/test%2Fparallel%2Ftest-https-slow-headers.js",
+            "raw_url": "https://github.com/nodejs/node/raw/ee618a7ab239c98d945c723a4e225bc409151736/test%2Fparallel%2Ftest-https-slow-headers.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-https-slow-headers.js?ref=ee618a7ab239c98d945c723a4e225bc409151736",
+            "patch": "@@ -0,0 +1,63 @@\n+'use strict';\n+\n+const common = require('../common');\n+const { readKey } = require('../common/fixtures');\n+\n+if (!common.hasCrypto)\n+  common.skip('missing crypto');\n+\n+const assert = require('assert');\n+const { createServer } = require('https');\n+const { connect } = require('tls');\n+const { finished } = require('stream');\n+\n+// This test validates that the 'timeout' event fires\n+// after server.headersTimeout.\n+\n+const headers =\n+  'GET / HTTP/1.1\\r\\n' +\n+  'Host: localhost\\r\\n' +\n+  'Agent: node\\r\\n';\n+\n+const server = createServer({\n+  key: readKey('agent1-key.pem'),\n+  cert: readKey('agent1-cert.pem'),\n+  ca: readKey('ca1-cert.pem'),\n+}, common.mustNotCall());\n+\n+let sendCharEvery = 1000;\n+\n+// 40 seconds is the default\n+assert.strictEqual(server.headersTimeout, 40 * 1000);\n+\n+// pass a REAL env variable to shortening up the default\n+// value which is 40s otherwise\n+// this is useful for manual testing\n+if (!process.env.REAL) {\n+  sendCharEvery = common.platformTimeout(10);\n+  server.headersTimeout = 2 * sendCharEvery;\n+}\n+\n+server.once('timeout', common.mustCall((socket) => {\n+  socket.destroy();\n+}));\n+\n+server.listen(0, common.mustCall(() => {\n+  const client = connect({\n+    port: server.address().port,\n+    rejectUnauthorized: false\n+  });\n+  client.write(headers);\n+  client.write('X-CRASH: ');\n+\n+  const interval = setInterval(() => {\n+    client.write('a');\n+  }, sendCharEvery);\n+\n+  client.resume();\n+\n+  finished(client, common.mustCall((err) => {\n+    clearInterval(interval);\n+    server.close();\n+  }));\n+}));"
+        }
+    ],
+    "stats": {
+        "total": 192,
+        "additions": 182,
+        "deletions": 10
+    }
+}

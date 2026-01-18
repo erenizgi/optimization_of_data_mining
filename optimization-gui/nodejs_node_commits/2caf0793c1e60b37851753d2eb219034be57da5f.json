@@ -1,0 +1,72 @@
+{
+    "author": "devsnek",
+    "message": "lib: trigger uncaught exception handler for microtasks\n\nPR-URL: https://github.com/nodejs/node/pull/23794\nReviewed-By: Anna Henningsen <anna@addaleax.net>\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Colin Ihrig <cjihrig@gmail.com>\nReviewed-By: Matheus Marchini <mat@mmarchini.me>",
+    "sha": "2caf0793c1e60b37851753d2eb219034be57da5f",
+    "files": [
+        {
+            "sha": "e41d621883184be14c6967f8652d2ff33b1f46e9",
+            "filename": "doc/api/globals.md",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/nodejs/node/blob/2caf0793c1e60b37851753d2eb219034be57da5f/doc%2Fapi%2Fglobals.md",
+            "raw_url": "https://github.com/nodejs/node/raw/2caf0793c1e60b37851753d2eb219034be57da5f/doc%2Fapi%2Fglobals.md",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/doc%2Fapi%2Fglobals.md?ref=2caf0793c1e60b37851753d2eb219034be57da5f",
+            "patch": "@@ -119,8 +119,8 @@ added: v11.0.0\n * `callback` {Function} Function to be queued.\n \n The `queueMicrotask()` method queues a microtask to invoke `callback`. If\n-`callback` throws an exception, the [`process` object][] `'error'` event will\n-be emitted.\n+`callback` throws an exception, the [`process` object][] `'uncaughtException'`\n+event will be emitted.\n \n In general, `queueMicrotask` is the idiomatic choice over `process.nextTick()`.\n `process.nextTick()` will always run before the microtask queue, and so"
+        },
+        {
+            "sha": "bc87801be2769bd5d66503aa744bf9bd8a855929",
+            "filename": "lib/internal/bootstrap/node.js",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 2,
+            "changes": 6,
+            "blob_url": "https://github.com/nodejs/node/blob/2caf0793c1e60b37851753d2eb219034be57da5f/lib%2Finternal%2Fbootstrap%2Fnode.js",
+            "raw_url": "https://github.com/nodejs/node/raw/2caf0793c1e60b37851753d2eb219034be57da5f/lib%2Finternal%2Fbootstrap%2Fnode.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fbootstrap%2Fnode.js?ref=2caf0793c1e60b37851753d2eb219034be57da5f",
+            "patch": "@@ -24,7 +24,8 @@\n                                 _umask, _initgroups, _setegid, _seteuid,\n                                 _setgid, _setuid, _setgroups,\n                                 _shouldAbortOnUncaughtToggle },\n-                              { internalBinding, NativeModule }) {\n+                              { internalBinding, NativeModule },\n+                              triggerFatalException) {\n   const exceptionHandlerState = { captureFn: null };\n   const isMainThread = internalBinding('worker').threadId === 0;\n \n@@ -538,8 +539,9 @@\n       get: () => {\n         process.emitWarning('queueMicrotask() is experimental.',\n                             'ExperimentalWarning');\n-        const { queueMicrotask } =\n+        const { setupQueueMicrotask } =\n           NativeModule.require('internal/queue_microtask');\n+        const queueMicrotask = setupQueueMicrotask(triggerFatalException);\n         Object.defineProperty(global, 'queueMicrotask', {\n           value: queueMicrotask,\n           writable: true,"
+        },
+        {
+            "sha": "6421e7f9400e551a498cee3bbe7b30e87b0b646b",
+            "filename": "lib/internal/queue_microtask.js",
+            "status": "modified",
+            "additions": 27,
+            "deletions": 19,
+            "changes": 46,
+            "blob_url": "https://github.com/nodejs/node/blob/2caf0793c1e60b37851753d2eb219034be57da5f/lib%2Finternal%2Fqueue_microtask.js",
+            "raw_url": "https://github.com/nodejs/node/raw/2caf0793c1e60b37851753d2eb219034be57da5f/lib%2Finternal%2Fqueue_microtask.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fqueue_microtask.js?ref=2caf0793c1e60b37851753d2eb219034be57da5f",
+            "patch": "@@ -5,27 +5,35 @@ const { AsyncResource } = require('async_hooks');\n const { getDefaultTriggerAsyncId } = require('internal/async_hooks');\n const { enqueueMicrotask } = internalBinding('util');\n \n-// declared separately for name, arrow function to prevent construction\n-const queueMicrotask = (callback) => {\n-  if (typeof callback !== 'function') {\n-    throw new ERR_INVALID_ARG_TYPE('callback', 'function', callback);\n-  }\n+const setupQueueMicrotask = (triggerFatalException) => {\n+  const queueMicrotask = (callback) => {\n+    if (typeof callback !== 'function') {\n+      throw new ERR_INVALID_ARG_TYPE('callback', 'function', callback);\n+    }\n \n-  const asyncResource = new AsyncResource('Microtask', {\n-    triggerAsyncId: getDefaultTriggerAsyncId(),\n-    requireManualDestroy: true,\n-  });\n+    const asyncResource = new AsyncResource('Microtask', {\n+      triggerAsyncId: getDefaultTriggerAsyncId(),\n+      requireManualDestroy: true,\n+    });\n \n-  enqueueMicrotask(() => {\n-    asyncResource.runInAsyncScope(() => {\n-      try {\n-        callback();\n-      } catch (e) {\n-        process.emit('error', e);\n-      }\n+    enqueueMicrotask(() => {\n+      asyncResource.runInAsyncScope(() => {\n+        try {\n+          callback();\n+        } catch (error) {\n+          // TODO(devsnek) remove this if\n+          // https://bugs.chromium.org/p/v8/issues/detail?id=8326\n+          // is resolved such that V8 triggers the fatal exception\n+          // handler for microtasks\n+          triggerFatalException(error);\n+        } finally {\n+          asyncResource.emitDestroy();\n+        }\n+      });\n     });\n-    asyncResource.emitDestroy();\n-  });\n+  };\n+\n+  return queueMicrotask;\n };\n \n-module.exports = { queueMicrotask };\n+module.exports = { setupQueueMicrotask };"
+        },
+        {
+            "sha": "02d9765301aebc6d377184f56e0889332909bf81",
+            "filename": "src/node.cc",
+            "status": "modified",
+            "additions": 18,
+            "deletions": 1,
+            "changes": 19,
+            "blob_url": "https://github.com/nodejs/node/blob/2caf0793c1e60b37851753d2eb219034be57da5f/src%2Fnode.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/2caf0793c1e60b37851753d2eb219034be57da5f/src%2Fnode.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode.cc?ref=2caf0793c1e60b37851753d2eb219034be57da5f",
+            "patch": "@@ -1423,6 +1423,18 @@ void FatalException(Isolate* isolate, const TryCatch& try_catch) {\n }\n \n \n+static void FatalException(const FunctionCallbackInfo<Value>& args) {\n+  Isolate* isolate = args.GetIsolate();\n+  Environment* env = Environment::GetCurrent(isolate);\n+  if (env != nullptr && env->abort_on_uncaught_exception()) {\n+    Abort();\n+  }\n+  Local<Value> exception = args[0];\n+  Local<Message> message = Exception::CreateMessage(isolate, exception);\n+  FatalException(isolate, exception, message);\n+}\n+\n+\n static void OnMessage(Local<Message> message, Local<Value> error) {\n   // The current version of V8 sends messages for errors only\n   // (thus `error` is always set).\n@@ -2161,14 +2173,19 @@ void LoadEnvironment(Environment* env) {\n     return;\n   }\n \n+  Local<Function> trigger_fatal_exception =\n+      env->NewFunctionTemplate(FatalException)->GetFunction(env->context())\n+          .ToLocalChecked();\n+\n   // Bootstrap Node.js\n   Local<Object> bootstrapper = Object::New(env->isolate());\n   SetupBootstrapObject(env, bootstrapper);\n   Local<Value> bootstrapped_node;\n   Local<Value> node_bootstrapper_args[] = {\n     env->process_object(),\n     bootstrapper,\n-    bootstrapped_loaders\n+    bootstrapped_loaders,\n+    trigger_fatal_exception,\n   };\n   if (!ExecuteBootstrapper(env, node_bootstrapper.ToLocalChecked(),\n                            arraysize(node_bootstrapper_args),"
+        },
+        {
+            "sha": "f0eb4364258cc1d8136e8995a218d52118a2f50b",
+            "filename": "test/parallel/test-queue-microtask.js",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/2caf0793c1e60b37851753d2eb219034be57da5f/test%2Fparallel%2Ftest-queue-microtask.js",
+            "raw_url": "https://github.com/nodejs/node/raw/2caf0793c1e60b37851753d2eb219034be57da5f/test%2Fparallel%2Ftest-queue-microtask.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-queue-microtask.js?ref=2caf0793c1e60b37851753d2eb219034be57da5f",
+            "patch": "@@ -42,7 +42,7 @@ queueMicrotask(common.mustCall(function() {\n }\n \n const eq = [];\n-process.on('error', (e) => {\n+process.on('uncaughtException', (e) => {\n   eq.push(e);\n });\n "
+        }
+    ],
+    "stats": {
+        "total": 77,
+        "additions": 52,
+        "deletions": 25
+    }
+}

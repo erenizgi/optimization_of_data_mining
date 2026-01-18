@@ -1,0 +1,48 @@
+{
+    "author": "akaariai",
+    "message": "Fixed #16047 -- Restore autocommit state correctly on psycopg2\n\nWhen the postgresql_psycopg2 backend was used with DB-level autocommit\nmode enabled, after entering transaction management and then leaving\nit, the isolation level was never set back to autocommit mode.\n\nThanks brodie for report and working on this issue.",
+    "sha": "f572ee0c65ec5eac9edb0cb3e35c96ec86d89ffb",
+    "files": [
+        {
+            "sha": "05ef7bf62a3bdf001d663e1c034118b7417f6f6c",
+            "filename": "django/db/backends/__init__.py",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 5,
+            "changes": 14,
+            "blob_url": "https://github.com/django/django/blob/f572ee0c65ec5eac9edb0cb3e35c96ec86d89ffb/django%2Fdb%2Fbackends%2F__init__.py",
+            "raw_url": "https://github.com/django/django/raw/f572ee0c65ec5eac9edb0cb3e35c96ec86d89ffb/django%2Fdb%2Fbackends%2F__init__.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fbackends%2F__init__.py?ref=f572ee0c65ec5eac9edb0cb3e35c96ec86d89ffb",
+            "patch": "@@ -109,16 +109,18 @@ def leave_transaction_management(self):\n         over to the surrounding block, as a commit will commit all changes, even\n         those from outside. (Commits are on connection level.)\n         \"\"\"\n-        self._leave_transaction_management(self.is_managed())\n         if self.transaction_state:\n             del self.transaction_state[-1]\n         else:\n-            raise TransactionManagementError(\"This code isn't under transaction \"\n-                \"management\")\n+            raise TransactionManagementError(\n+                \"This code isn't under transaction management\")\n+        # We will pass the next status (after leaving the previous state\n+        # behind) to subclass hook.\n+        self._leave_transaction_management(self.is_managed())\n         if self._dirty:\n             self.rollback()\n-            raise TransactionManagementError(\"Transaction managed block ended with \"\n-                \"pending COMMIT/ROLLBACK\")\n+            raise TransactionManagementError(\n+                \"Transaction managed block ended with pending COMMIT/ROLLBACK\")\n         self._dirty = False\n \n     def validate_thread_sharing(self):\n@@ -176,6 +178,8 @@ def is_managed(self):\n         \"\"\"\n         if self.transaction_state:\n             return self.transaction_state[-1]\n+        # Note that this setting isn't documented, and is only used here, and\n+        # in enter_transaction_management()\n         return settings.TRANSACTIONS_MANAGED\n \n     def managed(self, flag=True):"
+        },
+        {
+            "sha": "4544be0eacc7a4bec72a59bf15349c5321764d6d",
+            "filename": "docs/releases/1.5.txt",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/django/django/blob/f572ee0c65ec5eac9edb0cb3e35c96ec86d89ffb/docs%2Freleases%2F1.5.txt",
+            "raw_url": "https://github.com/django/django/raw/f572ee0c65ec5eac9edb0cb3e35c96ec86d89ffb/docs%2Freleases%2F1.5.txt",
+            "contents_url": "https://api.github.com/repos/django/django/contents/docs%2Freleases%2F1.5.txt?ref=f572ee0c65ec5eac9edb0cb3e35c96ec86d89ffb",
+            "patch": "@@ -168,6 +168,15 @@ number was inside the existing page range.\n It does check it now and raises an :exc:`InvalidPage` exception when the number\n is either too low or too high.\n \n+Behavior of autocommit database option on PostgreSQL changed\n+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n+\n+PostgreSQL's autocommit option didn't work as advertised previously. It did\n+work for single transaction block, but after the first block was left the\n+autocommit behavior was never restored. This bug is now fixed in 1.5. While\n+this is only a bug fix, it is worth checking your applications behavior if\n+you are using PostgreSQL together with the autocommit option.\n+\n Features deprecated in 1.5\n ==========================\n "
+        },
+        {
+            "sha": "fb26138eed941201dc7fa7b2c8d77fc28c0bdefc",
+            "filename": "tests/regressiontests/transactions_regress/tests.py",
+            "status": "modified",
+            "additions": 58,
+            "deletions": 2,
+            "changes": 60,
+            "blob_url": "https://github.com/django/django/blob/f572ee0c65ec5eac9edb0cb3e35c96ec86d89ffb/tests%2Fregressiontests%2Ftransactions_regress%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/f572ee0c65ec5eac9edb0cb3e35c96ec86d89ffb/tests%2Fregressiontests%2Ftransactions_regress%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Ftransactions_regress%2Ftests.py?ref=f572ee0c65ec5eac9edb0cb3e35c96ec86d89ffb",
+            "patch": "@@ -1,11 +1,11 @@\n from __future__ import absolute_import\n \n from django.core.exceptions import ImproperlyConfigured\n-from django.db import connection, transaction\n+from django.db import connection, connections, transaction, DEFAULT_DB_ALIAS\n from django.db.transaction import commit_on_success, commit_manually, TransactionManagementError\n from django.test import TransactionTestCase, skipUnlessDBFeature\n from django.test.utils import override_settings\n-from django.utils.unittest import skipIf\n+from django.utils.unittest import skipIf, skipUnless\n \n from .models import Mod, M2mA, M2mB\n \n@@ -175,6 +175,62 @@ def test_failing_query_transaction_closed_debug(self):\n         self.test_failing_query_transaction_closed()\n \n \n+class TestPostgresAutocommit(TransactionTestCase):\n+    \"\"\"\n+    Tests to make sure psycopg2's autocommit mode is restored after entering\n+    and leaving transaction management. Refs #16047.\n+    \"\"\"\n+    def setUp(self):\n+        from psycopg2.extensions import (ISOLATION_LEVEL_AUTOCOMMIT,\n+                                         ISOLATION_LEVEL_READ_COMMITTED)\n+        self._autocommit = ISOLATION_LEVEL_AUTOCOMMIT\n+        self._read_committed = ISOLATION_LEVEL_READ_COMMITTED\n+\n+        # We want a clean backend with autocommit = True, so\n+        # first we need to do a bit of work to have that.\n+        self._old_backend = connections[DEFAULT_DB_ALIAS]\n+        settings = self._old_backend.settings_dict.copy()\n+        opts = settings['OPTIONS'].copy()\n+        opts['autocommit'] = True\n+        settings['OPTIONS'] = opts\n+        new_backend = self._old_backend.__class__(settings, DEFAULT_DB_ALIAS)\n+        connections[DEFAULT_DB_ALIAS] = new_backend\n+\n+    def test_initial_autocommit_state(self):\n+        self.assertTrue(connection.features.uses_autocommit)\n+        self.assertEqual(connection.isolation_level, self._autocommit)\n+\n+    def test_transaction_management(self):\n+        transaction.enter_transaction_management()\n+        transaction.managed(True)\n+        self.assertEqual(connection.isolation_level, self._read_committed)\n+\n+        transaction.leave_transaction_management()\n+        self.assertEqual(connection.isolation_level, self._autocommit)\n+\n+    def test_transaction_stacking(self):\n+        transaction.enter_transaction_management()\n+        transaction.managed(True)\n+        self.assertEqual(connection.isolation_level, self._read_committed)\n+\n+        transaction.enter_transaction_management()\n+        self.assertEqual(connection.isolation_level, self._read_committed)\n+\n+        transaction.leave_transaction_management()\n+        self.assertEqual(connection.isolation_level, self._read_committed)\n+\n+        transaction.leave_transaction_management()\n+        self.assertEqual(connection.isolation_level, self._autocommit)\n+\n+    def tearDown(self):\n+        connections[DEFAULT_DB_ALIAS] = self._old_backend\n+\n+TestPostgresAutocommit = skipUnless(connection.vendor == 'postgresql',\n+    \"This test only valid for PostgreSQL\")(TestPostgresAutocommit)\n+TestPostgresAutoCommit = skipUnlessDBFeature('supports_transactions')(\n+    TestPostgresAutocommit)\n+\n+\n class TestManyToManyAddTransaction(TransactionTestCase):\n     def test_manyrelated_add_commit(self):\n         \"Test for https://code.djangoproject.com/ticket/16818\""
+        }
+    ],
+    "stats": {
+        "total": 83,
+        "additions": 76,
+        "deletions": 7
+    }
+}

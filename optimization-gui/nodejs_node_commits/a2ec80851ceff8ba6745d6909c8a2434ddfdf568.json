@@ -1,0 +1,60 @@
+{
+    "author": "rubys",
+    "message": "repl: support mult-line string-keyed objects\n\nisRecoverableError is completely reimplemented using acorn and an\nacorn plugin that examines the state of the parser at the time of the\nerror to determine if the code could be completed on a subsequent line.\n\nPR-URL: https://github.com/nodejs/node/pull/21805\nReviewed-By: Ruben Bridgewater <ruben@bridgewater.de>\nReviewed-By: Tiancheng \"Timothy\" Gu <timothygu99@gmail.com>\nReviewed-By: John-David Dalton <john.david.dalton@gmail.com>\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "a2ec80851ceff8ba6745d6909c8a2434ddfdf568",
+    "files": [
+        {
+            "sha": "465d77451a5b8201c514c4167248e2179109a5a9",
+            "filename": "lib/internal/repl/recoverable.js",
+            "status": "added",
+            "additions": 79,
+            "deletions": 0,
+            "changes": 79,
+            "blob_url": "https://github.com/nodejs/node/blob/a2ec80851ceff8ba6745d6909c8a2434ddfdf568/lib%2Finternal%2Frepl%2Frecoverable.js",
+            "raw_url": "https://github.com/nodejs/node/raw/a2ec80851ceff8ba6745d6909c8a2434ddfdf568/lib%2Finternal%2Frepl%2Frecoverable.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Frepl%2Frecoverable.js?ref=a2ec80851ceff8ba6745d6909c8a2434ddfdf568",
+            "patch": "@@ -0,0 +1,79 @@\n+'use strict';\n+\n+const acorn = require('internal/deps/acorn/dist/acorn');\n+const { tokTypes: tt } = acorn;\n+\n+// If the error is that we've unexpectedly ended the input,\n+// then let the user try to recover by adding more input.\n+// Note: `e` (the original exception) is not used by the current implemention,\n+// but may be needed in the future.\n+function isRecoverableError(e, code) {\n+  let recoverable = false;\n+\n+  // Determine if the point of the any error raised is at the end of the input.\n+  // There are two cases to consider:\n+  //\n+  //   1.  Any error raised after we have encountered the 'eof' token.\n+  //       This prevents us from declaring partial tokens (like '2e') as\n+  //       recoverable.\n+  //\n+  //   2.  Three cases where tokens can legally span lines.  This is\n+  //       template, comment, and strings with a backslash at the end of\n+  //       the line, indicating a continuation.  Note that we need to look\n+  //       for the specific errors of 'unterminated' kind (not, for example,\n+  //       a syntax error in a ${} expression in a template), and the only\n+  //       way to do that currently is to look at the message.  Should Acorn\n+  //       change these messages in the future, this will lead to a test\n+  //       failure, indicating that this code needs to be updated.\n+  //\n+  acorn.plugins.replRecoverable = (parser) => {\n+    parser.extend('nextToken', (nextToken) => {\n+      return function() {\n+        Reflect.apply(nextToken, this, []);\n+\n+        if (this.type === tt.eof) recoverable = true;\n+      };\n+    });\n+\n+    parser.extend('raise', (raise) => {\n+      return function(pos, message) {\n+        switch (message) {\n+          case 'Unterminated template':\n+          case 'Unterminated comment':\n+            recoverable = true;\n+            break;\n+\n+          case 'Unterminated string constant':\n+            const token = this.input.slice(this.lastTokStart, this.pos);\n+            // see https://www.ecma-international.org/ecma-262/#sec-line-terminators\n+            recoverable = /\\\\(?:\\r\\n?|\\n|\\u2028|\\u2029)$/.test(token);\n+        }\n+\n+        Reflect.apply(raise, this, [pos, message]);\n+      };\n+    });\n+  };\n+\n+  // For similar reasons as `defaultEval`, wrap expressions starting with a\n+  // curly brace with parenthesis.  Note: only the open parenthesis is added\n+  // here as the point is to test for potentially valid but incomplete\n+  // expressions.\n+  if (/^\\s*\\{/.test(code) && isRecoverableError(e, `(${code}`)) return true;\n+\n+  // Try to parse the code with acorn.  If the parse fails, ignore the acorn\n+  // error and return the recoverable status.\n+  try {\n+    acorn.parse(code, { plugins: { replRecoverable: true } });\n+\n+    // Odd case: the underlying JS engine (V8, Chakra) rejected this input\n+    // but Acorn detected no issue.  Presume that additional text won't\n+    // address this issue.\n+    return false;\n+  } catch {\n+    return recoverable;\n+  }\n+}\n+\n+module.exports = {\n+  isRecoverableError\n+};"
+        },
+        {
+            "sha": "4a01595ce1b72b6afb5e968c5c552953c7ff2965",
+            "filename": "lib/repl.js",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 71,
+            "changes": 74,
+            "blob_url": "https://github.com/nodejs/node/blob/a2ec80851ceff8ba6745d6909c8a2434ddfdf568/lib%2Frepl.js",
+            "raw_url": "https://github.com/nodejs/node/raw/a2ec80851ceff8ba6745d6909c8a2434ddfdf568/lib%2Frepl.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Frepl.js?ref=a2ec80851ceff8ba6745d6909c8a2434ddfdf568",
+            "patch": "@@ -73,6 +73,7 @@ const {\n } = require('internal/errors').codes;\n const { sendInspectorCommand } = require('internal/util/inspector');\n const { experimentalREPLAwait } = process.binding('config');\n+const { isRecoverableError } = require('internal/repl/recoverable');\n \n // Lazy-loaded.\n let processTopLevelAwait;\n@@ -227,7 +228,8 @@ function REPLServer(prompt,\n       // It's confusing for `{ a : 1 }` to be interpreted as a block\n       // statement rather than an object literal.  So, we first try\n       // to wrap it in parentheses, so that it will be interpreted as\n-      // an expression.\n+      // an expression.  Note that if the above condition changes,\n+      // lib/internal/repl/recoverable.js needs to be changed to match.\n       code = `(${code.trim()})\\n`;\n       wrappedCmd = true;\n     }\n@@ -1505,76 +1507,6 @@ function regexpEscape(s) {\n   return s.replace(/[-[\\]{}()*+?.,\\\\^$|#\\s]/g, '\\\\$&');\n }\n \n-// If the error is that we've unexpectedly ended the input,\n-// then let the user try to recover by adding more input.\n-function isRecoverableError(e, code) {\n-  if (e && e.name === 'SyntaxError') {\n-    var message = e.message;\n-    if (message === 'Unterminated template literal' ||\n-        message === 'Unexpected end of input') {\n-      return true;\n-    }\n-\n-    if (message === 'missing ) after argument list') {\n-      const frames = e.stack.split(/\\r?\\n/);\n-      const pos = frames.findIndex((f) => f.match(/^\\s*\\^+$/));\n-      return pos > 0 && frames[pos - 1].length === frames[pos].length;\n-    }\n-\n-    if (message === 'Invalid or unexpected token')\n-      return isCodeRecoverable(code);\n-  }\n-  return false;\n-}\n-\n-// Check whether a code snippet should be forced to fail in the REPL.\n-function isCodeRecoverable(code) {\n-  var current, previous, stringLiteral;\n-  var isBlockComment = false;\n-  var isSingleComment = false;\n-  var isRegExpLiteral = false;\n-  var lastChar = code.charAt(code.length - 2);\n-  var prevTokenChar = null;\n-\n-  for (var i = 0; i < code.length; i++) {\n-    previous = current;\n-    current = code[i];\n-\n-    if (previous === '\\\\' && (stringLiteral || isRegExpLiteral)) {\n-      current = null;\n-    } else if (stringLiteral) {\n-      if (stringLiteral === current) {\n-        stringLiteral = null;\n-      }\n-    } else if (isRegExpLiteral && current === '/') {\n-      isRegExpLiteral = false;\n-    } else if (isBlockComment && previous === '*' && current === '/') {\n-      isBlockComment = false;\n-    } else if (isSingleComment && current === '\\n') {\n-      isSingleComment = false;\n-    } else if (!isBlockComment && !isRegExpLiteral && !isSingleComment) {\n-      if (current === '/' && previous === '/') {\n-        isSingleComment = true;\n-      } else if (previous === '/') {\n-        if (current === '*') {\n-          isBlockComment = true;\n-          // Distinguish between a division operator and the start of a regex\n-          // by examining the non-whitespace character that precedes the /\n-        } else if ([null, '(', '[', '{', '}', ';'].includes(prevTokenChar)) {\n-          isRegExpLiteral = true;\n-        }\n-      } else {\n-        if (current.trim()) prevTokenChar = current;\n-        if (current === '\\'' || current === '\"') {\n-          stringLiteral = current;\n-        }\n-      }\n-    }\n-  }\n-\n-  return stringLiteral ? lastChar === '\\\\' : isBlockComment;\n-}\n-\n function Recoverable(err) {\n   this.err = err;\n }"
+        },
+        {
+            "sha": "682111051cb8008b28c7591640c38920a191b7cf",
+            "filename": "node.gyp",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/a2ec80851ceff8ba6745d6909c8a2434ddfdf568/node.gyp",
+            "raw_url": "https://github.com/nodejs/node/raw/a2ec80851ceff8ba6745d6909c8a2434ddfdf568/node.gyp",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/node.gyp?ref=a2ec80851ceff8ba6745d6909c8a2434ddfdf568",
+            "patch": "@@ -147,6 +147,7 @@\n       'lib/internal/readline.js',\n       'lib/internal/repl.js',\n       'lib/internal/repl/await.js',\n+      'lib/internal/repl/recoverable.js',\n       'lib/internal/socket_list.js',\n       'lib/internal/test/binding.js',\n       'lib/internal/test/heap.js',"
+        },
+        {
+            "sha": "8cb4b686b85e40ce3b8b62bea1d976e340e73558",
+            "filename": "test/parallel/test-repl.js",
+            "status": "modified",
+            "additions": 14,
+            "deletions": 7,
+            "changes": 21,
+            "blob_url": "https://github.com/nodejs/node/blob/a2ec80851ceff8ba6745d6909c8a2434ddfdf568/test%2Fparallel%2Ftest-repl.js",
+            "raw_url": "https://github.com/nodejs/node/raw/a2ec80851ceff8ba6745d6909c8a2434ddfdf568/test%2Fparallel%2Ftest-repl.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-repl.js?ref=a2ec80851ceff8ba6745d6909c8a2434ddfdf568",
+            "patch": "@@ -162,13 +162,11 @@ const errorTests = [\n   // Template expressions\n   {\n     send: '`io.js ${\"1.0\"',\n-    expect: [\n-      kSource,\n-      kArrow,\n-      '',\n-      /^SyntaxError: /,\n-      ''\n-    ]\n+    expect: '... '\n+  },\n+  {\n+    send: '+ \".2\"}`',\n+    expect: '\\'io.js 1.0.2\\''\n   },\n   {\n     send: '`io.js ${',\n@@ -315,6 +313,15 @@ const errorTests = [\n     send: '1 }',\n     expect: '{ a: 1 }'\n   },\n+  // Multiline string-keyed object (e.g. JSON)\n+  {\n+    send: '{ \"a\": ',\n+    expect: '... '\n+  },\n+  {\n+    send: '1 }',\n+    expect: '{ a: 1 }'\n+  },\n   // Multiline anonymous function with comment\n   {\n     send: '(function() {',"
+        }
+    ],
+    "stats": {
+        "total": 175,
+        "additions": 97,
+        "deletions": 78
+    }
+}

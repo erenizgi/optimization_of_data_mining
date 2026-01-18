@@ -1,0 +1,72 @@
+{
+    "author": "addaleax",
+    "message": "src: only call .ReThrow() if not terminating\n\nOtherwise, it looks like a `null` exception is being thrown.\n\nPR-URL: https://github.com/nodejs/node/pull/26130\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Daniel Bevenius <daniel.bevenius@gmail.com>",
+    "sha": "7b198935d63aec4acace1500d81ac2662c732d18",
+    "files": [
+        {
+            "sha": "93e791b52240aafc6691d2676bdb6f02fac6181d",
+            "filename": "src/module_wrap.cc",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 11,
+            "changes": 24,
+            "blob_url": "https://github.com/nodejs/node/blob/7b198935d63aec4acace1500d81ac2662c732d18/src%2Fmodule_wrap.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/7b198935d63aec4acace1500d81ac2662c732d18/src%2Fmodule_wrap.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fmodule_wrap.cc?ref=7b198935d63aec4acace1500d81ac2662c732d18",
+            "patch": "@@ -158,12 +158,13 @@ void ModuleWrap::New(const FunctionCallbackInfo<Value>& args) {\n     Context::Scope context_scope(context);\n     ScriptCompiler::Source source(source_text, origin);\n     if (!ScriptCompiler::CompileModule(isolate, &source).ToLocal(&module)) {\n-      CHECK(try_catch.HasCaught());\n-      CHECK(!try_catch.Message().IsEmpty());\n-      CHECK(!try_catch.Exception().IsEmpty());\n-      AppendExceptionLine(env, try_catch.Exception(), try_catch.Message(),\n-                          ErrorHandlingMode::MODULE_ERROR);\n-      try_catch.ReThrow();\n+      if (try_catch.HasCaught() && !try_catch.HasTerminated()) {\n+        CHECK(!try_catch.Message().IsEmpty());\n+        CHECK(!try_catch.Exception().IsEmpty());\n+        AppendExceptionLine(env, try_catch.Exception(), try_catch.Message(),\n+                            ErrorHandlingMode::MODULE_ERROR);\n+        try_catch.ReThrow();\n+      }\n       return;\n     }\n   }\n@@ -245,13 +246,12 @@ void ModuleWrap::Instantiate(const FunctionCallbackInfo<Value>& args) {\n   Local<Context> context = obj->context_.Get(isolate);\n   Local<Module> module = obj->module_.Get(isolate);\n   TryCatchScope try_catch(env);\n-  Maybe<bool> ok = module->InstantiateModule(context, ResolveCallback);\n+  USE(module->InstantiateModule(context, ResolveCallback));\n \n   // clear resolve cache on instantiate\n   obj->resolve_cache_.clear();\n \n-  if (!ok.FromMaybe(false)) {\n-    CHECK(try_catch.HasCaught());\n+  if (try_catch.HasCaught() && !try_catch.HasTerminated()) {\n     CHECK(!try_catch.Message().IsEmpty());\n     CHECK(!try_catch.Exception().IsEmpty());\n     AppendExceptionLine(env, try_catch.Exception(), try_catch.Message(),\n@@ -300,6 +300,8 @@ void ModuleWrap::Evaluate(const FunctionCallbackInfo<Value>& args) {\n \n   // Convert the termination exception into a regular exception.\n   if (timed_out || received_signal) {\n+    if (!env->is_main_thread() && env->is_stopping_worker())\n+      return;\n     env->isolate()->CancelTerminateExecution();\n     // It is possible that execution was terminated by another timeout in\n     // which this timeout is nested, so check whether one of the watchdogs\n@@ -312,7 +314,8 @@ void ModuleWrap::Evaluate(const FunctionCallbackInfo<Value>& args) {\n   }\n \n   if (try_catch.HasCaught()) {\n-    try_catch.ReThrow();\n+    if (!try_catch.HasTerminated())\n+      try_catch.ReThrow();\n     return;\n   }\n \n@@ -375,7 +378,6 @@ void ModuleWrap::GetError(const FunctionCallbackInfo<Value>& args) {\n   ASSIGN_OR_RETURN_UNWRAP(&obj, args.This());\n \n   Local<Module> module = obj->module_.Get(isolate);\n-\n   args.GetReturnValue().Set(module->GetException());\n }\n "
+        },
+        {
+            "sha": "0ba2b1a90cb93b102aedc80435f25263eee7c6bc",
+            "filename": "src/node_contextify.cc",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 5,
+            "changes": 17,
+            "blob_url": "https://github.com/nodejs/node/blob/7b198935d63aec4acace1500d81ac2662c732d18/src%2Fnode_contextify.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/7b198935d63aec4acace1500d81ac2662c732d18/src%2Fnode_contextify.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_contextify.cc?ref=7b198935d63aec4acace1500d81ac2662c732d18",
+            "patch": "@@ -252,7 +252,8 @@ void ContextifyContext::MakeContext(const FunctionCallbackInfo<Value>& args) {\n   ContextifyContext* context = new ContextifyContext(env, sandbox, options);\n \n   if (try_catch.HasCaught()) {\n-    try_catch.ReThrow();\n+    if (!try_catch.HasTerminated())\n+      try_catch.ReThrow();\n     return;\n   }\n \n@@ -729,7 +730,8 @@ void ContextifyScript::New(const FunctionCallbackInfo<Value>& args) {\n   if (v8_script.IsEmpty()) {\n     DecorateErrorStack(env, try_catch);\n     no_abort_scope.Close();\n-    try_catch.ReThrow();\n+    if (!try_catch.HasTerminated())\n+      try_catch.ReThrow();\n     TRACE_EVENT_NESTABLE_ASYNC_END0(\n         TRACING_CATEGORY_NODE2(vm, script),\n         \"ContextifyScript::New\",\n@@ -922,6 +924,8 @@ bool ContextifyScript::EvalMachine(Environment* env,\n \n   // Convert the termination exception into a regular exception.\n   if (timed_out || received_signal) {\n+    if (!env->is_main_thread() && env->is_stopping_worker())\n+      return false;\n     env->isolate()->CancelTerminateExecution();\n     // It is possible that execution was terminated by another timeout in\n     // which this timeout is nested, so check whether one of the watchdogs\n@@ -944,7 +948,8 @@ bool ContextifyScript::EvalMachine(Environment* env,\n     // letting try_catch catch it.\n     // If execution has been terminated, but not by one of the watchdogs from\n     // this invocation, this will re-throw a `null` value.\n-    try_catch.ReThrow();\n+    if (!try_catch.HasTerminated())\n+      try_catch.ReThrow();\n \n     return false;\n   }\n@@ -1098,8 +1103,10 @@ void ContextifyContext::CompileFunction(\n       context_extensions.size(), context_extensions.data(), options);\n \n   if (maybe_fn.IsEmpty()) {\n-    DecorateErrorStack(env, try_catch);\n-    try_catch.ReThrow();\n+    if (try_catch.HasCaught() && !try_catch.HasTerminated()) {\n+      DecorateErrorStack(env, try_catch);\n+      try_catch.ReThrow();\n+    }\n     return;\n   }\n   Local<Function> fn = maybe_fn.ToLocalChecked();"
+        },
+        {
+            "sha": "aa294f1bcbe6df80e043bce9645ad987e7a16243",
+            "filename": "test/fixtures/es-modules/import-process-exit.mjs",
+            "status": "added",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/7b198935d63aec4acace1500d81ac2662c732d18/test%2Ffixtures%2Fes-modules%2Fimport-process-exit.mjs",
+            "raw_url": "https://github.com/nodejs/node/raw/7b198935d63aec4acace1500d81ac2662c732d18/test%2Ffixtures%2Fes-modules%2Fimport-process-exit.mjs",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Ffixtures%2Fes-modules%2Fimport-process-exit.mjs?ref=7b198935d63aec4acace1500d81ac2662c732d18",
+            "patch": "@@ -0,0 +1 @@\n+import exit from \"./process-exit.mjs\";"
+        },
+        {
+            "sha": "869ce08efa56cb7896754ccdc194dcbd94873592",
+            "filename": "test/fixtures/es-modules/process-exit.mjs",
+            "status": "added",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/7b198935d63aec4acace1500d81ac2662c732d18/test%2Ffixtures%2Fes-modules%2Fprocess-exit.mjs",
+            "raw_url": "https://github.com/nodejs/node/raw/7b198935d63aec4acace1500d81ac2662c732d18/test%2Ffixtures%2Fes-modules%2Fprocess-exit.mjs",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Ffixtures%2Fes-modules%2Fprocess-exit.mjs?ref=7b198935d63aec4acace1500d81ac2662c732d18",
+            "patch": "@@ -0,0 +1,2 @@\n+process.exit(42);\n+export default null;"
+        },
+        {
+            "sha": "c0b9d874895725425f3a67ae830c28c75664c3fa",
+            "filename": "test/parallel/test-worker-esm-exit.js",
+            "status": "added",
+            "additions": 10,
+            "deletions": 0,
+            "changes": 10,
+            "blob_url": "https://github.com/nodejs/node/blob/7b198935d63aec4acace1500d81ac2662c732d18/test%2Fparallel%2Ftest-worker-esm-exit.js",
+            "raw_url": "https://github.com/nodejs/node/raw/7b198935d63aec4acace1500d81ac2662c732d18/test%2Fparallel%2Ftest-worker-esm-exit.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-worker-esm-exit.js?ref=7b198935d63aec4acace1500d81ac2662c732d18",
+            "patch": "@@ -0,0 +1,10 @@\n+'use strict';\n+const common = require('../common');\n+const fixtures = require('../common/fixtures');\n+const assert = require('assert');\n+const { Worker } = require('worker_threads');\n+\n+const w = new Worker(fixtures.path('es-modules/import-process-exit.mjs'),\n+                     { execArgv: ['--experimental-modules'] });\n+w.on('error', common.mustNotCall());\n+w.on('exit', (code) => assert.strictEqual(code, 42));"
+        }
+    ],
+    "stats": {
+        "total": 54,
+        "additions": 38,
+        "deletions": 16
+    }
+}

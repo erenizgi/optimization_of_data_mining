@@ -1,0 +1,84 @@
+{
+    "author": "TimothyGu",
+    "message": "readline: add support for async iteration\n\nCo-authored-by: Ivan Filenko <ivan.filenko@protonmail.com>\nFixes: https://github.com/nodejs/node/issues/18603\nRefs: https://github.com/nodejs/node/pull/18904\nPR-URL: https://github.com/nodejs/node/pull/23916\nReviewed-By: Matteo Collina <matteo.collina@gmail.com>\nReviewed-By: Gus Caplan <me@gus.host>",
+    "sha": "2a7432dadec08bbe7063d84f1aa4a6396807305c",
+    "files": [
+        {
+            "sha": "17640ae1702619ca61d824ea6902392044c89706",
+            "filename": "doc/api/readline.md",
+            "status": "modified",
+            "additions": 68,
+            "deletions": 2,
+            "changes": 70,
+            "blob_url": "https://github.com/nodejs/node/blob/2a7432dadec08bbe7063d84f1aa4a6396807305c/doc%2Fapi%2Freadline.md",
+            "raw_url": "https://github.com/nodejs/node/raw/2a7432dadec08bbe7063d84f1aa4a6396807305c/doc%2Fapi%2Freadline.md",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/doc%2Fapi%2Freadline.md?ref=2a7432dadec08bbe7063d84f1aa4a6396807305c",
+            "patch": "@@ -309,6 +309,43 @@ rl.write(null, { ctrl: true, name: 'u' });\n The `rl.write()` method will write the data to the `readline` `Interface`'s\n `input` *as if it were provided by the user*.\n \n+### rl\\[Symbol.asyncIterator\\]()\n+<!-- YAML\n+added: REPLACEME\n+-->\n+\n+> Stability: 1 - Experimental\n+\n+* Returns: {AsyncIterator}\n+\n+Create an `AsyncIterator` object that iterates through each line in the input\n+stream as a string. This method allows asynchronous iteration of\n+`readline.Interface` objects through `for`-`await`-`of` loops.\n+\n+Errors in the input stream are not forwarded.\n+\n+If the loop is terminated with `break`, `throw`, or `return`,\n+[`rl.close()`][] will be called. In other words, iterating over a\n+`readline.Interface` will always consume the input stream fully.\n+\n+A caveat with using this experimental API is that the performance is\n+currently not on par with the traditional `'line'` event API, and thus it is\n+not recommended for performance-sensitive applications. We expect this\n+situation to improve in the future.\n+\n+```js\n+async function processLineByLine() {\n+  const rl = readline.createInterface({\n+    // ...\n+  });\n+\n+  for await (const line of rl) {\n+    // Each line in the readline input will be successively available here as\n+    // `line`.\n+  }\n+}\n+```\n+\n ## readline.clearLine(stream, dir)\n <!-- YAML\n added: v0.7.7\n@@ -517,12 +554,38 @@ rl.on('line', (line) => {\n \n ## Example: Read File Stream Line-by-Line\n \n-A common use case for `readline` is to consume input from a filesystem\n-[Readable][] stream one line at a time:\n+A common use case for `readline` is to consume an input file one line at a\n+time. The easiest way to do so is leveraging the [`fs.ReadStream`][] API as\n+well as a `for`-`await`-`of` loop:\n \n ```js\n+const fs = require('fs');\n const readline = require('readline');\n+\n+async function processLineByLine() {\n+  const fileStream = fs.createReadStream('input.txt');\n+\n+  const rl = readline.createInterface({\n+    input: fileStream,\n+    crlfDelay: Infinity\n+  });\n+  // Note: we use the crlfDelay option to recognize all instances of CR LF\n+  // ('\\r\\n') in input.txt as a single line break.\n+\n+  for await (const line of rl) {\n+    // Each line in input.txt will be successively available here as `line`.\n+    console.log(`Line from file: ${line}`);\n+  }\n+}\n+\n+processLineByLine();\n+```\n+\n+Alternatively, one could use the [`'line'`][] event:\n+\n+```js\n const fs = require('fs');\n+const readline = require('readline');\n \n const rl = readline.createInterface({\n   input: fs.createReadStream('sample.txt'),\n@@ -536,8 +599,11 @@ rl.on('line', (line) => {\n \n [`'SIGCONT'`]: readline.html#readline_event_sigcont\n [`'SIGTSTP'`]: readline.html#readline_event_sigtstp\n+[`'line'`]: #readline_event_line\n+[`fs.ReadStream`]: fs.html#fs_class_fs_readstream\n [`process.stdin`]: process.html#process_process_stdin\n [`process.stdout`]: process.html#process_process_stdout\n+[`rl.close()`]: #readline_rl_close\n [Readable]: stream.html#stream_readable_streams\n [TTY]: tty.html\n [Writable]: stream.html#stream_writable_streams"
+        },
+        {
+            "sha": "049f5aaeccf439ec2632c7a1d7aff596add986ff",
+            "filename": "lib/readline.js",
+            "status": "modified",
+            "additions": 43,
+            "deletions": 0,
+            "changes": 43,
+            "blob_url": "https://github.com/nodejs/node/blob/2a7432dadec08bbe7063d84f1aa4a6396807305c/lib%2Freadline.js",
+            "raw_url": "https://github.com/nodejs/node/raw/2a7432dadec08bbe7063d84f1aa4a6396807305c/lib%2Freadline.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Freadline.js?ref=2a7432dadec08bbe7063d84f1aa4a6396807305c",
+            "patch": "@@ -33,6 +33,7 @@ const {\n   ERR_INVALID_OPT_VALUE\n } = require('internal/errors').codes;\n const { debug, inherits } = require('util');\n+const { emitExperimentalWarning } = require('internal/util');\n const { Buffer } = require('buffer');\n const EventEmitter = require('events');\n const {\n@@ -54,11 +55,16 @@ const {\n // Lazy load StringDecoder for startup performance.\n let StringDecoder;\n \n+// Lazy load Readable for startup performance.\n+let Readable;\n+\n const kHistorySize = 30;\n const kMincrlfDelay = 100;\n // \\r\\n, \\n, or \\r followed by something other than \\n\n const lineEnding = /\\r?\\n|\\r(?!\\n)/;\n \n+const kLineObjectStream = Symbol('line object stream');\n+\n const KEYPRESS_DECODER = Symbol('keypress-decoder');\n const ESCAPE_DECODER = Symbol('escape-decoder');\n \n@@ -190,6 +196,8 @@ function Interface(input, output, completer, terminal) {\n     self._refreshLine();\n   }\n \n+  this[kLineObjectStream] = undefined;\n+\n   if (!this.terminal) {\n     function onSelfCloseWithoutTerminal() {\n       input.removeListener('data', ondata);\n@@ -1019,6 +1027,41 @@ Interface.prototype._ttyWrite = function(s, key) {\n   }\n };\n \n+Interface.prototype[Symbol.asyncIterator] = function() {\n+  emitExperimentalWarning('readline Interface [Symbol.asyncIterator]');\n+\n+  if (this[kLineObjectStream] === undefined) {\n+    if (Readable === undefined) {\n+      Readable = require('stream').Readable;\n+    }\n+    const readable = new Readable({\n+      objectMode: true,\n+      read: () => {\n+        this.resume();\n+      },\n+      destroy: (err, cb) => {\n+        this.off('line', lineListener);\n+        this.off('close', closeListener);\n+        this.close();\n+        cb(err);\n+      }\n+    });\n+    const lineListener = (input) => {\n+      if (!readable.push(input)) {\n+        this.pause();\n+      }\n+    };\n+    const closeListener = () => {\n+      readable.push(null);\n+    };\n+    this.on('line', lineListener);\n+    this.on('close', closeListener);\n+    this[kLineObjectStream] = readable;\n+  }\n+\n+  return this[kLineObjectStream][Symbol.asyncIterator]();\n+};\n+\n /**\n  * accepts a readable Stream instance and makes it emit \"keypress\" events\n  */"
+        },
+        {
+            "sha": "2ca124dde5b890d3f806840d3bcd440da3fa68b6",
+            "filename": "test/parallel/test-readline-async-iterators-backpressure.js",
+            "status": "added",
+            "additions": 48,
+            "deletions": 0,
+            "changes": 48,
+            "blob_url": "https://github.com/nodejs/node/blob/2a7432dadec08bbe7063d84f1aa4a6396807305c/test%2Fparallel%2Ftest-readline-async-iterators-backpressure.js",
+            "raw_url": "https://github.com/nodejs/node/raw/2a7432dadec08bbe7063d84f1aa4a6396807305c/test%2Fparallel%2Ftest-readline-async-iterators-backpressure.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-readline-async-iterators-backpressure.js?ref=2a7432dadec08bbe7063d84f1aa4a6396807305c",
+            "patch": "@@ -0,0 +1,48 @@\n+'use strict';\n+\n+const common = require('../common');\n+const assert = require('assert');\n+const { Readable } = require('stream');\n+const readline = require('readline');\n+\n+const CONTENT = 'content';\n+const TOTAL_LINES = 18;\n+\n+(async () => {\n+  const readable = new Readable({ read() {} });\n+  readable.push(`${CONTENT}\\n`.repeat(TOTAL_LINES));\n+\n+  const rli = readline.createInterface({\n+    input: readable,\n+    crlfDelay: Infinity\n+  });\n+\n+  const it = rli[Symbol.asyncIterator]();\n+  const highWaterMark = it.stream.readableHighWaterMark;\n+\n+  // For this test to work, we have to queue up more than the number of\n+  // highWaterMark items in rli. Make sure that is the case.\n+  assert(TOTAL_LINES > highWaterMark);\n+\n+  let iterations = 0;\n+  let readableEnded = false;\n+  for await (const line of it) {\n+    assert.strictEqual(readableEnded, false);\n+\n+    assert.strictEqual(line, CONTENT);\n+\n+    const expectedPaused = TOTAL_LINES - iterations > highWaterMark;\n+    assert.strictEqual(readable.isPaused(), expectedPaused);\n+\n+    iterations += 1;\n+\n+    // We have to end the input stream asynchronously for back pressure to work.\n+    // Only end when we have reached the final line.\n+    if (iterations === TOTAL_LINES) {\n+      readable.push(null);\n+      readableEnded = true;\n+    }\n+  }\n+\n+  assert.strictEqual(iterations, TOTAL_LINES);\n+})().then(common.mustCall());"
+        },
+        {
+            "sha": "746981a1ae7cfdeba021de441f5e977467521171",
+            "filename": "test/parallel/test-readline-async-iterators-destroy.js",
+            "status": "added",
+            "additions": 78,
+            "deletions": 0,
+            "changes": 78,
+            "blob_url": "https://github.com/nodejs/node/blob/2a7432dadec08bbe7063d84f1aa4a6396807305c/test%2Fparallel%2Ftest-readline-async-iterators-destroy.js",
+            "raw_url": "https://github.com/nodejs/node/raw/2a7432dadec08bbe7063d84f1aa4a6396807305c/test%2Fparallel%2Ftest-readline-async-iterators-destroy.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-readline-async-iterators-destroy.js?ref=2a7432dadec08bbe7063d84f1aa4a6396807305c",
+            "patch": "@@ -0,0 +1,78 @@\n+'use strict';\n+\n+const common = require('../common');\n+const fs = require('fs');\n+const { join } = require('path');\n+const readline = require('readline');\n+const assert = require('assert');\n+\n+const tmpdir = require('../common/tmpdir');\n+tmpdir.refresh();\n+\n+const filename = join(tmpdir.path, 'test.txt');\n+\n+const testContents = [\n+  '',\n+  '\\n',\n+  'line 1',\n+  'line 1\\nline 2 南越国是前203年至前111年存在于岭南地区的一个国家\\nline 3\\ntrailing',\n+  'line 1\\nline 2\\nline 3 ends with newline\\n'\n+];\n+\n+async function testSimpleDestroy() {\n+  for (const fileContent of testContents) {\n+    fs.writeFileSync(filename, fileContent);\n+\n+    const readable = fs.createReadStream(filename);\n+    const rli = readline.createInterface({\n+      input: readable,\n+      crlfDelay: Infinity\n+    });\n+\n+    const iteratedLines = [];\n+    for await (const k of rli) {\n+      iteratedLines.push(k);\n+      break;\n+    }\n+\n+    const expectedLines = fileContent.split('\\n');\n+    if (expectedLines[expectedLines.length - 1] === '') {\n+      expectedLines.pop();\n+    }\n+    expectedLines.splice(1);\n+\n+    assert.deepStrictEqual(iteratedLines, expectedLines);\n+  }\n+}\n+\n+async function testMutualDestroy() {\n+  for (const fileContent of testContents) {\n+    fs.writeFileSync(filename, fileContent);\n+\n+    const readable = fs.createReadStream(filename);\n+    const rli = readline.createInterface({\n+      input: readable,\n+      crlfDelay: Infinity\n+    });\n+\n+    const expectedLines = fileContent.split('\\n');\n+    if (expectedLines[expectedLines.length - 1] === '') {\n+      expectedLines.pop();\n+    }\n+    expectedLines.splice(2);\n+\n+    const iteratedLines = [];\n+    for await (const k of rli) {\n+      iteratedLines.push(k);\n+      for await (const l of rli) {\n+        iteratedLines.push(l);\n+        break;\n+      }\n+      assert.deepStrictEqual(iteratedLines, expectedLines);\n+    }\n+\n+    assert.deepStrictEqual(iteratedLines, expectedLines);\n+  }\n+}\n+\n+testSimpleDestroy().then(testMutualDestroy).then(common.mustCall());"
+        },
+        {
+            "sha": "c3883e4f369fdec7559017a97c793b2fd05d0874",
+            "filename": "test/parallel/test-readline-async-iterators.js",
+            "status": "added",
+            "additions": 77,
+            "deletions": 0,
+            "changes": 77,
+            "blob_url": "https://github.com/nodejs/node/blob/2a7432dadec08bbe7063d84f1aa4a6396807305c/test%2Fparallel%2Ftest-readline-async-iterators.js",
+            "raw_url": "https://github.com/nodejs/node/raw/2a7432dadec08bbe7063d84f1aa4a6396807305c/test%2Fparallel%2Ftest-readline-async-iterators.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-readline-async-iterators.js?ref=2a7432dadec08bbe7063d84f1aa4a6396807305c",
+            "patch": "@@ -0,0 +1,77 @@\n+'use strict';\n+\n+const common = require('../common');\n+const fs = require('fs');\n+const { join } = require('path');\n+const readline = require('readline');\n+const assert = require('assert');\n+\n+const tmpdir = require('../common/tmpdir');\n+tmpdir.refresh();\n+\n+const filename = join(tmpdir.path, 'test.txt');\n+\n+const testContents = [\n+  '',\n+  '\\n',\n+  'line 1',\n+  'line 1\\nline 2 南越国是前203年至前111年存在于岭南地区的一个国家\\nline 3\\ntrailing',\n+  'line 1\\nline 2\\nline 3 ends with newline\\n'\n+];\n+\n+async function testSimple() {\n+  for (const fileContent of testContents) {\n+    fs.writeFileSync(filename, fileContent);\n+\n+    const readable = fs.createReadStream(filename);\n+    const rli = readline.createInterface({\n+      input: readable,\n+      crlfDelay: Infinity\n+    });\n+\n+    const iteratedLines = [];\n+    for await (const k of rli) {\n+      iteratedLines.push(k);\n+    }\n+\n+    const expectedLines = fileContent.split('\\n');\n+    if (expectedLines[expectedLines.length - 1] === '') {\n+      expectedLines.pop();\n+    }\n+    assert.deepStrictEqual(iteratedLines, expectedLines);\n+    assert.strictEqual(iteratedLines.join(''), fileContent.replace(/\\n/gm, ''));\n+  }\n+}\n+\n+async function testMutual() {\n+  for (const fileContent of testContents) {\n+    fs.writeFileSync(filename, fileContent);\n+\n+    const readable = fs.createReadStream(filename);\n+    const rli = readline.createInterface({\n+      input: readable,\n+      crlfDelay: Infinity\n+    });\n+\n+    const expectedLines = fileContent.split('\\n');\n+    if (expectedLines[expectedLines.length - 1] === '') {\n+      expectedLines.pop();\n+    }\n+    const iteratedLines = [];\n+    let iterated = false;\n+    for await (const k of rli) {\n+      // This outer loop should only iterate once.\n+      assert.strictEqual(iterated, false);\n+      iterated = true;\n+\n+      iteratedLines.push(k);\n+      for await (const l of rli) {\n+        iteratedLines.push(l);\n+      }\n+      assert.deepStrictEqual(iteratedLines, expectedLines);\n+    }\n+    assert.deepStrictEqual(iteratedLines, expectedLines);\n+  }\n+}\n+\n+testSimple().then(testMutual).then(common.mustCall());"
+        },
+        {
+            "sha": "527b44f969a77f79d481484ef4430b7976332fd9",
+            "filename": "tools/doc/type-parser.js",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/2a7432dadec08bbe7063d84f1aa4a6396807305c/tools%2Fdoc%2Ftype-parser.js",
+            "raw_url": "https://github.com/nodejs/node/raw/2a7432dadec08bbe7063d84f1aa4a6396807305c/tools%2Fdoc%2Ftype-parser.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/tools%2Fdoc%2Ftype-parser.js?ref=2a7432dadec08bbe7063d84f1aa4a6396807305c",
+            "patch": "@@ -26,7 +26,7 @@ const customTypesMap = {\n \n   'this': `${jsDocPrefix}Reference/Operators/this`,\n \n-  'AsyncIterator': 'https://github.com/tc39/proposal-async-iteration',\n+  'AsyncIterator': 'https://tc39.github.io/ecma262/#sec-asynciterator-interface',\n \n   'bigint': 'https://github.com/tc39/proposal-bigint',\n "
+        }
+    ],
+    "stats": {
+        "total": 318,
+        "additions": 315,
+        "deletions": 3
+    }
+}

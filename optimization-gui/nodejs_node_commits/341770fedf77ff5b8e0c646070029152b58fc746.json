@@ -1,0 +1,60 @@
+{
+    "author": "BridgeAR",
+    "message": "lib: improve normalize encoding performance\n\nThis focuses on the common case by making sure they are prioritized.\nIt also changes some typeof checks to test for undefined since\nthat is faster and it adds a benchmark.\n\nPR-URL: https://github.com/nodejs/node/pull/18790\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Benjamin Gruenbaum <benjamingr@gmail.com>\nReviewed-By: Matteo Collina <matteo.collina@gmail.com>",
+    "sha": "341770fedf77ff5b8e0c646070029152b58fc746",
+    "files": [
+        {
+            "sha": "7a820465bd5d6b186cdbc322d7feef1f399cba97",
+            "filename": "benchmark/buffers/buffer-normalize-encoding.js",
+            "status": "added",
+            "additions": 43,
+            "deletions": 0,
+            "changes": 43,
+            "blob_url": "https://github.com/nodejs/node/blob/341770fedf77ff5b8e0c646070029152b58fc746/benchmark%2Fbuffers%2Fbuffer-normalize-encoding.js",
+            "raw_url": "https://github.com/nodejs/node/raw/341770fedf77ff5b8e0c646070029152b58fc746/benchmark%2Fbuffers%2Fbuffer-normalize-encoding.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/benchmark%2Fbuffers%2Fbuffer-normalize-encoding.js?ref=341770fedf77ff5b8e0c646070029152b58fc746",
+            "patch": "@@ -0,0 +1,43 @@\n+'use strict';\n+\n+const common = require('../common.js');\n+\n+const bench = common.createBenchmark(main, {\n+  encoding: [\n+    'ascii',\n+    'ASCII',\n+    'base64',\n+    'BASE64',\n+    'binary',\n+    'BINARY',\n+    'hex',\n+    'HEX',\n+    'latin1',\n+    'LATIN1',\n+    'ucs-2',\n+    'UCS-2',\n+    'ucs2',\n+    'UCS2',\n+    'utf-16le',\n+    'UTF-16LE',\n+    'utf-8',\n+    'UTF-8',\n+    'utf16le',\n+    'UTF16LE',\n+    'utf8',\n+    'UTF8'\n+  ],\n+  n: [1e6]\n+}, {\n+  flags: ['--expose-internals']\n+});\n+\n+function main({ encoding, n }) {\n+  const { normalizeEncoding } = require('internal/util');\n+\n+  bench.start();\n+  for (var i = 0; i < n; i++) {\n+    normalizeEncoding(encoding);\n+  }\n+  bench.end(n);\n+}"
+        },
+        {
+            "sha": "68cebedcc97ef47d315f64944fe61c591bb34aa5",
+            "filename": "lib/buffer.js",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/nodejs/node/blob/341770fedf77ff5b8e0c646070029152b58fc746/lib%2Fbuffer.js",
+            "raw_url": "https://github.com/nodejs/node/raw/341770fedf77ff5b8e0c646070029152b58fc746/lib%2Fbuffer.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Fbuffer.js?ref=341770fedf77ff5b8e0c646070029152b58fc746",
+            "patch": "@@ -242,7 +242,7 @@ function assertSize(size) {\n     err = new errors.RangeError('ERR_INVALID_OPT_VALUE', 'size', size);\n   }\n \n-  if (err) {\n+  if (err !== null) {\n     Error.captureStackTrace(err, assertSize);\n     throw err;\n   }\n@@ -428,7 +428,7 @@ Buffer.compare = function compare(a, b) {\n \n Buffer.isEncoding = function isEncoding(encoding) {\n   return typeof encoding === 'string' &&\n-         typeof normalizeEncoding(encoding) === 'string';\n+         normalizeEncoding(encoding) !== undefined;\n };\n Buffer[kIsEncodingSymbol] = Buffer.isEncoding;\n "
+        },
+        {
+            "sha": "b144063ee501009ee26dc8328a8c2dbd8adb2d4b",
+            "filename": "lib/internal/util.js",
+            "status": "modified",
+            "additions": 50,
+            "deletions": 27,
+            "changes": 77,
+            "blob_url": "https://github.com/nodejs/node/blob/341770fedf77ff5b8e0c646070029152b58fc746/lib%2Finternal%2Futil.js",
+            "raw_url": "https://github.com/nodejs/node/raw/341770fedf77ff5b8e0c646070029152b58fc746/lib%2Finternal%2Futil.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Futil.js?ref=341770fedf77ff5b8e0c646070029152b58fc746",
+            "patch": "@@ -96,36 +96,59 @@ function assertCrypto() {\n     throw new errors.Error('ERR_NO_CRYPTO');\n }\n \n-// The loop should only run at most twice, retrying with lowercased enc\n-// if there is no match in the first pass.\n-// We use a loop instead of branching to retry with a helper\n-// function in order to avoid the performance hit.\n // Return undefined if there is no match.\n+// Move the \"slow cases\" to a separate function to make sure this function gets\n+// inlined properly. That prioritizes the common case.\n function normalizeEncoding(enc) {\n-  if (enc == null || enc === '') return 'utf8';\n-  let retried;\n-  while (true) {\n-    switch (enc) {\n-      case 'utf8':\n-      case 'utf-8':\n-        return 'utf8';\n-      case 'ucs2':\n-      case 'ucs-2':\n-      case 'utf16le':\n-      case 'utf-16le':\n+  if (enc == null || enc === 'utf8' || enc === 'utf-8') return 'utf8';\n+  return slowCases(enc);\n+}\n+\n+function slowCases(enc) {\n+  switch (enc.length) {\n+    case 4:\n+      if (enc === 'UTF8') return 'utf8';\n+      if (enc === 'ucs2' || enc === 'UCS2') return 'utf16le';\n+      enc = `${enc}`.toLowerCase();\n+      if (enc === 'utf8') return 'utf8';\n+      if (enc === 'ucs2' || enc === 'UCS2') return 'utf16le';\n+      break;\n+    case 3:\n+      if (enc === 'hex' || enc === 'HEX' || `${enc}`.toLowerCase() === 'hex')\n+        return 'hex';\n+      break;\n+    case 5:\n+      if (enc === 'ascii') return 'ascii';\n+      if (enc === 'ucs-2') return 'utf16le';\n+      if (enc === 'UTF-8') return 'utf8';\n+      if (enc === 'ASCII') return 'ascii';\n+      if (enc === 'UCS-2') return 'utf16le';\n+      enc = `${enc}`.toLowerCase();\n+      if (enc === 'utf-8') return 'utf8';\n+      if (enc === 'ascii') return 'ascii';\n+      if (enc === 'usc-2') return 'utf16le';\n+      break;\n+    case 6:\n+      if (enc === 'base64') return 'base64';\n+      if (enc === 'latin1' || enc === 'binary') return 'latin1';\n+      if (enc === 'BASE64') return 'base64';\n+      if (enc === 'LATIN1' || enc === 'BINARY') return 'latin1';\n+      enc = `${enc}`.toLowerCase();\n+      if (enc === 'base64') return 'base64';\n+      if (enc === 'latin1' || enc === 'binary') return 'latin1';\n+      break;\n+    case 7:\n+      if (enc === 'utf16le' || enc === 'UTF16LE' ||\n+        `${enc}`.toLowerCase() === 'utf16le')\n         return 'utf16le';\n-      case 'latin1':\n-      case 'binary':\n-        return 'latin1';\n-      case 'base64':\n-      case 'ascii':\n-      case 'hex':\n-        return enc;\n-      default:\n-        if (retried) return; // undefined\n-        enc = ('' + enc).toLowerCase();\n-        retried = true;\n-    }\n+      break;\n+    case 8:\n+      if (enc === 'utf-16le' || enc === 'UTF-16LE' ||\n+        `${enc}`.toLowerCase() === 'utf-16le')\n+        return 'utf16le';\n+      break;\n+    default:\n+      if (enc === '') return 'utf8';\n   }\n }\n "
+        },
+        {
+            "sha": "18097be0e6dd085b572d746d62ff9967fdeffdd2",
+            "filename": "lib/string_decoder.js",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 4,
+            "changes": 10,
+            "blob_url": "https://github.com/nodejs/node/blob/341770fedf77ff5b8e0c646070029152b58fc746/lib%2Fstring_decoder.js",
+            "raw_url": "https://github.com/nodejs/node/raw/341770fedf77ff5b8e0c646070029152b58fc746/lib%2Fstring_decoder.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Fstring_decoder.js?ref=341770fedf77ff5b8e0c646070029152b58fc746",
+            "patch": "@@ -43,10 +43,12 @@ const kNativeDecoder = Symbol('kNativeDecoder');\n // modules monkey-patch it to support additional encodings\n function normalizeEncoding(enc) {\n   const nenc = internalUtil.normalizeEncoding(enc);\n-  if (typeof nenc !== 'string' &&\n-      (Buffer.isEncoding === isEncoding || !Buffer.isEncoding(enc)))\n-    throw new errors.TypeError('ERR_UNKNOWN_ENCODING', enc);\n-  return nenc || enc;\n+  if (nenc === undefined) {\n+    if (Buffer.isEncoding === isEncoding || !Buffer.isEncoding(enc))\n+      throw new errors.TypeError('ERR_UNKNOWN_ENCODING', enc);\n+    return enc;\n+  }\n+  return nenc;\n }\n \n const encodingsMap = {};"
+        }
+    ],
+    "stats": {
+        "total": 134,
+        "additions": 101,
+        "deletions": 33
+    }
+}

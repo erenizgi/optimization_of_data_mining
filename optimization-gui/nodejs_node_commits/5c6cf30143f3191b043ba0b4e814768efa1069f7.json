@@ -1,0 +1,144 @@
+{
+    "author": "addaleax",
+    "message": "src: add environment cleanup hooks\n\nThis adds pairs of methods to the `Environment` class and to public APIs\nwhich can add and remove cleanup handlers.\n\nUnlike `AtExit`, this API targets addon developers rather than\nembedders, giving them (and Node’s internals) the ability to register\nper-`Environment` cleanup work.\n\nWe may want to replace `AtExit` with this API at some point.\n\nMany thanks for Stephen Belanger for reviewing the original version of\nthis commit in the Ayo.js project.\n\nRefs: https://github.com/ayojs/ayo/pull/82\nPR-URL: https://github.com/nodejs/node/pull/19377\nReviewed-By: Ben Noordhuis <info@bnoordhuis.nl>\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "5c6cf30143f3191b043ba0b4e814768efa1069f7",
+    "files": [
+        {
+            "sha": "3748e252fc8964afbc4088f87b4fd4c45b8c9432",
+            "filename": "doc/api/n-api.md",
+            "status": "modified",
+            "additions": 52,
+            "deletions": 0,
+            "changes": 52,
+            "blob_url": "https://github.com/nodejs/node/blob/5c6cf30143f3191b043ba0b4e814768efa1069f7/doc%2Fapi%2Fn-api.md",
+            "raw_url": "https://github.com/nodejs/node/raw/5c6cf30143f3191b043ba0b4e814768efa1069f7/doc%2Fapi%2Fn-api.md",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/doc%2Fapi%2Fn-api.md?ref=5c6cf30143f3191b043ba0b4e814768efa1069f7",
+            "patch": "@@ -886,6 +886,58 @@ If still valid, this API returns the `napi_value` representing the\n JavaScript `Object` associated with the `napi_ref`. Otherwise, result\n will be NULL.\n \n+### Cleanup on exit of the current Node.js instance\n+\n+While a Node.js process typically releases all its resources when exiting,\n+embedders of Node.js, or future Worker support, may require addons to register\n+clean-up hooks that will be run once the current Node.js instance exits.\n+\n+N-API provides functions for registering and un-registering such callbacks.\n+When those callbacks are run, all resources that are being held by the addon\n+should be freed up.\n+\n+#### napi_add_env_cleanup_hook\n+<!-- YAML\n+added: REPLACEME\n+-->\n+```C\n+NODE_EXTERN napi_status napi_add_env_cleanup_hook(napi_env env,\n+                                                  void (*fun)(void* arg),\n+                                                  void* arg);\n+```\n+\n+Registers `fun` as a function to be run with the `arg` parameter once the\n+current Node.js environment exits.\n+\n+A function can safely be specified multiple times with different\n+`arg` values. In that case, it will be called multiple times as well.\n+Providing the same `fun` and `arg` values multiple times is not allowed\n+and will lead the process to abort.\n+\n+The hooks will be called in reverse order, i.e. the most recently added one\n+will be called first.\n+\n+Removing this hook can be done by using `napi_remove_env_cleanup_hook`.\n+Typically, that happens when the resource for which this hook was added\n+is being torn down anyway.\n+\n+#### napi_remove_env_cleanup_hook\n+<!-- YAML\n+added: REPLACEME\n+-->\n+```C\n+NAPI_EXTERN napi_status napi_remove_env_cleanup_hook(napi_env env,\n+                                                     void (*fun)(void* arg),\n+                                                     void* arg);\n+```\n+\n+Unregisters `fun` as a function to be run with the `arg` parameter once the\n+current Node.js environment exits. Both the argument and the function value\n+need to be exact matches.\n+\n+The function must have originally been registered\n+with `napi_add_env_cleanup_hook`, otherwise the process will abort.\n+\n ## Module registration\n N-API modules are registered in a manner similar to other modules\n except that instead of using the `NODE_MODULE` macro the following"
+        },
+        {
+            "sha": "d3c0c211d97328f2dd2fa0791a535ccc20730a41",
+            "filename": "src/env-inl.h",
+            "status": "modified",
+            "additions": 23,
+            "deletions": 0,
+            "changes": 23,
+            "blob_url": "https://github.com/nodejs/node/blob/5c6cf30143f3191b043ba0b4e814768efa1069f7/src%2Fenv-inl.h",
+            "raw_url": "https://github.com/nodejs/node/raw/5c6cf30143f3191b043ba0b4e814768efa1069f7/src%2Fenv-inl.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv-inl.h?ref=5c6cf30143f3191b043ba0b4e814768efa1069f7",
+            "patch": "@@ -629,6 +629,29 @@ inline void Environment::SetTemplateMethod(v8::Local<v8::FunctionTemplate> that,\n   t->SetClassName(name_string);  // NODE_SET_METHOD() compatibility.\n }\n \n+void Environment::AddCleanupHook(void (*fn)(void*), void* arg) {\n+  auto insertion_info = cleanup_hooks_.emplace(CleanupHookCallback {\n+    fn, arg, cleanup_hook_counter_++\n+  });\n+  // Make sure there was no existing element with these values.\n+  CHECK_EQ(insertion_info.second, true);\n+}\n+\n+void Environment::RemoveCleanupHook(void (*fn)(void*), void* arg) {\n+  CleanupHookCallback search { fn, arg, 0 };\n+  cleanup_hooks_.erase(search);\n+}\n+\n+size_t Environment::CleanupHookCallback::Hash::operator()(\n+    const CleanupHookCallback& cb) const {\n+  return std::hash<void*>()(cb.arg_);\n+}\n+\n+bool Environment::CleanupHookCallback::Equal::operator()(\n+    const CleanupHookCallback& a, const CleanupHookCallback& b) const {\n+  return a.fn_ == b.fn_ && a.arg_ == b.arg_;\n+}\n+\n #define VP(PropertyName, StringValue) V(v8::Private, PropertyName)\n #define VS(PropertyName, StringValue) V(v8::String, PropertyName)\n #define V(TypeName, PropertyName)                                             \\"
+        },
+        {
+            "sha": "aadb81092e507cc63afdf43573b3665c94931fbc",
+            "filename": "src/env.cc",
+            "status": "modified",
+            "additions": 29,
+            "deletions": 0,
+            "changes": 29,
+            "blob_url": "https://github.com/nodejs/node/blob/5c6cf30143f3191b043ba0b4e814768efa1069f7/src%2Fenv.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/5c6cf30143f3191b043ba0b4e814768efa1069f7/src%2Fenv.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv.cc?ref=5c6cf30143f3191b043ba0b4e814768efa1069f7",
+            "patch": "@@ -305,6 +305,35 @@ void Environment::PrintSyncTrace() const {\n   fflush(stderr);\n }\n \n+void Environment::RunCleanup() {\n+  while (!cleanup_hooks_.empty()) {\n+    // Copy into a vector, since we can't sort an unordered_set in-place.\n+    std::vector<CleanupHookCallback> callbacks(\n+        cleanup_hooks_.begin(), cleanup_hooks_.end());\n+    // We can't erase the copied elements from `cleanup_hooks_` yet, because we\n+    // need to be able to check whether they were un-scheduled by another hook.\n+\n+    std::sort(callbacks.begin(), callbacks.end(),\n+              [](const CleanupHookCallback& a, const CleanupHookCallback& b) {\n+      // Sort in descending order so that the most recently inserted callbacks\n+      // are run first.\n+      return a.insertion_order_counter_ > b.insertion_order_counter_;\n+    });\n+\n+    for (const CleanupHookCallback& cb : callbacks) {\n+      if (cleanup_hooks_.count(cb) == 0) {\n+        // This hook was removed from the `cleanup_hooks_` set during another\n+        // hook that was run earlier. Nothing to do here.\n+        continue;\n+      }\n+\n+      cb.fn_(cb.arg_);\n+      cleanup_hooks_.erase(cb);\n+      CleanupHandles();\n+    }\n+  }\n+}\n+\n void Environment::RunBeforeExitCallbacks() {\n   for (ExitCallback before_exit : before_exit_functions_) {\n     before_exit.cb_(before_exit.arg_);"
+        },
+        {
+            "sha": "3acb27c95455251ee0d78bef5b750ec40c370bc1",
+            "filename": "src/env.h",
+            "status": "modified",
+            "additions": 31,
+            "deletions": 0,
+            "changes": 31,
+            "blob_url": "https://github.com/nodejs/node/blob/5c6cf30143f3191b043ba0b4e814768efa1069f7/src%2Fenv.h",
+            "raw_url": "https://github.com/nodejs/node/raw/5c6cf30143f3191b043ba0b4e814768efa1069f7/src%2Fenv.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv.h?ref=5c6cf30143f3191b043ba0b4e814768efa1069f7",
+            "patch": "@@ -42,6 +42,7 @@\n #include <stdint.h>\n #include <vector>\n #include <unordered_map>\n+#include <unordered_set>\n \n struct nghttp2_rcbuf;\n \n@@ -775,6 +776,10 @@ class Environment {\n \n   v8::Local<v8::Value> GetNow();\n \n+  inline void AddCleanupHook(void (*fn)(void*), void* arg);\n+  inline void RemoveCleanupHook(void (*fn)(void*), void* arg);\n+  void RunCleanup();\n+\n  private:\n   inline void CreateImmediate(native_immediate_callback cb,\n                               void* data,\n@@ -863,6 +868,32 @@ class Environment {\n   void RunAndClearNativeImmediates();\n   static void CheckImmediate(uv_check_t* handle);\n \n+  struct CleanupHookCallback {\n+    void (*fn_)(void*);\n+    void* arg_;\n+\n+    // We keep track of the insertion order for these objects, so that we can\n+    // call the callbacks in reverse order when we are cleaning up.\n+    uint64_t insertion_order_counter_;\n+\n+    // Only hashes `arg_`, since that is usually enough to identify the hook.\n+    struct Hash {\n+      inline size_t operator()(const CleanupHookCallback& cb) const;\n+    };\n+\n+    // Compares by `fn_` and `arg_` being equal.\n+    struct Equal {\n+      inline bool operator()(const CleanupHookCallback& a,\n+                             const CleanupHookCallback& b) const;\n+    };\n+  };\n+\n+  // Use an unordered_set, so that we have efficient insertion and removal.\n+  std::unordered_set<CleanupHookCallback,\n+                     CleanupHookCallback::Hash,\n+                     CleanupHookCallback::Equal> cleanup_hooks_;\n+  uint64_t cleanup_hook_counter_ = 0;\n+\n   static void EnvPromiseHook(v8::PromiseHookType type,\n                              v8::Local<v8::Promise> promise,\n                              v8::Local<v8::Value> parent);"
+        },
+        {
+            "sha": "c95e084f0c344bb133c6ce35a1f33e57e8ed1732",
+            "filename": "src/node.cc",
+            "status": "modified",
+            "additions": 19,
+            "deletions": 1,
+            "changes": 20,
+            "blob_url": "https://github.com/nodejs/node/blob/5c6cf30143f3191b043ba0b4e814768efa1069f7/src%2Fnode.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/5c6cf30143f3191b043ba0b4e814768efa1069f7/src%2Fnode.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode.cc?ref=5c6cf30143f3191b043ba0b4e814768efa1069f7",
+            "patch": "@@ -904,6 +904,22 @@ void AddPromiseHook(v8::Isolate* isolate, promise_hook_func fn, void* arg) {\n   env->AddPromiseHook(fn, arg);\n }\n \n+void AddEnvironmentCleanupHook(v8::Isolate* isolate,\n+                               void (*fun)(void* arg),\n+                               void* arg) {\n+  Environment* env = Environment::GetCurrent(isolate);\n+  env->AddCleanupHook(fun, arg);\n+}\n+\n+\n+void RemoveEnvironmentCleanupHook(v8::Isolate* isolate,\n+                                  void (*fun)(void* arg),\n+                                  void* arg) {\n+  Environment* env = Environment::GetCurrent(isolate);\n+  env->RemoveCleanupHook(fun, arg);\n+}\n+\n+\n CallbackScope::CallbackScope(Isolate* isolate,\n                              Local<Object> object,\n                              async_context asyncContext)\n@@ -4435,7 +4451,7 @@ Environment* CreateEnvironment(IsolateData* isolate_data,\n \n \n void FreeEnvironment(Environment* env) {\n-  env->CleanupHandles();\n+  env->RunCleanup();\n   delete env;\n }\n \n@@ -4533,6 +4549,8 @@ inline int Start(Isolate* isolate, IsolateData* isolate_data,\n   env.set_trace_sync_io(false);\n \n   const int exit_code = EmitExit(&env);\n+\n+  env.RunCleanup();\n   RunAtExit(&env);\n \n   v8_platform.DrainVMTasks(isolate);"
+        },
+        {
+            "sha": "23e2e9995ce2095f5083ff4819547a8276bb8577",
+            "filename": "src/node.h",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 0,
+            "changes": 13,
+            "blob_url": "https://github.com/nodejs/node/blob/5c6cf30143f3191b043ba0b4e814768efa1069f7/src%2Fnode.h",
+            "raw_url": "https://github.com/nodejs/node/raw/5c6cf30143f3191b043ba0b4e814768efa1069f7/src%2Fnode.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode.h?ref=5c6cf30143f3191b043ba0b4e814768efa1069f7",
+            "patch": "@@ -583,6 +583,19 @@ NODE_EXTERN void AddPromiseHook(v8::Isolate* isolate,\n                                 promise_hook_func fn,\n                                 void* arg);\n \n+/* This is a lot like node::AtExit, except that the hooks added via this\n+ * function are run before the AtExit ones and will always be registered\n+ * for the current Environment instance.\n+ * These functions are safe to use in an addon supporting multiple\n+ * threads/isolates. */\n+NODE_EXTERN void AddEnvironmentCleanupHook(v8::Isolate* isolate,\n+                                           void (*fun)(void* arg),\n+                                           void* arg);\n+\n+NODE_EXTERN void RemoveEnvironmentCleanupHook(v8::Isolate* isolate,\n+                                              void (*fun)(void* arg),\n+                                              void* arg);\n+\n /* Returns the id of the current execution context. If the return value is\n  * zero then no execution has been set. This will happen if the user handles\n  * I/O from native code. */"
+        },
+        {
+            "sha": "d5437d70d933ed59ab7471a46c91476291668bc4",
+            "filename": "src/node_api.cc",
+            "status": "modified",
+            "additions": 22,
+            "deletions": 0,
+            "changes": 22,
+            "blob_url": "https://github.com/nodejs/node/blob/5c6cf30143f3191b043ba0b4e814768efa1069f7/src%2Fnode_api.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/5c6cf30143f3191b043ba0b4e814768efa1069f7/src%2Fnode_api.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_api.cc?ref=5c6cf30143f3191b043ba0b4e814768efa1069f7",
+            "patch": "@@ -902,6 +902,28 @@ void napi_module_register(napi_module* mod) {\n   node::node_module_register(nm);\n }\n \n+napi_status napi_add_env_cleanup_hook(napi_env env,\n+                                      void (*fun)(void* arg),\n+                                      void* arg) {\n+  CHECK_ENV(env);\n+  CHECK_ARG(env, fun);\n+\n+  node::AddEnvironmentCleanupHook(env->isolate, fun, arg);\n+\n+  return napi_ok;\n+}\n+\n+napi_status napi_remove_env_cleanup_hook(napi_env env,\n+                                         void (*fun)(void* arg),\n+                                         void* arg) {\n+  CHECK_ENV(env);\n+  CHECK_ARG(env, fun);\n+\n+  node::RemoveEnvironmentCleanupHook(env->isolate, fun, arg);\n+\n+  return napi_ok;\n+}\n+\n // Warning: Keep in-sync with napi_status enum\n static\n const char* error_messages[] = {nullptr,"
+        },
+        {
+            "sha": "91c2775a03ed764309db1291d8d9537d4a411092",
+            "filename": "src/node_api.h",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/nodejs/node/blob/5c6cf30143f3191b043ba0b4e814768efa1069f7/src%2Fnode_api.h",
+            "raw_url": "https://github.com/nodejs/node/raw/5c6cf30143f3191b043ba0b4e814768efa1069f7/src%2Fnode_api.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_api.h?ref=5c6cf30143f3191b043ba0b4e814768efa1069f7",
+            "patch": "@@ -118,6 +118,13 @@ EXTERN_C_START\n \n NAPI_EXTERN void napi_module_register(napi_module* mod);\n \n+NAPI_EXTERN napi_status napi_add_env_cleanup_hook(napi_env env,\n+                                                  void (*fun)(void* arg),\n+                                                  void* arg);\n+NAPI_EXTERN napi_status napi_remove_env_cleanup_hook(napi_env env,\n+                                                     void (*fun)(void* arg),\n+                                                     void* arg);\n+\n NAPI_EXTERN napi_status\n napi_get_last_error_info(napi_env env,\n                          const napi_extended_error_info** result);"
+        },
+        {
+            "sha": "66d53508c69f138ad0da26cf7db23829ee75b596",
+            "filename": "test/addons-napi/test_cleanup_hook/binding.cc",
+            "status": "added",
+            "additions": 24,
+            "deletions": 0,
+            "changes": 24,
+            "blob_url": "https://github.com/nodejs/node/blob/5c6cf30143f3191b043ba0b4e814768efa1069f7/test%2Faddons-napi%2Ftest_cleanup_hook%2Fbinding.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/5c6cf30143f3191b043ba0b4e814768efa1069f7/test%2Faddons-napi%2Ftest_cleanup_hook%2Fbinding.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Faddons-napi%2Ftest_cleanup_hook%2Fbinding.cc?ref=5c6cf30143f3191b043ba0b4e814768efa1069f7",
+            "patch": "@@ -0,0 +1,24 @@\n+#include \"node_api.h\"\n+#include \"uv.h\"\n+#include \"../common.h\"\n+\n+namespace {\n+\n+void cleanup(void* arg) {\n+  printf(\"cleanup(%d)\\n\", *static_cast<int*>(arg));\n+}\n+\n+int secret = 42;\n+int wrong_secret = 17;\n+\n+napi_value Init(napi_env env, napi_value exports) {\n+  napi_add_env_cleanup_hook(env, cleanup, &wrong_secret);\n+  napi_add_env_cleanup_hook(env, cleanup, &secret);\n+  napi_remove_env_cleanup_hook(env, cleanup, &wrong_secret);\n+\n+  return nullptr;\n+}\n+\n+}  // anonymous namespace\n+\n+NAPI_MODULE(NODE_GYP_MODULE_NAME, Init)"
+        },
+        {
+            "sha": "7ede63d94a0d77635ff78b8ad2d0079216eefa1a",
+            "filename": "test/addons-napi/test_cleanup_hook/binding.gyp",
+            "status": "added",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/nodejs/node/blob/5c6cf30143f3191b043ba0b4e814768efa1069f7/test%2Faddons-napi%2Ftest_cleanup_hook%2Fbinding.gyp",
+            "raw_url": "https://github.com/nodejs/node/raw/5c6cf30143f3191b043ba0b4e814768efa1069f7/test%2Faddons-napi%2Ftest_cleanup_hook%2Fbinding.gyp",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Faddons-napi%2Ftest_cleanup_hook%2Fbinding.gyp?ref=5c6cf30143f3191b043ba0b4e814768efa1069f7",
+            "patch": "@@ -0,0 +1,9 @@\n+{\n+  'targets': [\n+    {\n+      'target_name': 'binding',\n+      'defines': [ 'V8_DEPRECATION_WARNINGS=1' ],\n+      'sources': [ 'binding.cc' ]\n+    }\n+  ]\n+}"
+        },
+        {
+            "sha": "354f4449045c17bbe093a2134683c57097e3d791",
+            "filename": "test/addons-napi/test_cleanup_hook/test.js",
+            "status": "added",
+            "additions": 12,
+            "deletions": 0,
+            "changes": 12,
+            "blob_url": "https://github.com/nodejs/node/blob/5c6cf30143f3191b043ba0b4e814768efa1069f7/test%2Faddons-napi%2Ftest_cleanup_hook%2Ftest.js",
+            "raw_url": "https://github.com/nodejs/node/raw/5c6cf30143f3191b043ba0b4e814768efa1069f7/test%2Faddons-napi%2Ftest_cleanup_hook%2Ftest.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Faddons-napi%2Ftest_cleanup_hook%2Ftest.js?ref=5c6cf30143f3191b043ba0b4e814768efa1069f7",
+            "patch": "@@ -0,0 +1,12 @@\n+'use strict';\n+const common = require('../../common');\n+const assert = require('assert');\n+const child_process = require('child_process');\n+\n+if (process.argv[2] === 'child') {\n+  require(`./build/${common.buildType}/binding`);\n+} else {\n+  const { stdout } =\n+    child_process.spawnSync(process.execPath, [__filename, 'child']);\n+  assert.strictEqual(stdout.toString().trim(), 'cleanup(42)');\n+}"
+        }
+    ],
+    "stats": {
+        "total": 242,
+        "additions": 241,
+        "deletions": 1
+    }
+}

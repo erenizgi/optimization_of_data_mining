@@ -1,0 +1,48 @@
+{
+    "author": "addaleax",
+    "message": "zlib: simplify flushing mechanism\n\nPreviously, flushing on zlib streams was implemented through\nstream 'drain' handlers. This has a number of downsides; in\nparticular, it is complex, and could lead to unpredictable\nbehaviour, since it meant that in a sequence like\n\n```js\ncompressor.write('abc');\ncompressor.flush();\nwaitForMoreDataAsynchronously(() => {\n  compressor.write('def');\n});\n```\n\nit was not fully deterministic whether the flush happens after\nthe second chunk is written or the first one.\n\nThis commit replaces this mechanism by one that piggy-backs\nalong the stream’s write queue, using a “special” `Buffer`\ninstance that signals that a flush is currently due.\n\nPR-URL: https://github.com/nodejs/node/pull/23186\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "e688fe6b7e60d3dd50f0aa922a1ab74d85cb39b5",
+    "files": [
+        {
+            "sha": "5d5ef3e083ce9c7c803600f3afe0e6f488977da6",
+            "filename": "lib/zlib.js",
+            "status": "modified",
+            "additions": 19,
+            "deletions": 29,
+            "changes": 48,
+            "blob_url": "https://github.com/nodejs/node/blob/e688fe6b7e60d3dd50f0aa922a1ab74d85cb39b5/lib%2Fzlib.js",
+            "raw_url": "https://github.com/nodejs/node/raw/e688fe6b7e60d3dd50f0aa922a1ab74d85cb39b5/lib%2Fzlib.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Fzlib.js?ref=e688fe6b7e60d3dd50f0aa922a1ab74d85cb39b5",
+            "patch": "@@ -311,10 +311,9 @@ function Zlib(opts, mode) {\n   this._level = level;\n   this._strategy = strategy;\n   this._chunkSize = chunkSize;\n-  this._flushFlag = flush;\n-  this._scheduledFlushFlag = Z_NO_FLUSH;\n-  this._origFlushFlag = flush;\n+  this._defaultFlushFlag = flush;\n   this._finishFlushFlag = finishFlush;\n+  this._nextFlush = -1;\n   this._info = opts && opts.info;\n   this.once('end', this.close);\n }\n@@ -398,6 +397,7 @@ function maxFlush(a, b) {\n   return flushiness[a] > flushiness[b] ? a : b;\n }\n \n+const flushBuffer = Buffer.alloc(0);\n Zlib.prototype.flush = function flush(kind, callback) {\n   var ws = this._writableState;\n \n@@ -412,21 +412,13 @@ Zlib.prototype.flush = function flush(kind, callback) {\n   } else if (ws.ending) {\n     if (callback)\n       this.once('end', callback);\n-  } else if (ws.needDrain) {\n-    const alreadyHadFlushScheduled = this._scheduledFlushFlag !== Z_NO_FLUSH;\n-    this._scheduledFlushFlag = maxFlush(kind, this._scheduledFlushFlag);\n-\n-    // If a callback was passed, always register a new `drain` + flush handler,\n-    // mostly because that's simpler and flush callbacks piling up is a rare\n-    // thing anyway.\n-    if (!alreadyHadFlushScheduled || callback) {\n-      const drainHandler = () => this.flush(this._scheduledFlushFlag, callback);\n-      this.once('drain', drainHandler);\n-    }\n+  } else if (this._nextFlush !== -1) {\n+    // This means that there is a flush currently in the write queue.\n+    // We currently coalesce this flush into the pending one.\n+    this._nextFlush = maxFlush(this._nextFlush, kind);\n   } else {\n-    this._flushFlag = kind;\n-    this.write(Buffer.alloc(0), '', callback);\n-    this._scheduledFlushFlag = Z_NO_FLUSH;\n+    this._nextFlush = kind;\n+    this.write(flushBuffer, '', callback);\n   }\n };\n \n@@ -436,20 +428,18 @@ Zlib.prototype.close = function close(callback) {\n };\n \n Zlib.prototype._transform = function _transform(chunk, encoding, cb) {\n-  // If it's the last chunk, or a final flush, we use the Z_FINISH flush flag\n-  // (or whatever flag was provided using opts.finishFlush).\n-  // If it's explicitly flushing at some other time, then we use\n-  // Z_FULL_FLUSH. Otherwise, use the original opts.flush flag.\n-  var flushFlag;\n+  var flushFlag = this._defaultFlushFlag;\n+  // We use a 'fake' zero-length chunk to carry information about flushes from\n+  // the public API to the actual stream implementation.\n+  if (chunk === flushBuffer) {\n+    flushFlag = this._nextFlush;\n+    this._nextFlush = -1;\n+  }\n+\n+  // For the last chunk, also apply `_finishFlushFlag`.\n   var ws = this._writableState;\n   if ((ws.ending || ws.ended) && ws.length === chunk.byteLength) {\n-    flushFlag = this._finishFlushFlag;\n-  } else {\n-    flushFlag = this._flushFlag;\n-    // once we've flushed the last of the queue, stop flushing and\n-    // go back to the normal behavior.\n-    if (chunk.byteLength >= ws.length)\n-      this._flushFlag = this._origFlushFlag;\n+    flushFlag = maxFlush(flushFlag, this._finishFlushFlag);\n   }\n   processChunk(this, chunk, flushFlag, cb);\n };"
+        },
+        {
+            "sha": "a470e32090f084d8c617658bce963bda8879b5d9",
+            "filename": "test/parallel/test-zlib-flush-drain.js",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/e688fe6b7e60d3dd50f0aa922a1ab74d85cb39b5/test%2Fparallel%2Ftest-zlib-flush-drain.js",
+            "raw_url": "https://github.com/nodejs/node/raw/e688fe6b7e60d3dd50f0aa922a1ab74d85cb39b5/test%2Fparallel%2Ftest-zlib-flush-drain.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-zlib-flush-drain.js?ref=e688fe6b7e60d3dd50f0aa922a1ab74d85cb39b5",
+            "patch": "@@ -44,5 +44,5 @@ process.once('exit', function() {\n   assert.strictEqual(\n     drainCount, 1);\n   assert.strictEqual(\n-    flushCount, 2);\n+    flushCount, 1);\n });"
+        },
+        {
+            "sha": "6d8d787343426f650ad449f49e8de35c687adf56",
+            "filename": "test/parallel/test-zlib-write-after-flush.js",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/e688fe6b7e60d3dd50f0aa922a1ab74d85cb39b5/test%2Fparallel%2Ftest-zlib-write-after-flush.js",
+            "raw_url": "https://github.com/nodejs/node/raw/e688fe6b7e60d3dd50f0aa922a1ab74d85cb39b5/test%2Fparallel%2Ftest-zlib-write-after-flush.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-zlib-write-after-flush.js?ref=e688fe6b7e60d3dd50f0aa922a1ab74d85cb39b5",
+            "patch": "@@ -35,7 +35,7 @@ gunz.setEncoding('utf8');\n gunz.on('data', (c) => output += c);\n gunz.on('end', common.mustCall(() => {\n   assert.strictEqual(output, input);\n-  assert.strictEqual(gzip._flushFlag, zlib.constants.Z_NO_FLUSH);\n+  assert.strictEqual(gzip._nextFlush, -1);\n }));\n \n // make sure that flush/write doesn't trigger an assert failure"
+        }
+    ],
+    "stats": {
+        "total": 52,
+        "additions": 21,
+        "deletions": 31
+    }
+}

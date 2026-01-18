@@ -1,0 +1,48 @@
+{
+    "author": "joyeecheung",
+    "message": "src: simplify inspector initialization in node::Start()\n\nRemove the `StartInspector` and `InspectorStarted` abstraction\nout of `v8_platform`, and error out early and directly in the\noption parser if Node is configured with NODE_USE_V8_PLATFORM and\ninspector enabled but the user still tries to use inspector options.\n\nPR-URL: https://github.com/nodejs/node/pull/25612\nReviewed-By: Anna Henningsen <anna@addaleax.net>\nReviewed-By: Ben Noordhuis <info@bnoordhuis.nl>\nReviewed-By: Colin Ihrig <cjihrig@gmail.com>",
+    "sha": "e3e404858d5fb1ae0b50a45f0d1678235f200de0",
+    "files": [
+        {
+            "sha": "5b5cff078b423a94b22b8b82298ef110d0271326",
+            "filename": "src/node.cc",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 38,
+            "changes": 53,
+            "blob_url": "https://github.com/nodejs/node/blob/e3e404858d5fb1ae0b50a45f0d1678235f200de0/src%2Fnode.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/e3e404858d5fb1ae0b50a45f0d1678235f200de0/src%2Fnode.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode.cc?ref=e3e404858d5fb1ae0b50a45f0d1678235f200de0",
+            "patch": "@@ -262,23 +262,6 @@ static struct {\n     platform_->CancelPendingDelayedTasks(isolate);\n   }\n \n-#if HAVE_INSPECTOR\n-  bool StartInspector(Environment* env, const char* script_path) {\n-    // Inspector agent can't fail to start, but if it was configured to listen\n-    // right away on the websocket port and fails to bind/etc, this will return\n-    // false.\n-    return env->inspector_agent()->Start(\n-        script_path == nullptr ? \"\" : script_path,\n-        env->options()->debug_options(),\n-        env->inspector_host_port(),\n-        true);\n-  }\n-\n-  bool InspectorStarted(Environment* env) {\n-    return env->inspector_agent()->IsListening();\n-  }\n-#endif  // HAVE_INSPECTOR\n-\n   void StartTracingAgent() {\n     if (per_process::cli_options->trace_event_categories.empty()) {\n       tracing_file_writer_ = tracing_agent_->DefaultHandle();\n@@ -317,10 +300,6 @@ static struct {\n   void Dispose() {}\n   void DrainVMTasks(Isolate* isolate) {}\n   void CancelVMTasks(Isolate* isolate) {}\n-  bool StartInspector(Environment* env, const char* script_path) {\n-    env->ThrowError(\"Node compiled with NODE_USE_V8_PLATFORM=0\");\n-    return true;\n-  }\n \n   void StartTracingAgent() {\n     if (!trace_enabled_categories.empty()) {\n@@ -338,12 +317,6 @@ static struct {\n     return nullptr;\n   }\n #endif  // !NODE_USE_V8_PLATFORM\n-\n-#if !NODE_USE_V8_PLATFORM || !HAVE_INSPECTOR\n-  bool InspectorStarted(Environment* env) {\n-    return false;\n-  }\n-#endif  //  !NODE_USE_V8_PLATFORM || !HAVE_INSPECTOR\n } v8_platform;\n \n tracing::AgentWriterHandle* GetTracingAgentWriter() {\n@@ -783,13 +756,6 @@ void StartExecution(Environment* env, const char* main_script_id) {\n       env->context(), Undefined(env->isolate()), arraysize(argv), argv));\n }\n \n-static void StartInspector(Environment* env, const char* path) {\n-#if HAVE_INSPECTOR\n-  CHECK(!env->inspector_agent()->IsListening());\n-  v8_platform.StartInspector(env, path);\n-#endif  // HAVE_INSPECTOR\n-}\n-\n \n #ifdef __POSIX__\n void RegisterSignalHandler(int signal,\n@@ -1289,13 +1255,24 @@ inline int Start(Isolate* isolate, IsolateData* isolate_data,\n   Environment env(isolate_data, context);\n   env.Start(args, exec_args, per_process::v8_is_profiling);\n \n-  const char* path = args.size() > 1 ? args[1].c_str() : nullptr;\n-  StartInspector(&env, path);\n-\n+#if HAVE_INSPECTOR && NODE_USE_V8_PLATFORM\n+  CHECK(!env.inspector_agent()->IsListening());\n+  // Inspector agent can't fail to start, but if it was configured to listen\n+  // right away on the websocket port and fails to bind/etc, this will return\n+  // false.\n+  env.inspector_agent()->Start(args.size() > 1 ? args[1].c_str() : \"\",\n+                               env.options()->debug_options(),\n+                               env.inspector_host_port(),\n+                               true);\n   if (env.options()->debug_options().inspector_enabled &&\n-      !v8_platform.InspectorStarted(&env)) {\n+      !env.inspector_agent()->IsListening()) {\n     return 12;  // Signal internal error.\n   }\n+#else\n+  // inspector_enabled can't be true if !HAVE_INSPECTOR or !NODE_USE_V8_PLATFORM\n+  // - the option parser should not allow that.\n+  CHECK(!env.options()->debug_options().inspector_enabled);\n+#endif  // HAVE_INSPECTOR && NODE_USE_V8_PLATFORM\n \n   {\n     Environment::AsyncCallbackScope callback_scope(&env);"
+        },
+        {
+            "sha": "8bd8b827faa1098a1ff69c60fe8a6451a8a782e0",
+            "filename": "src/node_options.cc",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/nodejs/node/blob/e3e404858d5fb1ae0b50a45f0d1678235f200de0/src%2Fnode_options.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/e3e404858d5fb1ae0b50a45f0d1678235f200de0/src%2Fnode_options.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_options.cc?ref=e3e404858d5fb1ae0b50a45f0d1678235f200de0",
+            "patch": "@@ -23,6 +23,15 @@ Mutex cli_options_mutex;\n std::shared_ptr<PerProcessOptions> cli_options{new PerProcessOptions()};\n }  // namespace per_process\n \n+void DebugOptions::CheckOptions(std::vector<std::string>* errors) {\n+#if !NODE_USE_V8_PLATFORM\n+  if (inspector_enabled) {\n+    errors->push_back(\"Inspector is not available when Node is compiled \"\n+                      \"--without-v8-platform\");\n+  }\n+#endif\n+}\n+\n void PerProcessOptions::CheckOptions(std::vector<std::string>* errors) {\n #if HAVE_OPENSSL\n   if (use_openssl_ca && use_bundled_ca) {"
+        },
+        {
+            "sha": "50c66ce890bf4c6d60ea23118a1f5bb1a447d40d",
+            "filename": "src/node_options.h",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/e3e404858d5fb1ae0b50a45f0d1678235f200de0/src%2Fnode_options.h",
+            "raw_url": "https://github.com/nodejs/node/raw/e3e404858d5fb1ae0b50a45f0d1678235f200de0/src%2Fnode_options.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_options.h?ref=e3e404858d5fb1ae0b50a45f0d1678235f200de0",
+            "patch": "@@ -88,6 +88,8 @@ class DebugOptions : public Options {\n   bool wait_for_connect() const {\n     return break_first_line || break_node_first_line;\n   }\n+\n+  void CheckOptions(std::vector<std::string>* errors);\n };\n \n class EnvironmentOptions : public Options {"
+        }
+    ],
+    "stats": {
+        "total": 64,
+        "additions": 26,
+        "deletions": 38
+    }
+}

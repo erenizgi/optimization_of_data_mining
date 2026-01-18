@@ -1,0 +1,60 @@
+{
+    "author": "jmansilla",
+    "message": "Fixed #19838 -- Admin: Don't leak a 500 HTTP status when trying to delete protected FKs.\n\nThanks rafadev for the report and Javier Mansilla for the fix.",
+    "sha": "3ea0c7d35ac461cb469170486683d10732eb534b",
+    "files": [
+        {
+            "sha": "d59404e771885482c53b71d29b72debd322ba8b0",
+            "filename": "AUTHORS",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/django/django/blob/3ea0c7d35ac461cb469170486683d10732eb534b/AUTHORS",
+            "raw_url": "https://github.com/django/django/raw/3ea0c7d35ac461cb469170486683d10732eb534b/AUTHORS",
+            "contents_url": "https://api.github.com/repos/django/django/contents/AUTHORS?ref=3ea0c7d35ac461cb469170486683d10732eb534b",
+            "patch": "@@ -363,6 +363,7 @@ answer newbie questions, and generally made Django that much better:\n     Mike Malone <mjmalone@gmail.com>\n     Martin Maney <http://www.chipy.org/Martin_Maney>\n     Michael Manfre <mmanfre@gmail.com>\n+    Javier Mansilla <javimansilla@gmail.com>\n     masonsimon+django@gmail.com\n     Manuzhai\n     Petr Marhoun <petr.marhoun@gmail.com>"
+        },
+        {
+            "sha": "8f78aaf8dd4bd8cfe9847df66c6315d17389f30a",
+            "filename": "django/contrib/admin/options.py",
+            "status": "modified",
+            "additions": 40,
+            "deletions": 2,
+            "changes": 42,
+            "blob_url": "https://github.com/django/django/blob/3ea0c7d35ac461cb469170486683d10732eb534b/django%2Fcontrib%2Fadmin%2Foptions.py",
+            "raw_url": "https://github.com/django/django/raw/3ea0c7d35ac461cb469170486683d10732eb534b/django%2Fcontrib%2Fadmin%2Foptions.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fcontrib%2Fadmin%2Foptions.py?ref=3ea0c7d35ac461cb469170486683d10732eb534b",
+            "patch": "@@ -3,12 +3,13 @@\n \n from django import forms\n from django.conf import settings\n-from django.forms.formsets import all_valid\n+from django.forms.formsets import all_valid, DELETION_FIELD_NAME\n from django.forms.models import (modelform_factory, modelformset_factory,\n     inlineformset_factory, BaseInlineFormSet)\n from django.contrib.contenttypes.models import ContentType\n from django.contrib.admin import widgets, helpers\n-from django.contrib.admin.util import unquote, flatten_fieldsets, get_deleted_objects, model_format_dict\n+from django.contrib.admin.util import (unquote, flatten_fieldsets, get_deleted_objects,\n+    model_format_dict, NestedObjects)\n from django.contrib.admin.templatetags.admin_static import static\n from django.contrib import messages\n from django.views.decorators.csrf import csrf_protect\n@@ -1452,7 +1453,44 @@ def get_formset(self, request, obj=None, **kwargs):\n             \"max_num\": self.max_num,\n             \"can_delete\": can_delete,\n         }\n+\n         defaults.update(kwargs)\n+        base_model_form = defaults['form']\n+\n+        class DeleteProtectedModelForm(base_model_form):\n+            def hand_clean_DELETE(self):\n+                \"\"\"\n+                We don't validate the 'DELETE' field itself because on\n+                templates it's not rendered using the field information, but\n+                just using a generic \"deletion_field\" of the InlineModelAdmin.\n+                \"\"\"\n+                if self.cleaned_data.get(DELETION_FIELD_NAME, False):\n+                    using = router.db_for_write(self._meta.model)\n+                    collector = NestedObjects(using=using)\n+                    collector.collect([self.instance])\n+                    if collector.protected:\n+                        objs = []\n+                        for p in collector.protected:\n+                            objs.append(\n+                                # Translators: Model verbose name and instance representation, suitable to be an item in a list\n+                                _('%(class_name)s %(instance)s') % {\n+                                    'class_name': p._meta.verbose_name,\n+                                    'instance': p}\n+                            )\n+                        msg_dict = {'class_name': self._meta.model._meta.verbose_name,\n+                                    'instance': self.instance,\n+                                    'related_objects': get_text_list(objs, _('and'))}\n+                        msg = _(\"Deleting %(class_name)s %(instance)s would require \"\n+                                \"deleting the following protected related objects: \"\n+                                \"%(related_objects)s\") % msg_dict\n+                        raise ValidationError(msg)\n+\n+            def is_valid(self):\n+                result = super(DeleteProtectedModelForm, self).is_valid()\n+                self.hand_clean_DELETE()\n+                return result\n+\n+        defaults['form'] = DeleteProtectedModelForm\n         return inlineformset_factory(self.parent_model, self.model, **defaults)\n \n     def get_fieldsets(self, request, obj=None):"
+        },
+        {
+            "sha": "82c1c3f07819efbd4975f95e67422729b672346a",
+            "filename": "tests/admin_inlines/models.py",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 0,
+            "changes": 8,
+            "blob_url": "https://github.com/django/django/blob/3ea0c7d35ac461cb469170486683d10732eb534b/tests%2Fadmin_inlines%2Fmodels.py",
+            "raw_url": "https://github.com/django/django/raw/3ea0c7d35ac461cb469170486683d10732eb534b/tests%2Fadmin_inlines%2Fmodels.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fadmin_inlines%2Fmodels.py?ref=3ea0c7d35ac461cb469170486683d10732eb534b",
+            "patch": "@@ -128,8 +128,16 @@ class Novel(models.Model):\n     name = models.CharField(max_length=40)\n \n class Chapter(models.Model):\n+    name = models.CharField(max_length=40)\n     novel = models.ForeignKey(Novel)\n \n+class FootNote(models.Model):\n+    \"\"\"\n+    Model added for ticket 19838\n+    \"\"\"\n+    chapter = models.ForeignKey(Chapter, on_delete=models.PROTECT)\n+    note = models.CharField(max_length=40)\n+\n # Models for #16838\n \n class CapoFamiglia(models.Model):"
+        },
+        {
+            "sha": "714a2f1c6161009a8526aab21c9ccf0f583a3318",
+            "filename": "tests/admin_inlines/tests.py",
+            "status": "modified",
+            "additions": 39,
+            "deletions": 1,
+            "changes": 40,
+            "blob_url": "https://github.com/django/django/blob/3ea0c7d35ac461cb469170486683d10732eb534b/tests%2Fadmin_inlines%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/3ea0c7d35ac461cb469170486683d10732eb534b/tests%2Fadmin_inlines%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fadmin_inlines%2Ftests.py?ref=3ea0c7d35ac461cb469170486683d10732eb534b",
+            "patch": "@@ -12,7 +12,7 @@\n from .models import (Holder, Inner, Holder2, Inner2, Holder3, Inner3, Person,\n     OutfitItem, Fashionista, Teacher, Parent, Child, Author, Book, Profile,\n     ProfileCollection, ParentModelWithCustomPk, ChildModel1, ChildModel2,\n-    Sighting, Title)\n+    Sighting, Title, Novel, Chapter, FootNote)\n \n \n @override_settings(PASSWORD_HASHERS=('django.contrib.auth.hashers.SHA1PasswordHasher',))\n@@ -250,6 +250,44 @@ def test_immutable_content_type(self):\n         parent_ct = ContentType.objects.get_for_model(Parent)\n         self.assertEqual(iaf.original.content_type, parent_ct)\n \n+\n+@override_settings(PASSWORD_HASHERS=('django.contrib.auth.hashers.SHA1PasswordHasher',))\n+class TestInlineProtectedOnDelete(TestCase):\n+    urls = \"admin_inlines.urls\"\n+    fixtures = ['admin-views-users.xml']\n+\n+    def setUp(self):\n+        result = self.client.login(username='super', password='secret')\n+        self.assertEqual(result, True)\n+\n+    def tearDown(self):\n+        self.client.logout()\n+\n+    def test_deleting_inline_with_protected_delete_does_not_validate(self):\n+        lotr = Novel.objects.create(name='Lord of the rings')\n+        chapter = Chapter.objects.create(novel=lotr, name='Many Meetings')\n+        foot_note = FootNote.objects.create(chapter=chapter, note='yadda yadda')\n+\n+        change_url = '/admin/admin_inlines/novel/%i/' % lotr.id\n+        response = self.client.get(change_url)\n+        data = {\n+            'name': lotr.name,\n+            'chapter_set-TOTAL_FORMS': 1,\n+            'chapter_set-INITIAL_FORMS': 1,\n+            'chapter_set-MAX_NUM_FORMS': 1000,\n+            '_save': 'Save',\n+            'chapter_set-0-id': chapter.id,\n+            'chapter_set-0-name': chapter.name,\n+            'chapter_set-0-novel': lotr.id,\n+            'chapter_set-0-DELETE': 'on'\n+        }\n+        response = self.client.post(change_url, data)\n+        self.assertEqual(response.status_code, 200)\n+        self.assertContains(response, \"Deleting chapter %s would require deleting \"\n+                            \"the following protected related objects: foot note %s\"\n+                            % (chapter, foot_note))\n+\n+\n class TestInlinePermissions(TestCase):\n     \"\"\"\n     Make sure the admin respects permissions for objects that are edited"
+        }
+    ],
+    "stats": {
+        "total": 91,
+        "additions": 88,
+        "deletions": 3
+    }
+}

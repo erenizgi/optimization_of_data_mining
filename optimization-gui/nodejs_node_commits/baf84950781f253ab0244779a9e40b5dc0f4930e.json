@@ -1,0 +1,60 @@
+{
+    "author": "unknown",
+    "message": "http: process 100, 102-199 according to specs.\n\nAdding ServerResponse.writeProcessing to send 102 status codes.\n\nAdded an `'information'` event to ClientRequest to handle\n1xx status codes except 101 Upgrade.\n101 Upgrade is excluded due to its non-informational\nprocessing according to RFC7231, Section 6.2.2.\n\nThis affects several modules downstream that use the http\nmodule, e.g., node-fetch, all of whom violate HTTP RFCs\ndue to this module. As such, this could introduce a\nbreaking change for downstream if HTTP standards were\nignored in an ad-hoc fashion.\n\nSee also RFC2518 RFC8297.\n\nPR-URL: https://github.com/nodejs/node/pull/18033\nReviewed-By: Matteo Collina <matteo.collina@gmail.com>\nReviewed-By: Ruben Bridgewater <ruben@bridgewater.de>\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Tiancheng \"Timothy\" Gu <timothygu99@gmail.com>",
+    "sha": "baf84950781f253ab0244779a9e40b5dc0f4930e",
+    "files": [
+        {
+            "sha": "74ba9e8792c4ef6a7a5d58be81d3b13f20fafb8f",
+            "filename": "doc/api/http.md",
+            "status": "modified",
+            "additions": 40,
+            "deletions": 0,
+            "changes": 40,
+            "blob_url": "https://github.com/nodejs/node/blob/baf84950781f253ab0244779a9e40b5dc0f4930e/doc%2Fapi%2Fhttp.md",
+            "raw_url": "https://github.com/nodejs/node/raw/baf84950781f253ab0244779a9e40b5dc0f4930e/doc%2Fapi%2Fhttp.md",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/doc%2Fapi%2Fhttp.md?ref=baf84950781f253ab0244779a9e40b5dc0f4930e",
+            "patch": "@@ -400,6 +400,37 @@ Emitted when the server sends a '100 Continue' HTTP response, usually because\n the request contained 'Expect: 100-continue'. This is an instruction that\n the client should send the request body.\n \n+### Event: 'information'\n+<!-- YAML\n+added: REPLACEME\n+-->\n+\n+Emitted when the server sends a 1xx response (excluding 101 Upgrade). This\n+event is emitted with a callback containing an object with a status code.\n+\n+```js\n+const http = require('http');\n+\n+const options = {\n+  hostname: '127.0.0.1',\n+  port: 8080,\n+  path: '/length_request'\n+};\n+\n+// Make a request\n+const req = http.request(options);\n+req.end();\n+\n+req.on('information', (res) => {\n+  console.log('got information prior to main response: ' + res.statusCode);\n+});\n+```\n+\n+101 Upgrade statuses do not fire this event due to their break from the\n+traditional HTTP request/response chain, such as web sockets, in-place TLS\n+upgrades, or HTTP 2.0. To be notified of 101 Upgrade notices, listen for the\n+[`'upgrade'`][] event instead.\n+\n ### Event: 'response'\n <!-- YAML\n added: v0.1.0\n@@ -1384,6 +1415,14 @@ which has been transmitted are equal or not.\n Attempting to set a header field name or value that contains invalid characters\n will result in a [`TypeError`][] being thrown.\n \n+### response.writeProcessing()\n+<!-- YAML\n+added: REPLACEME\n+-->\n+\n+Sends a HTTP/1.1 102 Processing message to the client, indicating that\n+the request body should be sent.\n+\n ## Class: http.IncomingMessage\n <!-- YAML\n added: v0.1.17\n@@ -1937,6 +1976,7 @@ not abort the request or do anything besides add a `timeout` event.\n [`'checkContinue'`]: #http_event_checkcontinue\n [`'request'`]: #http_event_request\n [`'response'`]: #http_event_response\n+[`'upgrade'`]: #http_event_upgrade\n [`Agent`]: #http_class_http_agent\n [`Duplex`]: stream.html#stream_class_stream_duplex\n [`EventEmitter`]: events.html#events_class_eventemitter"
+        },
+        {
+            "sha": "cab11ae8f296c09dfdccfa65021ccd00d3ced815",
+            "filename": "lib/_http_client.js",
+            "status": "modified",
+            "additions": 22,
+            "deletions": 7,
+            "changes": 29,
+            "blob_url": "https://github.com/nodejs/node/blob/baf84950781f253ab0244779a9e40b5dc0f4930e/lib%2F_http_client.js",
+            "raw_url": "https://github.com/nodejs/node/raw/baf84950781f253ab0244779a9e40b5dc0f4930e/lib%2F_http_client.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2F_http_client.js?ref=baf84950781f253ab0244779a9e40b5dc0f4930e",
+            "patch": "@@ -447,16 +447,25 @@ function socketOnData(d) {\n       socket.destroy();\n     }\n   } else if (parser.incoming && parser.incoming.complete &&\n-             // When the status code is 100 (Continue), the server will\n-             // send a final response after this client sends a request\n-             // body. So, we must not free the parser.\n-             parser.incoming.statusCode !== 100) {\n+             // When the status code is informational (100, 102-199),\n+             // the server will send a final response after this client\n+             // sends a request body, so we must not free the parser.\n+             // 101 (Switching Protocols) and all other status codes\n+             // should be processed normally.\n+             !statusIsInformational(parser.incoming.statusCode)) {\n     socket.removeListener('data', socketOnData);\n     socket.removeListener('end', socketOnEnd);\n     freeParser(parser, req, socket);\n   }\n }\n \n+function statusIsInformational(status) {\n+  // 100 (Continue)    RFC7231 Section 6.2.1\n+  // 102 (Processing)  RFC2518\n+  // 103 (Early Hints) RFC8297\n+  // 104-199 (Unassigned)\n+  return (status < 200 && status >= 100 && status !== 101);\n+}\n \n // client\n function parserOnIncomingClient(res, shouldKeepAlive) {\n@@ -480,10 +489,16 @@ function parserOnIncomingClient(res, shouldKeepAlive) {\n     return 2;  // Skip body and treat as Upgrade.\n   }\n \n-  if (res.statusCode === 100) {\n-    // restart the parser, as this is a continue message.\n+  if (statusIsInformational(res.statusCode)) {\n+    // Restart the parser, as this is a 1xx informational message.\n     req.res = null; // Clear res so that we don't hit double-responses.\n-    req.emit('continue');\n+    // Maintain compatibility by sending 100-specific events\n+    if (res.statusCode === 100) {\n+      req.emit('continue');\n+    }\n+    // Send information events to all 1xx responses except 101 Upgrade.\n+    req.emit('information', { statusCode: res.statusCode });\n+\n     return 1;  // Skip body but don't treat as Upgrade.\n   }\n "
+        },
+        {
+            "sha": "1d093bab8bdf3350f588e7f248a5729cd6615822",
+            "filename": "lib/_http_server.js",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/nodejs/node/blob/baf84950781f253ab0244779a9e40b5dc0f4930e/lib%2F_http_server.js",
+            "raw_url": "https://github.com/nodejs/node/raw/baf84950781f253ab0244779a9e40b5dc0f4930e/lib%2F_http_server.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2F_http_server.js?ref=baf84950781f253ab0244779a9e40b5dc0f4930e",
+            "patch": "@@ -188,6 +188,10 @@ ServerResponse.prototype.writeContinue = function writeContinue(cb) {\n   this._sent100 = true;\n };\n \n+ServerResponse.prototype.writeProcessing = function writeProcessing(cb) {\n+  this._writeRaw(`HTTP/1.1 102 Processing${CRLF}${CRLF}`, 'ascii', cb);\n+};\n+\n ServerResponse.prototype._implicitHeader = function _implicitHeader() {\n   this.writeHead(this.statusCode);\n };"
+        },
+        {
+            "sha": "af589477f05dd1629d54a5c222688c9378554632",
+            "filename": "test/parallel/test-http-information-processing.js",
+            "status": "added",
+            "additions": 52,
+            "deletions": 0,
+            "changes": 52,
+            "blob_url": "https://github.com/nodejs/node/blob/baf84950781f253ab0244779a9e40b5dc0f4930e/test%2Fparallel%2Ftest-http-information-processing.js",
+            "raw_url": "https://github.com/nodejs/node/raw/baf84950781f253ab0244779a9e40b5dc0f4930e/test%2Fparallel%2Ftest-http-information-processing.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-http-information-processing.js?ref=baf84950781f253ab0244779a9e40b5dc0f4930e",
+            "patch": "@@ -0,0 +1,52 @@\n+'use strict';\n+require('../common');\n+const assert = require('assert');\n+const http = require('http');\n+const Countdown = require('../common/countdown');\n+\n+const test_res_body = 'other stuff!\\n';\n+const countdown = new Countdown(3, () => server.close());\n+\n+const server = http.createServer((req, res) => {\n+  console.error('Server sending informational message #1...');\n+  res.writeProcessing();\n+  console.error('Server sending informational message #2...');\n+  res.writeProcessing();\n+  console.error('Server sending full response...');\n+  res.writeHead(200, {\n+    'Content-Type': 'text/plain',\n+    'ABCD': '1'\n+  });\n+  res.end(test_res_body);\n+});\n+\n+server.listen(0, function() {\n+  const req = http.request({\n+    port: this.address().port,\n+    path: '/world'\n+  });\n+  req.end();\n+  console.error('Client sending request...');\n+\n+  let body = '';\n+\n+  req.on('information', function(res) {\n+    console.error('Client got 102 Processing...');\n+    countdown.dec();\n+  });\n+\n+  req.on('response', function(res) {\n+    assert.strictEqual(countdown.remaining, 1,\n+                       'Full response received before all 102 Processing');\n+    assert.strictEqual(200, res.statusCode,\n+                       `Final status code was ${res.statusCode}, not 200.`);\n+    res.setEncoding('utf8');\n+    res.on('data', function(chunk) { body += chunk; });\n+    res.on('end', function() {\n+      console.error('Got full response.');\n+      assert.strictEqual(body, test_res_body);\n+      assert.ok('abcd' in res.headers);\n+      countdown.dec();\n+    });\n+  });\n+});"
+        }
+    ],
+    "stats": {
+        "total": 125,
+        "additions": 118,
+        "deletions": 7
+    }
+}

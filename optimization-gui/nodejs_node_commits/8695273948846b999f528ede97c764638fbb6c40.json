@@ -1,0 +1,72 @@
+{
+    "author": "addaleax",
+    "message": "src: tighten handle scopes for stream operations\n\nPut `HandleScope`s and `Context::Scope`s where they are used,\nand don’t create one for native stream callbacks automatically.\n\nThis is slightly less convenient but means that stream listeners\nthat don’t actually call back into JS don’t have to pay the\n(small) cost of setting these up.\n\nPR-URL: https://github.com/nodejs/node/pull/18936\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Matteo Collina <matteo.collina@gmail.com>",
+    "sha": "8695273948846b999f528ede97c764638fbb6c40",
+    "files": [
+        {
+            "sha": "939e0011bdfa42d318e4964b389f0381eeeed802",
+            "filename": "src/node_http2.cc",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 2,
+            "changes": 7,
+            "blob_url": "https://github.com/nodejs/node/blob/8695273948846b999f528ede97c764638fbb6c40/src%2Fnode_http2.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/8695273948846b999f528ede97c764638fbb6c40/src%2Fnode_http2.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_http2.cc?ref=8695273948846b999f528ede97c764638fbb6c40",
+            "patch": "@@ -1132,6 +1132,8 @@ void Http2StreamListener::OnStreamRead(ssize_t nread, const uv_buf_t& buf) {\n   Http2Stream* stream = static_cast<Http2Stream*>(stream_);\n   Http2Session* session = stream->session();\n   Environment* env = stream->env();\n+  HandleScope handle_scope(env->isolate());\n+  Context::Scope context_scope(env->context());\n \n   if (nread < 0) {\n     PassReadErrorToPreviousListener(nread);\n@@ -1422,6 +1424,7 @@ void Http2Session::OnStreamAfterWrite(WriteWrap* w, int status) {\n void Http2Session::MaybeScheduleWrite() {\n   CHECK_EQ(flags_ & SESSION_STATE_WRITE_SCHEDULED, 0);\n   if (session_ != nullptr && nghttp2_session_want_write(session_)) {\n+    HandleScope handle_scope(env()->isolate());\n     DEBUG_HTTP2SESSION(this, \"scheduling write\");\n     flags_ |= SESSION_STATE_WRITE_SCHEDULED;\n     env()->SetImmediate([](Environment* env, void* data) {\n@@ -1632,6 +1635,8 @@ inline Http2Stream* Http2Session::SubmitRequest(\n \n // Callback used to receive inbound data from the i/o stream\n void Http2Session::OnStreamRead(ssize_t nread, const uv_buf_t& buf) {\n+  HandleScope handle_scope(env()->isolate());\n+  Context::Scope context_scope(env()->context());\n   Http2Scope h2scope(this);\n   CHECK_NE(stream_, nullptr);\n   DEBUG_HTTP2SESSION2(this, \"receiving %d bytes\", nread);\n@@ -1661,8 +1666,6 @@ void Http2Session::OnStreamRead(ssize_t nread, const uv_buf_t& buf) {\n     CHECK_LE(static_cast<size_t>(nread), stream_buf_.len);\n \n     Isolate* isolate = env()->isolate();\n-    HandleScope scope(isolate);\n-    Context::Scope context_scope(env()->context());\n \n     // Create an array buffer for the read data. DATA frames will be emitted\n     // as slices of this array buffer to avoid having to copy memory."
+        },
+        {
+            "sha": "c87393e6fc1c723d3ae70b963e22232c03d3eb3c",
+            "filename": "src/stream_base-inl.h",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 26,
+            "changes": 42,
+            "blob_url": "https://github.com/nodejs/node/blob/8695273948846b999f528ede97c764638fbb6c40/src%2Fstream_base-inl.h",
+            "raw_url": "https://github.com/nodejs/node/raw/8695273948846b999f528ede97c764638fbb6c40/src%2Fstream_base-inl.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fstream_base-inl.h?ref=8695273948846b999f528ede97c764638fbb6c40",
+            "patch": "@@ -106,22 +106,33 @@ inline void StreamResource::RemoveStreamListener(StreamListener* listener) {\n   listener->previous_listener_ = nullptr;\n }\n \n-\n inline uv_buf_t StreamResource::EmitAlloc(size_t suggested_size) {\n+#ifdef DEBUG\n+  v8::SealHandleScope handle_scope(v8::Isolate::GetCurrent());\n+#endif\n   return listener_->OnStreamAlloc(suggested_size);\n }\n \n inline void StreamResource::EmitRead(ssize_t nread, const uv_buf_t& buf) {\n+#ifdef DEBUG\n+  v8::SealHandleScope handle_scope(v8::Isolate::GetCurrent());\n+#endif\n   if (nread > 0)\n     bytes_read_ += static_cast<uint64_t>(nread);\n   listener_->OnStreamRead(nread, buf);\n }\n \n inline void StreamResource::EmitAfterWrite(WriteWrap* w, int status) {\n+#ifdef DEBUG\n+  v8::SealHandleScope handle_scope(v8::Isolate::GetCurrent());\n+#endif\n   listener_->OnStreamAfterWrite(w, status);\n }\n \n inline void StreamResource::EmitAfterShutdown(ShutdownWrap* w, int status) {\n+#ifdef DEBUG\n+  v8::SealHandleScope handle_scope(v8::Isolate::GetCurrent());\n+#endif\n   listener_->OnStreamAfterShutdown(w, status);\n }\n \n@@ -133,29 +144,6 @@ inline Environment* StreamBase::stream_env() const {\n   return env_;\n }\n \n-inline void StreamBase::AfterWrite(WriteWrap* req_wrap, int status) {\n-  AfterRequest(req_wrap, [&]() {\n-    EmitAfterWrite(req_wrap, status);\n-  });\n-}\n-\n-inline void StreamBase::AfterShutdown(ShutdownWrap* req_wrap, int status) {\n-  AfterRequest(req_wrap, [&]() {\n-    EmitAfterShutdown(req_wrap, status);\n-  });\n-}\n-\n-template<typename Wrap, typename EmitEvent>\n-inline void StreamBase::AfterRequest(Wrap* req_wrap, EmitEvent emit) {\n-  Environment* env = stream_env();\n-\n-  v8::HandleScope handle_scope(env->isolate());\n-  v8::Context::Scope context_scope(env->context());\n-\n-  emit();\n-  req_wrap->Dispose();\n-}\n-\n inline int StreamBase::Shutdown(v8::Local<v8::Object> req_wrap_obj) {\n   Environment* env = stream_env();\n   if (req_wrap_obj.IsEmpty()) {\n@@ -387,7 +375,8 @@ void StreamBase::JSMethod(const FunctionCallbackInfo<Value>& args) {\n \n \n inline void ShutdownWrap::OnDone(int status) {\n-  stream()->AfterShutdown(this, status);\n+  stream()->EmitAfterShutdown(this, status);\n+  Dispose();\n }\n \n inline void WriteWrap::SetAllocatedStorage(char* data, size_t size) {\n@@ -405,7 +394,8 @@ inline size_t WriteWrap::StorageSize() const {\n }\n \n inline void WriteWrap::OnDone(int status) {\n-  stream()->AfterWrite(this, status);\n+  stream()->EmitAfterWrite(this, status);\n+  Dispose();\n }\n \n inline void StreamReq::Done(int status, const char* error_str) {"
+        },
+        {
+            "sha": "8838a1a6dfb6b3b03181398ebf40b7bbab3e1674",
+            "filename": "src/stream_base.cc",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/8695273948846b999f528ede97c764638fbb6c40/src%2Fstream_base.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/8695273948846b999f528ede97c764638fbb6c40/src%2Fstream_base.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fstream_base.cc?ref=8695273948846b999f528ede97c764638fbb6c40",
+            "patch": "@@ -387,6 +387,8 @@ void ReportWritesToJSStreamListener::OnStreamAfterReqFinished(\n   StreamBase* stream = static_cast<StreamBase*>(stream_);\n   Environment* env = stream->stream_env();\n   AsyncWrap* async_wrap = req_wrap->GetAsyncWrap();\n+  HandleScope handle_scope(env->isolate());\n+  Context::Scope context_scope(env->context());\n   Local<Object> req_wrap_obj = async_wrap->object();\n \n   Local<Value> argv[] = {"
+        },
+        {
+            "sha": "6962648650e1a620acc4121b289e4fc9b065ca85",
+            "filename": "src/stream_base.h",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 9,
+            "changes": 13,
+            "blob_url": "https://github.com/nodejs/node/blob/8695273948846b999f528ede97c764638fbb6c40/src%2Fstream_base.h",
+            "raw_url": "https://github.com/nodejs/node/raw/8695273948846b999f528ede97c764638fbb6c40/src%2Fstream_base.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fstream_base.h?ref=8695273948846b999f528ede97c764638fbb6c40",
+            "patch": "@@ -61,7 +61,8 @@ class ShutdownWrap : public StreamReq {\n                v8::Local<v8::Object> req_wrap_obj)\n     : StreamReq(stream, req_wrap_obj) { }\n \n-  void OnDone(int status) override;  // Just calls stream()->AfterShutdown()\n+  // Call stream()->EmitAfterShutdown() and dispose of this request wrap.\n+  void OnDone(int status) override;\n };\n \n class WriteWrap : public StreamReq {\n@@ -78,7 +79,8 @@ class WriteWrap : public StreamReq {\n     free(storage_);\n   }\n \n-  void OnDone(int status) override;  // Just calls stream()->AfterWrite()\n+  // Call stream()->EmitAfterWrite() and dispose of this request wrap.\n+  void OnDone(int status) override;\n \n  private:\n   char* storage_ = nullptr;\n@@ -306,13 +308,6 @@ class StreamBase : public StreamResource {\n   Environment* env_;\n   EmitToJSStreamListener default_listener_;\n \n-  // These are called by the respective {Write,Shutdown}Wrap class.\n-  void AfterShutdown(ShutdownWrap* req, int status);\n-  void AfterWrite(WriteWrap* req, int status);\n-\n-  template <typename Wrap, typename EmitEvent>\n-  void AfterRequest(Wrap* req_wrap, EmitEvent emit);\n-\n   friend class WriteWrap;\n   friend class ShutdownWrap;\n };"
+        },
+        {
+            "sha": "cddef66c44a8e553e0aaef1ce96e643f11f1548c",
+            "filename": "src/tls_wrap.cc",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 0,
+            "changes": 11,
+            "blob_url": "https://github.com/nodejs/node/blob/8695273948846b999f528ede97c764638fbb6c40/src%2Ftls_wrap.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/8695273948846b999f528ede97c764638fbb6c40/src%2Ftls_wrap.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Ftls_wrap.cc?ref=8695273948846b999f528ede97c764638fbb6c40",
+            "patch": "@@ -220,6 +220,8 @@ void TLSWrap::SSLInfoCallback(const SSL* ssl_, int where, int ret) {\n   SSL* ssl = const_cast<SSL*>(ssl_);\n   TLSWrap* c = static_cast<TLSWrap*>(SSL_get_app_data(ssl));\n   Environment* env = c->env();\n+  HandleScope handle_scope(env->isolate());\n+  Context::Scope context_scope(env->context());\n   Local<Object> object = c->object();\n \n   if (where & SSL_CB_HANDSHAKE_START) {\n@@ -289,6 +291,8 @@ void TLSWrap::EncOut() {\n   NODE_COUNT_NET_BYTES_SENT(write_size_);\n \n   if (!res.async) {\n+    HandleScope handle_scope(env()->isolate());\n+\n     // Simulate asynchronous finishing, TLS cannot handle this at the moment.\n     env()->SetImmediate([](Environment* env, void* data) {\n       static_cast<TLSWrap*>(data)->OnStreamAfterWrite(nullptr, 0);\n@@ -427,6 +431,7 @@ void TLSWrap::ClearOut() {\n   // shutdown cleanly (SSL_ERROR_ZERO_RETURN) even when read == 0.\n   // See node#1642 and SSL_read(3SSL) for details.\n   if (read <= 0) {\n+    HandleScope handle_scope(env()->isolate());\n     int err;\n     Local<Value> arg = GetSSLError(read, &err, nullptr);\n \n@@ -477,6 +482,9 @@ bool TLSWrap::ClearIn() {\n   }\n \n   // Error or partial write\n+  HandleScope handle_scope(env()->isolate());\n+  Context::Scope context_scope(env()->context());\n+\n   int err;\n   std::string error_str;\n   Local<Value> arg = GetSSLError(written, &err, &error_str);\n@@ -814,6 +822,9 @@ int TLSWrap::SelectSNIContextCallback(SSL* s, int* ad, void* arg) {\n   if (servername == nullptr)\n     return SSL_TLSEXT_ERR_OK;\n \n+  HandleScope handle_scope(env->isolate());\n+  Context::Scope context_scope(env->context());\n+\n   // Call the SNI callback and use its return value as context\n   Local<Object> object = p->object();\n   Local<Value> ctx = object->Get(env->sni_context_string());"
+        }
+    ],
+    "stats": {
+        "total": 75,
+        "additions": 38,
+        "deletions": 37
+    }
+}

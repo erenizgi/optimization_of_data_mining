@@ -1,0 +1,60 @@
+{
+    "author": "joyeecheung",
+    "message": "fs: do not crash when using a closed fs event watcher\n\nBefore this commit, when the user calls methods on a closed or\nerrored fs event watcher, they could hit a crash since the\nFSEventWrap in C++ land may have already been destroyed with\nthe internal pointer set to nullptr. This commit makes sure\nthat the user cannot hit crashes like that, instead the\nmethods calling on a closed watcher will be noops.\n\nAlso explicitly documents that the watchers should not be used\nin `close` and `error` event handlers.\n\nPR-URL: https://github.com/nodejs/node/pull/20985\nFixes: https://github.com/nodejs/node/issues/20738\nFixes: https://github.com/nodejs/node/issues/20297\nReviewed-By: Anna Henningsen <anna@addaleax.net>\nReviewed-By: Benjamin Gruenbaum <benjamingr@gmail.com>\nReviewed-By: Ruben Bridgewater <ruben@bridgewater.de>\nReviewed-By: Ron Korving <ron@ronkorving.nl>\nReviewed-By: Sakthipriyan Vairamani <thechargingvolcano@gmail.com>\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Tiancheng \"Timothy\" Gu <timothygu99@gmail.com>",
+    "sha": "cd8f06f64f5fba32cf851de4d59c0e22f45b89c7",
+    "files": [
+        {
+            "sha": "5c4dc4901a46bcdf9ff7ab05438b8630aec923cb",
+            "filename": "doc/api/fs.md",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 2,
+            "changes": 6,
+            "blob_url": "https://github.com/nodejs/node/blob/cd8f06f64f5fba32cf851de4d59c0e22f45b89c7/doc%2Fapi%2Ffs.md",
+            "raw_url": "https://github.com/nodejs/node/raw/cd8f06f64f5fba32cf851de4d59c0e22f45b89c7/doc%2Fapi%2Ffs.md",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/doc%2Fapi%2Ffs.md?ref=cd8f06f64f5fba32cf851de4d59c0e22f45b89c7",
+            "patch": "@@ -325,7 +325,8 @@ fs.watch('./tmp', { encoding: 'buffer' }, (eventType, filename) => {\n added: v10.0.0\n -->\n \n-Emitted when the watcher stops watching for changes.\n+Emitted when the watcher stops watching for changes. The closed\n+`fs.FSWatcher` object is no longer usable in the event handler.\n \n ### Event: 'error'\n <!-- YAML\n@@ -334,7 +335,8 @@ added: v0.5.8\n \n * `error` {Error}\n \n-Emitted when an error occurs while watching the file.\n+Emitted when an error occurs while watching the file. The errored\n+`fs.FSWatcher` object is no longer usable in the event handler.\n \n ### watcher.close()\n <!-- YAML"
+        },
+        {
+            "sha": "1007a5a13614d2633ad999b6b9e95cc45a37faae",
+            "filename": "lib/internal/fs/watchers.js",
+            "status": "modified",
+            "additions": 17,
+            "deletions": 4,
+            "changes": 21,
+            "blob_url": "https://github.com/nodejs/node/blob/cd8f06f64f5fba32cf851de4d59c0e22f45b89c7/lib%2Finternal%2Ffs%2Fwatchers.js",
+            "raw_url": "https://github.com/nodejs/node/raw/cd8f06f64f5fba32cf851de4d59c0e22f45b89c7/lib%2Finternal%2Ffs%2Fwatchers.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Ffs%2Fwatchers.js?ref=cd8f06f64f5fba32cf851de4d59c0e22f45b89c7",
+            "patch": "@@ -100,7 +100,11 @@ function FSWatcher() {\n     // after the handle is closed, and to fire both UV_RENAME and UV_CHANGE\n     // if they are set by libuv at the same time.\n     if (status < 0) {\n-      this._handle.close();\n+      if (this._handle !== null) {\n+        // We don't use this.close() here to avoid firing the close event.\n+        this._handle.close();\n+        this._handle = null;  // make the handle garbage collectable\n+      }\n       const error = errors.uvException({\n         errno: status,\n         syscall: 'watch',\n@@ -120,13 +124,17 @@ util.inherits(FSWatcher, EventEmitter);\n // 1. Throw an Error if it's the first time .start() is called\n // 2. Return silently if .start() has already been called\n //    on a valid filename and the wrap has been initialized\n+// 3. Return silently if the watcher has already been closed\n // This method is a noop if the watcher has already been started.\n FSWatcher.prototype.start = function(filename,\n                                      persistent,\n                                      recursive,\n                                      encoding) {\n+  if (this._handle === null) {  // closed\n+    return;\n+  }\n   assert(this._handle instanceof FSEvent, 'handle must be a FSEvent');\n-  if (this._handle.initialized) {\n+  if (this._handle.initialized) {  // already started\n     return;\n   }\n \n@@ -148,13 +156,18 @@ FSWatcher.prototype.start = function(filename,\n   }\n };\n \n-// This method is a noop if the watcher has not been started.\n+// This method is a noop if the watcher has not been started or\n+// has already been closed.\n FSWatcher.prototype.close = function() {\n+  if (this._handle === null) {  // closed\n+    return;\n+  }\n   assert(this._handle instanceof FSEvent, 'handle must be a FSEvent');\n-  if (!this._handle.initialized) {\n+  if (!this._handle.initialized) {  // not started\n     return;\n   }\n   this._handle.close();\n+  this._handle = null;  // make the handle garbage collectable\n   process.nextTick(emitCloseNT, this);\n };\n "
+        },
+        {
+            "sha": "fb5239bc446eff03b51521845c4de80576c6f92f",
+            "filename": "test/parallel/test-fs-watch-close-when-destroyed.js",
+            "status": "added",
+            "additions": 38,
+            "deletions": 0,
+            "changes": 38,
+            "blob_url": "https://github.com/nodejs/node/blob/cd8f06f64f5fba32cf851de4d59c0e22f45b89c7/test%2Fparallel%2Ftest-fs-watch-close-when-destroyed.js",
+            "raw_url": "https://github.com/nodejs/node/raw/cd8f06f64f5fba32cf851de4d59c0e22f45b89c7/test%2Fparallel%2Ftest-fs-watch-close-when-destroyed.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-fs-watch-close-when-destroyed.js?ref=cd8f06f64f5fba32cf851de4d59c0e22f45b89c7",
+            "patch": "@@ -0,0 +1,38 @@\n+'use strict';\n+\n+// This tests that closing a watcher when the underlying handle is\n+// already destroyed will result in a noop instead of a crash.\n+\n+const common = require('../common');\n+const tmpdir = require('../common/tmpdir');\n+const fs = require('fs');\n+const path = require('path');\n+\n+tmpdir.refresh();\n+const root = path.join(tmpdir.path, 'watched-directory');\n+fs.mkdirSync(root);\n+\n+const watcher = fs.watch(root, { persistent: false, recursive: false });\n+\n+// The following listeners may or may not be invoked.\n+\n+watcher.addListener('error', () => {\n+  setTimeout(\n+    () => { watcher.close(); },  // Should not crash if it's invoked\n+    common.platformTimeout(10)\n+  );\n+});\n+\n+watcher.addListener('change', () => {\n+  setTimeout(\n+    () => { watcher.close(); },\n+    common.platformTimeout(10)\n+  );\n+});\n+\n+fs.rmdirSync(root);\n+// Wait for the listener to hit\n+setTimeout(\n+  common.mustCall(() => {}),\n+  common.platformTimeout(100)\n+);"
+        },
+        {
+            "sha": "e596f32a7669269847945ac20a2f50316b562516",
+            "filename": "test/parallel/test-fs-watch.js",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 4,
+            "changes": 19,
+            "blob_url": "https://github.com/nodejs/node/blob/cd8f06f64f5fba32cf851de4d59c0e22f45b89c7/test%2Fparallel%2Ftest-fs-watch.js",
+            "raw_url": "https://github.com/nodejs/node/raw/cd8f06f64f5fba32cf851de4d59c0e22f45b89c7/test%2Fparallel%2Ftest-fs-watch.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-fs-watch.js?ref=cd8f06f64f5fba32cf851de4d59c0e22f45b89c7",
+            "patch": "@@ -46,15 +46,20 @@ for (const testCase of cases) {\n   fs.writeFileSync(testCase.filePath, content1);\n \n   let interval;\n-  const watcher = fs.watch(testCase[testCase.field]);\n+  const pathToWatch = testCase[testCase.field];\n+  const watcher = fs.watch(pathToWatch);\n   watcher.on('error', (err) => {\n     if (interval) {\n       clearInterval(interval);\n       interval = null;\n     }\n     assert.fail(err);\n   });\n-  watcher.on('close', common.mustCall());\n+  watcher.on('close', common.mustCall(() => {\n+    watcher.close(); // Closing a closed watcher should be a noop\n+    // Starting a closed watcher should be a noop\n+    watcher.start();\n+  }));\n   watcher.on('change', common.mustCall(function(eventType, argFilename) {\n     if (interval) {\n       clearInterval(interval);\n@@ -66,10 +71,16 @@ for (const testCase of cases) {\n       assert.strictEqual(eventType, 'change');\n     assert.strictEqual(argFilename, testCase.fileName);\n \n-    watcher.start(); // Starting a started watcher should be a noop\n-    // End of test case\n+    // Starting a started watcher should be a noop\n+    watcher.start();\n+    watcher.start(pathToWatch);\n+\n     watcher.close();\n+\n+    // We document that watchers cannot be used anymore when it's closed,\n+    // here we turn the methods into noops instead of throwing\n     watcher.close(); // Closing a closed watcher should be a noop\n+    watcher.start();  // Starting a closed watcher should be a noop\n   }));\n \n   // Long content so it's actually flushed. toUpperCase so there's real change."
+        }
+    ],
+    "stats": {
+        "total": 84,
+        "additions": 74,
+        "deletions": 10
+    }
+}

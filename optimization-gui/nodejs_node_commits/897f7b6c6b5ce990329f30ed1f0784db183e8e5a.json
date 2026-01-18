@@ -1,0 +1,72 @@
+{
+    "author": "joyeecheung",
+    "message": "fs: improve errors in watchFile and unwatchFile\n\n- Check if the watcher is active in JS land before\n  invoking the binding, act as a noop if the state of\n  the watcher does not match the expectation. This\n  avoids firing 'stop' when the watcher is already\n  stopped.\n- Update comments, validate more arguments and\n  the type of the handle.\n- Handle the errors from uv_fs_poll_start\n- Create an `IsActive` helper method on StatWatcher\n\nPR-URL: https://github.com/nodejs/node/pull/19345\nRefs: https://github.com/nodejs/node/pull/19089\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Michaël Zasso <targos@protonmail.com>\nReviewed-By: Matteo Collina <matteo.collina@gmail.com>",
+    "sha": "897f7b6c6b5ce990329f30ed1f0784db183e8e5a",
+    "files": [
+        {
+            "sha": "f6722921fc56d155aff33f2d3676f1719e94685a",
+            "filename": "lib/fs.js",
+            "status": "modified",
+            "additions": 31,
+            "deletions": 6,
+            "changes": 37,
+            "blob_url": "https://github.com/nodejs/node/blob/897f7b6c6b5ce990329f30ed1f0784db183e8e5a/lib%2Ffs.js",
+            "raw_url": "https://github.com/nodejs/node/raw/897f7b6c6b5ce990329f30ed1f0784db183e8e5a/lib%2Ffs.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Ffs.js?ref=897f7b6c6b5ce990329f30ed1f0784db183e8e5a",
+            "patch": "@@ -1449,18 +1449,43 @@ util.inherits(StatWatcher, EventEmitter);\n \n // FIXME(joyeecheung): this method is not documented.\n // At the moment if filename is undefined, we\n-// 1. Throw an Error from C++ land if it's the first time .start() is called\n-// 2. Return silently from C++ land if .start() has already been called\n+// 1. Throw an Error if it's the first time .start() is called\n+// 2. Return silently if .start() has already been called\n //    on a valid filename and the wrap has been initialized\n+// This method is a noop if the watcher has already been started.\n StatWatcher.prototype.start = function(filename, persistent, interval) {\n+  lazyAssert()(this._handle instanceof binding.StatWatcher,\n+               'handle must be a StatWatcher');\n+  if (this._handle.isActive) {\n+    return;\n+  }\n+\n   filename = getPathFromURL(filename);\n-  nullCheck(filename, 'filename');\n-  this._handle.start(pathModule.toNamespacedPath(filename),\n-                     persistent, interval);\n+  validatePath(filename, 'filename');\n+  validateUint32(interval, 'interval');\n+  const err = this._handle.start(pathModule.toNamespacedPath(filename),\n+                                 persistent, interval);\n+  if (err) {\n+    const error = errors.uvException({\n+      errno: err,\n+      syscall: 'watch',\n+      path: filename\n+    });\n+    error.filename = filename;\n+    throw error;\n+  }\n };\n \n-\n+// FIXME(joyeecheung): this method is not documented while there is\n+// another documented fs.unwatchFile(). The counterpart in\n+// FSWatcher is .close()\n+// This method is a noop if the watcher has not been started.\n StatWatcher.prototype.stop = function() {\n+  lazyAssert()(this._handle instanceof binding.StatWatcher,\n+               'handle must be a StatWatcher');\n+  if (!this._handle.isActive) {\n+    return;\n+  }\n   this._handle.stop();\n };\n "
+        },
+        {
+            "sha": "32b416c466f5ae63d49ad3449d4c886cbfb13d71",
+            "filename": "src/node_stat_watcher.cc",
+            "status": "modified",
+            "additions": 60,
+            "deletions": 12,
+            "changes": 72,
+            "blob_url": "https://github.com/nodejs/node/blob/897f7b6c6b5ce990329f30ed1f0784db183e8e5a/src%2Fnode_stat_watcher.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/897f7b6c6b5ce990329f30ed1f0784db183e8e5a/src%2Fnode_stat_watcher.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_stat_watcher.cc?ref=897f7b6c6b5ce990329f30ed1f0784db183e8e5a",
+            "patch": "@@ -30,13 +30,19 @@\n namespace node {\n \n using v8::Context;\n+using v8::DontDelete;\n+using v8::DontEnum;\n using v8::FunctionCallbackInfo;\n using v8::FunctionTemplate;\n using v8::HandleScope;\n using v8::Integer;\n using v8::Local;\n using v8::Object;\n+using v8::PropertyAttribute;\n+using v8::ReadOnly;\n+using v8::Signature;\n using v8::String;\n+using v8::Uint32;\n using v8::Value;\n \n \n@@ -53,6 +59,17 @@ void StatWatcher::Initialize(Environment* env, Local<Object> target) {\n   env->SetProtoMethod(t, \"start\", StatWatcher::Start);\n   env->SetProtoMethod(t, \"stop\", StatWatcher::Stop);\n \n+  Local<FunctionTemplate> is_active_templ =\n+      FunctionTemplate::New(env->isolate(),\n+                            IsActive,\n+                            env->as_external(),\n+                            Signature::New(env->isolate(), t));\n+  t->PrototypeTemplate()->SetAccessorProperty(\n+      FIXED_ONE_BYTE_STRING(env->isolate(), \"isActive\"),\n+      is_active_templ,\n+      Local<FunctionTemplate>(),\n+      static_cast<PropertyAttribute>(ReadOnly | DontDelete | DontEnum));\n+\n   target->Set(statWatcherString, t->GetFunction());\n }\n \n@@ -73,7 +90,9 @@ StatWatcher::StatWatcher(Environment* env, Local<Object> wrap)\n \n \n StatWatcher::~StatWatcher() {\n-  Stop();\n+  if (IsActive()) {\n+    Stop();\n+  }\n   uv_close(reinterpret_cast<uv_handle_t*>(watcher_), Delete);\n }\n \n@@ -101,32 +120,63 @@ void StatWatcher::New(const FunctionCallbackInfo<Value>& args) {\n   new StatWatcher(env, args.This());\n }\n \n+bool StatWatcher::IsActive() {\n+  return uv_is_active(reinterpret_cast<uv_handle_t*>(watcher_)) != 0;\n+}\n+\n+void StatWatcher::IsActive(const v8::FunctionCallbackInfo<v8::Value>& args) {\n+  StatWatcher* wrap = Unwrap<StatWatcher>(args.This());\n+  CHECK(wrap != nullptr);\n+  args.GetReturnValue().Set(wrap->IsActive());\n+}\n \n+// wrap.start(filename, persistent, interval)\n void StatWatcher::Start(const FunctionCallbackInfo<Value>& args) {\n   CHECK_EQ(args.Length(), 3);\n \n-  StatWatcher* wrap;\n-  ASSIGN_OR_RETURN_UNWRAP(&wrap, args.Holder());\n+  StatWatcher* wrap = Unwrap<StatWatcher>(args.Holder());\n+  CHECK_NE(wrap, nullptr);\n+  if (wrap->IsActive()) {\n+    return;\n+  }\n+\n+  const int argc = args.Length();\n+  CHECK_GE(argc, 3);\n+\n   node::Utf8Value path(args.GetIsolate(), args[0]);\n-  const bool persistent = args[1]->BooleanValue();\n-  const uint32_t interval = args[2]->Uint32Value();\n+  CHECK_NE(*path, nullptr);\n+\n+  bool persistent = true;\n+  if (args[1]->IsFalse()) {\n+    persistent = false;\n+  }\n+\n+  CHECK(args[2]->IsUint32());\n+  const uint32_t interval = args[2].As<Uint32>()->Value();\n \n-  if (uv_is_active(reinterpret_cast<uv_handle_t*>(wrap->watcher_)))\n-    return;\n   // Safe, uv_ref/uv_unref are idempotent.\n   if (persistent)\n     uv_ref(reinterpret_cast<uv_handle_t*>(wrap->watcher_));\n   else\n     uv_unref(reinterpret_cast<uv_handle_t*>(wrap->watcher_));\n-  uv_fs_poll_start(wrap->watcher_, Callback, *path, interval);\n \n+  // Note that uv_fs_poll_start does not return ENOENT, we are handling\n+  // mostly memory errors here.\n+  const int err = uv_fs_poll_start(wrap->watcher_, Callback, *path, interval);\n+  if (err != 0) {\n+    args.GetReturnValue().Set(err);\n+  }\n   wrap->ClearWeak();\n }\n \n \n void StatWatcher::Stop(const FunctionCallbackInfo<Value>& args) {\n-  StatWatcher* wrap;\n-  ASSIGN_OR_RETURN_UNWRAP(&wrap, args.Holder());\n+  StatWatcher* wrap = Unwrap<StatWatcher>(args.Holder());\n+  CHECK_NE(wrap, nullptr);\n+  if (!wrap->IsActive()) {\n+    return;\n+  }\n+\n   Environment* env = wrap->env();\n   Context::Scope context_scope(env->context());\n   wrap->MakeCallback(env->onstop_string(), 0, nullptr);\n@@ -135,8 +185,6 @@ void StatWatcher::Stop(const FunctionCallbackInfo<Value>& args) {\n \n \n void StatWatcher::Stop() {\n-  if (!uv_is_active(reinterpret_cast<uv_handle_t*>(watcher_)))\n-    return;\n   uv_fs_poll_stop(watcher_);\n   MakeWeak<StatWatcher>(this);\n }"
+        },
+        {
+            "sha": "587203ff1edf462ef7aedc62b28f40d2aa3d0105",
+            "filename": "src/node_stat_watcher.h",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/897f7b6c6b5ce990329f30ed1f0784db183e8e5a/src%2Fnode_stat_watcher.h",
+            "raw_url": "https://github.com/nodejs/node/raw/897f7b6c6b5ce990329f30ed1f0784db183e8e5a/src%2Fnode_stat_watcher.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_stat_watcher.h?ref=897f7b6c6b5ce990329f30ed1f0784db183e8e5a",
+            "patch": "@@ -44,6 +44,7 @@ class StatWatcher : public AsyncWrap {\n   static void New(const v8::FunctionCallbackInfo<v8::Value>& args);\n   static void Start(const v8::FunctionCallbackInfo<v8::Value>& args);\n   static void Stop(const v8::FunctionCallbackInfo<v8::Value>& args);\n+  static void IsActive(const v8::FunctionCallbackInfo<v8::Value>& args);\n \n   size_t self_size() const override { return sizeof(*this); }\n \n@@ -53,6 +54,7 @@ class StatWatcher : public AsyncWrap {\n                        const uv_stat_t* prev,\n                        const uv_stat_t* curr);\n   void Stop();\n+  bool IsActive();\n \n   uv_fs_poll_t* watcher_;\n };"
+        },
+        {
+            "sha": "ba4becb2627c872fea36a473cc473a73997a7d1e",
+            "filename": "test/parallel/test-fs-watchfile.js",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 1,
+            "changes": 7,
+            "blob_url": "https://github.com/nodejs/node/blob/897f7b6c6b5ce990329f30ed1f0784db183e8e5a/test%2Fparallel%2Ftest-fs-watchfile.js",
+            "raw_url": "https://github.com/nodejs/node/raw/897f7b6c6b5ce990329f30ed1f0784db183e8e5a/test%2Fparallel%2Ftest-fs-watchfile.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-fs-watchfile.js?ref=897f7b6c6b5ce990329f30ed1f0784db183e8e5a",
+            "patch": "@@ -74,10 +74,15 @@ const watcher =\n       assert(prev.ino <= 0);\n       // Stop watching the file\n       fs.unwatchFile(enoentFile);\n+      watcher.stop();  // stopping a stopped watcher should be a noop\n     }\n   }, 2));\n \n-watcher.start();  // should not crash\n+// 'stop' should only be emitted once - stopping a stopped watcher should\n+// not trigger a 'stop' event.\n+watcher.on('stop', common.mustCall(function onStop() {}));\n+\n+watcher.start();  // starting a started watcher should be a noop\n \n // Watch events should callback with a filename on supported systems.\n // Omitting AIX. It works but not reliably."
+        },
+        {
+            "sha": "3c8ae0eba7d278e6a69f22848f76baa346675adf",
+            "filename": "test/sequential/test-fs-watch.js",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 3,
+            "changes": 13,
+            "blob_url": "https://github.com/nodejs/node/blob/897f7b6c6b5ce990329f30ed1f0784db183e8e5a/test%2Fsequential%2Ftest-fs-watch.js",
+            "raw_url": "https://github.com/nodejs/node/raw/897f7b6c6b5ce990329f30ed1f0784db183e8e5a/test%2Fsequential%2Ftest-fs-watch.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fsequential%2Ftest-fs-watch.js?ref=897f7b6c6b5ce990329f30ed1f0784db183e8e5a",
+            "patch": "@@ -122,13 +122,20 @@ tmpdir.refresh();\n     code: 'ERR_ASSERTION'\n   });\n   oldhandle.close(); // clean up\n+}\n \n-  assert.throws(function() {\n-    const w = fs.watchFile(__filename, { persistent: false },\n+{\n+  let oldhandle;\n+  assert.throws(() => {\n+    const w = fs.watchFile(__filename,\n+                           { persistent: false },\n                            common.mustNotCall());\n     oldhandle = w._handle;\n     w._handle = { stop: w._handle.stop };\n     w.stop();\n-  }, /^TypeError: Illegal invocation$/);\n+  }, {\n+    message: 'handle must be a StatWatcher',\n+    code: 'ERR_ASSERTION'\n+  });\n   oldhandle.stop(); // clean up\n }"
+        }
+    ],
+    "stats": {
+        "total": 131,
+        "additions": 109,
+        "deletions": 22
+    }
+}

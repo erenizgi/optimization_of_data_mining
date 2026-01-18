@@ -1,0 +1,48 @@
+{
+    "author": "addaleax",
+    "message": "net,http2: merge write error handling & property names\n\nMerge error handling for `net.Socket`s and `Http2Stream`s,\nand align the callback property names as `callback`.\n\nRefs: https://github.com/nodejs/node/issues/19060\n\nPR-URL: https://github.com/nodejs/node/pull/19734\nReviewed-By: Luigi Pinca <luigipinca@gmail.com>\nReviewed-By: Tobias Nießen <tniessen@tnie.de>\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Matteo Collina <matteo.collina@gmail.com>\nReviewed-By: Trivikram Kamat <trivikr.dev@gmail.com>",
+    "sha": "93967d00e9feb944b1ec907dabaaf32f243e5806",
+    "files": [
+        {
+            "sha": "c9f4f36748628c6b3c65eff0a1bf688122c10c4f",
+            "filename": "lib/internal/http2/core.js",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 2,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/93967d00e9feb944b1ec907dabaaf32f243e5806/lib%2Finternal%2Fhttp2%2Fcore.js",
+            "raw_url": "https://github.com/nodejs/node/raw/93967d00e9feb944b1ec907dabaaf32f243e5806/lib%2Finternal%2Fhttp2%2Fcore.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fhttp2%2Fcore.js?ref=93967d00e9feb944b1ec907dabaaf32f243e5806",
+            "patch": "@@ -1657,7 +1657,6 @@ class Http2Stream extends Duplex {\n \n     const req = createWriteWrap(this[kHandle], afterDoStreamWrite);\n     req.stream = this[kID];\n-    req.callback = cb;\n \n     writeGeneric(this, req, data, encoding, cb);\n \n@@ -1690,7 +1689,6 @@ class Http2Stream extends Duplex {\n \n     var req = createWriteWrap(this[kHandle], afterDoStreamWrite);\n     req.stream = this[kID];\n-    req.callback = cb;\n \n     writevGeneric(this, req, data, cb);\n "
+        },
+        {
+            "sha": "b252b1d8ff76702336ae85744692ed4790f981ee",
+            "filename": "lib/internal/stream_base_commons.js",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 3,
+            "changes": 15,
+            "blob_url": "https://github.com/nodejs/node/blob/93967d00e9feb944b1ec907dabaaf32f243e5806/lib%2Finternal%2Fstream_base_commons.js",
+            "raw_url": "https://github.com/nodejs/node/raw/93967d00e9feb944b1ec907dabaaf32f243e5806/lib%2Finternal%2Fstream_base_commons.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fstream_base_commons.js?ref=93967d00e9feb944b1ec907dabaaf32f243e5806",
+            "patch": "@@ -61,15 +61,24 @@ function writevGeneric(self, req, data, cb) {\n   // Retain chunks\n   if (err === 0) req._chunks = chunks;\n \n-  if (err)\n-    return self.destroy(errnoException(err, 'write', req.error), cb);\n+  afterWriteDispatched(self, req, err, cb);\n }\n \n function writeGeneric(self, req, data, encoding, cb) {\n   var err = handleWriteReq(req, data, encoding);\n \n-  if (err)\n+  afterWriteDispatched(self, req, err, cb);\n+}\n+\n+function afterWriteDispatched(self, req, err, cb) {\n+  if (err !== 0)\n     return self.destroy(errnoException(err, 'write', req.error), cb);\n+\n+  if (!req.async) {\n+    cb();\n+  } else {\n+    req.callback = cb;\n+  }\n }\n \n module.exports = {"
+        },
+        {
+            "sha": "c367712686cf6a9abd1280c32d68887b9d5a1a08",
+            "filename": "lib/net.js",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 17,
+            "changes": 24,
+            "blob_url": "https://github.com/nodejs/node/blob/93967d00e9feb944b1ec907dabaaf32f243e5806/lib%2Fnet.js",
+            "raw_url": "https://github.com/nodejs/node/raw/93967d00e9feb944b1ec907dabaaf32f243e5806/lib%2Fnet.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Fnet.js?ref=93967d00e9feb944b1ec907dabaaf32f243e5806",
+            "patch": "@@ -754,23 +754,13 @@ Socket.prototype._writeGeneric = function(writev, data, encoding, cb) {\n     return false;\n   }\n \n-  var ret;\n   var req = createWriteWrap(this._handle, afterWrite);\n   if (writev)\n-    ret = writevGeneric(this, req, data, cb);\n+    writevGeneric(this, req, data, cb);\n   else\n-    ret = writeGeneric(this, req, data, encoding, cb);\n-\n-  // Bail out if handle.write* returned an error\n-  if (ret) return ret;\n-\n-  if (!req.async) {\n-    cb();\n-    return;\n-  }\n-\n-  req.cb = cb;\n-  this[kLastWriteQueueSize] = req.bytes;\n+    writeGeneric(this, req, data, encoding, cb);\n+  if (req.async)\n+    this[kLastWriteQueueSize] = req.bytes;\n };\n \n \n@@ -845,7 +835,7 @@ function afterWrite(status, handle, err) {\n   if (status < 0) {\n     var ex = errnoException(status, 'write', this.error);\n     debug('write failure', ex);\n-    self.destroy(ex, this.cb);\n+    self.destroy(ex, this.callback);\n     return;\n   }\n \n@@ -854,8 +844,8 @@ function afterWrite(status, handle, err) {\n   if (self !== process.stderr && self !== process.stdout)\n     debug('afterWrite call cb');\n \n-  if (this.cb)\n-    this.cb.call(undefined);\n+  if (this.callback)\n+    this.callback.call(undefined);\n }\n \n "
+        }
+    ],
+    "stats": {
+        "total": 41,
+        "additions": 19,
+        "deletions": 22
+    }
+}

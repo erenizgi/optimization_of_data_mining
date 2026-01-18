@@ -1,0 +1,48 @@
+{
+    "author": "jasnell",
+    "message": "vm,trace_events: add node.vm.script trace events category\n\nAdd basic trace events for node_contextify. These generally\nalign very well with V8.ScriptCompile and V8.ScriptExecute\ntrace events and provide good additional context. For instance,\nusing the node.vm.script trace category at startup allows us to\nsee exactly how long compilation and init of each of our core\nmodules adds to the startup time.\n\nPR-URL: https://github.com/nodejs/node/pull/20728\nReviewed-By: Anna Henningsen <anna@addaleax.net>\nReviewed-By: Ali Ijaz Sheikh <ofrobots@google.com>\nReviewed-By: Colin Ihrig <cjihrig@gmail.com>",
+    "sha": "8630eea1717811523cd4333f0310f93eb2068d73",
+    "files": [
+        {
+            "sha": "ca91b8aac78cc3d3d6c7e5374ba1beb3f7133037",
+            "filename": "doc/api/tracing.md",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/8630eea1717811523cd4333f0310f93eb2068d73/doc%2Fapi%2Ftracing.md",
+            "raw_url": "https://github.com/nodejs/node/raw/8630eea1717811523cd4333f0310f93eb2068d73/doc%2Fapi%2Ftracing.md",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/doc%2Fapi%2Ftracing.md?ref=8630eea1717811523cd4333f0310f93eb2068d73",
+            "patch": "@@ -24,6 +24,8 @@ The available categories are:\n   * `node.perf.timerify` - Enables capture of only Performance API timerify\n     measurements.\n * `node.fs.sync` - Enables capture of trace data for file system sync methods.\n+* `node.vm.script` - Enables capture of trace data for the `vm` module's\n+  `runInNewContext()`, `runInContext()`, and `runInThisContext()` methods.\n * `v8` - The [V8] events are GC, compiling, and execution related.\n \n By default the `node`, `node.async_hooks`, and `v8` categories are enabled."
+        },
+        {
+            "sha": "13863985a466766e6e8aa9a2c3647a4b330de3f1",
+            "filename": "src/node_contextify.cc",
+            "status": "modified",
+            "additions": 36,
+            "deletions": 0,
+            "changes": 36,
+            "blob_url": "https://github.com/nodejs/node/blob/8630eea1717811523cd4333f0310f93eb2068d73/src%2Fnode_contextify.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/8630eea1717811523cd4333f0310f93eb2068d73/src%2Fnode_contextify.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_contextify.cc?ref=8630eea1717811523cd4333f0310f93eb2068d73",
+            "patch": "@@ -666,6 +666,16 @@ class ContextifyScript : public BaseObject {\n     ContextifyScript* contextify_script =\n         new ContextifyScript(env, args.This());\n \n+    if (*TRACE_EVENT_API_GET_CATEGORY_GROUP_ENABLED(\n+            TRACING_CATEGORY_NODE2(vm, script)) != 0) {\n+      Utf8Value fn(isolate, filename);\n+      TRACE_EVENT_NESTABLE_ASYNC_BEGIN1(\n+          TRACING_CATEGORY_NODE2(vm, script),\n+          \"ContextifyScript::New\",\n+          contextify_script,\n+          \"filename\", TRACE_STR_COPY(*fn));\n+    }\n+\n     ScriptCompiler::CachedData* cached_data = nullptr;\n     if (!cached_data_buf.IsEmpty()) {\n       ArrayBuffer::Contents contents = cached_data_buf->Buffer()->GetContents();\n@@ -695,6 +705,10 @@ class ContextifyScript : public BaseObject {\n       DecorateErrorStack(env, try_catch);\n       no_abort_scope.Close();\n       try_catch.ReThrow();\n+      TRACE_EVENT_NESTABLE_ASYNC_END0(\n+          TRACING_CATEGORY_NODE2(vm, script),\n+          \"ContextifyScript::New\",\n+          contextify_script);\n       return;\n     }\n     contextify_script->script_.Reset(isolate, v8_script.ToLocalChecked());\n@@ -718,6 +732,10 @@ class ContextifyScript : public BaseObject {\n           env->cached_data_produced_string(),\n           Boolean::New(isolate, cached_data_produced));\n     }\n+    TRACE_EVENT_NESTABLE_ASYNC_END0(\n+        TRACING_CATEGORY_NODE2(vm, script),\n+        \"ContextifyScript::New\",\n+        contextify_script);\n   }\n \n \n@@ -730,6 +748,12 @@ class ContextifyScript : public BaseObject {\n   static void RunInThisContext(const FunctionCallbackInfo<Value>& args) {\n     Environment* env = Environment::GetCurrent(args);\n \n+    ContextifyScript* wrapped_script;\n+    ASSIGN_OR_RETURN_UNWRAP(&wrapped_script, args.Holder());\n+\n+    TRACE_EVENT_NESTABLE_ASYNC_BEGIN0(\n+        TRACING_CATEGORY_NODE2(vm, script), \"RunInThisContext\", wrapped_script);\n+\n     CHECK_EQ(args.Length(), 3);\n \n     CHECK(args[0]->IsNumber());\n@@ -743,11 +767,17 @@ class ContextifyScript : public BaseObject {\n \n     // Do the eval within this context\n     EvalMachine(env, timeout, display_errors, break_on_sigint, args);\n+\n+    TRACE_EVENT_NESTABLE_ASYNC_END0(\n+        TRACING_CATEGORY_NODE2(vm, script), \"RunInThisContext\", wrapped_script);\n   }\n \n   static void RunInContext(const FunctionCallbackInfo<Value>& args) {\n     Environment* env = Environment::GetCurrent(args);\n \n+    ContextifyScript* wrapped_script;\n+    ASSIGN_OR_RETURN_UNWRAP(&wrapped_script, args.Holder());\n+\n     CHECK_EQ(args.Length(), 4);\n \n     CHECK(args[0]->IsObject());\n@@ -760,6 +790,9 @@ class ContextifyScript : public BaseObject {\n     if (contextify_context->context().IsEmpty())\n       return;\n \n+    TRACE_EVENT_NESTABLE_ASYNC_BEGIN0(\n+        TRACING_CATEGORY_NODE2(vm, script), \"RunInContext\", wrapped_script);\n+\n     CHECK(args[1]->IsNumber());\n     int64_t timeout = args[1]->IntegerValue(env->context()).FromJust();\n \n@@ -776,6 +809,9 @@ class ContextifyScript : public BaseObject {\n                 display_errors,\n                 break_on_sigint,\n                 args);\n+\n+    TRACE_EVENT_NESTABLE_ASYNC_END0(\n+        TRACING_CATEGORY_NODE2(vm, script), \"RunInContext\", wrapped_script);\n   }\n \n   static void DecorateErrorStack(Environment* env, const TryCatch& try_catch) {"
+        },
+        {
+            "sha": "fc7af34d8866d2c5fb9e4b0831066fe6443f246c",
+            "filename": "test/parallel/test-trace-events-vm.js",
+            "status": "added",
+            "additions": 42,
+            "deletions": 0,
+            "changes": 42,
+            "blob_url": "https://github.com/nodejs/node/blob/8630eea1717811523cd4333f0310f93eb2068d73/test%2Fparallel%2Ftest-trace-events-vm.js",
+            "raw_url": "https://github.com/nodejs/node/raw/8630eea1717811523cd4333f0310f93eb2068d73/test%2Fparallel%2Ftest-trace-events-vm.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-trace-events-vm.js?ref=8630eea1717811523cd4333f0310f93eb2068d73",
+            "patch": "@@ -0,0 +1,42 @@\n+'use strict';\n+const common = require('../common');\n+const assert = require('assert');\n+const cp = require('child_process');\n+const path = require('path');\n+const fs = require('fs');\n+const tmpdir = require('../common/tmpdir');\n+\n+const names = [\n+  'ContextifyScript::New',\n+  'RunInThisContext',\n+  'RunInContext'\n+];\n+\n+if (process.argv[2] === 'child') {\n+  const vm = require('vm');\n+  vm.runInNewContext('1 + 1');\n+} else {\n+  tmpdir.refresh();\n+  process.chdir(tmpdir.path);\n+\n+  const proc = cp.fork(__filename,\n+                       [ 'child' ], {\n+                         execArgv: [\n+                           '--trace-event-categories',\n+                           'node.vm.script'\n+                         ]\n+                       });\n+\n+  proc.once('exit', common.mustCall(() => {\n+    const file = path.join(tmpdir.path, 'node_trace.1.log');\n+\n+    assert(common.fileExists(file));\n+    fs.readFile(file, common.mustCall((err, data) => {\n+      const traces = JSON.parse(data.toString()).traceEvents;\n+      traces.forEach((trace) => {\n+        assert.strictEqual(trace.pid, proc.pid);\n+        assert(names.includes(trace.name));\n+      });\n+    }));\n+  }));\n+}"
+        }
+    ],
+    "stats": {
+        "total": 80,
+        "additions": 80,
+        "deletions": 0
+    }
+}

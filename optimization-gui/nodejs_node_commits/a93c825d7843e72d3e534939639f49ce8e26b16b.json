@@ -1,0 +1,36 @@
+{
+    "author": "joyeecheung",
+    "message": "process: clarify the pre- and post-condition of esm setup\n\nThis patch:\n\n- Clarifies the dependency of the ESM loader initialization\n  (`process.cwd()` and the value of `--loader`) in `node.js`.\n- Moves the initialization of the per-isolate `importModuleDynamically`\n  and `initializeImportMetaObject` callbacks into `node.js`\n- Moves the initialization of the ESM loader into\n  `prepareUserCodeExecution()` since it potentially involves\n  execution of user code (similar to `--require` for CJS modules).\n\nPR-URL: https://github.com/nodejs/node/pull/25530\nReviewed-By: Gus Caplan <me@gus.host>",
+    "sha": "a93c825d7843e72d3e534939639f49ce8e26b16b",
+    "files": [
+        {
+            "sha": "8f38bff448d9e20e49d972f53182eae6cb6d1f58",
+            "filename": "lib/internal/bootstrap/node.js",
+            "status": "modified",
+            "additions": 24,
+            "deletions": 11,
+            "changes": 35,
+            "blob_url": "https://github.com/nodejs/node/blob/a93c825d7843e72d3e534939639f49ce8e26b16b/lib%2Finternal%2Fbootstrap%2Fnode.js",
+            "raw_url": "https://github.com/nodejs/node/raw/a93c825d7843e72d3e534939639f49ce8e26b16b/lib%2Finternal%2Fbootstrap%2Fnode.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fbootstrap%2Fnode.js?ref=a93c825d7843e72d3e534939639f49ce8e26b16b",
+            "patch": "@@ -240,17 +240,6 @@ function startup() {\n       'DeprecationWarning', 'DEP0062', startup, true);\n   }\n \n-  const experimentalModules = getOptionValue('--experimental-modules');\n-  const experimentalVMModules = getOptionValue('--experimental-vm-modules');\n-  if (experimentalModules || experimentalVMModules) {\n-    if (experimentalModules) {\n-      process.emitWarning(\n-        'The ESM module loader is experimental.',\n-        'ExperimentalWarning', undefined);\n-    }\n-    NativeModule.require('internal/process/esm_loader').setup();\n-  }\n-\n   const { deprecate } = NativeModule.require('internal/util');\n   {\n     // Install legacy getters on the `util` binding for typechecking.\n@@ -445,6 +434,30 @@ function prepareUserCodeExecution() {\n     delete process.env.NODE_UNIQUE_ID;\n   }\n \n+  const experimentalModules = getOptionValue('--experimental-modules');\n+  const experimentalVMModules = getOptionValue('--experimental-vm-modules');\n+  if (experimentalModules || experimentalVMModules) {\n+    if (experimentalModules) {\n+      process.emitWarning(\n+        'The ESM module loader is experimental.',\n+        'ExperimentalWarning', undefined);\n+    }\n+\n+    const {\n+      setImportModuleDynamicallyCallback,\n+      setInitializeImportMetaObjectCallback\n+    } = internalBinding('module_wrap');\n+    const esm = NativeModule.require('internal/process/esm_loader');\n+    // Setup per-isolate callbacks that locate data or callbacks that we keep\n+    // track of for different ESM modules.\n+    setInitializeImportMetaObjectCallback(esm.initializeImportMetaObject);\n+    setImportModuleDynamicallyCallback(esm.importModuleDynamicallyCallback);\n+    const userLoader = getOptionValue('--loader');\n+    // If --loader is specified, create a loader with user hooks. Otherwise\n+    // create the default loader.\n+    esm.initializeLoader(process.cwd(), userLoader);\n+  }\n+\n   // For user code, we preload modules if `-r` is passed\n   const preloadModules = getOptionValue('--require');\n   if (preloadModules) {"
+        },
+        {
+            "sha": "0b7f1be6ff0595baf40b1ae3ca944b07147309fe",
+            "filename": "lib/internal/process/esm_loader.js",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 12,
+            "changes": 18,
+            "blob_url": "https://github.com/nodejs/node/blob/a93c825d7843e72d3e534939639f49ce8e26b16b/lib%2Finternal%2Fprocess%2Fesm_loader.js",
+            "raw_url": "https://github.com/nodejs/node/raw/a93c825d7843e72d3e534939639f49ce8e26b16b/lib%2Finternal%2Fprocess%2Fesm_loader.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fprocess%2Fesm_loader.js?ref=a93c825d7843e72d3e534939639f49ce8e26b16b",
+            "patch": "@@ -1,8 +1,6 @@\n 'use strict';\n \n const {\n-  setImportModuleDynamicallyCallback,\n-  setInitializeImportMetaObjectCallback,\n   callbackMap,\n } = internalBinding('module_wrap');\n \n@@ -15,16 +13,16 @@ const {\n   ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING,\n } = require('internal/errors').codes;\n \n-function initializeImportMetaObject(wrap, meta) {\n+exports.initializeImportMetaObject = function(wrap, meta) {\n   if (callbackMap.has(wrap)) {\n     const { initializeImportMeta } = callbackMap.get(wrap);\n     if (initializeImportMeta !== undefined) {\n       initializeImportMeta(meta, wrapToModuleMap.get(wrap) || wrap);\n     }\n   }\n-}\n+};\n \n-async function importModuleDynamicallyCallback(wrap, specifier) {\n+exports.importModuleDynamicallyCallback = async function(wrap, specifier) {\n   if (callbackMap.has(wrap)) {\n     const { importModuleDynamically } = callbackMap.get(wrap);\n     if (importModuleDynamically !== undefined) {\n@@ -33,10 +31,7 @@ async function importModuleDynamicallyCallback(wrap, specifier) {\n     }\n   }\n   throw new ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING();\n-}\n-\n-setInitializeImportMetaObjectCallback(initializeImportMetaObject);\n-setImportModuleDynamicallyCallback(importModuleDynamicallyCallback);\n+};\n \n let loaderResolve;\n exports.loaderPromise = new Promise((resolve, reject) => {\n@@ -45,13 +40,12 @@ exports.loaderPromise = new Promise((resolve, reject) => {\n \n exports.ESMLoader = undefined;\n \n-exports.setup = function() {\n+exports.initializeLoader = function(cwd, userLoader) {\n   let ESMLoader = new Loader();\n   const loaderPromise = (async () => {\n-    const userLoader = require('internal/options').getOptionValue('--loader');\n     if (userLoader) {\n       const hooks = await ESMLoader.import(\n-        userLoader, pathToFileURL(`${process.cwd()}/`).href);\n+        userLoader, pathToFileURL(`${cwd}/`).href);\n       ESMLoader = new Loader();\n       ESMLoader.hook(hooks);\n       exports.ESMLoader = ESMLoader;"
+        }
+    ],
+    "stats": {
+        "total": 53,
+        "additions": 30,
+        "deletions": 23
+    }
+}

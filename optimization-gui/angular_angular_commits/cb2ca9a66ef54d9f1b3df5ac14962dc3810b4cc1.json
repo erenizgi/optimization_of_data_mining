@@ -1,0 +1,36 @@
+{
+    "author": "gkalpak",
+    "message": "fix(service-worker): correctly handle unrecoverable state when a client no longer exists (#42736)\n\nPreviously, the ServiceWorker assumed that a client found in\n`clientVersionMap` would exist (i.e. it could be retrieved via\n`clients.get()`). However, if a browser tab had been closed, the\ncorresponding client (while present in `clientVersionMap`, which is only\nupdated on ServiceWorker initialization) would not be retrievable via\n`clients.get()`.\n\nThis commit fixes it by checking whether the client exists before trying\nto notify it about an unrecoverable state.\n\nPR Close #42736",
+    "sha": "cb2ca9a66ef54d9f1b3df5ac14962dc3810b4cc1",
+    "files": [
+        {
+            "sha": "a40fde67ccac22593ffb574e486d2bf73d200d5d",
+            "filename": "packages/service-worker/worker/src/driver.ts",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 2,
+            "changes": 8,
+            "blob_url": "https://github.com/angular/angular/blob/cb2ca9a66ef54d9f1b3df5ac14962dc3810b4cc1/packages%2Fservice-worker%2Fworker%2Fsrc%2Fdriver.ts",
+            "raw_url": "https://github.com/angular/angular/raw/cb2ca9a66ef54d9f1b3df5ac14962dc3810b4cc1/packages%2Fservice-worker%2Fworker%2Fsrc%2Fdriver.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fservice-worker%2Fworker%2Fsrc%2Fdriver.ts?ref=cb2ca9a66ef54d9f1b3df5ac14962dc3810b4cc1",
+            "patch": "@@ -672,8 +672,10 @@ export class Driver implements Debuggable, UpdateSource {\n           }\n \n           const client = await this.scope.clients.get(clientId);\n+          if (client) {\n+            await this.updateClient(client);\n+          }\n \n-          await this.updateClient(client!);\n           appVersion = this.lookupVersionByHash(this.latestHash, 'assignVersion');\n         }\n \n@@ -1050,7 +1052,9 @@ export class Driver implements Debuggable, UpdateSource {\n \n     await Promise.all(affectedClients.map(async clientId => {\n       const client = await this.scope.clients.get(clientId);\n-      client!.postMessage({type: 'UNRECOVERABLE_STATE', reason});\n+      if (client) {\n+        client.postMessage({type: 'UNRECOVERABLE_STATE', reason});\n+      }\n     }));\n   }\n "
+        },
+        {
+            "sha": "fede0a01a0ae148a7ae1682898a758d21e620e2a",
+            "filename": "packages/service-worker/worker/test/happy_spec.ts",
+            "status": "modified",
+            "additions": 56,
+            "deletions": 0,
+            "changes": 56,
+            "blob_url": "https://github.com/angular/angular/blob/cb2ca9a66ef54d9f1b3df5ac14962dc3810b4cc1/packages%2Fservice-worker%2Fworker%2Ftest%2Fhappy_spec.ts",
+            "raw_url": "https://github.com/angular/angular/raw/cb2ca9a66ef54d9f1b3df5ac14962dc3810b4cc1/packages%2Fservice-worker%2Fworker%2Ftest%2Fhappy_spec.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fservice-worker%2Fworker%2Ftest%2Fhappy_spec.ts?ref=cb2ca9a66ef54d9f1b3df5ac14962dc3810b4cc1",
+            "patch": "@@ -2306,6 +2306,62 @@ describe('Driver', () => {\n         // latest one.\n         expect(driver.state).toEqual(DriverReadyState.EXISTING_CLIENTS_ONLY);\n       });\n+\n+      it('is handled correctly even if some of the clients no longer exist', async () => {\n+        const originalFiles = new MockFileSystemBuilder()\n+                                  .addFile('/index.html', '<script src=\"foo.hash.js\"></script>')\n+                                  .addFile('/foo.hash.js', 'console.log(\"FOO\");')\n+                                  .build();\n+\n+        const updatedFiles = new MockFileSystemBuilder()\n+                                 .addFile('/index.html', '<script src=\"bar.hash.js\"></script>')\n+                                 .addFile('/bar.hash.js', 'console.log(\"BAR\");')\n+                                 .build();\n+\n+        const {serverState: originalServer, manifest} = generateMockServerState(originalFiles);\n+        const {serverState: updatedServer} = generateMockServerState(updatedFiles);\n+\n+        // Create initial server state and initialize the SW.\n+        scope = new SwTestHarnessBuilder().withServerState(originalServer).build();\n+        driver = new Driver(scope, scope, new CacheDatabase(scope));\n+\n+        expect(await makeRequest(scope, '/foo.hash.js', 'client-1')).toBe('console.log(\"FOO\");');\n+        expect(await makeRequest(scope, '/foo.hash.js', 'client-2')).toBe('console.log(\"FOO\");');\n+        await driver.initialized;\n+\n+        // Update the server state to emulate deploying a new version (where `foo.hash.js` does not\n+        // exist any more). Keep the cache though.\n+        scope = new SwTestHarnessBuilder()\n+                    .withCacheState(scope.caches.original.dehydrate())\n+                    .withServerState(updatedServer)\n+                    .build();\n+        driver = new Driver(scope, scope, new CacheDatabase(scope));\n+\n+        // The SW is still able to serve `foo.hash.js` from the cache.\n+        expect(await makeRequest(scope, '/foo.hash.js', 'client-1')).toBe('console.log(\"FOO\");');\n+        expect(await makeRequest(scope, '/foo.hash.js', 'client-2')).toBe('console.log(\"FOO\");');\n+\n+        // Remove `foo.hash.js` from the cache to emulate the browser evicting files from the cache.\n+        await removeAssetFromCache(scope, manifest, '/foo.hash.js');\n+\n+        // Remove one of the clients to emulate closing a browser tab.\n+        scope.clients.remove('client-1');\n+\n+        // Retrieve the remaining client to ensure it is notified.\n+        const mockClient2 = scope.clients.getMock('client-2')!;\n+        expect(mockClient2.messages).toEqual([]);\n+\n+        // Try to retrieve `foo.hash.js`, which is neither in the cache nor on the server.\n+        // This should put the SW in an unrecoverable state and notify clients (even if some of the\n+        // previously known clients no longer exist).\n+        expect(await makeRequest(scope, '/foo.hash.js', 'client-2')).toBeNull();\n+        expect(mockClient2.messages).toEqual([jasmine.objectContaining(\n+            {type: 'UNRECOVERABLE_STATE'})]);\n+\n+        // This should also enter the `SW` into degraded mode, because the broken version was the\n+        // latest one.\n+        expect(driver.state).toEqual(DriverReadyState.EXISTING_CLIENTS_ONLY);\n+      });\n     });\n \n     describe('backwards compatibility with v5', () => {"
+        }
+    ],
+    "stats": {
+        "total": 64,
+        "additions": 62,
+        "deletions": 2
+    }
+}

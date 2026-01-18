@@ -1,0 +1,36 @@
+{
+    "author": "crisbeto",
+    "message": "fix(router): error if module is destroyed before location is initialized (#42560)\n\nThis is something I ran into while working on a fix for the `TestBed` module teardown behavior for #18831. In the `RouterInitializer.appInitializer` we have a callback to the `LOCATION_INITIALIZED` which has to do some DI lookups. The problem is that if the module is destroyed before the location promise resolves, the `Injector.get` calls will fail. This is unlikely to happen in a real app, but it'll show up in unit tests once the test module teardown behavior is fixed.\n\nPR Close #42560",
+    "sha": "07c1ddc48775967190b9c50530bae20c97140c0f",
+    "files": [
+        {
+            "sha": "399a90cd8caf88348ddcb063d033892211e0c445",
+            "filename": "packages/router/src/router_module.ts",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 3,
+            "changes": 16,
+            "blob_url": "https://github.com/angular/angular/blob/07c1ddc48775967190b9c50530bae20c97140c0f/packages%2Frouter%2Fsrc%2Frouter_module.ts",
+            "raw_url": "https://github.com/angular/angular/raw/07c1ddc48775967190b9c50530bae20c97140c0f/packages%2Frouter%2Fsrc%2Frouter_module.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Frouter%2Fsrc%2Frouter_module.ts?ref=07c1ddc48775967190b9c50530bae20c97140c0f",
+            "patch": "@@ -7,7 +7,7 @@\n  */\n \n import {APP_BASE_HREF, HashLocationStrategy, Location, LOCATION_INITIALIZED, LocationStrategy, PathLocationStrategy, PlatformLocation, ViewportScroller} from '@angular/common';\n-import {ANALYZE_FOR_ENTRY_COMPONENTS, APP_BOOTSTRAP_LISTENER, APP_INITIALIZER, ApplicationRef, Compiler, ComponentRef, Inject, Injectable, InjectionToken, Injector, ModuleWithProviders, NgModule, NgModuleFactoryLoader, NgProbeToken, Optional, Provider, SkipSelf, SystemJsNgModuleLoader} from '@angular/core';\n+import {ANALYZE_FOR_ENTRY_COMPONENTS, APP_BOOTSTRAP_LISTENER, APP_INITIALIZER, ApplicationRef, Compiler, ComponentRef, Inject, Injectable, InjectionToken, Injector, ModuleWithProviders, NgModule, NgModuleFactoryLoader, NgProbeToken, OnDestroy, Optional, Provider, SkipSelf, SystemJsNgModuleLoader} from '@angular/core';\n import {of, Subject} from 'rxjs';\n \n import {EmptyOutletComponent} from './components/empty_outlet';\n@@ -503,15 +503,21 @@ export function rootRoute(router: Router): ActivatedRoute {\n  * pauses. It waits for the hook to be resolved. We then resolve it only in a bootstrap listener.\n  */\n @Injectable()\n-export class RouterInitializer {\n-  private initNavigation: boolean = false;\n+export class RouterInitializer implements OnDestroy {\n+  private initNavigation = false;\n+  private destroyed = false;\n   private resultOfPreactivationDone = new Subject<void>();\n \n   constructor(private injector: Injector) {}\n \n   appInitializer(): Promise<any> {\n     const p: Promise<any> = this.injector.get(LOCATION_INITIALIZED, Promise.resolve(null));\n     return p.then(() => {\n+      // If the injector was destroyed, the DI lookups below will fail.\n+      if (this.destroyed) {\n+        return Promise.resolve(true);\n+      }\n+\n       let resolve: Function = null!;\n       const res = new Promise(r => resolve = r);\n       const router = this.injector.get(Router);\n@@ -566,6 +572,10 @@ export class RouterInitializer {\n     this.resultOfPreactivationDone.next(null!);\n     this.resultOfPreactivationDone.complete();\n   }\n+\n+  ngOnDestroy() {\n+    this.destroyed = true;\n+  }\n }\n \n export function getAppInitializer(r: RouterInitializer) {"
+        },
+        {
+            "sha": "4f14d123e5f6d203a6e946599fd07e06c7495ac2",
+            "filename": "packages/router/test/integration.spec.ts",
+            "status": "modified",
+            "additions": 38,
+            "deletions": 1,
+            "changes": 39,
+            "blob_url": "https://github.com/angular/angular/blob/07c1ddc48775967190b9c50530bae20c97140c0f/packages%2Frouter%2Ftest%2Fintegration.spec.ts",
+            "raw_url": "https://github.com/angular/angular/raw/07c1ddc48775967190b9c50530bae20c97140c0f/packages%2Frouter%2Ftest%2Fintegration.spec.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Frouter%2Ftest%2Fintegration.spec.ts?ref=07c1ddc48775967190b9c50530bae20c97140c0f",
+            "patch": "@@ -6,7 +6,7 @@\n  * found in the LICENSE file at https://angular.io/license\n  */\n \n-import {CommonModule, Location, LocationStrategy, PlatformLocation} from '@angular/common';\n+import {APP_BASE_HREF, CommonModule, Location, LOCATION_INITIALIZED, LocationStrategy, PlatformLocation} from '@angular/common';\n import {SpyLocation} from '@angular/common/testing';\n import {ChangeDetectionStrategy, Component, EventEmitter, Injectable, NgModule, NgModuleFactoryLoader, NgModuleRef, NgZone, OnDestroy, ViewChild, ɵConsole as Console, ɵNoopNgZone as NoopNgZone} from '@angular/core';\n import {ComponentFixture, fakeAsync, inject, TestBed, tick} from '@angular/core/testing';\n@@ -16,6 +16,7 @@ import {ActivatedRoute, ActivatedRouteSnapshot, ActivationEnd, ActivationStart,\n import {EMPTY, Observable, Observer, of, Subscription, SubscriptionLike} from 'rxjs';\n import {delay, filter, first, map, mapTo, tap} from 'rxjs/operators';\n \n+import {RouterInitializer} from '../src/router_module';\n import {forEach} from '../src/utils/collection';\n import {RouterTestingModule, SpyNgModuleFactoryLoader} from '../testing';\n \n@@ -6210,6 +6211,42 @@ describe('Integration', () => {\n          expect(fixture).toContainComponent(Tool2Component, '(e)');\n        }));\n   });\n+\n+  describe('RouterInitializer', () => {\n+    it('should not throw from appInitializer if module is destroyed before location is initialized',\n+       done => {\n+         let resolveInitializer: () => void;\n+         let moduleRef: NgModuleRef<SelfDestructModule>;\n+\n+         @NgModule({\n+           imports: [RouterModule.forRoot([])],\n+           providers: [\n+             {\n+               provide: LOCATION_INITIALIZED,\n+               useValue: new Promise<void>(resolve => resolveInitializer = resolve)\n+             },\n+             {\n+               // Required when running the tests in a browser\n+               provide: APP_BASE_HREF,\n+               useValue: ''\n+             }\n+           ]\n+         })\n+         class SelfDestructModule {\n+           constructor(ref: NgModuleRef<SelfDestructModule>, routerInitializer: RouterInitializer) {\n+             moduleRef = ref;\n+             routerInitializer.appInitializer().then(done, done.fail);\n+           }\n+         }\n+\n+         TestBed.resetTestingModule()\n+             .configureTestingModule({imports: [SelfDestructModule], declarations: [SimpleCmp]})\n+             .createComponent(SimpleCmp);\n+\n+         moduleRef!.destroy();\n+         resolveInitializer!();\n+       });\n+  });\n });\n \n describe('Testing router options', () => {"
+        }
+    ],
+    "stats": {
+        "total": 55,
+        "additions": 51,
+        "deletions": 4
+    }
+}

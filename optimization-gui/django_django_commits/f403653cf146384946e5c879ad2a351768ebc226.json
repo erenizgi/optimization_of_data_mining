@@ -1,0 +1,48 @@
+{
+    "author": "akaariai",
+    "message": "Fixed #19635 -- Made fields pickleable",
+    "sha": "f403653cf146384946e5c879ad2a351768ebc226",
+    "files": [
+        {
+            "sha": "c210cfabf69908c19bab9c4b4845e6f18f5c8a65",
+            "filename": "django/db/models/fields/__init__.py",
+            "status": "modified",
+            "additions": 40,
+            "deletions": 0,
+            "changes": 40,
+            "blob_url": "https://github.com/django/django/blob/f403653cf146384946e5c879ad2a351768ebc226/django%2Fdb%2Fmodels%2Ffields%2F__init__.py",
+            "raw_url": "https://github.com/django/django/raw/f403653cf146384946e5c879ad2a351768ebc226/django%2Fdb%2Fmodels%2Ffields%2F__init__.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fmodels%2Ffields%2F__init__.py?ref=f403653cf146384946e5c879ad2a351768ebc226",
+            "patch": "@@ -10,6 +10,7 @@\n from itertools import tee\n \n from django.db import connection\n+from django.db.models.loading import get_model\n from django.db.models.query_utils import QueryWrapper\n from django.conf import settings\n from django import forms\n@@ -24,13 +25,19 @@\n from django.utils.ipv6 import clean_ipv6_address\n from django.utils import six\n \n+class Empty(object):\n+    pass\n+\n class NOT_PROVIDED:\n     pass\n \n # The values to use for \"blank\" in SelectFields. Will be appended to the start\n # of most \"choices\" lists.\n BLANK_CHOICE_DASH = [(\"\", \"---------\")]\n \n+def _load_field(app_label, model_name, field_name):\n+    return get_model(app_label, model_name)._meta.get_field_by_name(field_name)[0]\n+\n class FieldDoesNotExist(Exception):\n     pass\n \n@@ -49,6 +56,11 @@ class FieldDoesNotExist(Exception):\n #\n #     getattr(obj, opts.pk.attname)\n \n+def _empty(of_cls):\n+    new = Empty()\n+    new.__class__ = of_cls\n+    return new\n+\n @total_ordering\n class Field(object):\n     \"\"\"Base class for all field types\"\"\"\n@@ -148,6 +160,34 @@ def __deepcopy__(self, memodict):\n         memodict[id(self)] = obj\n         return obj\n \n+    def __copy__(self):\n+        # We need to avoid hitting __reduce__, so define this\n+        # slightly weird copy construct.\n+        obj = Empty()\n+        obj.__class__ = self.__class__\n+        obj.__dict__ = self.__dict__.copy()\n+        return obj\n+\n+    def __reduce__(self):\n+        \"\"\"\n+        Pickling should return the model._meta.fields instance of the field,\n+        not a new copy of that field. So, we use the app cache to load the\n+        model and then the field back.\n+        \"\"\"\n+        if not hasattr(self, 'model'):\n+            # Fields are sometimes used without attaching them to models (for\n+            # example in aggregation). In this case give back a plain field\n+            # instance. The code below will create a new empty instance of\n+            # class self.__class__, then update its dict with self.__dict__\n+            # values - so, this is very close to normal pickle.\n+            return _empty, (self.__class__,), self.__dict__\n+        if self.model._deferred:\n+            # Deferred model will not be found from the app cache. This could\n+            # be fixed by reconstructing the deferred model on unpickle.\n+            raise RuntimeError(\"Fields of deferred models can't be reduced\")\n+        return _load_field, (self.model._meta.app_label, self.model._meta.object_name,\n+                             self.name)\n+\n     def to_python(self, value):\n         \"\"\"\n         Converts the input value into the expected Python data type, raising"
+        },
+        {
+            "sha": "8085a6b2379fa2cc84c455d6e6eaf3892ffacf60",
+            "filename": "django/db/models/sql/query.py",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 48,
+            "changes": 48,
+            "blob_url": "https://github.com/django/django/blob/f403653cf146384946e5c879ad2a351768ebc226/django%2Fdb%2Fmodels%2Fsql%2Fquery.py",
+            "raw_url": "https://github.com/django/django/raw/f403653cf146384946e5c879ad2a351768ebc226/django%2Fdb%2Fmodels%2Fsql%2Fquery.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fmodels%2Fsql%2Fquery.py?ref=f403653cf146384946e5c879ad2a351768ebc226",
+            "patch": "@@ -189,54 +189,6 @@ def __deepcopy__(self, memo):\n         memo[id(self)] = result\n         return result\n \n-    def __getstate__(self):\n-        \"\"\"\n-        Pickling support.\n-        \"\"\"\n-        obj_dict = self.__dict__.copy()\n-        obj_dict['related_select_cols'] = []\n-\n-        # Fields can't be pickled, so if a field list has been\n-        # specified, we pickle the list of field names instead.\n-        # None is also a possible value; that can pass as-is\n-        obj_dict['select'] = [\n-            (s.col, s.field is not None and s.field.name or None)\n-            for s in obj_dict['select']\n-        ]\n-        # alias_map can also contain references to fields.\n-        new_alias_map = {}\n-        for alias, join_info in obj_dict['alias_map'].items():\n-            if join_info.join_field is None:\n-                new_alias_map[alias] = join_info\n-            else:\n-                model = join_info.join_field.model._meta\n-                field_id = (model.app_label, model.object_name, join_info.join_field.name)\n-                new_alias_map[alias] = join_info._replace(join_field=field_id)\n-        obj_dict['alias_map'] = new_alias_map\n-        return obj_dict\n-\n-    def __setstate__(self, obj_dict):\n-        \"\"\"\n-        Unpickling support.\n-        \"\"\"\n-        # Rebuild list of field instances\n-        opts = obj_dict['model']._meta\n-        obj_dict['select'] = [\n-            SelectInfo(tpl[0], tpl[1] is not None and opts.get_field(tpl[1]) or None)\n-            for tpl in obj_dict['select']\n-        ]\n-        new_alias_map = {}\n-        for alias, join_info in obj_dict['alias_map'].items():\n-            if join_info.join_field is None:\n-                new_alias_map[alias] = join_info\n-            else:\n-                field_id = join_info.join_field\n-                new_alias_map[alias] = join_info._replace(\n-                    join_field=get_model(field_id[0], field_id[1])._meta.get_field(field_id[2]))\n-        obj_dict['alias_map'] = new_alias_map\n-\n-        self.__dict__.update(obj_dict)\n-\n     def prepare(self):\n         return self\n "
+        },
+        {
+            "sha": "754e33292d2dfd70665a0b4e7529539e8542b6b9",
+            "filename": "django/db/models/sql/where.py",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 24,
+            "changes": 24,
+            "blob_url": "https://github.com/django/django/blob/f403653cf146384946e5c879ad2a351768ebc226/django%2Fdb%2Fmodels%2Fsql%2Fwhere.py",
+            "raw_url": "https://github.com/django/django/raw/f403653cf146384946e5c879ad2a351768ebc226/django%2Fdb%2Fmodels%2Fsql%2Fwhere.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fmodels%2Fsql%2Fwhere.py?ref=f403653cf146384946e5c879ad2a351768ebc226",
+            "patch": "@@ -345,30 +345,6 @@ class Constraint(object):\n     def __init__(self, alias, col, field):\n         self.alias, self.col, self.field = alias, col, field\n \n-    def __getstate__(self):\n-        \"\"\"Save the state of the Constraint for pickling.\n-\n-        Fields aren't necessarily pickleable, because they can have\n-        callable default values. So, instead of pickling the field\n-        store a reference so we can restore it manually\n-        \"\"\"\n-        obj_dict = self.__dict__.copy()\n-        if self.field:\n-            obj_dict['model'] = self.field.model\n-            obj_dict['field_name'] = self.field.name\n-        del obj_dict['field']\n-        return obj_dict\n-\n-    def __setstate__(self, data):\n-        \"\"\"Restore the constraint \"\"\"\n-        model = data.pop('model', None)\n-        field_name = data.pop('field_name', None)\n-        self.__dict__.update(data)\n-        if model is not None:\n-            self.field = model._meta.get_field(field_name)\n-        else:\n-            self.field = None\n-\n     def prepare(self, lookup_type, value):\n         if self.field:\n             return self.field.get_prep_lookup(lookup_type, value)"
+        }
+    ],
+    "stats": {
+        "total": 112,
+        "additions": 40,
+        "deletions": 72
+    }
+}

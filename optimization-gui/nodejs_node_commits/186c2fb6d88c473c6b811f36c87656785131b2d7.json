@@ -1,0 +1,60 @@
+{
+    "author": "joyeecheung",
+    "message": "build: create V8 code cache after script is run\n\nThis patch makes it possible to generate the code cache\nfor the builtins directly from the original script object\n(instead of compiling a new one) and after the script has\nbeen run (via `NativeModule.require`). Before this patch\nonly the top level functions (the wrapped ones)\nare included in the cache, after this patch the inner\nfunctions in those modules will be included as well.\n\nAlso blacklists modules from dependencies like V8 and\nnode-inspect since we cannot guarantee that they are suitable\nto be executed directly.\n\nPR-URL: https://github.com/nodejs/node/pull/21567\nRefs: https://github.com/nodejs/node/issues/21563\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Tiancheng \"Timothy\" Gu <timothygu99@gmail.com>\nReviewed-By: Gus Caplan <me@gus.host>\nReviewed-By: John-David Dalton <john.david.dalton@gmail.com>\nReviewed-By: Colin Ihrig <cjihrig@gmail.com>",
+    "sha": "186c2fb6d88c473c6b811f36c87656785131b2d7",
+    "files": [
+        {
+            "sha": "e7e46bdf5174d500d7c49352ebc5f000dfd62bf1",
+            "filename": "lib/internal/bootstrap/cache.js",
+            "status": "modified",
+            "additions": 38,
+            "deletions": 11,
+            "changes": 49,
+            "blob_url": "https://github.com/nodejs/node/blob/186c2fb6d88c473c6b811f36c87656785131b2d7/lib%2Finternal%2Fbootstrap%2Fcache.js",
+            "raw_url": "https://github.com/nodejs/node/raw/186c2fb6d88c473c6b811f36c87656785131b2d7/lib%2Finternal%2Fbootstrap%2Fcache.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fbootstrap%2Fcache.js?ref=186c2fb6d88c473c6b811f36c87656785131b2d7",
+            "patch": "@@ -9,23 +9,50 @@ const {\n   NativeModule, internalBinding\n } = require('internal/bootstrap/loaders');\n \n+function getCodeCache(id) {\n+  const cached = NativeModule.getCached(id);\n+  if (cached && (cached.loaded || cached.loading)) {\n+    return cached.script.createCachedData();\n+  }\n+\n+  // The script has not been compiled and run\n+  NativeModule.require(id);\n+  return getCodeCache(id);\n+}\n+\n+const depsModule = Object.keys(NativeModule._source).filter(\n+  (key) => NativeModule.isDepsModule(key) || key.startsWith('internal/deps')\n+);\n+\n+// Modules with source code compiled in js2c that\n+// cannot be compiled with the code cache\n+const cannotUseCache = [\n+  'config',\n+  'sys',  // deprecated\n+  'internal/v8_prof_polyfill',\n+  'internal/v8_prof_processor',\n+\n+  'internal/per_context',\n+\n+  'internal/test/binding',\n+  // TODO(joyeecheung): update the C++ side so that\n+  // the code cache is also used when compiling these\n+  // two files.\n+  'internal/bootstrap/loaders',\n+  'internal/bootstrap/node'\n+].concat(depsModule);\n+\n module.exports = {\n+  cachableBuiltins: Object.keys(NativeModule._source).filter(\n+    (key) => !cannotUseCache.includes(key)\n+  ),\n   builtinSource: Object.assign({}, NativeModule._source),\n+  getCodeCache,\n   codeCache: internalBinding('code_cache'),\n   compiledWithoutCache: NativeModule.compiledWithoutCache,\n   compiledWithCache: NativeModule.compiledWithCache,\n   nativeModuleWrap(script) {\n     return NativeModule.wrap(script);\n   },\n-  // Modules with source code compiled in js2c that\n-  // cannot be compiled with the code cache\n-  cannotUseCache: [\n-    'config',\n-    // TODO(joyeecheung): update the C++ side so that\n-    // the code cache is also used when compiling these\n-    // two files.\n-    'internal/bootstrap/loaders',\n-    'internal/bootstrap/node',\n-    'internal/per_context',\n-  ]\n+  cannotUseCache\n };"
+        },
+        {
+            "sha": "e85d5de9b79a49a21600c7306b1509c6f4692567",
+            "filename": "lib/internal/bootstrap/loaders.js",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 2,
+            "changes": 10,
+            "blob_url": "https://github.com/nodejs/node/blob/186c2fb6d88c473c6b811f36c87656785131b2d7/lib%2Finternal%2Fbootstrap%2Floaders.js",
+            "raw_url": "https://github.com/nodejs/node/raw/186c2fb6d88c473c6b811f36c87656785131b2d7/lib%2Finternal%2Fbootstrap%2Floaders.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fbootstrap%2Floaders.js?ref=186c2fb6d88c473c6b811f36c87656785131b2d7",
+            "patch": "@@ -118,6 +118,7 @@\n     this.exportKeys = undefined;\n     this.loaded = false;\n     this.loading = false;\n+    this.script = null;  // The ContextifyScript of the module\n   }\n \n   NativeModule._source = getBinding('natives');\n@@ -165,11 +166,14 @@\n     return nativeModule.exports;\n   };\n \n+  NativeModule.isDepsModule = function(id) {\n+    return id.startsWith('node-inspect/') || id.startsWith('v8/');\n+  };\n+\n   NativeModule.requireForDeps = function(id) {\n     if (!NativeModule.exists(id) ||\n         // TODO(TimothyGu): remove when DEP0084 reaches end of life.\n-        id.startsWith('node-inspect/') ||\n-        id.startsWith('v8/')) {\n+        NativeModule.isDepsModule(id)) {\n       id = `internal/deps/${id}`;\n     }\n     return NativeModule.require(id);\n@@ -241,6 +245,8 @@\n         codeCache[this.id], false, undefined\n       );\n \n+      this.script = script;\n+\n       // One of these conditions may be false when any of the inputs\n       // of the `node_js2c` target in node.gyp is modified.\n       // FIXME(joyeecheung):"
+        },
+        {
+            "sha": "b05e764e8ad2904a4b8523800953653688f5c8db",
+            "filename": "test/code-cache/test-code-cache.js",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 4,
+            "changes": 6,
+            "blob_url": "https://github.com/nodejs/node/blob/186c2fb6d88c473c6b811f36c87656785131b2d7/test%2Fcode-cache%2Ftest-code-cache.js",
+            "raw_url": "https://github.com/nodejs/node/raw/186c2fb6d88c473c6b811f36c87656785131b2d7/test%2Fcode-cache%2Ftest-code-cache.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fcode-cache%2Ftest-code-cache.js?ref=186c2fb6d88c473c6b811f36c87656785131b2d7",
+            "patch": "@@ -12,9 +12,8 @@ const {\n   }\n } = require('util');\n const {\n-  builtinSource,\n+  cachableBuiltins,\n   codeCache,\n-  cannotUseCache,\n   compiledWithCache,\n   compiledWithoutCache\n } = require('internal/bootstrap/cache');\n@@ -35,8 +34,7 @@ for (const key of loadedModules) {\n          `\"${key}\" should've been compiled with code cache`);\n }\n \n-for (const key of Object.keys(builtinSource)) {\n-  if (cannotUseCache.includes(key)) continue;\n+for (const key of cachableBuiltins) {\n   assert(isUint8Array(codeCache[key]) && codeCache[key].length > 0,\n          `Code cache for \"${key}\" should've been generated`);\n }"
+        },
+        {
+            "sha": "740cbd718aa11e0c7178023b82babfadd9a45394",
+            "filename": "tools/generate_code_cache.js",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 18,
+            "changes": 25,
+            "blob_url": "https://github.com/nodejs/node/blob/186c2fb6d88c473c6b811f36c87656785131b2d7/tools%2Fgenerate_code_cache.js",
+            "raw_url": "https://github.com/nodejs/node/raw/186c2fb6d88c473c6b811f36c87656785131b2d7/tools%2Fgenerate_code_cache.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/tools%2Fgenerate_code_cache.js?ref=186c2fb6d88c473c6b811f36c87656785131b2d7",
+            "patch": "@@ -8,12 +8,10 @@\n // of `configure`.\n \n const {\n-  nativeModuleWrap,\n-  builtinSource,\n-  cannotUseCache\n+  getCodeCache,\n+  cachableBuiltins\n } = require('internal/bootstrap/cache');\n \n-const vm = require('vm');\n const fs = require('fs');\n \n const resultPath = process.argv[2];\n@@ -72,25 +70,16 @@ const cacheInitializers = [];\n let totalCacheSize = 0;\n \n \n-for (const key of Object.keys(builtinSource)) {\n-  if (cannotUseCache.includes(key)) continue;\n-  const code = nativeModuleWrap(builtinSource[key]);\n-\n-  // Note that this must corresponds to the code in\n-  // NativeModule.prototype.compile\n-  const script = new vm.Script(code, {\n-    filename: `${key}.js`,\n-    produceCachedData: true\n-  });\n-\n-  if (!script.cachedData) {\n+for (const key of cachableBuiltins) {\n+  const cachedData = getCodeCache(key);\n+  if (!cachedData.length) {\n     console.error(`Failed to generate code cache for '${key}'`);\n     process.exit(1);\n   }\n \n-  const length = script.cachedData.length;\n+  const length = cachedData.length;\n   totalCacheSize += length;\n-  const { definition, initializer } = getInitalizer(key, script.cachedData);\n+  const { definition, initializer } = getInitalizer(key, cachedData);\n   cacheDefinitions.push(definition);\n   cacheInitializers.push(initializer);\n   console.log(`Generated cache for '${key}', size = ${formatSize(length)}` +"
+        }
+    ],
+    "stats": {
+        "total": 90,
+        "additions": 55,
+        "deletions": 35
+    }
+}

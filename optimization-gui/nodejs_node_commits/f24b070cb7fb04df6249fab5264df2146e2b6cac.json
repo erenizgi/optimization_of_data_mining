@@ -1,0 +1,72 @@
+{
+    "author": "mafintosh",
+    "message": "stream: add auto-destroy mode\n\nPR-URL: https://github.com/nodejs/node/pull/22795\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Matteo Collina <matteo.collina@gmail.com>\nReviewed-By: Anna Henningsen <anna@addaleax.net>\nReviewed-By: Jeremiah Senkpiel <fishrock123@rocketmail.com>",
+    "sha": "f24b070cb7fb04df6249fab5264df2146e2b6cac",
+    "files": [
+        {
+            "sha": "f2e1c2a0c4ff9e8f82e056bbbda76eb43079b10b",
+            "filename": "doc/api/stream.md",
+            "status": "modified",
+            "additions": 17,
+            "deletions": 0,
+            "changes": 17,
+            "blob_url": "https://github.com/nodejs/node/blob/f24b070cb7fb04df6249fab5264df2146e2b6cac/doc%2Fapi%2Fstream.md",
+            "raw_url": "https://github.com/nodejs/node/raw/f24b070cb7fb04df6249fab5264df2146e2b6cac/doc%2Fapi%2Fstream.md",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/doc%2Fapi%2Fstream.md?ref=f24b070cb7fb04df6249fab5264df2146e2b6cac",
+            "patch": "@@ -1493,6 +1493,11 @@ changes:\n     pr-url: https://github.com/nodejs/node/pull/18438\n     description: >\n       Add `emitClose` option to specify if `'close'` is emitted on destroy\n+  - version: REPLACEME\n+    pr-url: https://github.com/nodejs/node/pull/22795\n+    description: >\n+      Add `autoDestroy` option to automatically `destroy()` the stream\n+      when it emits `'finish'` or errors\n -->\n \n * `options` {Object}\n@@ -1521,6 +1526,8 @@ changes:\n     [`stream._destroy()`][writable-_destroy] method.\n   * `final` {Function} Implementation for the\n     [`stream._final()`][stream-_final] method.\n+  * `autoDestroy` {boolean} Whether this stream should automatically call\n+    `.destroy()` on itself after ending. **Default:** `false`.\n \n ```js\n const { Writable } = require('stream');\n@@ -1756,6 +1763,14 @@ Custom `Readable` streams *must* call the `new stream.Readable([options])`\n constructor and implement the `readable._read()` method.\n \n #### new stream.Readable([options])\n+<!-- YAML\n+changes:\n+  - version: REPLACEME\n+    pr-url: https://github.com/nodejs/node/pull/22795\n+    description: >\n+      Add `autoDestroy` option to automatically `destroy()` the stream\n+      when it emits `'end'` or errors\n+-->\n \n * `options` {Object}\n   * `highWaterMark` {number} The maximum [number of bytes][hwm-gotcha] to store\n@@ -1770,6 +1785,8 @@ constructor and implement the `readable._read()` method.\n     method.\n   * `destroy` {Function} Implementation for the\n     [`stream._destroy()`][readable-_destroy] method.\n+  * `autoDestroy` {boolean} Whether this stream should automatically call\n+    `.destroy()` on itself after ending. **Default:** `false`.\n \n ```js\n const { Readable } = require('stream');"
+        },
+        {
+            "sha": "2a2122e0e553cd10bc844779d96ae4a1a93aa6b9",
+            "filename": "lib/_stream_readable.js",
+            "status": "modified",
+            "additions": 18,
+            "deletions": 5,
+            "changes": 23,
+            "blob_url": "https://github.com/nodejs/node/blob/f24b070cb7fb04df6249fab5264df2146e2b6cac/lib%2F_stream_readable.js",
+            "raw_url": "https://github.com/nodejs/node/raw/f24b070cb7fb04df6249fab5264df2146e2b6cac/lib%2F_stream_readable.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2F_stream_readable.js?ref=f24b070cb7fb04df6249fab5264df2146e2b6cac",
+            "patch": "@@ -46,6 +46,7 @@ let createReadableStreamAsyncIterator;\n \n util.inherits(Readable, Stream);\n \n+const { errorOrDestroy } = destroyImpl;\n const kProxyEvents = ['error', 'close', 'destroy', 'pause', 'resume'];\n \n function prependListener(emitter, event, fn) {\n@@ -117,6 +118,9 @@ function ReadableState(options, stream, isDuplex) {\n   // Should close be emitted on destroy. Defaults to true.\n   this.emitClose = options.emitClose !== false;\n \n+  // Should .destroy() be called after 'end' (and potentially 'finish')\n+  this.autoDestroy = !!options.autoDestroy;\n+\n   // has it been destroyed\n   this.destroyed = false;\n \n@@ -235,7 +239,7 @@ function readableAddChunk(stream, chunk, encoding, addToFront, skipChunkCheck) {\n     if (!skipChunkCheck)\n       er = chunkInvalid(state, chunk);\n     if (er) {\n-      stream.emit('error', er);\n+      errorOrDestroy(stream, er);\n     } else if (state.objectMode || chunk && chunk.length > 0) {\n       if (typeof chunk !== 'string' &&\n           !state.objectMode &&\n@@ -245,11 +249,11 @@ function readableAddChunk(stream, chunk, encoding, addToFront, skipChunkCheck) {\n \n       if (addToFront) {\n         if (state.endEmitted)\n-          stream.emit('error', new ERR_STREAM_UNSHIFT_AFTER_END_EVENT());\n+          errorOrDestroy(stream, new ERR_STREAM_UNSHIFT_AFTER_END_EVENT());\n         else\n           addChunk(stream, state, chunk, true);\n       } else if (state.ended) {\n-        stream.emit('error', new ERR_STREAM_PUSH_AFTER_EOF());\n+        errorOrDestroy(stream, new ERR_STREAM_PUSH_AFTER_EOF());\n       } else if (state.destroyed) {\n         return false;\n       } else {\n@@ -581,7 +585,7 @@ function maybeReadMore_(stream, state) {\n // for virtual (non-string, non-buffer) streams, \"length\" is somewhat\n // arbitrary, and perhaps not very meaningful.\n Readable.prototype._read = function(n) {\n-  this.emit('error', new ERR_METHOD_NOT_IMPLEMENTED('_read()'));\n+  errorOrDestroy(this, new ERR_METHOD_NOT_IMPLEMENTED('_read()'));\n };\n \n Readable.prototype.pipe = function(dest, pipeOpts) {\n@@ -687,7 +691,7 @@ Readable.prototype.pipe = function(dest, pipeOpts) {\n     unpipe();\n     dest.removeListener('error', onerror);\n     if (EE.listenerCount(dest, 'error') === 0)\n-      dest.emit('error', er);\n+      errorOrDestroy(dest, er);\n   }\n \n   // Make sure our error handler is attached before userland ones.\n@@ -1092,5 +1096,14 @@ function endReadableNT(state, stream) {\n     state.endEmitted = true;\n     stream.readable = false;\n     stream.emit('end');\n+\n+    if (state.autoDestroy) {\n+      // In case of duplex streams we need a way to detect\n+      // if the writable side is ready for autoDestroy as well\n+      const wState = stream._writableState;\n+      if (!wState || (wState.autoDestroy && wState.finished)) {\n+        stream.destroy();\n+      }\n+    }\n   }\n }"
+        },
+        {
+            "sha": "160179cd0e84fa49d4f377580ddb2415b010fcc1",
+            "filename": "lib/_stream_writable.js",
+            "status": "modified",
+            "additions": 20,
+            "deletions": 6,
+            "changes": 26,
+            "blob_url": "https://github.com/nodejs/node/blob/f24b070cb7fb04df6249fab5264df2146e2b6cac/lib%2F_stream_writable.js",
+            "raw_url": "https://github.com/nodejs/node/raw/f24b070cb7fb04df6249fab5264df2146e2b6cac/lib%2F_stream_writable.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2F_stream_writable.js?ref=f24b070cb7fb04df6249fab5264df2146e2b6cac",
+            "patch": "@@ -45,6 +45,8 @@ const {\n   ERR_UNKNOWN_ENCODING\n } = require('internal/errors').codes;\n \n+const { errorOrDestroy } = destroyImpl;\n+\n util.inherits(Writable, Stream);\n \n function nop() {}\n@@ -147,6 +149,9 @@ function WritableState(options, stream, isDuplex) {\n   // Should close be emitted on destroy. Defaults to true.\n   this.emitClose = options.emitClose !== false;\n \n+  // Should .destroy() be called after 'finish' (and potentially 'end')\n+  this.autoDestroy = !!options.autoDestroy;\n+\n   // count buffered requests\n   this.bufferedRequestCount = 0;\n \n@@ -235,14 +240,14 @@ function Writable(options) {\n \n // Otherwise people can pipe Writable streams, which is just wrong.\n Writable.prototype.pipe = function() {\n-  this.emit('error', new ERR_STREAM_CANNOT_PIPE());\n+  errorOrDestroy(this, new ERR_STREAM_CANNOT_PIPE());\n };\n \n \n function writeAfterEnd(stream, cb) {\n   var er = new ERR_STREAM_WRITE_AFTER_END();\n   // TODO: defer error events consistently everywhere, not just the cb\n-  stream.emit('error', er);\n+  errorOrDestroy(stream, er);\n   process.nextTick(cb, er);\n }\n \n@@ -258,7 +263,7 @@ function validChunk(stream, state, chunk, cb) {\n     er = new ERR_INVALID_ARG_TYPE('chunk', ['string', 'Buffer'], chunk);\n   }\n   if (er) {\n-    stream.emit('error', er);\n+    errorOrDestroy(stream, er);\n     process.nextTick(cb, er);\n     return false;\n   }\n@@ -422,13 +427,13 @@ function onwriteError(stream, state, sync, er, cb) {\n     // after error\n     process.nextTick(finishMaybe, stream, state);\n     stream._writableState.errorEmitted = true;\n-    stream.emit('error', er);\n+    errorOrDestroy(stream, er);\n   } else {\n     // the caller expect this to happen before if\n     // it is async\n     cb(er);\n     stream._writableState.errorEmitted = true;\n-    stream.emit('error', er);\n+    errorOrDestroy(stream, er);\n     // this can emit finish, but finish must\n     // always follow error\n     finishMaybe(stream, state);\n@@ -612,7 +617,7 @@ function callFinal(stream, state) {\n   stream._final((err) => {\n     state.pendingcb--;\n     if (err) {\n-      stream.emit('error', err);\n+      errorOrDestroy(stream, err);\n     }\n     state.prefinished = true;\n     stream.emit('prefinish');\n@@ -639,6 +644,15 @@ function finishMaybe(stream, state) {\n     if (state.pendingcb === 0) {\n       state.finished = true;\n       stream.emit('finish');\n+\n+      if (state.autoDestroy) {\n+        // In case of duplex streams we need a way to detect\n+        // if the readable side is ready for autoDestroy as well\n+        const rState = stream._readableState;\n+        if (!rState || (rState.autoDestroy && rState.endEmitted)) {\n+          stream.destroy();\n+        }\n+      }\n     }\n   }\n   return need;"
+        },
+        {
+            "sha": "ce9d2545e45022610ed9009b01ed690061a85d68",
+            "filename": "lib/internal/streams/destroy.js",
+            "status": "modified",
+            "additions": 19,
+            "deletions": 1,
+            "changes": 20,
+            "blob_url": "https://github.com/nodejs/node/blob/f24b070cb7fb04df6249fab5264df2146e2b6cac/lib%2Finternal%2Fstreams%2Fdestroy.js",
+            "raw_url": "https://github.com/nodejs/node/raw/f24b070cb7fb04df6249fab5264df2146e2b6cac/lib%2Finternal%2Fstreams%2Fdestroy.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fstreams%2Fdestroy.js?ref=f24b070cb7fb04df6249fab5264df2146e2b6cac",
+            "patch": "@@ -82,7 +82,25 @@ function emitErrorNT(self, err) {\n   self.emit('error', err);\n }\n \n+function errorOrDestroy(stream, err) {\n+  // We have tests that rely on errors being emitted\n+  // in the same tick, so changing this is semver major.\n+  // For now when you opt-in to autoDestroy we allow\n+  // the error to be emitted nextTick. In a future\n+  // semver major update we should change the default to this.\n+\n+  const rState = stream._readableState;\n+  const wState = stream._writableState;\n+\n+  if ((rState && rState.autoDestroy) || (wState && wState.autoDestroy))\n+    stream.destroy(err);\n+  else\n+    stream.emit('error', err);\n+}\n+\n+\n module.exports = {\n   destroy,\n-  undestroy\n+  undestroy,\n+  errorOrDestroy\n };"
+        },
+        {
+            "sha": "7bce8a563683130f02a282bbf7321f2901b73191",
+            "filename": "test/parallel/test-stream-auto-destroy.js",
+            "status": "added",
+            "additions": 84,
+            "deletions": 0,
+            "changes": 84,
+            "blob_url": "https://github.com/nodejs/node/blob/f24b070cb7fb04df6249fab5264df2146e2b6cac/test%2Fparallel%2Ftest-stream-auto-destroy.js",
+            "raw_url": "https://github.com/nodejs/node/raw/f24b070cb7fb04df6249fab5264df2146e2b6cac/test%2Fparallel%2Ftest-stream-auto-destroy.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-stream-auto-destroy.js?ref=f24b070cb7fb04df6249fab5264df2146e2b6cac",
+            "patch": "@@ -0,0 +1,84 @@\n+'use strict';\n+const common = require('../common');\n+const stream = require('stream');\n+const assert = require('assert');\n+\n+{\n+  const r = new stream.Readable({\n+    autoDestroy: true,\n+    read() {\n+      this.push('hello');\n+      this.push('world');\n+      this.push(null);\n+    },\n+    destroy: common.mustCall((err, cb) => cb())\n+  });\n+\n+  let ended = false;\n+\n+  r.resume();\n+\n+  r.on('end', common.mustCall(() => {\n+    ended = true;\n+  }));\n+\n+  r.on('close', common.mustCall(() => {\n+    assert(ended);\n+  }));\n+}\n+\n+{\n+  const w = new stream.Writable({\n+    autoDestroy: true,\n+    write(data, enc, cb) {\n+      cb(null);\n+    },\n+    destroy: common.mustCall((err, cb) => cb())\n+  });\n+\n+  let finished = false;\n+\n+  w.write('hello');\n+  w.write('world');\n+  w.end();\n+\n+  w.on('finish', common.mustCall(() => {\n+    finished = true;\n+  }));\n+\n+  w.on('close', common.mustCall(() => {\n+    assert(finished);\n+  }));\n+}\n+\n+{\n+  const t = new stream.Transform({\n+    autoDestroy: true,\n+    transform(data, enc, cb) {\n+      cb(null, data);\n+    },\n+    destroy: common.mustCall((err, cb) => cb())\n+  });\n+\n+  let ended = false;\n+  let finished = false;\n+\n+  t.write('hello');\n+  t.write('world');\n+  t.end();\n+\n+  t.resume();\n+\n+  t.on('end', common.mustCall(() => {\n+    ended = true;\n+  }));\n+\n+  t.on('finish', common.mustCall(() => {\n+    finished = true;\n+  }));\n+\n+  t.on('close', common.mustCall(() => {\n+    assert(ended);\n+    assert(finished);\n+  }));\n+}"
+        }
+    ],
+    "stats": {
+        "total": 170,
+        "additions": 158,
+        "deletions": 12
+    }
+}

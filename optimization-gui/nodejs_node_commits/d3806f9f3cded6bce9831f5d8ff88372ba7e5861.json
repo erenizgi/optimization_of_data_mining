@@ -1,0 +1,120 @@
+{
+    "author": "joyeecheung",
+    "message": "console: refactor inspector console extension installation\n\n- Instead of creating the console extensions eagerly during bootstrap\n  and storing them on an object, wrap the code into a function to be\n  called during `installAdditionalCommandLineAPI` only when the\n  extensions are actually needed, which may not even happen if the\n  user do not use the console in an inspector session, and does not\n  need to happen during bootstrap unconditionally.\n- Simplify the console methods wrapping and move the `consoleFromVM`\n  storage to `internal/util/inspector.js`\n\nPR-URL: https://github.com/nodejs/node/pull/25450\nReviewed-By: John-David Dalton <john.david.dalton@gmail.com>\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Ruben Bridgewater <ruben@bridgewater.de>",
+    "sha": "d3806f9f3cded6bce9831f5d8ff88372ba7e5861",
+    "files": [
+        {
+            "sha": "cc8f86ee46c7c394710fa1ea65605bcbf80d1d6a",
+            "filename": "lib/inspector.js",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/d3806f9f3cded6bce9831f5d8ff88372ba7e5861/lib%2Finspector.js",
+            "raw_url": "https://github.com/nodejs/node/raw/d3806f9f3cded6bce9831f5d8ff88372ba7e5861/lib%2Finspector.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finspector.js?ref=d3806f9f3cded6bce9831f5d8ff88372ba7e5861",
+            "patch": "@@ -106,6 +106,6 @@ module.exports = {\n   url: url,\n   // This is dynamically added during bootstrap,\n   // where the console from the VM is still available\n-  console: require('internal/console/inspector').consoleFromVM,\n+  console: require('internal/util/inspector').consoleFromVM,\n   Session\n };"
+        },
+        {
+            "sha": "bb07bee6f4a6d94344d5a95b15a28d89bbe2a62e",
+            "filename": "lib/internal/bootstrap/node.js",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 4,
+            "changes": 12,
+            "blob_url": "https://github.com/nodejs/node/blob/d3806f9f3cded6bce9831f5d8ff88372ba7e5861/lib%2Finternal%2Fbootstrap%2Fnode.js",
+            "raw_url": "https://github.com/nodejs/node/raw/d3806f9f3cded6bce9831f5d8ff88372ba7e5861/lib%2Finternal%2Fbootstrap%2Fnode.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fbootstrap%2Fnode.js?ref=d3806f9f3cded6bce9831f5d8ff88372ba7e5861",
+            "patch": "@@ -710,13 +710,17 @@ function setupGlobalConsole() {\n     value: consoleFromNode,\n     writable: true\n   });\n-  // TODO(joyeecheung): can we skip this if inspector is not active?\n+\n   if (config.hasInspector) {\n-    const inspector =\n-      NativeModule.require('internal/console/inspector');\n-    inspector.addInspectorApis(consoleFromNode, consoleFromVM);\n+    const inspector = NativeModule.require('internal/util/inspector');\n     // This will be exposed by `require('inspector').console` later.\n     inspector.consoleFromVM = consoleFromVM;\n+    // TODO(joyeecheung): postpone this until the first time inspector\n+    // is activated.\n+    inspector.wrapConsole(consoleFromNode, consoleFromVM);\n+    const { setConsoleExtensionInstaller } = internalBinding('inspector');\n+    // Setup inspector command line API.\n+    setConsoleExtensionInstaller(inspector.installConsoleExtensions);\n   }\n }\n "
+        },
+        {
+            "sha": "3dbc68a193db533096bd1016f72f79feabc46aae",
+            "filename": "lib/internal/console/inspector.js",
+            "status": "removed",
+            "additions": 0,
+            "deletions": 52,
+            "changes": 52,
+            "blob_url": "https://github.com/nodejs/node/blob/a93c825d7843e72d3e534939639f49ce8e26b16b/lib%2Finternal%2Fconsole%2Finspector.js",
+            "raw_url": "https://github.com/nodejs/node/raw/a93c825d7843e72d3e534939639f49ce8e26b16b/lib%2Finternal%2Fconsole%2Finspector.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fconsole%2Finspector.js?ref=a93c825d7843e72d3e534939639f49ce8e26b16b",
+            "patch": "@@ -1,52 +0,0 @@\n-'use strict';\n-\n-const CJSModule = require('internal/modules/cjs/loader');\n-const { makeRequireFunction } = require('internal/modules/cjs/helpers');\n-const { tryGetCwd } = require('internal/process/execution');\n-const { addCommandLineAPI, consoleCall } = internalBinding('inspector');\n-\n-// Wrap a console implemented by Node.js with features from the VM inspector\n-function addInspectorApis(consoleFromNode, consoleFromVM) {\n-  // Setup inspector command line API.\n-  const cwd = tryGetCwd();\n-  const consoleAPIModule = new CJSModule('<inspector console>');\n-  consoleAPIModule.paths =\n-      CJSModule._nodeModulePaths(cwd).concat(CJSModule.globalPaths);\n-  addCommandLineAPI('require', makeRequireFunction(consoleAPIModule));\n-  const config = {};\n-\n-  // If global console has the same method as inspector console,\n-  // then wrap these two methods into one. Native wrapper will preserve\n-  // the original stack.\n-  for (const key of Object.keys(consoleFromNode)) {\n-    if (!consoleFromVM.hasOwnProperty(key))\n-      continue;\n-    consoleFromNode[key] = consoleCall.bind(consoleFromNode,\n-                                            consoleFromVM[key],\n-                                            consoleFromNode[key],\n-                                            config);\n-  }\n-\n-  // Add additional console APIs from the inspector\n-  for (const key of Object.keys(consoleFromVM)) {\n-    if (consoleFromNode.hasOwnProperty(key))\n-      continue;\n-    consoleFromNode[key] = consoleFromVM[key];\n-  }\n-}\n-\n-module.exports = {\n-  addInspectorApis\n-};\n-\n-// Stores the console from VM, should be set during bootstrap.\n-let consoleFromVM;\n-\n-Object.defineProperty(module.exports, 'consoleFromVM', {\n-  get() {\n-    return consoleFromVM;\n-  },\n-  set(val) {\n-    consoleFromVM = val;\n-  }\n-});"
+        },
+        {
+            "sha": "68c20108bd317b9ecb619d126ba03aad90e8e6c6",
+            "filename": "lib/internal/util/inspector.js",
+            "status": "modified",
+            "additions": 46,
+            "deletions": 5,
+            "changes": 51,
+            "blob_url": "https://github.com/nodejs/node/blob/d3806f9f3cded6bce9831f5d8ff88372ba7e5861/lib%2Finternal%2Futil%2Finspector.js",
+            "raw_url": "https://github.com/nodejs/node/raw/d3806f9f3cded6bce9831f5d8ff88372ba7e5861/lib%2Finternal%2Futil%2Finspector.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Futil%2Finspector.js?ref=d3806f9f3cded6bce9831f5d8ff88372ba7e5861",
+            "patch": "@@ -1,11 +1,9 @@\n 'use strict';\n \n-const { hasInspector } = internalBinding('config');\n-const inspector = hasInspector ? require('inspector') : undefined;\n-\n let session;\n-\n function sendInspectorCommand(cb, onError) {\n+  const { hasInspector } = internalBinding('config');\n+  const inspector = hasInspector ? require('inspector') : undefined;\n   if (!hasInspector) return onError();\n   if (session === undefined) session = new inspector.Session();\n   try {\n@@ -20,6 +18,49 @@ function sendInspectorCommand(cb, onError) {\n   }\n }\n \n+// Create a special require function for the inspector command line API\n+function installConsoleExtensions(commandLineApi) {\n+  if (commandLineApi.require) { return; }\n+  const { tryGetCwd } = require('internal/process/execution');\n+  const CJSModule = require('internal/modules/cjs/loader');\n+  const { makeRequireFunction } = require('internal/modules/cjs/helpers');\n+  const consoleAPIModule = new CJSModule('<inspector console>');\n+  const cwd = tryGetCwd();\n+  consoleAPIModule.paths =\n+      CJSModule._nodeModulePaths(cwd).concat(CJSModule.globalPaths);\n+  commandLineApi.require = makeRequireFunction(consoleAPIModule);\n+}\n+\n+// Wrap a console implemented by Node.js with features from the VM inspector\n+function wrapConsole(consoleFromNode, consoleFromVM) {\n+  const config = {};\n+  const { consoleCall } = internalBinding('inspector');\n+  for (const key of Object.keys(consoleFromVM)) {\n+    // If global console has the same method as inspector console,\n+    // then wrap these two methods into one. Native wrapper will preserve\n+    // the original stack.\n+    if (consoleFromNode.hasOwnProperty(key)) {\n+      consoleFromNode[key] = consoleCall.bind(consoleFromNode,\n+                                              consoleFromVM[key],\n+                                              consoleFromNode[key],\n+                                              config);\n+    } else {\n+      // Add additional console APIs from the inspector\n+      consoleFromNode[key] = consoleFromVM[key];\n+    }\n+  }\n+}\n+\n+// Stores the console from VM, should be set during bootstrap.\n+let consoleFromVM;\n module.exports = {\n-  sendInspectorCommand\n+  installConsoleExtensions,\n+  sendInspectorCommand,\n+  wrapConsole,\n+  get consoleFromVM() {\n+    return consoleFromVM;\n+  },\n+  set consoleFromVM(val) {\n+    consoleFromVM = val;\n+  }\n };"
+        },
+        {
+            "sha": "6a536c9285a20faec546b719212f11b85c5a909b",
+            "filename": "node.gyp",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 1,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/d3806f9f3cded6bce9831f5d8ff88372ba7e5861/node.gyp",
+            "raw_url": "https://github.com/nodejs/node/raw/d3806f9f3cded6bce9831f5d8ff88372ba7e5861/node.gyp",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/node.gyp?ref=d3806f9f3cded6bce9831f5d8ff88372ba7e5861",
+            "patch": "@@ -97,7 +97,6 @@\n       'lib/internal/cluster/worker.js',\n       'lib/internal/console/constructor.js',\n       'lib/internal/console/global.js',\n-      'lib/internal/console/inspector.js',\n       'lib/internal/coverage-gen/with_profiler.js',\n       'lib/internal/crypto/certificate.js',\n       'lib/internal/crypto/cipher.js',"
+        },
+        {
+            "sha": "97cfc72a9dd58e4900fbdbeda494375cd9cfbab8",
+            "filename": "src/env.cc",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 7,
+            "changes": 7,
+            "blob_url": "https://github.com/nodejs/node/blob/d3806f9f3cded6bce9831f5d8ff88372ba7e5861/src%2Fenv.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/d3806f9f3cded6bce9831f5d8ff88372ba7e5861/src%2Fenv.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv.cc?ref=d3806f9f3cded6bce9831f5d8ff88372ba7e5861",
+            "patch": "@@ -352,13 +352,6 @@ void Environment::Start(const std::vector<std::string>& args,\n   static uv_once_t init_once = UV_ONCE_INIT;\n   uv_once(&init_once, InitThreadLocalOnce);\n   uv_key_set(&thread_local_env, this);\n-\n-#if HAVE_INSPECTOR\n-  // This needs to be set before we start the inspector\n-  Local<Object> obj = Object::New(isolate());\n-  CHECK(obj->SetPrototype(context(), Null(isolate())).FromJust());\n-  set_inspector_console_api_object(obj);\n-#endif  // HAVE_INSPECTOR\n }\n \n void Environment::RegisterHandleCleanups() {"
+        },
+        {
+            "sha": "9de45a464bd421f86dfdaebb3cb289ee34c7a2cd",
+            "filename": "src/env.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/d3806f9f3cded6bce9831f5d8ff88372ba7e5861/src%2Fenv.h",
+            "raw_url": "https://github.com/nodejs/node/raw/d3806f9f3cded6bce9831f5d8ff88372ba7e5861/src%2Fenv.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv.h?ref=d3806f9f3cded6bce9831f5d8ff88372ba7e5861",
+            "patch": "@@ -356,7 +356,7 @@ constexpr size_t kFsStatsBufferLength = kFsStatsFieldsNumber * 2;\n   V(http2settings_constructor_template, v8::ObjectTemplate)                    \\\n   V(http2stream_constructor_template, v8::ObjectTemplate)                      \\\n   V(immediate_callback_function, v8::Function)                                 \\\n-  V(inspector_console_api_object, v8::Object)                                  \\\n+  V(inspector_console_extension_installer, v8::Function)                       \\\n   V(libuv_stream_wrap_ctor_template, v8::FunctionTemplate)                     \\\n   V(message_port, v8::Object)                                                  \\\n   V(message_port_constructor_template, v8::FunctionTemplate)                   \\"
+        },
+        {
+            "sha": "dcc256b7f70434fc39e1ae2818b7099b8fe0325b",
+            "filename": "src/inspector_agent.cc",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 11,
+            "changes": 16,
+            "blob_url": "https://github.com/nodejs/node/blob/d3806f9f3cded6bce9831f5d8ff88372ba7e5861/src%2Finspector_agent.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/d3806f9f3cded6bce9831f5d8ff88372ba7e5861/src%2Finspector_agent.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Finspector_agent.cc?ref=d3806f9f3cded6bce9831f5d8ff88372ba7e5861",
+            "patch": "@@ -32,7 +32,6 @@ namespace {\n \n using node::FatalError;\n \n-using v8::Array;\n using v8::Context;\n using v8::Function;\n using v8::HandleScope;\n@@ -493,16 +492,11 @@ class NodeInspectorClient : public V8InspectorClient {\n \n   void installAdditionalCommandLineAPI(Local<Context> context,\n                                        Local<Object> target) override {\n-    Local<Object> console_api = env_->inspector_console_api_object();\n-    CHECK(!console_api.IsEmpty());\n-\n-    Local<Array> properties =\n-        console_api->GetOwnPropertyNames(context).ToLocalChecked();\n-    for (uint32_t i = 0; i < properties->Length(); ++i) {\n-      Local<Value> key = properties->Get(context, i).ToLocalChecked();\n-      target->Set(context,\n-                  key,\n-                  console_api->Get(context, key).ToLocalChecked()).FromJust();\n+    Local<Function> installer = env_->inspector_console_extension_installer();\n+    if (!installer.IsEmpty()) {\n+      Local<Value> argv[] = {target};\n+      // If there is an exception, proceed in JS land\n+      USE(installer->Call(context, target, arraysize(argv), argv));\n     }\n   }\n "
+        },
+        {
+            "sha": "8802998e9a021e4cee592794f51a45ba7d494492",
+            "filename": "src/inspector_js_api.cc",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 8,
+            "changes": 14,
+            "blob_url": "https://github.com/nodejs/node/blob/d3806f9f3cded6bce9831f5d8ff88372ba7e5861/src%2Finspector_js_api.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/d3806f9f3cded6bce9831f5d8ff88372ba7e5861/src%2Finspector_js_api.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Finspector_js_api.cc?ref=d3806f9f3cded6bce9831f5d8ff88372ba7e5861",
+            "patch": "@@ -122,16 +122,13 @@ static bool InspectorEnabled(Environment* env) {\n   return agent->IsActive();\n }\n \n-void AddCommandLineAPI(const FunctionCallbackInfo<Value>& info) {\n+void SetConsoleExtensionInstaller(const FunctionCallbackInfo<Value>& info) {\n   auto env = Environment::GetCurrent(info);\n-  Local<Context> context = env->context();\n \n-  // inspector.addCommandLineAPI takes 2 arguments: a string and a value.\n-  CHECK_EQ(info.Length(), 2);\n-  CHECK(info[0]->IsString());\n+  CHECK_EQ(info.Length(), 1);\n+  CHECK(info[0]->IsFunction());\n \n-  Local<Object> console_api = env->inspector_console_api_object();\n-  console_api->Set(context, info[0], info[1]).FromJust();\n+  env->set_inspector_console_extension_installer(info[0].As<Function>());\n }\n \n void CallAndPauseOnStart(const FunctionCallbackInfo<v8::Value>& args) {\n@@ -279,7 +276,8 @@ void Initialize(Local<Object> target, Local<Value> unused,\n \n   Agent* agent = env->inspector_agent();\n   env->SetMethod(target, \"consoleCall\", InspectorConsoleCall);\n-  env->SetMethod(target, \"addCommandLineAPI\", AddCommandLineAPI);\n+  env->SetMethod(\n+      target, \"setConsoleExtensionInstaller\", SetConsoleExtensionInstaller);\n   if (agent->WillWaitForConnect())\n     env->SetMethod(target, \"callAndPauseOnStart\", CallAndPauseOnStart);\n   env->SetMethod(target, \"open\", Open);"
+        }
+    ],
+    "stats": {
+        "total": 157,
+        "additions": 67,
+        "deletions": 90
+    }
+}

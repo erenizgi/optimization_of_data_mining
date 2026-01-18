@@ -1,0 +1,48 @@
+{
+    "author": "joyeecheung",
+    "message": "src: lazily load internalBinding('uv') and build the errmap lazily\n\nThis removes the `internalBinding('uv')` call from the normal\nbootstrap for now, and avoids building `errmap` by default which\nexpands to a lot of calls into V8.\n\nPR-URL: https://github.com/nodejs/node/pull/25143\nReviewed-By: Anna Henningsen <anna@addaleax.net>\nReviewed-By: Daniel Bevenius <daniel.bevenius@gmail.com>\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Ruben Bridgewater <ruben@bridgewater.de>",
+    "sha": "c66c0732e0887c3f07a3e387d8a90b432eae134e",
+    "files": [
+        {
+            "sha": "dae7f8600d17864e494d0d2d92274ea4a1dd926a",
+            "filename": "lib/internal/errors.js",
+            "status": "modified",
+            "additions": 21,
+            "deletions": 8,
+            "changes": 29,
+            "blob_url": "https://github.com/nodejs/node/blob/c66c0732e0887c3f07a3e387d8a90b432eae134e/lib%2Finternal%2Ferrors.js",
+            "raw_url": "https://github.com/nodejs/node/raw/c66c0732e0887c3f07a3e387d8a90b432eae134e/lib%2Finternal%2Ferrors.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Ferrors.js?ref=c66c0732e0887c3f07a3e387d8a90b432eae134e",
+            "patch": "@@ -15,11 +15,6 @@ const kInfo = Symbol('info');\n const messages = new Map();\n const codes = {};\n \n-const {\n-  errmap,\n-  UV_EAI_NODATA,\n-  UV_EAI_NONAME\n-} = internalBinding('uv');\n const { kMaxLength } = internalBinding('buffer');\n const { defineProperty } = Object;\n \n@@ -237,6 +232,24 @@ function getMessage(key, args) {\n   return util.format.apply(null, args);\n }\n \n+let uvBinding;\n+\n+function lazyUv() {\n+  if (!uvBinding) {\n+    uvBinding = internalBinding('uv');\n+  }\n+  return uvBinding;\n+}\n+\n+function lazyErrmapGet(name) {\n+  uvBinding = lazyUv();\n+  if (!uvBinding.errmap) {\n+    uvBinding.errmap = uvBinding.getErrorMap();\n+  }\n+  return uvBinding.errmap.get(name);\n+}\n+\n+\n /**\n  * This creates an error compatible with errors produced in the C++\n  * function UVException using a context object with data assembled in C++.\n@@ -247,7 +260,7 @@ function getMessage(key, args) {\n  * @returns {Error}\n  */\n function uvException(ctx) {\n-  const [ code, uvmsg ] = errmap.get(ctx.errno);\n+  const [ code, uvmsg ] = lazyErrmapGet(ctx.errno);\n   let message = `${code}: ${ctx.message || uvmsg}, ${ctx.syscall}`;\n \n   let path;\n@@ -303,7 +316,7 @@ function uvException(ctx) {\n  * @returns {Error}\n  */\n function uvExceptionWithHostPort(err, syscall, address, port) {\n-  const [ code, uvmsg ] = errmap.get(err);\n+  const [ code, uvmsg ] = lazyErrmapGet(err);\n   const message = `${syscall} ${code}: ${uvmsg}`;\n   let details = '';\n \n@@ -421,7 +434,7 @@ function dnsException(code, syscall, hostname) {\n   if (typeof code === 'number') {\n     // FIXME(bnoordhuis) Remove this backwards compatibility nonsense and pass\n     // the true error to the user. ENOTFOUND is not even a proper POSIX error!\n-    if (code === UV_EAI_NODATA || code === UV_EAI_NONAME) {\n+    if (code === lazyUv().UV_EAI_NODATA || code === lazyUv().UV_EAI_NONAME) {\n       code = 'ENOTFOUND'; // Fabricated error name.\n     } else {\n       code = lazyInternalUtil().getSystemErrorName(code);"
+        },
+        {
+            "sha": "902375afdb0b52c5be608197f33e0809fbd94340",
+            "filename": "lib/internal/util.js",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 3,
+            "changes": 15,
+            "blob_url": "https://github.com/nodejs/node/blob/c66c0732e0887c3f07a3e387d8a90b432eae134e/lib%2Finternal%2Futil.js",
+            "raw_url": "https://github.com/nodejs/node/raw/c66c0732e0887c3f07a3e387d8a90b432eae134e/lib%2Finternal%2Futil.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Futil.js?ref=c66c0732e0887c3f07a3e387d8a90b432eae134e",
+            "patch": "@@ -16,8 +16,6 @@ const {\n   isNativeError\n } = require('internal/util/types');\n \n-const { errmap } = internalBinding('uv');\n-\n const noCrypto = !process.versions.openssl;\n \n const experimentalWarnings = new Set();\n@@ -250,8 +248,19 @@ function getConstructorOf(obj) {\n   return null;\n }\n \n+let uvBinding;\n+function lazyErrmapGet(name) {\n+  if (!uvBinding) {\n+    uvBinding = internalBinding('uv');\n+  }\n+  if (!uvBinding.errmap) {\n+    uvBinding.errmap = uvBinding.getErrorMap();\n+  }\n+  return uvBinding.errmap.get(name);\n+}\n+\n function getSystemErrorName(err) {\n-  const entry = errmap.get(err);\n+  const entry = lazyErrmapGet(err);\n   return entry ? entry[0] : `Unknown system error ${err}`;\n }\n "
+        },
+        {
+            "sha": "a7d0b1012ce2f4e2304a8ef03d0f44f130862d52",
+            "filename": "src/uv.cc",
+            "status": "modified",
+            "additions": 57,
+            "deletions": 22,
+            "changes": 79,
+            "blob_url": "https://github.com/nodejs/node/blob/c66c0732e0887c3f07a3e387d8a90b432eae134e/src%2Fuv.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/c66c0732e0887c3f07a3e387d8a90b432eae134e/src%2Fuv.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fuv.cc?ref=c66c0732e0887c3f07a3e387d8a90b432eae134e",
+            "patch": "@@ -25,20 +25,39 @@\n #include \"env-inl.h\"\n \n namespace node {\n+\n+namespace per_process {\n+struct UVError {\n+  int value;\n+  const char* name;\n+  const char* message;\n+};\n+\n+// We only expand the macro once here to reduce the amount of code\n+// generated.\n+static const struct UVError uv_errors_map[] = {\n+#define V(name, message) {UV_##name, #name, message},\n+    UV_ERRNO_MAP(V)\n+#undef V\n+};\n+}  // namespace per_process\n+\n namespace {\n \n using v8::Array;\n using v8::Context;\n+using v8::DontDelete;\n using v8::FunctionCallbackInfo;\n using v8::Integer;\n using v8::Isolate;\n using v8::Local;\n using v8::Map;\n using v8::Object;\n+using v8::PropertyAttribute;\n+using v8::ReadOnly;\n using v8::String;\n using v8::Value;\n \n-\n void ErrName(const FunctionCallbackInfo<Value>& args) {\n   Environment* env = Environment::GetCurrent(args);\n   if (env->options()->pending_deprecation && env->EmitErrNameWarning()) {\n@@ -57,6 +76,29 @@ void ErrName(const FunctionCallbackInfo<Value>& args) {\n   args.GetReturnValue().Set(OneByteString(env->isolate(), name));\n }\n \n+void GetErrMap(const FunctionCallbackInfo<Value>& args) {\n+  Environment* env = Environment::GetCurrent(args);\n+  Isolate* isolate = env->isolate();\n+  Local<Context> context = env->context();\n+\n+  Local<Map> err_map = Map::New(isolate);\n+\n+  size_t errors_len = arraysize(per_process::uv_errors_map);\n+  for (size_t i = 0; i < errors_len; ++i) {\n+    const auto& error = per_process::uv_errors_map[i];\n+    Local<Value> arr[] = {OneByteString(isolate, error.name),\n+                          OneByteString(isolate, error.message)};\n+    if (err_map\n+            ->Set(context,\n+                  Integer::New(isolate, error.value),\n+                  Array::New(isolate, arr, arraysize(arr)))\n+            .IsEmpty()) {\n+      return;\n+    }\n+  }\n+\n+  args.GetReturnValue().Set(err_map);\n+}\n \n void Initialize(Local<Object> target,\n                 Local<Value> unused,\n@@ -70,28 +112,21 @@ void Initialize(Local<Object> target,\n                   ->GetFunction(env->context())\n                   .ToLocalChecked()).FromJust();\n \n-#define V(name, _) NODE_DEFINE_CONSTANT(target, UV_##name);\n-  UV_ERRNO_MAP(V)\n-#undef V\n-\n-  Local<Map> err_map = Map::New(isolate);\n-\n-#define V(name, msg) do {                                                     \\\n-  Local<Value> arr[] = {                                                      \\\n-    OneByteString(isolate, #name),                                            \\\n-    OneByteString(isolate, msg)                                               \\\n-  };                                                                          \\\n-  if (err_map->Set(context,                                                   \\\n-                   Integer::New(isolate, UV_##name),                          \\\n-                   Array::New(isolate, arr, arraysize(arr))).IsEmpty()) {     \\\n-    return;                                                                   \\\n-  }                                                                           \\\n-} while (0);\n-  UV_ERRNO_MAP(V)\n-#undef V\n+  // TODO(joyeecheung): This should be deprecated in user land in favor of\n+  // `util.getSystemErrorName(err)`.\n+  PropertyAttribute attributes =\n+      static_cast<PropertyAttribute>(ReadOnly | DontDelete);\n+  size_t errors_len = arraysize(per_process::uv_errors_map);\n+  const std::string prefix = \"UV_\";\n+  for (size_t i = 0; i < errors_len; ++i) {\n+    const auto& error = per_process::uv_errors_map[i];\n+    const std::string prefixed_name = prefix + error.name;\n+    Local<String> name = OneByteString(isolate, prefixed_name.c_str());\n+    Local<Integer> value = Integer::New(isolate, error.value);\n+    target->DefineOwnProperty(context, name, value, attributes).FromJust();\n+  }\n \n-  target->Set(context, FIXED_ONE_BYTE_STRING(isolate, \"errmap\"),\n-              err_map).FromJust();\n+  env->SetMethod(target, \"getErrorMap\", GetErrMap);\n }\n \n }  // anonymous namespace"
+        }
+    ],
+    "stats": {
+        "total": 123,
+        "additions": 90,
+        "deletions": 33
+    }
+}

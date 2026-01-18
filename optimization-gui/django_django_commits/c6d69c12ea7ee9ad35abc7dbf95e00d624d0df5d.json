@@ -1,0 +1,36 @@
+{
+    "author": "carljm",
+    "message": "Restrict the XML deserializer to prevent network and entity-expansion DoS attacks.\n\nThis is a security fix. Disclosure and advisory coming shortly.",
+    "sha": "c6d69c12ea7ee9ad35abc7dbf95e00d624d0df5d",
+    "files": [
+        {
+            "sha": "9dd4eee282eaf27983921b56eee94561d0519d47",
+            "filename": "django/core/serializers/xml_serializer.py",
+            "status": "modified",
+            "additions": 94,
+            "deletions": 1,
+            "changes": 95,
+            "blob_url": "https://github.com/django/django/blob/c6d69c12ea7ee9ad35abc7dbf95e00d624d0df5d/django%2Fcore%2Fserializers%2Fxml_serializer.py",
+            "raw_url": "https://github.com/django/django/raw/c6d69c12ea7ee9ad35abc7dbf95e00d624d0df5d/django%2Fcore%2Fserializers%2Fxml_serializer.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fcore%2Fserializers%2Fxml_serializer.py?ref=c6d69c12ea7ee9ad35abc7dbf95e00d624d0df5d",
+            "patch": "@@ -10,6 +10,8 @@\n from django.utils.xmlutils import SimplerXMLGenerator\n from django.utils.encoding import smart_text\n from xml.dom import pulldom\n+from xml.sax import handler\n+from xml.sax.expatreader import ExpatParser as _ExpatParser\n \n class Serializer(base.Serializer):\n     \"\"\"\n@@ -151,9 +153,13 @@ class Deserializer(base.Deserializer):\n \n     def __init__(self, stream_or_string, **options):\n         super(Deserializer, self).__init__(stream_or_string, **options)\n-        self.event_stream = pulldom.parse(self.stream)\n+        self.event_stream = pulldom.parse(self.stream, self._make_parser())\n         self.db = options.pop('using', DEFAULT_DB_ALIAS)\n \n+    def _make_parser(self):\n+        \"\"\"Create a hardened XML parser (no custom/external entities).\"\"\"\n+        return DefusedExpatParser()\n+\n     def __next__(self):\n         for event, node in self.event_stream:\n             if event == \"START_ELEMENT\" and node.nodeName == \"object\":\n@@ -292,3 +298,90 @@ def getInnerText(node):\n         else:\n            pass\n     return \"\".join(inner_text)\n+\n+\n+# Below code based on Christian Heimes' defusedxml\n+\n+\n+class DefusedExpatParser(_ExpatParser):\n+    \"\"\"\n+    An expat parser hardened against XML bomb attacks.\n+\n+    Forbids DTDs, external entity references\n+\n+    \"\"\"\n+    def __init__(self, *args, **kwargs):\n+        _ExpatParser.__init__(self, *args, **kwargs)\n+        self.setFeature(handler.feature_external_ges, False)\n+        self.setFeature(handler.feature_external_pes, False)\n+\n+    def start_doctype_decl(self, name, sysid, pubid, has_internal_subset):\n+        raise DTDForbidden(name, sysid, pubid)\n+\n+    def entity_decl(self, name, is_parameter_entity, value, base,\n+                    sysid, pubid, notation_name):\n+        raise EntitiesForbidden(name, value, base, sysid, pubid, notation_name)\n+\n+    def unparsed_entity_decl(self, name, base, sysid, pubid, notation_name):\n+        # expat 1.2\n+        raise EntitiesForbidden(name, None, base, sysid, pubid, notation_name)\n+\n+    def external_entity_ref_handler(self, context, base, sysid, pubid):\n+        raise ExternalReferenceForbidden(context, base, sysid, pubid)\n+\n+    def reset(self):\n+        _ExpatParser.reset(self)\n+        parser = self._parser\n+        parser.StartDoctypeDeclHandler = self.start_doctype_decl\n+        parser.EntityDeclHandler = self.entity_decl\n+        parser.UnparsedEntityDeclHandler = self.unparsed_entity_decl\n+        parser.ExternalEntityRefHandler = self.external_entity_ref_handler\n+\n+\n+class DefusedXmlException(ValueError):\n+    \"\"\"Base exception.\"\"\"\n+    def __repr__(self):\n+        return str(self)\n+\n+\n+class DTDForbidden(DefusedXmlException):\n+    \"\"\"Document type definition is forbidden.\"\"\"\n+    def __init__(self, name, sysid, pubid):\n+        super(DTDForbidden, self).__init__()\n+        self.name = name\n+        self.sysid = sysid\n+        self.pubid = pubid\n+\n+    def __str__(self):\n+        tpl = \"DTDForbidden(name='{}', system_id={!r}, public_id={!r})\"\n+        return tpl.format(self.name, self.sysid, self.pubid)\n+\n+\n+class EntitiesForbidden(DefusedXmlException):\n+    \"\"\"Entity definition is forbidden.\"\"\"\n+    def __init__(self, name, value, base, sysid, pubid, notation_name):\n+        super(EntitiesForbidden, self).__init__()\n+        self.name = name\n+        self.value = value\n+        self.base = base\n+        self.sysid = sysid\n+        self.pubid = pubid\n+        self.notation_name = notation_name\n+\n+    def __str__(self):\n+        tpl = \"EntitiesForbidden(name='{}', system_id={!r}, public_id={!r})\"\n+        return tpl.format(self.name, self.sysid, self.pubid)\n+\n+\n+class ExternalReferenceForbidden(DefusedXmlException):\n+    \"\"\"Resolving an external reference is forbidden.\"\"\"\n+    def __init__(self, context, base, sysid, pubid):\n+        super(ExternalReferenceForbidden, self).__init__()\n+        self.context = context\n+        self.base = base\n+        self.sysid = sysid\n+        self.pubid = pubid\n+\n+    def __str__(self):\n+        tpl = \"ExternalReferenceForbidden(system_id='{}', public_id={})\"\n+        return tpl.format(self.sysid, self.pubid)"
+        },
+        {
+            "sha": "e586d76e7f3f5b19ee54f5b9f64fdb17685fee8f",
+            "filename": "tests/regressiontests/serializers_regress/tests.py",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 0,
+            "changes": 15,
+            "blob_url": "https://github.com/django/django/blob/c6d69c12ea7ee9ad35abc7dbf95e00d624d0df5d/tests%2Fregressiontests%2Fserializers_regress%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/c6d69c12ea7ee9ad35abc7dbf95e00d624d0df5d/tests%2Fregressiontests%2Fserializers_regress%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fserializers_regress%2Ftests.py?ref=c6d69c12ea7ee9ad35abc7dbf95e00d624d0df5d",
+            "patch": "@@ -10,6 +10,7 @@\n \n import datetime\n import decimal\n+from django.core.serializers.xml_serializer import DTDForbidden\n \n try:\n     import yaml\n@@ -514,3 +515,17 @@ def streamTest(format, self):\n     if format != 'python':\n         setattr(SerializerTests, 'test_' + format + '_serializer_stream', curry(streamTest, format))\n \n+\n+class XmlDeserializerSecurityTests(TestCase):\n+\n+    def test_no_dtd(self):\n+        \"\"\"\n+        The XML deserializer shouldn't allow a DTD.\n+\n+        This is the most straightforward way to prevent all entity definitions\n+        and avoid both external entities and entity-expansion attacks.\n+\n+        \"\"\"\n+        xml = '<?xml version=\"1.0\" standalone=\"no\"?><!DOCTYPE example SYSTEM \"http://example.com/example.dtd\">'\n+        with self.assertRaises(DTDForbidden):\n+            next(serializers.deserialize('xml', xml))"
+        }
+    ],
+    "stats": {
+        "total": 110,
+        "additions": 109,
+        "deletions": 1
+    }
+}

@@ -1,0 +1,120 @@
+{
+    "author": "addaleax",
+    "message": "test: add heap snapshot tests\n\nAdd a number of tests that validate that heap snapshots\ncontain what we expect them to contain, and cross-check\nagainst a JS version of our own embedder graphs.\n\nPR-URL: https://github.com/nodejs/node/pull/21741\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Joyee Cheung <joyeec9h3@gmail.com>\nReviewed-By: Refael Ackermann <refack@gmail.com>",
+    "sha": "1009118d27b069411016df4ca6915aac3c36a41f",
+    "files": [
+        {
+            "sha": "c0051ad9f7ca6ebb19a051b52efc0813d61215f9",
+            "filename": "test/common/README.md",
+            "status": "modified",
+            "additions": 37,
+            "deletions": 0,
+            "changes": 37,
+            "blob_url": "https://github.com/nodejs/node/blob/1009118d27b069411016df4ca6915aac3c36a41f/test%2Fcommon%2FREADME.md",
+            "raw_url": "https://github.com/nodejs/node/raw/1009118d27b069411016df4ca6915aac3c36a41f/test%2Fcommon%2FREADME.md",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fcommon%2FREADME.md?ref=1009118d27b069411016df4ca6915aac3c36a41f",
+            "patch": "@@ -10,6 +10,7 @@ This directory contains modules used to test the Node.js implementation.\n * [DNS module](#dns-module)\n * [Duplex pair helper](#duplex-pair-helper)\n * [Fixtures module](#fixtures-module)\n+* [Heap dump checker module](#heap-dump-checker-module)\n * [HTTP2 module](#http2-module)\n * [Internet module](#internet-module)\n * [tmpdir module](#tmpdir-module)\n@@ -538,6 +539,42 @@ Returns the result of\n Returns the result of\n `fs.readFileSync(path.join(fixtures.fixturesDir, 'keys', arg), 'enc')`.\n \n+## Heap dump checker module\n+\n+This provides utilities for checking the validity of heap dumps.\n+This requires the usage of `--expose-internals`.\n+\n+### heap.recordState()\n+\n+Create a heap dump and an embedder graph copy for inspection.\n+The returned object has a `validateSnapshotNodes` function similar to the\n+one listed below. (`heap.validateSnapshotNodes(...)` is a shortcut for\n+`heap.recordState().validateSnapshotNodes(...)`.)\n+\n+### heap.validateSnapshotNodes(name, expected, options)\n+\n+* `name` [&lt;string>] Look for this string as the name of heap dump nodes.\n+* `expected` [&lt;Array>] A list of objects, possibly with an `children`\n+  property that points to expected other adjacent nodes.\n+* `options` [&lt;Array>]\n+  * `loose` [&lt;boolean>] Do not expect an exact listing of occurrences\n+    of nodes with name `name` in `expected`.\n+\n+Create a heap dump and an embedder graph copy and validate occurrences.\n+\n+<!-- eslint-disable no-undef, no-unused-vars, node-core/required-modules, strict -->\n+```js\n+validateSnapshotNodes('TLSWRAP', [\n+  {\n+    children: [\n+      { name: 'enc_out' },\n+      { name: 'enc_in' },\n+      { name: 'TLSWrap' }\n+    ]\n+  }\n+]);\n+```\n+\n ## HTTP/2 Module\n \n The http2.js module provides a handful of utilities for creating mock HTTP/2"
+        },
+        {
+            "sha": "a02de9a60651f4f7367e0992c7e6e46156ea5670",
+            "filename": "test/common/heap.js",
+            "status": "added",
+            "additions": 80,
+            "deletions": 0,
+            "changes": 80,
+            "blob_url": "https://github.com/nodejs/node/blob/1009118d27b069411016df4ca6915aac3c36a41f/test%2Fcommon%2Fheap.js",
+            "raw_url": "https://github.com/nodejs/node/raw/1009118d27b069411016df4ca6915aac3c36a41f/test%2Fcommon%2Fheap.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fcommon%2Fheap.js?ref=1009118d27b069411016df4ca6915aac3c36a41f",
+            "patch": "@@ -0,0 +1,80 @@\n+/* eslint-disable node-core/required-modules */\n+'use strict';\n+const assert = require('assert');\n+const util = require('util');\n+\n+let internalTestHeap;\n+try {\n+  internalTestHeap = require('internal/test/heap');\n+} catch (e) {\n+  console.log('using `test/common/heap.js` requires `--expose-internals`');\n+  throw e;\n+}\n+const { createJSHeapDump, buildEmbedderGraph } = internalTestHeap;\n+\n+class State {\n+  constructor() {\n+    this.snapshot = createJSHeapDump();\n+    this.embedderGraph = buildEmbedderGraph();\n+  }\n+\n+  validateSnapshotNodes(name, expected, { loose = false } = {}) {\n+    const snapshot = this.snapshot.filter(\n+      (node) => node.name === 'Node / ' + name && node.type !== 'string');\n+    if (loose)\n+      assert(snapshot.length >= expected.length);\n+    else\n+      assert.strictEqual(snapshot.length, expected.length);\n+    for (const expectedNode of expected) {\n+      if (expectedNode.children) {\n+        for (const expectedChild of expectedNode.children) {\n+          const check = typeof expectedChild === 'function' ?\n+            expectedChild :\n+            (node) => [expectedChild.name, 'Node / ' + expectedChild.name]\n+              .includes(node.name);\n+\n+          assert(snapshot.some((node) => {\n+            return node.outgoingEdges.map((edge) => edge.toNode).some(check);\n+          }), `expected to find child ${util.inspect(expectedChild)} ` +\n+              `in ${util.inspect(snapshot)}`);\n+        }\n+      }\n+    }\n+\n+    const graph = this.embedderGraph.filter((node) => node.name === name);\n+    if (loose)\n+      assert(graph.length >= expected.length);\n+    else\n+      assert.strictEqual(graph.length, expected.length);\n+    for (const expectedNode of expected) {\n+      if (expectedNode.edges) {\n+        for (const expectedChild of expectedNode.children) {\n+          const check = typeof expectedChild === 'function' ?\n+            expectedChild : (node) => {\n+              return node.name === expectedChild.name ||\n+                (node.value &&\n+                 node.value.constructor &&\n+                 node.value.constructor.name === expectedChild.name);\n+            };\n+\n+          assert(graph.some((node) => node.edges.some(check)),\n+                 `expected to find child ${util.inspect(expectedChild)} ` +\n+                 `in ${util.inspect(snapshot)}`);\n+        }\n+      }\n+    }\n+  }\n+}\n+\n+function recordState() {\n+  return new State();\n+}\n+\n+function validateSnapshotNodes(...args) {\n+  return recordState().validateSnapshotNodes(...args);\n+}\n+\n+module.exports = {\n+  recordState,\n+  validateSnapshotNodes\n+};"
+        },
+        {
+            "sha": "011503f5874d5af78a08a3080a2c134eed95e349",
+            "filename": "test/parallel/test-heapdump-dns.js",
+            "status": "added",
+            "additions": 17,
+            "deletions": 0,
+            "changes": 17,
+            "blob_url": "https://github.com/nodejs/node/blob/1009118d27b069411016df4ca6915aac3c36a41f/test%2Fparallel%2Ftest-heapdump-dns.js",
+            "raw_url": "https://github.com/nodejs/node/raw/1009118d27b069411016df4ca6915aac3c36a41f/test%2Fparallel%2Ftest-heapdump-dns.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-heapdump-dns.js?ref=1009118d27b069411016df4ca6915aac3c36a41f",
+            "patch": "@@ -0,0 +1,17 @@\n+// Flags: --expose-internals\n+'use strict';\n+require('../common');\n+const { validateSnapshotNodes } = require('../common/heap');\n+\n+validateSnapshotNodes('DNSCHANNEL', []);\n+const dns = require('dns');\n+validateSnapshotNodes('DNSCHANNEL', [{}]);\n+dns.resolve('localhost', () => {});\n+validateSnapshotNodes('DNSCHANNEL', [\n+  {\n+    children: [\n+      { name: 'task list' },\n+      { name: 'ChannelWrap' }\n+    ]\n+  }\n+]);"
+        },
+        {
+            "sha": "be44b3d8731bc13439d103df3c9ae46f064cadd2",
+            "filename": "test/parallel/test-heapdump-fs-promise.js",
+            "status": "added",
+            "additions": 16,
+            "deletions": 0,
+            "changes": 16,
+            "blob_url": "https://github.com/nodejs/node/blob/1009118d27b069411016df4ca6915aac3c36a41f/test%2Fparallel%2Ftest-heapdump-fs-promise.js",
+            "raw_url": "https://github.com/nodejs/node/raw/1009118d27b069411016df4ca6915aac3c36a41f/test%2Fparallel%2Ftest-heapdump-fs-promise.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-heapdump-fs-promise.js?ref=1009118d27b069411016df4ca6915aac3c36a41f",
+            "patch": "@@ -0,0 +1,16 @@\n+// Flags: --expose-internals\n+'use strict';\n+require('../common');\n+const { validateSnapshotNodes } = require('../common/heap');\n+const fs = require('fs').promises;\n+\n+validateSnapshotNodes('FSREQPROMISE', []);\n+fs.stat(__filename);\n+validateSnapshotNodes('FSREQPROMISE', [\n+  {\n+    children: [\n+      { name: 'FSReqPromise' },\n+      { name: 'Float64Array' }  // Stat array\n+    ]\n+  }\n+]);"
+        },
+        {
+            "sha": "19a70d8c44b15dd991a7e7755a46a525af4939c5",
+            "filename": "test/parallel/test-heapdump-http2.js",
+            "status": "added",
+            "additions": 76,
+            "deletions": 0,
+            "changes": 76,
+            "blob_url": "https://github.com/nodejs/node/blob/1009118d27b069411016df4ca6915aac3c36a41f/test%2Fparallel%2Ftest-heapdump-http2.js",
+            "raw_url": "https://github.com/nodejs/node/raw/1009118d27b069411016df4ca6915aac3c36a41f/test%2Fparallel%2Ftest-heapdump-http2.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-heapdump-http2.js?ref=1009118d27b069411016df4ca6915aac3c36a41f",
+            "patch": "@@ -0,0 +1,76 @@\n+// Flags: --expose-internals\n+'use strict';\n+const common = require('../common');\n+const { recordState } = require('../common/heap');\n+const http2 = require('http2');\n+if (!common.hasCrypto)\n+  common.skip('missing crypto');\n+\n+{\n+  const state = recordState();\n+  state.validateSnapshotNodes('HTTP2SESSION', []);\n+  state.validateSnapshotNodes('HTTP2STREAM', []);\n+}\n+\n+const server = http2.createServer();\n+server.on('stream', (stream) => {\n+  stream.respondWithFile(__filename);\n+});\n+server.listen(0, () => {\n+  const client = http2.connect(`http://localhost:${server.address().port}`);\n+  const req = client.request();\n+\n+  req.on('response', common.mustCall(() => {\n+    const state = recordState();\n+    state.validateSnapshotNodes('HTTP2STREAM', [\n+      {\n+        children: [\n+          { name: 'Http2Stream' }\n+        ]\n+      },\n+    ], { loose: true });\n+    state.validateSnapshotNodes('FILEHANDLE', [\n+      {\n+        children: [\n+          { name: 'FileHandle' }\n+        ]\n+      }\n+    ]);\n+    state.validateSnapshotNodes('TCPWRAP', [\n+      {\n+        children: [\n+          { name: 'TCP' }\n+        ]\n+      }\n+    ], { loose: true });\n+    state.validateSnapshotNodes('TCPSERVERWRAP', [\n+      {\n+        children: [\n+          { name: 'TCP' }\n+        ]\n+      }\n+    ], { loose: true });\n+    state.validateSnapshotNodes('STREAMPIPE', [\n+      {\n+        children: [\n+          { name: 'StreamPipe' }\n+        ]\n+      }\n+    ]);\n+    state.validateSnapshotNodes('HTTP2SESSION', [\n+      {\n+        children: [\n+          { name: 'Http2Session' },\n+          { name: 'streams' }\n+        ]\n+      }\n+    ], { loose: true });\n+  }));\n+\n+  req.resume();\n+  req.on('end', common.mustCall(() => {\n+    client.close();\n+    server.close();\n+  }));\n+  req.end();\n+});"
+        },
+        {
+            "sha": "355b8d0d0a1d518ab13501b066d9c801558961df",
+            "filename": "test/parallel/test-heapdump-inspector.js",
+            "status": "added",
+            "additions": 21,
+            "deletions": 0,
+            "changes": 21,
+            "blob_url": "https://github.com/nodejs/node/blob/1009118d27b069411016df4ca6915aac3c36a41f/test%2Fparallel%2Ftest-heapdump-inspector.js",
+            "raw_url": "https://github.com/nodejs/node/raw/1009118d27b069411016df4ca6915aac3c36a41f/test%2Fparallel%2Ftest-heapdump-inspector.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-heapdump-inspector.js?ref=1009118d27b069411016df4ca6915aac3c36a41f",
+            "patch": "@@ -0,0 +1,21 @@\n+// Flags: --expose-internals\n+'use strict';\n+const common = require('../common');\n+\n+common.skipIfInspectorDisabled();\n+\n+const { validateSnapshotNodes } = require('../common/heap');\n+const inspector = require('inspector');\n+\n+const session = new inspector.Session();\n+validateSnapshotNodes('INSPECTORJSBINDING', []);\n+session.connect();\n+validateSnapshotNodes('INSPECTORJSBINDING', [\n+  {\n+    children: [\n+      { name: 'session' },\n+      { name: 'Connection' },\n+      (node) => node.type === 'closure' || typeof node.value === 'function'\n+    ]\n+  }\n+]);"
+        },
+        {
+            "sha": "be14b7b5f7ca640a6004d0e3f5b12761df0a615b",
+            "filename": "test/parallel/test-heapdump-tls.js",
+            "status": "added",
+            "additions": 33,
+            "deletions": 0,
+            "changes": 33,
+            "blob_url": "https://github.com/nodejs/node/blob/1009118d27b069411016df4ca6915aac3c36a41f/test%2Fparallel%2Ftest-heapdump-tls.js",
+            "raw_url": "https://github.com/nodejs/node/raw/1009118d27b069411016df4ca6915aac3c36a41f/test%2Fparallel%2Ftest-heapdump-tls.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-heapdump-tls.js?ref=1009118d27b069411016df4ca6915aac3c36a41f",
+            "patch": "@@ -0,0 +1,33 @@\n+// Flags: --expose-internals\n+'use strict';\n+const common = require('../common');\n+\n+if (!common.hasCrypto)\n+  common.skip('missing crypto');\n+\n+const { validateSnapshotNodes } = require('../common/heap');\n+const net = require('net');\n+const tls = require('tls');\n+\n+validateSnapshotNodes('TLSWRAP', []);\n+\n+const server = net.createServer(common.mustCall((c) => {\n+  c.end();\n+})).listen(0, common.mustCall(() => {\n+  const c = tls.connect({ port: server.address().port });\n+\n+  c.on('error', common.mustCall(() => {\n+    server.close();\n+  }));\n+  c.write('hello');\n+\n+  validateSnapshotNodes('TLSWRAP', [\n+    {\n+      children: [\n+        { name: 'enc_out' },\n+        { name: 'enc_in' },\n+        { name: 'TLSWrap' }\n+      ]\n+    }\n+  ]);\n+}));"
+        },
+        {
+            "sha": "68d2ccd1abbc293557ba734952a127fa87adfbe1",
+            "filename": "test/parallel/test-heapdump-worker.js",
+            "status": "added",
+            "additions": 27,
+            "deletions": 0,
+            "changes": 27,
+            "blob_url": "https://github.com/nodejs/node/blob/1009118d27b069411016df4ca6915aac3c36a41f/test%2Fparallel%2Ftest-heapdump-worker.js",
+            "raw_url": "https://github.com/nodejs/node/raw/1009118d27b069411016df4ca6915aac3c36a41f/test%2Fparallel%2Ftest-heapdump-worker.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-heapdump-worker.js?ref=1009118d27b069411016df4ca6915aac3c36a41f",
+            "patch": "@@ -0,0 +1,27 @@\n+// Flags: --expose-internals --experimental-worker\n+'use strict';\n+require('../common');\n+const { validateSnapshotNodes } = require('../common/heap');\n+const { Worker } = require('worker_threads');\n+\n+validateSnapshotNodes('WORKER', []);\n+const worker = new Worker('setInterval(() => {}, 100);', { eval: true });\n+validateSnapshotNodes('WORKER', [\n+  {\n+    children: [\n+      { name: 'thread_exit_async' },\n+      { name: 'env' },\n+      { name: 'MESSAGEPORT' },\n+      { name: 'Worker' }\n+    ]\n+  }\n+]);\n+validateSnapshotNodes('MESSAGEPORT', [\n+  {\n+    children: [\n+      { name: 'data' },\n+      { name: 'MessagePort' }\n+    ]\n+  }\n+], { loose: true });\n+worker.terminate();"
+        },
+        {
+            "sha": "7a749902f5aaf69f7ce50102135adf43a18c11a1",
+            "filename": "test/parallel/test-heapdump-zlib.js",
+            "status": "added",
+            "additions": 17,
+            "deletions": 0,
+            "changes": 17,
+            "blob_url": "https://github.com/nodejs/node/blob/1009118d27b069411016df4ca6915aac3c36a41f/test%2Fparallel%2Ftest-heapdump-zlib.js",
+            "raw_url": "https://github.com/nodejs/node/raw/1009118d27b069411016df4ca6915aac3c36a41f/test%2Fparallel%2Ftest-heapdump-zlib.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-heapdump-zlib.js?ref=1009118d27b069411016df4ca6915aac3c36a41f",
+            "patch": "@@ -0,0 +1,17 @@\n+// Flags: --expose-internals\n+'use strict';\n+require('../common');\n+const { validateSnapshotNodes } = require('../common/heap');\n+const zlib = require('zlib');\n+\n+validateSnapshotNodes('ZLIB', []);\n+// eslint-disable-next-line no-unused-vars\n+const gunzip = zlib.createGunzip();\n+validateSnapshotNodes('ZLIB', [\n+  {\n+    children: [\n+      { name: 'Zlib' },\n+      { name: 'zlib memory' }\n+    ]\n+  }\n+]);"
+        }
+    ],
+    "stats": {
+        "total": 324,
+        "additions": 324,
+        "deletions": 0
+    }
+}

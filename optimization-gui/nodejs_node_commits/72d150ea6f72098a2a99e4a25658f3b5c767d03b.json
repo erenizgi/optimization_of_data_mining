@@ -1,0 +1,48 @@
+{
+    "author": "joyeecheung",
+    "message": "fs: throw realpathSync.native errors in JS\n\nPR-URL: https://github.com/nodejs/node/pull/18871\nRefs: https://github.com/nodejs/node/issues/18106\nReviewed-By: Michaël Zasso <targos@protonmail.com>\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Ruben Bridgewater <ruben@bridgewater.de>",
+    "sha": "72d150ea6f72098a2a99e4a25658f3b5c767d03b",
+    "files": [
+        {
+            "sha": "e6ba189fe8130941ae9bc23caf6525dc259b157a",
+            "filename": "lib/fs.js",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 1,
+            "changes": 5,
+            "blob_url": "https://github.com/nodejs/node/blob/72d150ea6f72098a2a99e4a25658f3b5c767d03b/lib%2Ffs.js",
+            "raw_url": "https://github.com/nodejs/node/raw/72d150ea6f72098a2a99e4a25658f3b5c767d03b/lib%2Ffs.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Ffs.js?ref=72d150ea6f72098a2a99e4a25658f3b5c767d03b",
+            "patch": "@@ -1649,7 +1649,10 @@ fs.realpathSync.native = function(path, options) {\n   options = getOptions(options, {});\n   path = getPathFromURL(path);\n   validatePath(path);\n-  return binding.realpath(path, options.encoding);\n+  const ctx = { path };\n+  const result = binding.realpath(path, options.encoding, undefined, ctx);\n+  handleErrorFromBinding(ctx);\n+  return result;\n };\n \n "
+        },
+        {
+            "sha": "e3c9801b8a845c7e959f7fbc048f1f95ff648a5e",
+            "filename": "src/node_file.cc",
+            "status": "modified",
+            "additions": 18,
+            "deletions": 6,
+            "changes": 24,
+            "blob_url": "https://github.com/nodejs/node/blob/72d150ea6f72098a2a99e4a25658f3b5c767d03b/src%2Fnode_file.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/72d150ea6f72098a2a99e4a25658f3b5c767d03b/src%2Fnode_file.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_file.cc?ref=72d150ea6f72098a2a99e4a25658f3b5c767d03b",
+            "patch": "@@ -1047,30 +1047,42 @@ static void MKDir(const FunctionCallbackInfo<Value>& args) {\n }\n \n static void RealPath(const FunctionCallbackInfo<Value>& args) {\n-  CHECK_GE(args.Length(), 2);\n   Environment* env = Environment::GetCurrent(args);\n+\n+  const int argc = args.Length();\n+  CHECK_GE(argc, 3);\n+\n   BufferValue path(env->isolate(), args[0]);\n   CHECK_NE(*path, nullptr);\n \n   const enum encoding encoding = ParseEncoding(env->isolate(), args[1], UTF8);\n \n   FSReqBase* req_wrap = GetReqWrap(env, args[2]);\n-  if (req_wrap != nullptr) {\n+  if (req_wrap != nullptr) {  // realpath(path, encoding, req)\n     AsyncCall(env, req_wrap, args, \"realpath\", encoding, AfterStringPtr,\n               uv_fs_realpath, *path);\n-  } else {\n-    SYNC_CALL(realpath, *path, *path);\n-    const char* link_path = static_cast<const char*>(SYNC_REQ.ptr);\n+  } else {  // realpath(path, encoding, undefined, ctx)\n+    CHECK_EQ(argc, 4);\n+    fs_req_wrap req_wrap;\n+    int err = SyncCall(env, args[3], &req_wrap, \"realpath\",\n+                       uv_fs_realpath, *path);\n+    if (err < 0) {\n+      return;  // syscall failed, no need to continue, error info is in ctx\n+    }\n+\n+    const char* link_path = static_cast<const char*>(req_wrap.req.ptr);\n \n     Local<Value> error;\n     MaybeLocal<Value> rc = StringBytes::Encode(env->isolate(),\n                                                link_path,\n                                                encoding,\n                                                &error);\n     if (rc.IsEmpty()) {\n-      env->isolate()->ThrowException(error);\n+      Local<Object> ctx = args[3].As<Object>();\n+      ctx->Set(env->context(), env->error_string(), error).FromJust();\n       return;\n     }\n+\n     args.GetReturnValue().Set(rc.ToLocalChecked());\n   }\n }"
+        },
+        {
+            "sha": "fad7802ce12f8b37d9ae10461e75b74ef5a9e1de",
+            "filename": "test/parallel/test-fs-error-messages.js",
+            "status": "modified",
+            "additions": 21,
+            "deletions": 0,
+            "changes": 21,
+            "blob_url": "https://github.com/nodejs/node/blob/72d150ea6f72098a2a99e4a25658f3b5c767d03b/test%2Fparallel%2Ftest-fs-error-messages.js",
+            "raw_url": "https://github.com/nodejs/node/raw/72d150ea6f72098a2a99e4a25658f3b5c767d03b/test%2Fparallel%2Ftest-fs-error-messages.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-fs-error-messages.js?ref=72d150ea6f72098a2a99e4a25658f3b5c767d03b",
+            "patch": "@@ -125,6 +125,27 @@ function re(literals, ...values) {\n   );\n }\n \n+// native realpath\n+{\n+  const validateError = (err) => {\n+    assert.strictEqual(nonexistentFile, err.path);\n+    assert.strictEqual(\n+      err.message,\n+      `ENOENT: no such file or directory, realpath '${nonexistentFile}'`);\n+    assert.strictEqual(err.errno, uv.UV_ENOENT);\n+    assert.strictEqual(err.code, 'ENOENT');\n+    assert.strictEqual(err.syscall, 'realpath');\n+    return true;\n+  };\n+\n+  fs.realpath.native(nonexistentFile, common.mustCall(validateError));\n+\n+  assert.throws(\n+    () => fs.realpathSync.native(nonexistentFile),\n+    validateError\n+  );\n+}\n+\n // readlink\n {\n   const validateError = (err) => {"
+        }
+    ],
+    "stats": {
+        "total": 50,
+        "additions": 43,
+        "deletions": 7
+    }
+}

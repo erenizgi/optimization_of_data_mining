@@ -1,0 +1,60 @@
+{
+    "author": "mcollina",
+    "message": "stream: restore flow if there are 'data' handlers after once('readable')\n\nFixes: https://github.com/nodejs/node/issues/21398\nSee: https://github.com/nodejs/node/pull/21696\n\nPR-URL: https://github.com/nodejs/node/pull/22209\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Mathias Buus <mathiasbuus@gmail.com>",
+    "sha": "98cf84f2c9d13386362386eac6089bc356c017b2",
+    "files": [
+        {
+            "sha": "840e85b71606c3a86b4c8143c9b5fec34bd782eb",
+            "filename": "doc/api/stream.md",
+            "status": "modified",
+            "additions": 19,
+            "deletions": 3,
+            "changes": 22,
+            "blob_url": "https://github.com/nodejs/node/blob/98cf84f2c9d13386362386eac6089bc356c017b2/doc%2Fapi%2Fstream.md",
+            "raw_url": "https://github.com/nodejs/node/raw/98cf84f2c9d13386362386eac6089bc356c017b2/doc%2Fapi%2Fstream.md",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/doc%2Fapi%2Fstream.md?ref=98cf84f2c9d13386362386eac6089bc356c017b2",
+            "patch": "@@ -618,6 +618,12 @@ instance, when the `readable.resume()` method is called without a listener\n attached to the `'data'` event, or when a `'data'` event handler is removed\n from the stream.\n \n+Adding a [`'readable'`][] event handler automatically make the stream to\n+stop flowing, and the data to be consumed via\n+[`readable.read()`][stream-read]. If the [`'readable'`] event handler is\n+removed, then the stream will start flowing again if there is a\n+[`'data'`][] event handler.\n+\n #### Three States\n \n The \"two modes\" of operation for a `Readable` stream are a simplified\n@@ -666,12 +672,15 @@ within the streams internal buffer.\n The `Readable` stream API evolved across multiple Node.js versions and provides\n multiple methods of consuming stream data. In general, developers should choose\n *one* of the methods of consuming data and *should never* use multiple methods\n-to consume data from a single stream.\n+to consume data from a single stream. Specifically, using a combination\n+of `on('data')`, `on('readable')`, `pipe()` or async iterators could\n+lead to unintuitive behavior.\n \n Use of the `readable.pipe()` method is recommended for most users as it has been\n implemented to provide the easiest way of consuming stream data. Developers that\n require more fine-grained control over the transfer and generation of data can\n-use the [`EventEmitter`][] and `readable.pause()`/`readable.resume()` APIs.\n+use the [`EventEmitter`][] and `readable.on('readable')`/`readable.read()`\n+or the `readable.pause()`/`readable.resume()` APIs.\n \n #### Class: stream.Readable\n <!-- YAML\n@@ -825,7 +834,11 @@ result in increased throughput.\n \n If both `'readable'` and [`'data'`][]  are used at the same time, `'readable'`\n takes precedence in controlling the flow, i.e. `'data'` will be emitted\n-only when [`stream.read()`][stream-read] is called.\n+only when [`stream.read()`][stream-read] is called. The\n+`readableFlowing` property would become `false`.\n+If there are `'data'` listeners when `'readable'` is removed, the stream\n+will start flowing, i.e. `'data'` events will be emitted without calling\n+`.resume()`.\n \n ##### readable.destroy([error])\n <!-- YAML\n@@ -887,6 +900,9 @@ readable.on('data', (chunk) => {\n });\n ```\n \n+The `readable.pause()` method has no effect if there is a `'readable'`\n+event listener.\n+\n ##### readable.pipe(destination[, options])\n <!-- YAML\n added: v0.9.4"
+        },
+        {
+            "sha": "f08299664380774ace7a5369860736f0706a94cc",
+            "filename": "lib/_stream_readable.js",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 1,
+            "changes": 9,
+            "blob_url": "https://github.com/nodejs/node/blob/98cf84f2c9d13386362386eac6089bc356c017b2/lib%2F_stream_readable.js",
+            "raw_url": "https://github.com/nodejs/node/raw/98cf84f2c9d13386362386eac6089bc356c017b2/lib%2F_stream_readable.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2F_stream_readable.js?ref=98cf84f2c9d13386362386eac6089bc356c017b2",
+            "patch": "@@ -810,6 +810,7 @@ Readable.prototype.on = function(ev, fn) {\n   } else if (ev === 'readable') {\n     if (!state.endEmitted && !state.readableListening) {\n       state.readableListening = state.needReadable = true;\n+      state.flowing = false;\n       state.emittedReadable = false;\n       debug('on readable', state.length, state.reading);\n       if (state.length) {\n@@ -858,6 +859,11 @@ Readable.prototype.removeAllListeners = function(ev) {\n \n function updateReadableListening(self) {\n   self._readableState.readableListening = self.listenerCount('readable') > 0;\n+\n+  // crude way to check if we should resume\n+  if (self.listenerCount('data') > 0) {\n+    self.resume();\n+  }\n }\n \n function nReadingNextTick(self) {\n@@ -872,7 +878,8 @@ Readable.prototype.resume = function() {\n   if (!state.flowing) {\n     debug('resume');\n     // we flow only if there is no one listening\n-    // for readable\n+    // for readable, but we still have to call\n+    // resume()\n     state.flowing = !state.readableListening;\n     resume(this, state);\n   }"
+        },
+        {
+            "sha": "e8f4e9422db40180827fe90f0629323a293f0ee1",
+            "filename": "test/parallel/test-stream-once-readable-pipe.js",
+            "status": "added",
+            "additions": 61,
+            "deletions": 0,
+            "changes": 61,
+            "blob_url": "https://github.com/nodejs/node/blob/98cf84f2c9d13386362386eac6089bc356c017b2/test%2Fparallel%2Ftest-stream-once-readable-pipe.js",
+            "raw_url": "https://github.com/nodejs/node/raw/98cf84f2c9d13386362386eac6089bc356c017b2/test%2Fparallel%2Ftest-stream-once-readable-pipe.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-stream-once-readable-pipe.js?ref=98cf84f2c9d13386362386eac6089bc356c017b2",
+            "patch": "@@ -0,0 +1,61 @@\n+'use strict';\n+\n+const common = require('../common');\n+const assert = require('assert');\n+const { Readable, Writable } = require('stream');\n+\n+// This test ensures that if have 'readable' listener\n+// on Readable instance it will not disrupt the pipe.\n+\n+{\n+  let receivedData = '';\n+  const w = new Writable({\n+    write: (chunk, env, callback) => {\n+      receivedData += chunk;\n+      callback();\n+    },\n+  });\n+\n+  const data = ['foo', 'bar', 'baz'];\n+  const r = new Readable({\n+    read: () => {},\n+  });\n+\n+  r.once('readable', common.mustCall());\n+\n+  r.pipe(w);\n+  r.push(data[0]);\n+  r.push(data[1]);\n+  r.push(data[2]);\n+  r.push(null);\n+\n+  w.on('finish', common.mustCall(() => {\n+    assert.strictEqual(receivedData, data.join(''));\n+  }));\n+}\n+\n+{\n+  let receivedData = '';\n+  const w = new Writable({\n+    write: (chunk, env, callback) => {\n+      receivedData += chunk;\n+      callback();\n+    },\n+  });\n+\n+  const data = ['foo', 'bar', 'baz'];\n+  const r = new Readable({\n+    read: () => {},\n+  });\n+\n+  r.pipe(w);\n+  r.push(data[0]);\n+  r.push(data[1]);\n+  r.push(data[2]);\n+  r.push(null);\n+  r.once('readable', common.mustCall());\n+\n+  w.on('finish', common.mustCall(() => {\n+    assert.strictEqual(receivedData, data.join(''));\n+  }));\n+}"
+        },
+        {
+            "sha": "71c07d7b062c184a86ac6a163376f0ac362cec93",
+            "filename": "test/parallel/test-stream-readable-reading-readingMore.js",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 3,
+            "changes": 7,
+            "blob_url": "https://github.com/nodejs/node/blob/98cf84f2c9d13386362386eac6089bc356c017b2/test%2Fparallel%2Ftest-stream-readable-reading-readingMore.js",
+            "raw_url": "https://github.com/nodejs/node/raw/98cf84f2c9d13386362386eac6089bc356c017b2/test%2Fparallel%2Ftest-stream-readable-reading-readingMore.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-stream-readable-reading-readingMore.js?ref=98cf84f2c9d13386362386eac6089bc356c017b2",
+            "patch": "@@ -31,10 +31,11 @@ const Readable = require('stream').Readable;\n     assert.strictEqual(state.reading, false);\n   }\n \n+  const expectedReadingMore = [true, false];\n   readable.on('readable', common.mustCall(() => {\n-    // 'readable' always gets called before 'end'\n-    // since 'end' hasn't been emitted, more data could be incoming\n-    assert.strictEqual(state.readingMore, true);\n+    // there is only one readingMore scheduled from on('data'),\n+    // after which everything is governed by the .read() call\n+    assert.strictEqual(state.readingMore, expectedReadingMore.shift());\n \n     // if the stream has ended, we shouldn't be reading\n     assert.strictEqual(state.ended, !state.reading);"
+        }
+    ],
+    "stats": {
+        "total": 99,
+        "additions": 92,
+        "deletions": 7
+    }
+}

@@ -1,0 +1,48 @@
+{
+    "author": "joyeecheung",
+    "message": "fs: throw readSync errors in JS\n\nPR-URL: https://github.com/nodejs/node/pull/19041\nReviewed-By: Michaël Zasso <targos@protonmail.com>\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "c6acfdb3acc41439899398a615e0ea0a821dcd90",
+    "files": [
+        {
+            "sha": "95c32b4b71af353400a4cabb50d0da2ee5754387",
+            "filename": "lib/fs.js",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 1,
+            "changes": 6,
+            "blob_url": "https://github.com/nodejs/node/blob/c6acfdb3acc41439899398a615e0ea0a821dcd90/lib%2Ffs.js",
+            "raw_url": "https://github.com/nodejs/node/raw/c6acfdb3acc41439899398a615e0ea0a821dcd90/lib%2Ffs.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Ffs.js?ref=c6acfdb3acc41439899398a615e0ea0a821dcd90",
+            "patch": "@@ -577,7 +577,11 @@ fs.readSync = function(fd, buffer, offset, length, position) {\n   if (!isUint32(position))\n     position = -1;\n \n-  return binding.read(fd, buffer, offset, length, position);\n+  const ctx = {};\n+  const result = binding.read(fd, buffer, offset, length, position,\n+                              undefined, ctx);\n+  handleErrorFromBinding(ctx);\n+  return result;\n };\n \n // usage:"
+        },
+        {
+            "sha": "837d5971c86cd1cac5e952de33fdf73bb2cfac6b",
+            "filename": "src/node_file.cc",
+            "status": "modified",
+            "additions": 25,
+            "deletions": 26,
+            "changes": 51,
+            "blob_url": "https://github.com/nodejs/node/blob/c6acfdb3acc41439899398a615e0ea0a821dcd90/src%2Fnode_file.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/c6acfdb3acc41439899398a615e0ea0a821dcd90/src%2Fnode_file.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_file.cc?ref=c6acfdb3acc41439899398a615e0ea0a821dcd90",
+            "patch": "@@ -110,7 +110,7 @@ using v8::Value;\n # define MIN(a, b) ((a) < (b) ? (a) : (b))\n #endif\n \n-#define GET_OFFSET(a) ((a)->IsNumber() ? (a)->IntegerValue() : -1)\n+#define GET_OFFSET(a) ((a)->IsNumber() ? (a).As<Integer>()->Value() : -1)\n \n // The FileHandle object wraps a file descriptor and will close it on garbage\n // collection if necessary. If that happens, a process warning will be\n@@ -1411,51 +1411,50 @@ static void WriteString(const FunctionCallbackInfo<Value>& args) {\n  *\n  * bytesRead = fs.read(fd, buffer, offset, length, position)\n  *\n- * 0 fd        integer. file descriptor\n+ * 0 fd        int32. file descriptor\n  * 1 buffer    instance of Buffer\n- * 2 offset    integer. offset to start reading into inside buffer\n- * 3 length    integer. length to read\n- * 4 position  file position - null for current position\n- *\n+ * 2 offset    int32. offset to start reading into inside buffer\n+ * 3 length    int32. length to read\n+ * 4 position  int64. file position - -1 for current position\n  */\n static void Read(const FunctionCallbackInfo<Value>& args) {\n   Environment* env = Environment::GetCurrent(args);\n \n-  CHECK(args[0]->IsInt32());\n-  CHECK(Buffer::HasInstance(args[1]));\n-\n-  int fd = args[0]->Int32Value();\n-\n-  Local<Value> req;\n-\n-  size_t len;\n-  int64_t pos;\n+  const int argc = args.Length();\n+  CHECK_GE(argc, 5);\n \n-  char * buf = nullptr;\n+  CHECK(args[0]->IsInt32());\n+  const int fd = args[0].As<Int32>()->Value();\n \n+  CHECK(Buffer::HasInstance(args[1]));\n   Local<Object> buffer_obj = args[1].As<Object>();\n-  char *buffer_data = Buffer::Data(buffer_obj);\n+  char* buffer_data = Buffer::Data(buffer_obj);\n   size_t buffer_length = Buffer::Length(buffer_obj);\n \n-  size_t off = args[2]->Int32Value();\n+  CHECK(args[2]->IsInt32());\n+  const size_t off = static_cast<size_t>(args[2].As<Int32>()->Value());\n   CHECK_LT(off, buffer_length);\n \n-  len = args[3]->Int32Value();\n+  CHECK(args[3]->IsInt32());\n+  const size_t len = static_cast<size_t>(args[3].As<Int32>()->Value());\n   CHECK(Buffer::IsWithinBounds(off, len, buffer_length));\n \n-  pos = GET_OFFSET(args[4]);\n-\n-  buf = buffer_data + off;\n+  CHECK(args[4]->IsNumber());\n+  const int64_t pos = args[4].As<Integer>()->Value();\n \n+  char* buf = buffer_data + off;\n   uv_buf_t uvbuf = uv_buf_init(const_cast<char*>(buf), len);\n \n   FSReqBase* req_wrap = GetReqWrap(env, args[5]);\n-  if (req_wrap != nullptr) {\n+  if (req_wrap != nullptr) {  // read(fd, buffer, offset, len, pos, req)\n     AsyncCall(env, req_wrap, args, \"read\", UTF8, AfterInteger,\n               uv_fs_read, fd, &uvbuf, 1, pos);\n-  } else {\n-    SYNC_CALL(read, 0, fd, &uvbuf, 1, pos)\n-    args.GetReturnValue().Set(SYNC_RESULT);\n+  } else {  // read(fd, buffer, offset, len, pos, undefined, ctx)\n+    CHECK_EQ(argc, 7);\n+    fs_req_wrap req_wrap;\n+    const int bytesRead = SyncCall(env, args[6], &req_wrap, \"read\",\n+                                   uv_fs_read, fd, &uvbuf, 1, pos);\n+    args.GetReturnValue().Set(bytesRead);\n   }\n }\n "
+        },
+        {
+            "sha": "dc925069ba01eb49801adfeefc0c325b3bc24a91",
+            "filename": "test/parallel/test-fs-error-messages.js",
+            "status": "modified",
+            "additions": 21,
+            "deletions": 0,
+            "changes": 21,
+            "blob_url": "https://github.com/nodejs/node/blob/c6acfdb3acc41439899398a615e0ea0a821dcd90/test%2Fparallel%2Ftest-fs-error-messages.js",
+            "raw_url": "https://github.com/nodejs/node/raw/c6acfdb3acc41439899398a615e0ea0a821dcd90/test%2Fparallel%2Ftest-fs-error-messages.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-fs-error-messages.js?ref=c6acfdb3acc41439899398a615e0ea0a821dcd90",
+            "patch": "@@ -708,3 +708,24 @@ if (!common.isAIX) {\n     validateError\n   );\n }\n+\n+// read\n+{\n+  const validateError = (err) => {\n+    assert.strictEqual(err.message, 'EBADF: bad file descriptor, read');\n+    assert.strictEqual(err.errno, uv.UV_EBADF);\n+    assert.strictEqual(err.code, 'EBADF');\n+    assert.strictEqual(err.syscall, 'read');\n+    return true;\n+  };\n+\n+  common.runWithInvalidFD((fd) => {\n+    const buf = Buffer.alloc(5);\n+    fs.read(fd, buf, 0, 1, 1, common.mustCall(validateError));\n+\n+    assert.throws(\n+      () => fs.readSync(fd, buf, 0, 1, 1),\n+      validateError\n+    );\n+  });\n+}"
+        }
+    ],
+    "stats": {
+        "total": 78,
+        "additions": 51,
+        "deletions": 27
+    }
+}

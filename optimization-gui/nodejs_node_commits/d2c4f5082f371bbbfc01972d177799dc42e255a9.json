@@ -1,0 +1,36 @@
+{
+    "author": "joyeecheung",
+    "message": "fs: throw readdirSync errors in JS\n\nPR-URL: https://github.com/nodejs/node/pull/18871\nRefs: https://github.com/nodejs/node/issues/18106\nReviewed-By: Michaël Zasso <targos@protonmail.com>\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Ruben Bridgewater <ruben@bridgewater.de>",
+    "sha": "d2c4f5082f371bbbfc01972d177799dc42e255a9",
+    "files": [
+        {
+            "sha": "7e80bb68007bed1a7c39b308576990bf9d8eca01",
+            "filename": "lib/fs.js",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 1,
+            "changes": 6,
+            "blob_url": "https://github.com/nodejs/node/blob/d2c4f5082f371bbbfc01972d177799dc42e255a9/lib%2Ffs.js",
+            "raw_url": "https://github.com/nodejs/node/raw/d2c4f5082f371bbbfc01972d177799dc42e255a9/lib%2Ffs.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Ffs.js?ref=d2c4f5082f371bbbfc01972d177799dc42e255a9",
+            "patch": "@@ -819,7 +819,11 @@ fs.readdirSync = function(path, options) {\n   options = getOptions(options, {});\n   path = getPathFromURL(path);\n   validatePath(path);\n-  return binding.readdir(pathModule.toNamespacedPath(path), options.encoding);\n+  const ctx = { path };\n+  const result = binding.readdir(pathModule.toNamespacedPath(path),\n+                                 options.encoding, undefined, ctx);\n+  handleErrorFromBinding(ctx);\n+  return result;\n };\n \n fs.fstat = function(fd, callback) {"
+        },
+        {
+            "sha": "88662fad4e529f618015cc377031f7b27e57948a",
+            "filename": "src/node_file.cc",
+            "status": "modified",
+            "additions": 23,
+            "deletions": 9,
+            "changes": 32,
+            "blob_url": "https://github.com/nodejs/node/blob/d2c4f5082f371bbbfc01972d177799dc42e255a9/src%2Fnode_file.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/d2c4f5082f371bbbfc01972d177799dc42e255a9/src%2Fnode_file.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_file.cc?ref=d2c4f5082f371bbbfc01972d177799dc42e255a9",
+            "patch": "@@ -1090,21 +1090,28 @@ static void RealPath(const FunctionCallbackInfo<Value>& args) {\n static void ReadDir(const FunctionCallbackInfo<Value>& args) {\n   Environment* env = Environment::GetCurrent(args);\n \n-  CHECK_GE(args.Length(), 1);\n+  const int argc = args.Length();\n+  CHECK_GE(argc, 3);\n \n   BufferValue path(env->isolate(), args[0]);\n   CHECK_NE(*path, nullptr);\n \n   const enum encoding encoding = ParseEncoding(env->isolate(), args[1], UTF8);\n \n   FSReqBase* req_wrap = GetReqWrap(env, args[2]);\n-  if (req_wrap != nullptr) {\n+  if (req_wrap != nullptr) {  // readdir(path, encoding, req)\n     AsyncCall(env, req_wrap, args, \"scandir\", encoding, AfterScanDir,\n               uv_fs_scandir, *path, 0 /*flags*/);\n-  } else {\n-    SYNC_CALL(scandir, *path, *path, 0 /*flags*/)\n+  } else {  // readdir(path, encoding, undefined, ctx)\n+    CHECK_EQ(argc, 4);\n+    fs_req_wrap req_wrap;\n+    int err = SyncCall(env, args[3], &req_wrap, \"scandir\",\n+                       uv_fs_scandir, *path, 0 /*flags*/);\n+    if (err < 0) {\n+      return;  // syscall failed, no need to continue, error info is in ctx\n+    }\n \n-    CHECK_GE(SYNC_REQ.result, 0);\n+    CHECK_GE(req_wrap.req.result, 0);\n     int r;\n     Local<Array> names = Array::New(env->isolate(), 0);\n     Local<Function> fn = env->push_values_to_array_function();\n@@ -1114,19 +1121,26 @@ static void ReadDir(const FunctionCallbackInfo<Value>& args) {\n     for (int i = 0; ; i++) {\n       uv_dirent_t ent;\n \n-      r = uv_fs_scandir_next(&SYNC_REQ, &ent);\n+      r = uv_fs_scandir_next(&(req_wrap.req), &ent);\n       if (r == UV_EOF)\n         break;\n-      if (r != 0)\n-        return env->ThrowUVException(r, \"readdir\", \"\", *path);\n+      if (r != 0) {\n+        Local<Object> ctx = args[3].As<Object>();\n+        ctx->Set(env->context(), env->errno_string(),\n+                 Integer::New(env->isolate(), r)).FromJust();\n+        ctx->Set(env->context(), env->syscall_string(),\n+                 OneByteString(env->isolate(), \"readdir\")).FromJust();\n+        return;\n+      }\n \n       Local<Value> error;\n       MaybeLocal<Value> filename = StringBytes::Encode(env->isolate(),\n                                                        ent.name,\n                                                        encoding,\n                                                        &error);\n       if (filename.IsEmpty()) {\n-        env->isolate()->ThrowException(error);\n+        Local<Object> ctx = args[3].As<Object>();\n+        ctx->Set(env->context(), env->error_string(), error).FromJust();\n         return;\n       }\n "
+        }
+    ],
+    "stats": {
+        "total": 38,
+        "additions": 28,
+        "deletions": 10
+    }
+}

@@ -1,0 +1,48 @@
+{
+    "author": "addaleax",
+    "message": "src: add native debugging code to workers\n\nNow that we have better native debugging utilities in core,\nlet’s use them :)\n\nPR-URL: https://github.com/nodejs/node/pull/21423\nReviewed-By: Gus Caplan <me@gus.host>\nReviewed-By: Colin Ihrig <cjihrig@gmail.com>\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Tiancheng \"Timothy\" Gu <timothygu99@gmail.com>\nReviewed-By: Matheus Marchini <matheus@sthima.com>",
+    "sha": "018d6186a7b426026f431b39e709f880868bd03a",
+    "files": [
+        {
+            "sha": "89e82b9ce364b64b6a3e4a97d8dddb469bb92bb7",
+            "filename": "src/async_wrap.cc",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/nodejs/node/blob/018d6186a7b426026f431b39e709f880868bd03a/src%2Fasync_wrap.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/018d6186a7b426026f431b39e709f880868bd03a/src%2Fasync_wrap.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fasync_wrap.cc?ref=018d6186a7b426026f431b39e709f880868bd03a",
+            "patch": "@@ -803,7 +803,8 @@ void EmitAsyncDestroy(Isolate* isolate, async_context asyncContext) {\n \n std::string AsyncWrap::diagnostic_name() const {\n   return std::string(provider_names[provider_type()]) +\n-      \" (\" + std::to_string(static_cast<int64_t>(async_id_)) + \")\";\n+      \" (\" + std::to_string(env()->thread_id()) + \":\" +\n+      std::to_string(static_cast<int64_t>(async_id_)) + \")\";\n }\n \n }  // namespace node"
+        },
+        {
+            "sha": "be37cd39c366d09e515a06a8406ce52160165ea3",
+            "filename": "src/node_messaging.cc",
+            "status": "modified",
+            "additions": 18,
+            "deletions": 1,
+            "changes": 19,
+            "blob_url": "https://github.com/nodejs/node/blob/018d6186a7b426026f431b39e709f880868bd03a/src%2Fnode_messaging.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/018d6186a7b426026f431b39e709f880868bd03a/src%2Fnode_messaging.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_messaging.cc?ref=018d6186a7b426026f431b39e709f880868bd03a",
+            "patch": "@@ -1,3 +1,4 @@\n+#include \"debug_utils.h\"\n #include \"node_messaging.h\"\n #include \"node_internals.h\"\n #include \"node_buffer.h\"\n@@ -305,8 +306,10 @@ void MessagePortData::AddToIncomingQueue(Message&& message) {\n   Mutex::ScopedLock lock(mutex_);\n   incoming_messages_.emplace_back(std::move(message));\n \n-  if (owner_ != nullptr)\n+  if (owner_ != nullptr) {\n+    Debug(owner_, \"Adding message to incoming queue\");\n     owner_->TriggerAsync();\n+  }\n }\n \n bool MessagePortData::IsSiblingClosed() const {\n@@ -380,6 +383,8 @@ MessagePort::MessagePort(Environment* env,\n     Local<Function> init = fn.As<Function>();\n     USE(init->Call(context, wrap, 0, nullptr));\n   }\n+\n+  Debug(this, \"Created message port\");\n }\n \n void MessagePort::AddToIncomingQueue(Message&& message) {\n@@ -396,6 +401,8 @@ void MessagePort::TriggerAsync() {\n }\n \n void MessagePort::Close(v8::Local<v8::Value> close_callback) {\n+  Debug(this, \"Closing message port, data set = %d\", static_cast<int>(!!data_));\n+\n   if (data_) {\n     // Wrap this call with accessing the mutex, so that TriggerAsync()\n     // can check IsHandleClosing() without race conditions.\n@@ -447,6 +454,7 @@ MessagePort* MessagePort::New(\n }\n \n void MessagePort::OnMessage() {\n+  Debug(this, \"Running MessagePort::OnMessage()\");\n   HandleScope handle_scope(env()->isolate());\n   Local<Context> context = object(env()->isolate())->CreationContext();\n \n@@ -461,11 +469,15 @@ void MessagePort::OnMessage() {\n       Mutex::ScopedLock lock(data_->mutex_);\n \n       if (stop_event_loop_) {\n+        Debug(this, \"MessagePort stops loop as requested\");\n         CHECK(!data_->receiving_messages_);\n         uv_stop(env()->event_loop());\n         break;\n       }\n \n+      Debug(this, \"MessagePort has message, receiving = %d\",\n+            static_cast<int>(data_->receiving_messages_));\n+\n       if (!data_->receiving_messages_)\n         break;\n       if (data_->incoming_messages_.empty())\n@@ -475,6 +487,7 @@ void MessagePort::OnMessage() {\n     }\n \n     if (!env()->can_call_into_js()) {\n+      Debug(this, \"MessagePort drains queue because !can_call_into_js()\");\n       // In this case there is nothing to do but to drain the current queue.\n       continue;\n     }\n@@ -508,6 +521,7 @@ bool MessagePort::IsSiblingClosed() const {\n }\n \n void MessagePort::OnClose() {\n+  Debug(this, \"MessagePort::OnClose()\");\n   if (data_) {\n     data_->owner_ = nullptr;\n     data_->Disentangle();\n@@ -557,13 +571,15 @@ void MessagePort::PostMessage(const FunctionCallbackInfo<Value>& args) {\n \n void MessagePort::Start() {\n   Mutex::ScopedLock lock(data_->mutex_);\n+  Debug(this, \"Start receiving messages\");\n   data_->receiving_messages_ = true;\n   if (!data_->incoming_messages_.empty())\n     TriggerAsync();\n }\n \n void MessagePort::Stop() {\n   Mutex::ScopedLock lock(data_->mutex_);\n+  Debug(this, \"Stop receiving messages\");\n   data_->receiving_messages_ = false;\n }\n \n@@ -572,6 +588,7 @@ void MessagePort::StopEventLoop() {\n   data_->receiving_messages_ = false;\n   stop_event_loop_ = true;\n \n+  Debug(this, \"Received StopEventLoop request\");\n   TriggerAsync();\n }\n "
+        },
+        {
+            "sha": "6f325668b86921387fe5d723c718102fcc4114d7",
+            "filename": "src/node_worker.cc",
+            "status": "modified",
+            "additions": 22,
+            "deletions": 0,
+            "changes": 22,
+            "blob_url": "https://github.com/nodejs/node/blob/018d6186a7b426026f431b39e709f880868bd03a/src%2Fnode_worker.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/018d6186a7b426026f431b39e709f880868bd03a/src%2Fnode_worker.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_worker.cc?ref=018d6186a7b426026f431b39e709f880868bd03a",
+            "patch": "@@ -44,6 +44,8 @@ Worker::Worker(Environment* env, Local<Object> wrap)\n     Mutex::ScopedLock next_thread_id_lock(next_thread_id_mutex);\n     thread_id_ = next_thread_id++;\n   }\n+\n+  Debug(this, \"Creating worker with id %llu\", thread_id_);\n   wrap->Set(env->context(),\n             env->thread_id_string(),\n             Number::New(env->isolate(),\n@@ -107,6 +109,8 @@ Worker::Worker(Environment* env, Local<Object> wrap)\n \n   // The new isolate won't be bothered on this thread again.\n   isolate_->DiscardThreadSpecificMetadata();\n+\n+  Debug(this, \"Set up worker with id %llu\", thread_id_);\n }\n \n bool Worker::is_stopped() const {\n@@ -123,6 +127,7 @@ void Worker::Run() {\n   MultiIsolatePlatform* platform = isolate_data_->platform();\n   CHECK_NE(platform, nullptr);\n \n+  Debug(this, \"Starting worker with id %llu\", thread_id_);\n   {\n     Locker locker(isolate_);\n     Isolate::Scope isolate_scope(isolate_);\n@@ -143,6 +148,8 @@ void Worker::Run() {\n         // within it.\n         if (child_port_ != nullptr)\n           env_->set_message_port(child_port_->object(isolate_));\n+\n+        Debug(this, \"Created message port for worker %llu\", thread_id_);\n       }\n \n       if (!is_stopped()) {\n@@ -152,6 +159,8 @@ void Worker::Run() {\n         // This loads the Node bootstrapping code.\n         LoadEnvironment(env_.get());\n         env_->async_hooks()->pop_async_id(1);\n+\n+        Debug(this, \"Loaded environment for worker %llu\", thread_id_);\n       }\n \n       {\n@@ -189,6 +198,9 @@ void Worker::Run() {\n       Mutex::ScopedLock lock(mutex_);\n       if (exit_code_ == 0 && !stopped)\n         exit_code_ = exit_code;\n+\n+      Debug(this, \"Exiting thread for worker %llu with exit code %d\",\n+            thread_id_, exit_code_);\n     }\n \n     env_->set_can_call_into_js(false);\n@@ -237,12 +249,15 @@ void Worker::Run() {\n     scheduled_on_thread_stopped_ = true;\n     uv_async_send(thread_exit_async_.get());\n   }\n+\n+  Debug(this, \"Worker %llu thread stops\", thread_id_);\n }\n \n void Worker::DisposeIsolate() {\n   if (isolate_ == nullptr)\n     return;\n \n+  Debug(this, \"Worker %llu dispose isolate\", thread_id_);\n   CHECK(isolate_data_);\n   MultiIsolatePlatform* platform = isolate_data_->platform();\n   platform->CancelPendingDelayedTasks(isolate_);\n@@ -275,6 +290,8 @@ void Worker::OnThreadStopped() {\n   Mutex::ScopedLock lock(mutex_);\n   scheduled_on_thread_stopped_ = false;\n \n+  Debug(this, \"Worker %llu thread stopped\", thread_id_);\n+\n   {\n     Mutex::ScopedLock stopped_lock(stopped_mutex_);\n     CHECK(stopped_);\n@@ -318,6 +335,8 @@ Worker::~Worker() {\n   // This has most likely already happened within the worker thread -- this\n   // is just in case Worker creation failed early.\n   DisposeIsolate();\n+\n+  Debug(this, \"Worker %llu destroyed\", thread_id_);\n }\n \n void Worker::New(const FunctionCallbackInfo<Value>& args) {\n@@ -371,6 +390,9 @@ void Worker::Unref(const FunctionCallbackInfo<Value>& args) {\n void Worker::Exit(int code) {\n   Mutex::ScopedLock lock(mutex_);\n   Mutex::ScopedLock stopped_lock(stopped_mutex_);\n+\n+  Debug(this, \"Worker %llu called Exit(%d)\", thread_id_, code);\n+\n   if (!stopped_) {\n     CHECK_NE(env_, nullptr);\n     stopped_ = true;"
+        }
+    ],
+    "stats": {
+        "total": 44,
+        "additions": 42,
+        "deletions": 2
+    }
+}

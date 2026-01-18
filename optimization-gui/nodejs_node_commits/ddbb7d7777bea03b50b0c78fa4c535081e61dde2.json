@@ -1,0 +1,132 @@
+{
+    "author": "BridgeAR",
+    "message": "deps: cherry-pick 56f6a76 from upstream V8\n\nOriginal commit message:\n\n    [turbofan] Fix -0 check for subnormals.\n\n    Previously we'd check `x` for -0 by testing `(1.0 / x) == -Infinity`,\n    but this will yield the wrong results when `x` is a subnormal, i.e.\n    really close to 0.\n\n    In CSA we already perform bit checks to test for -0, so teach TurboFan\n    to do the same for comparisons to -0 (via `Object.is`). We introduce a\n    new NumberIsMinusZero simplified operator to handle the case where\n    SimplifiedLowering already knows that the input is a number.\n\n    Bug: chromium:903043, v8:6882\n    Change-Id: I0cb7c568029b461a92fc183104d5f359b4bfe7f4\n    Reviewed-on: https://chromium-review.googlesource.com/c/1328802\n    Commit-Queue: Benedikt Meurer <bmeurer@chromium.org>\n    Reviewed-by: Sigurd Schneider <sigurds@chromium.org>\n    Cr-Commit-Position: refs/heads/master@{#57382}\n\nPR-URL: https://github.com/nodejs/node/pull/25269\nRefs: https://github.com/v8/v8/commit/56f6a763c27d77afbee997a50baa34996e97ba40\nFixes: https://github.com/nodejs/node/issues/25268\nReviewed-By: Tiancheng \"Timothy\" Gu <timothygu99@gmail.com>\nReviewed-By: Franziska Hinkelmann <franziska.hinkelmann@gmail.com>\nReviewed-By: Ujjwal Sharma <usharma1998@gmail.com>\nReviewed-By: Gus Caplan <me@gus.host>\nReviewed-By: Michael Dawson <michael_dawson@ca.ibm.com>\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "ddbb7d7777bea03b50b0c78fa4c535081e61dde2",
+    "files": [
+        {
+            "sha": "37f7e298ee5fdc555eb44f277b7e7ff7263b1b2b",
+            "filename": "common.gypi",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/ddbb7d7777bea03b50b0c78fa4c535081e61dde2/common.gypi",
+            "raw_url": "https://github.com/nodejs/node/raw/ddbb7d7777bea03b50b0c78fa4c535081e61dde2/common.gypi",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/common.gypi?ref=ddbb7d7777bea03b50b0c78fa4c535081e61dde2",
+            "patch": "@@ -38,7 +38,7 @@\n \n     # Reset this number to 0 on major V8 upgrades.\n     # Increment by one for each non-official patch applied to deps/v8.\n-    'v8_embedder_string': '-node.8',\n+    'v8_embedder_string': '-node.9',\n \n     ##### V8 defaults for Node.js #####\n "
+        },
+        {
+            "sha": "5f56d080d9e053935f50c77b5680885b2c349162",
+            "filename": "deps/v8/src/compiler/effect-control-linearizer.cc",
+            "status": "modified",
+            "additions": 43,
+            "deletions": 4,
+            "changes": 47,
+            "blob_url": "https://github.com/nodejs/node/blob/ddbb7d7777bea03b50b0c78fa4c535081e61dde2/deps%2Fv8%2Fsrc%2Fcompiler%2Feffect-control-linearizer.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/ddbb7d7777bea03b50b0c78fa4c535081e61dde2/deps%2Fv8%2Fsrc%2Fcompiler%2Feffect-control-linearizer.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/deps%2Fv8%2Fsrc%2Fcompiler%2Feffect-control-linearizer.cc?ref=ddbb7d7777bea03b50b0c78fa4c535081e61dde2",
+            "patch": "@@ -797,6 +797,9 @@ bool EffectControlLinearizer::TryWireInStateEffect(Node* node,\n     case IrOpcode::kObjectIsMinusZero:\n       result = LowerObjectIsMinusZero(node);\n       break;\n+    case IrOpcode::kNumberIsMinusZero:\n+      result = LowerNumberIsMinusZero(node);\n+      break;\n     case IrOpcode::kObjectIsNaN:\n       result = LowerObjectIsNaN(node);\n       break;\n@@ -2543,6 +2546,14 @@ Node* EffectControlLinearizer::LowerObjectIsSafeInteger(Node* node) {\n   return done.PhiAt(0);\n }\n \n+namespace {\n+\n+const int64_t kMinusZeroBits = bit_cast<int64_t>(-0.0);\n+const int32_t kMinusZeroLoBits = static_cast<int32_t>(kMinusZeroBits);\n+const int32_t kMinusZeroHiBits = static_cast<int32_t>(kMinusZeroBits >> 32);\n+\n+}  // namespace\n+\n Node* EffectControlLinearizer::LowerObjectIsMinusZero(Node* node) {\n   Node* value = node->InputAt(0);\n   Node* zero = __ Int32Constant(0);\n@@ -2559,15 +2570,43 @@ Node* EffectControlLinearizer::LowerObjectIsMinusZero(Node* node) {\n \n   // Check if {value} contains -0.\n   Node* value_value = __ LoadField(AccessBuilder::ForHeapNumberValue(), value);\n-  __ Goto(&done,\n-          __ Float64Equal(\n-              __ Float64Div(__ Float64Constant(1.0), value_value),\n-              __ Float64Constant(-std::numeric_limits<double>::infinity())));\n+  if (machine()->Is64()) {\n+    Node* value64 = __ BitcastFloat64ToInt64(value_value);\n+    __ Goto(&done, __ Word64Equal(value64, __ Int64Constant(kMinusZeroBits)));\n+  } else {\n+    Node* value_lo = __ Float64ExtractLowWord32(value_value);\n+    __ GotoIfNot(__ Word32Equal(value_lo, __ Int32Constant(kMinusZeroLoBits)),\n+                 &done, zero);\n+    Node* value_hi = __ Float64ExtractHighWord32(value_value);\n+    __ Goto(&done,\n+            __ Word32Equal(value_hi, __ Int32Constant(kMinusZeroHiBits)));\n+  }\n \n   __ Bind(&done);\n   return done.PhiAt(0);\n }\n \n+Node* EffectControlLinearizer::LowerNumberIsMinusZero(Node* node) {\n+  Node* value = node->InputAt(0);\n+\n+  if (machine()->Is64()) {\n+    Node* value64 = __ BitcastFloat64ToInt64(value);\n+    return __ Word64Equal(value64, __ Int64Constant(kMinusZeroBits));\n+  } else {\n+    auto done = __ MakeLabel(MachineRepresentation::kBit);\n+\n+    Node* value_lo = __ Float64ExtractLowWord32(value);\n+    __ GotoIfNot(__ Word32Equal(value_lo, __ Int32Constant(kMinusZeroLoBits)),\n+                 &done, __ Int32Constant(0));\n+    Node* value_hi = __ Float64ExtractHighWord32(value);\n+    __ Goto(&done,\n+            __ Word32Equal(value_hi, __ Int32Constant(kMinusZeroHiBits)));\n+\n+    __ Bind(&done);\n+    return done.PhiAt(0);\n+  }\n+}\n+\n Node* EffectControlLinearizer::LowerObjectIsNaN(Node* node) {\n   Node* value = node->InputAt(0);\n   Node* zero = __ Int32Constant(0);"
+        },
+        {
+            "sha": "20c94b3d4f5482eb475c967466d360c820d8cccd",
+            "filename": "deps/v8/src/compiler/effect-control-linearizer.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/ddbb7d7777bea03b50b0c78fa4c535081e61dde2/deps%2Fv8%2Fsrc%2Fcompiler%2Feffect-control-linearizer.h",
+            "raw_url": "https://github.com/nodejs/node/raw/ddbb7d7777bea03b50b0c78fa4c535081e61dde2/deps%2Fv8%2Fsrc%2Fcompiler%2Feffect-control-linearizer.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/deps%2Fv8%2Fsrc%2Fcompiler%2Feffect-control-linearizer.h?ref=ddbb7d7777bea03b50b0c78fa4c535081e61dde2",
+            "patch": "@@ -106,6 +106,7 @@ class V8_EXPORT_PRIVATE EffectControlLinearizer {\n   Node* LowerObjectIsConstructor(Node* node);\n   Node* LowerObjectIsDetectableCallable(Node* node);\n   Node* LowerObjectIsMinusZero(Node* node);\n+  Node* LowerNumberIsMinusZero(Node* node);\n   Node* LowerObjectIsNaN(Node* node);\n   Node* LowerNumberIsNaN(Node* node);\n   Node* LowerObjectIsNonCallable(Node* node);"
+        },
+        {
+            "sha": "ab854e6eb6160fe3b25489a5fe1f427b1599d437",
+            "filename": "deps/v8/src/compiler/opcodes.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/ddbb7d7777bea03b50b0c78fa4c535081e61dde2/deps%2Fv8%2Fsrc%2Fcompiler%2Fopcodes.h",
+            "raw_url": "https://github.com/nodejs/node/raw/ddbb7d7777bea03b50b0c78fa4c535081e61dde2/deps%2Fv8%2Fsrc%2Fcompiler%2Fopcodes.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/deps%2Fv8%2Fsrc%2Fcompiler%2Fopcodes.h?ref=ddbb7d7777bea03b50b0c78fa4c535081e61dde2",
+            "patch": "@@ -417,6 +417,7 @@\n   V(ObjectIsConstructor)                \\\n   V(ObjectIsDetectableCallable)         \\\n   V(ObjectIsMinusZero)                  \\\n+  V(NumberIsMinusZero)                  \\\n   V(ObjectIsNaN)                        \\\n   V(NumberIsNaN)                        \\\n   V(ObjectIsNonCallable)                \\"
+        },
+        {
+            "sha": "a06cb7423761abf5c2fcc70ce37de0807dcbdbc8",
+            "filename": "deps/v8/src/compiler/simplified-lowering.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 11,
+            "changes": 12,
+            "blob_url": "https://github.com/nodejs/node/blob/ddbb7d7777bea03b50b0c78fa4c535081e61dde2/deps%2Fv8%2Fsrc%2Fcompiler%2Fsimplified-lowering.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/ddbb7d7777bea03b50b0c78fa4c535081e61dde2/deps%2Fv8%2Fsrc%2Fcompiler%2Fsimplified-lowering.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/deps%2Fv8%2Fsrc%2Fcompiler%2Fsimplified-lowering.cc?ref=ddbb7d7777bea03b50b0c78fa4c535081e61dde2",
+            "patch": "@@ -3008,17 +3008,7 @@ class RepresentationSelector {\n           VisitUnop(node, UseInfo::TruncatingFloat64(),\n                     MachineRepresentation::kBit);\n           if (lower()) {\n-            // ObjectIsMinusZero(x:kRepFloat64)\n-            //   => Float64Equal(Float64Div(1.0,x),-Infinity)\n-            Node* const input = node->InputAt(0);\n-            node->ReplaceInput(\n-                0, jsgraph_->graph()->NewNode(\n-                       lowering->machine()->Float64Div(),\n-                       lowering->jsgraph()->Float64Constant(1.0), input));\n-            node->AppendInput(jsgraph_->zone(),\n-                              jsgraph_->Float64Constant(\n-                                  -std::numeric_limits<double>::infinity()));\n-            NodeProperties::ChangeOp(node, lowering->machine()->Float64Equal());\n+            NodeProperties::ChangeOp(node, simplified()->NumberIsMinusZero());\n           }\n         } else {\n           VisitUnop(node, UseInfo::AnyTagged(), MachineRepresentation::kBit);"
+        },
+        {
+            "sha": "a898b715a584bd80d7df9e97deffee4bfb3b8d00",
+            "filename": "deps/v8/src/compiler/simplified-operator.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/ddbb7d7777bea03b50b0c78fa4c535081e61dde2/deps%2Fv8%2Fsrc%2Fcompiler%2Fsimplified-operator.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/ddbb7d7777bea03b50b0c78fa4c535081e61dde2/deps%2Fv8%2Fsrc%2Fcompiler%2Fsimplified-operator.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/deps%2Fv8%2Fsrc%2Fcompiler%2Fsimplified-operator.cc?ref=ddbb7d7777bea03b50b0c78fa4c535081e61dde2",
+            "patch": "@@ -745,6 +745,7 @@ bool operator==(CheckMinusZeroParameters const& lhs,\n   V(ObjectIsConstructor, Operator::kNoProperties, 1, 0)          \\\n   V(ObjectIsDetectableCallable, Operator::kNoProperties, 1, 0)   \\\n   V(ObjectIsMinusZero, Operator::kNoProperties, 1, 0)            \\\n+  V(NumberIsMinusZero, Operator::kNoProperties, 1, 0)            \\\n   V(ObjectIsNaN, Operator::kNoProperties, 1, 0)                  \\\n   V(NumberIsNaN, Operator::kNoProperties, 1, 0)                  \\\n   V(ObjectIsNonCallable, Operator::kNoProperties, 1, 0)          \\"
+        },
+        {
+            "sha": "4cea393a15cd74b6f02e008f514466f6df182963",
+            "filename": "deps/v8/src/compiler/simplified-operator.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/ddbb7d7777bea03b50b0c78fa4c535081e61dde2/deps%2Fv8%2Fsrc%2Fcompiler%2Fsimplified-operator.h",
+            "raw_url": "https://github.com/nodejs/node/raw/ddbb7d7777bea03b50b0c78fa4c535081e61dde2/deps%2Fv8%2Fsrc%2Fcompiler%2Fsimplified-operator.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/deps%2Fv8%2Fsrc%2Fcompiler%2Fsimplified-operator.h?ref=ddbb7d7777bea03b50b0c78fa4c535081e61dde2",
+            "patch": "@@ -719,6 +719,7 @@ class V8_EXPORT_PRIVATE SimplifiedOperatorBuilder final\n   const Operator* ObjectIsConstructor();\n   const Operator* ObjectIsDetectableCallable();\n   const Operator* ObjectIsMinusZero();\n+  const Operator* NumberIsMinusZero();\n   const Operator* ObjectIsNaN();\n   const Operator* NumberIsNaN();\n   const Operator* ObjectIsNonCallable();"
+        },
+        {
+            "sha": "7ef20e7faea11133fcc33a6e9355c75554c7897b",
+            "filename": "deps/v8/src/compiler/typer.cc",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 0,
+            "changes": 11,
+            "blob_url": "https://github.com/nodejs/node/blob/ddbb7d7777bea03b50b0c78fa4c535081e61dde2/deps%2Fv8%2Fsrc%2Fcompiler%2Ftyper.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/ddbb7d7777bea03b50b0c78fa4c535081e61dde2/deps%2Fv8%2Fsrc%2Fcompiler%2Ftyper.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/deps%2Fv8%2Fsrc%2Fcompiler%2Ftyper.cc?ref=ddbb7d7777bea03b50b0c78fa4c535081e61dde2",
+            "patch": "@@ -290,6 +290,7 @@ class Typer::Visitor : public Reducer {\n   static Type ObjectIsConstructor(Type, Typer*);\n   static Type ObjectIsDetectableCallable(Type, Typer*);\n   static Type ObjectIsMinusZero(Type, Typer*);\n+  static Type NumberIsMinusZero(Type, Typer*);\n   static Type ObjectIsNaN(Type, Typer*);\n   static Type NumberIsNaN(Type, Typer*);\n   static Type ObjectIsNonCallable(Type, Typer*);\n@@ -597,6 +598,12 @@ Type Typer::Visitor::ObjectIsMinusZero(Type type, Typer* t) {\n   return Type::Boolean();\n }\n \n+Type Typer::Visitor::NumberIsMinusZero(Type type, Typer* t) {\n+  if (type.Is(Type::MinusZero())) return t->singleton_true_;\n+  if (!type.Maybe(Type::MinusZero())) return t->singleton_false_;\n+  return Type::Boolean();\n+}\n+\n Type Typer::Visitor::ObjectIsNaN(Type type, Typer* t) {\n   if (type.Is(Type::NaN())) return t->singleton_true_;\n   if (!type.Maybe(Type::NaN())) return t->singleton_false_;\n@@ -2104,6 +2111,10 @@ Type Typer::Visitor::TypeObjectIsMinusZero(Node* node) {\n   return TypeUnaryOp(node, ObjectIsMinusZero);\n }\n \n+Type Typer::Visitor::TypeNumberIsMinusZero(Node* node) {\n+  return TypeUnaryOp(node, NumberIsMinusZero);\n+}\n+\n Type Typer::Visitor::TypeNumberIsFloat64Hole(Node* node) {\n   return Type::Boolean();\n }"
+        },
+        {
+            "sha": "7eedd2b37b8f68fa8fbe4407a2ee2d684e99df5d",
+            "filename": "deps/v8/src/compiler/verifier.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/ddbb7d7777bea03b50b0c78fa4c535081e61dde2/deps%2Fv8%2Fsrc%2Fcompiler%2Fverifier.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/ddbb7d7777bea03b50b0c78fa4c535081e61dde2/deps%2Fv8%2Fsrc%2Fcompiler%2Fverifier.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/deps%2Fv8%2Fsrc%2Fcompiler%2Fverifier.cc?ref=ddbb7d7777bea03b50b0c78fa4c535081e61dde2",
+            "patch": "@@ -1188,6 +1188,7 @@ void Verifier::Visitor::Check(Node* node, const AllNodes& all) {\n       CheckValueInputIs(node, 0, Type::Number());\n       CheckTypeIs(node, Type::Boolean());\n       break;\n+    case IrOpcode::kNumberIsMinusZero:\n     case IrOpcode::kNumberIsNaN:\n       CheckValueInputIs(node, 0, Type::Number());\n       CheckTypeIs(node, Type::Boolean());"
+        },
+        {
+            "sha": "a877e6e12ab7edf188b59633d0124bc5d1cf734e",
+            "filename": "deps/v8/test/mjsunit/regress/regress-crbug-903043.js",
+            "status": "added",
+            "additions": 39,
+            "deletions": 0,
+            "changes": 39,
+            "blob_url": "https://github.com/nodejs/node/blob/ddbb7d7777bea03b50b0c78fa4c535081e61dde2/deps%2Fv8%2Ftest%2Fmjsunit%2Fregress%2Fregress-crbug-903043.js",
+            "raw_url": "https://github.com/nodejs/node/raw/ddbb7d7777bea03b50b0c78fa4c535081e61dde2/deps%2Fv8%2Ftest%2Fmjsunit%2Fregress%2Fregress-crbug-903043.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/deps%2Fv8%2Ftest%2Fmjsunit%2Fregress%2Fregress-crbug-903043.js?ref=ddbb7d7777bea03b50b0c78fa4c535081e61dde2",
+            "patch": "@@ -0,0 +1,39 @@\n+// Copyright 2018 the V8 project authors. All rights reserved.\n+// Use of this source code is governed by a BSD-style license that can be\n+// found in the LICENSE file.\n+\n+// Flags: --allow-natives-syntax\n+\n+(function() {\n+  function foo() {\n+    const x = 1e-1;\n+    return Object.is(-0, x * (-1e-308));\n+  }\n+\n+  assertFalse(foo());\n+  assertFalse(foo());\n+  %OptimizeFunctionOnNextCall(foo);\n+  assertFalse(foo());\n+})();\n+\n+(function() {\n+  function foo(x) {\n+    return Object.is(-0, x * (-1e-308));\n+  }\n+\n+  assertFalse(foo(1e-1));\n+  assertFalse(foo(1e-1));\n+  %OptimizeFunctionOnNextCall(foo);\n+  assertFalse(foo(1e-1));\n+})();\n+\n+(function() {\n+  function foo(x) {\n+    return Object.is(-0, x);\n+  }\n+\n+  assertFalse(foo(1e-1 * (-1e-308)));\n+  assertFalse(foo(1e-1 * (-1e-308)));\n+  %OptimizeFunctionOnNextCall(foo);\n+  assertFalse(foo(1e-1 * (-1e-308)));\n+})();"
+        }
+    ],
+    "stats": {
+        "total": 116,
+        "additions": 100,
+        "deletions": 16
+    }
+}

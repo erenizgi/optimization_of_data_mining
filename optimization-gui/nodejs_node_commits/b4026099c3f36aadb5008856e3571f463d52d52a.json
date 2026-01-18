@@ -1,0 +1,48 @@
+{
+    "author": "tniessen",
+    "message": "crypto: improve setAuthTag\n\nThis is an attempt to make the behavior of setAuthTag match the\ndocumentation: In GCM mode, it can be called at any time before\ninvoking final, even after the last call to update.\n\nFixes: https://github.com/nodejs/node/issues/22421\n\nPR-URL: https://github.com/nodejs/node/pull/22538\nReviewed-By: Anna Henningsen <anna@addaleax.net>",
+    "sha": "b4026099c3f36aadb5008856e3571f463d52d52a",
+    "files": [
+        {
+            "sha": "93c71001b3b2af12cc71a090f74d3801101a7ccf",
+            "filename": "src/node_crypto.cc",
+            "status": "modified",
+            "additions": 24,
+            "deletions": 16,
+            "changes": 40,
+            "blob_url": "https://github.com/nodejs/node/blob/b4026099c3f36aadb5008856e3571f463d52d52a/src%2Fnode_crypto.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/b4026099c3f36aadb5008856e3571f463d52d52a/src%2Fnode_crypto.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_crypto.cc?ref=b4026099c3f36aadb5008856e3571f463d52d52a",
+            "patch": "@@ -2928,6 +2928,20 @@ void CipherBase::SetAuthTag(const FunctionCallbackInfo<Value>& args) {\n }\n \n \n+bool CipherBase::MaybePassAuthTagToOpenSSL() {\n+  if (!auth_tag_set_ && auth_tag_len_ != kNoAuthTagLength) {\n+    if (!EVP_CIPHER_CTX_ctrl(ctx_.get(),\n+                             EVP_CTRL_AEAD_SET_TAG,\n+                             auth_tag_len_,\n+                             reinterpret_cast<unsigned char*>(auth_tag_))) {\n+      return false;\n+    }\n+    auth_tag_set_ = true;\n+  }\n+  return true;\n+}\n+\n+\n bool CipherBase::SetAAD(const char* data, unsigned int len, int plaintext_len) {\n   if (!ctx_ || !IsAuthenticatedMode())\n     return false;\n@@ -2947,15 +2961,9 @@ bool CipherBase::SetAAD(const char* data, unsigned int len, int plaintext_len) {\n     if (!CheckCCMMessageLength(plaintext_len))\n       return false;\n \n-    if (kind_ == kDecipher && !auth_tag_set_ && auth_tag_len_ > 0 &&\n-        auth_tag_len_ != kNoAuthTagLength) {\n-      if (!EVP_CIPHER_CTX_ctrl(ctx_.get(),\n-                               EVP_CTRL_CCM_SET_TAG,\n-                               auth_tag_len_,\n-                               reinterpret_cast<unsigned char*>(auth_tag_))) {\n+    if (kind_ == kDecipher) {\n+      if (!MaybePassAuthTagToOpenSSL())\n         return false;\n-      }\n-      auth_tag_set_ = true;\n     }\n \n     // Specify the plaintext length.\n@@ -3000,14 +3008,10 @@ CipherBase::UpdateResult CipherBase::Update(const char* data,\n       return kErrorMessageSize;\n   }\n \n-  // on first update:\n-  if (kind_ == kDecipher && IsAuthenticatedMode() && auth_tag_len_ > 0 &&\n-      auth_tag_len_ != kNoAuthTagLength && !auth_tag_set_) {\n-    CHECK(EVP_CIPHER_CTX_ctrl(ctx_.get(),\n-                              EVP_CTRL_AEAD_SET_TAG,\n-                              auth_tag_len_,\n-                              reinterpret_cast<unsigned char*>(auth_tag_)));\n-    auth_tag_set_ = true;\n+  // Pass the authentication tag to OpenSSL if possible. This will only happen\n+  // once, usually on the first update.\n+  if (kind_ == kDecipher && IsAuthenticatedMode()) {\n+    CHECK(MaybePassAuthTagToOpenSSL());\n   }\n \n   *out_len = 0;\n@@ -3107,6 +3111,10 @@ bool CipherBase::Final(unsigned char** out, int* out_len) {\n   *out = Malloc<unsigned char>(\n       static_cast<size_t>(EVP_CIPHER_CTX_block_size(ctx_.get())));\n \n+  if (kind_ == kDecipher && IsSupportedAuthenticatedMode(mode)) {\n+    MaybePassAuthTagToOpenSSL();\n+  }\n+\n   // In CCM mode, final() only checks whether authentication failed in update().\n   // EVP_CipherFinal_ex must not be called and will fail.\n   bool ok;"
+        },
+        {
+            "sha": "86aa3ba4ba83953e5fc0d9d7a93ccfcec9a9997c",
+            "filename": "src/node_crypto.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/b4026099c3f36aadb5008856e3571f463d52d52a/src%2Fnode_crypto.h",
+            "raw_url": "https://github.com/nodejs/node/raw/b4026099c3f36aadb5008856e3571f463d52d52a/src%2Fnode_crypto.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_crypto.h?ref=b4026099c3f36aadb5008856e3571f463d52d52a",
+            "patch": "@@ -385,6 +385,7 @@ class CipherBase : public BaseObject {\n \n   bool IsAuthenticatedMode() const;\n   bool SetAAD(const char* data, unsigned int len, int plaintext_len);\n+  bool MaybePassAuthTagToOpenSSL();\n \n   static void New(const v8::FunctionCallbackInfo<v8::Value>& args);\n   static void Init(const v8::FunctionCallbackInfo<v8::Value>& args);"
+        },
+        {
+            "sha": "a2f5e9cdd8a04343381cbbe0296e8199292cd14b",
+            "filename": "test/parallel/test-crypto-authenticated.js",
+            "status": "modified",
+            "additions": 26,
+            "deletions": 0,
+            "changes": 26,
+            "blob_url": "https://github.com/nodejs/node/blob/b4026099c3f36aadb5008856e3571f463d52d52a/test%2Fparallel%2Ftest-crypto-authenticated.js",
+            "raw_url": "https://github.com/nodejs/node/raw/b4026099c3f36aadb5008856e3571f463d52d52a/test%2Fparallel%2Ftest-crypto-authenticated.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-crypto-authenticated.js?ref=b4026099c3f36aadb5008856e3571f463d52d52a",
+            "patch": "@@ -555,3 +555,29 @@ for (const test of TEST_CASES) {\n   encrypt.update('boom');  // Should not throw 'Message exceeds maximum size'.\n   encrypt.final();\n }\n+\n+// Test that the authentication tag can be set at any point before calling\n+// final() in GCM mode.\n+{\n+  const plain = Buffer.from('Hello world', 'utf8');\n+  const key = Buffer.from('0123456789abcdef', 'utf8');\n+  const iv = Buffer.from('0123456789ab', 'utf8');\n+\n+  const cipher = crypto.createCipheriv('aes-128-gcm', key, iv);\n+  const ciphertext = Buffer.concat([cipher.update(plain), cipher.final()]);\n+  const authTag = cipher.getAuthTag();\n+\n+  for (const authTagBeforeUpdate of [true, false]) {\n+    const decipher = crypto.createDecipheriv('aes-128-gcm', key, iv);\n+    if (authTagBeforeUpdate) {\n+      decipher.setAuthTag(authTag);\n+    }\n+    const resultUpdate = decipher.update(ciphertext);\n+    if (!authTagBeforeUpdate) {\n+      decipher.setAuthTag(authTag);\n+    }\n+    const resultFinal = decipher.final();\n+    const result = Buffer.concat([resultUpdate, resultFinal]);\n+    assert(result.equals(plain));\n+  }\n+}"
+        }
+    ],
+    "stats": {
+        "total": 67,
+        "additions": 51,
+        "deletions": 16
+    }
+}

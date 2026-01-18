@@ -1,0 +1,84 @@
+{
+    "author": "crisbeto",
+    "message": "fix(core): not inserting ViewContainerRef nodes when inside root of a component (#39599)\n\nWhen a `ViewContainerRef` is injected, we dynamically create a comment node next to the host\nso that it can be used as an anchor point for inserting views. The comment node is inserted\nthrough the `appendChild` helper from `node_manipulation.ts` in most cases.\n\nThe problem with using `appendChild` here is that it has some extra logic which doesn't return\na parent `RNode` if an element is at the root of a component. I __think__ that this is a performance\noptimization which is used to avoid inserting an element in one place in the DOM and then\nmoving it a bit later when it is projected. This can break down in some cases when creating\na `ViewContainerRef` for a non-component node at the root of another component like the following:\n\n```\n<root>\n  <div #viewContainerRef></div>\n</root>\n```\n\nIn this case the `#viewContainerRef` node is at the root of a component so we intentionally don't\ninsert it, but since its anchor element was created manually, it'll never be projected. This will\nprevent any views added through the `ViewContainerRef` from being inserted into the DOM.\n\nThese changes resolve the issue by not going through `appendChild` at all when creating a comment\nnode for `ViewContainerRef`. This should work identically since `appendChild` doesn't really do\nanything with the T structures anyway, it only uses them to reach the relevant DOM nodes.\n\nFixes #39556.\n\nPR Close #39599",
+    "sha": "b015d3e9505b530bff1f4a0424394a785a013a0a",
+    "files": [
+        {
+            "sha": "b1f211edeb364d33dd5c87fb8de5542cabf340ad",
+            "filename": "packages/core/src/render3/node_manipulation.ts",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 3,
+            "changes": 5,
+            "blob_url": "https://github.com/angular/angular/blob/b015d3e9505b530bff1f4a0424394a785a013a0a/packages%2Fcore%2Fsrc%2Frender3%2Fnode_manipulation.ts",
+            "raw_url": "https://github.com/angular/angular/raw/b015d3e9505b530bff1f4a0424394a785a013a0a/packages%2Fcore%2Fsrc%2Frender3%2Fnode_manipulation.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcore%2Fsrc%2Frender3%2Fnode_manipulation.ts?ref=b015d3e9505b530bff1f4a0424394a785a013a0a",
+            "patch": "@@ -557,9 +557,8 @@ export function getClosestRElement(tView: TView, tNode: TNode|null, lView: LView\n     ngDevMode && assertTNodeType(parentTNode, TNodeType.AnyRNode | TNodeType.Container);\n     if (parentTNode.flags & TNodeFlags.isComponentHost) {\n       ngDevMode && assertTNodeForLView(parentTNode, lView);\n-      const tData = tView.data;\n-      const tNode = tData[parentTNode.index] as TNode;\n-      const encapsulation = (tData[tNode.directiveStart] as ComponentDef<any>).encapsulation;\n+      const encapsulation =\n+          (tView.data[parentTNode.directiveStart] as ComponentDef<unknown>).encapsulation;\n       // We've got a parent which is an element in the current view. We just need to verify if the\n       // parent element is not a component. Component's content nodes are not inserted immediately\n       // because they will be projected, and so doing insert at this point would be wasteful."
+        },
+        {
+            "sha": "d2616be35916929be0bb5cfdacd806fb87509728",
+            "filename": "packages/core/src/render3/view_engine_compatibility.ts",
+            "status": "modified",
+            "additions": 14,
+            "deletions": 24,
+            "changes": 38,
+            "blob_url": "https://github.com/angular/angular/blob/b015d3e9505b530bff1f4a0424394a785a013a0a/packages%2Fcore%2Fsrc%2Frender3%2Fview_engine_compatibility.ts",
+            "raw_url": "https://github.com/angular/angular/raw/b015d3e9505b530bff1f4a0424394a785a013a0a/packages%2Fcore%2Fsrc%2Frender3%2Fview_engine_compatibility.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcore%2Fsrc%2Frender3%2Fview_engine_compatibility.ts?ref=b015d3e9505b530bff1f4a0424394a785a013a0a",
+            "patch": "@@ -20,15 +20,15 @@ import {assertDefined, assertEqual, assertGreaterThan, assertLessThan} from '../\n \n import {assertLContainer, assertNodeInjector} from './assert';\n import {getParentInjectorLocation, NodeInjector} from './di';\n-import {addToViewTree, createLContainer, createLView, createTNode, renderView} from './instructions/shared';\n+import {addToViewTree, createLContainer, createLView, renderView} from './instructions/shared';\n import {CONTAINER_HEADER_OFFSET, LContainer, NATIVE, VIEW_REFS} from './interfaces/container';\n import {NodeInjectorOffset} from './interfaces/injector';\n import {TContainerNode, TDirectiveHostNode, TElementContainerNode, TElementNode, TNode, TNodeType} from './interfaces/node';\n import {isProceduralRenderer, RComment, RElement} from './interfaces/renderer';\n-import {isComponentHost, isLContainer, isLView, isRootView} from './interfaces/type_checks';\n+import {isComponentHost, isLContainer, isLView} from './interfaces/type_checks';\n import {DECLARATION_COMPONENT_VIEW, DECLARATION_LCONTAINER, LView, LViewFlags, PARENT, QUERIES, RENDERER, T_HOST, TVIEW, TView} from './interfaces/view';\n import {assertTNodeType} from './node_assert';\n-import {addViewToContainer, appendChild, destroyLView, detachView, getBeforeNodeForView, insertView, nativeInsertBefore, nativeNextSibling, nativeParentNode} from './node_manipulation';\n+import {addViewToContainer, destroyLView, detachView, getBeforeNodeForView, insertView, nativeInsertBefore, nativeNextSibling, nativeParentNode} from './node_manipulation';\n import {getCurrentTNode, getLView} from './state';\n import {getParentInjectorIndex, getParentInjectorView, hasParentInjector} from './util/injector_utils';\n import {getComponentLViewByIndex, getNativeByTNode, unwrapRNode, viewAttachedToContainer} from './util/view_utils';\n@@ -373,28 +373,18 @@ export function createContainerRef(\n     if (hostTNode.type & TNodeType.ElementContainer) {\n       commentNode = unwrapRNode(slotValue) as RComment;\n     } else {\n+      // If the host is a regular element, we have to insert a comment node manually which will\n+      // be used as an anchor when inserting elements. In this specific case we use low-level DOM\n+      // manipulation to insert it.\n+      const renderer = hostView[RENDERER];\n       ngDevMode && ngDevMode.rendererCreateComment++;\n-      commentNode = hostView[RENDERER].createComment(ngDevMode ? 'container' : '');\n-\n-      // A `ViewContainerRef` can be injected by the root (topmost / bootstrapped) component. In\n-      // this case we can't use TView / TNode data structures to insert container's marker node\n-      // (both a parent of a comment node and the comment node itself are not part of any view). In\n-      // this specific case we use low-level DOM manipulation to insert container's marker (comment)\n-      // node.\n-      if (isRootView(hostView)) {\n-        const renderer = hostView[RENDERER];\n-        const hostNative = getNativeByTNode(hostTNode, hostView)!;\n-        const parentOfHostNative = nativeParentNode(renderer, hostNative);\n-        nativeInsertBefore(\n-            renderer, parentOfHostNative!, commentNode, nativeNextSibling(renderer, hostNative),\n-            false);\n-      } else {\n-        // The TNode created here is bogus, in that it is not added to the TView. It is only created\n-        // to allow us to create a dynamic Comment node.\n-        const commentTNode =\n-            createTNode(hostView[TVIEW], hostTNode.parent, TNodeType.Container, 0, null, null);\n-        appendChild(hostView[TVIEW], hostView, commentNode, commentTNode);\n-      }\n+      commentNode = renderer.createComment(ngDevMode ? 'container' : '');\n+\n+      const hostNative = getNativeByTNode(hostTNode, hostView)!;\n+      const parentOfHostNative = nativeParentNode(renderer, hostNative);\n+      nativeInsertBefore(\n+          renderer, parentOfHostNative!, commentNode, nativeNextSibling(renderer, hostNative),\n+          false);\n     }\n \n     hostView[hostTNode.index] = lContainer ="
+        },
+        {
+            "sha": "4023e77118f1da0fd3662e33a6255f6a4ef6d679",
+            "filename": "packages/core/test/acceptance/component_spec.ts",
+            "status": "modified",
+            "additions": 44,
+            "deletions": 0,
+            "changes": 44,
+            "blob_url": "https://github.com/angular/angular/blob/b015d3e9505b530bff1f4a0424394a785a013a0a/packages%2Fcore%2Ftest%2Facceptance%2Fcomponent_spec.ts",
+            "raw_url": "https://github.com/angular/angular/raw/b015d3e9505b530bff1f4a0424394a785a013a0a/packages%2Fcore%2Ftest%2Facceptance%2Fcomponent_spec.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcore%2Ftest%2Facceptance%2Fcomponent_spec.ts?ref=b015d3e9505b530bff1f4a0424394a785a013a0a",
+            "patch": "@@ -96,6 +96,50 @@ describe('component', () => {\n     expect(fixture.nativeElement).toHaveText('foo|bar');\n   });\n \n+  it('should be able to dynamically insert a component into a view container at the root of a component',\n+     () => {\n+       @Component({template: 'hello'})\n+       class HelloComponent {\n+       }\n+\n+       // TODO: This module is only used to declare the `entryComponets` since\n+       //  `configureTestingModule` doesn't support it. The module can be removed\n+       // once ViewEngine is removed.\n+       @NgModule({\n+         declarations: [HelloComponent],\n+         exports: [HelloComponent],\n+         entryComponents: [HelloComponent]\n+       })\n+       class HelloModule {\n+       }\n+\n+       @Component({selector: 'wrapper', template: '<ng-content></ng-content>'})\n+       class Wrapper {\n+       }\n+\n+       @Component({\n+         template: `\n+            <wrapper>\n+              <div #insertionPoint></div>\n+            </wrapper>\n+          `\n+       })\n+       class App {\n+         @ViewChild('insertionPoint', {read: ViewContainerRef}) viewContainerRef!: ViewContainerRef;\n+         constructor(public componentFactoryResolver: ComponentFactoryResolver) {}\n+       }\n+\n+       TestBed.configureTestingModule({declarations: [App, Wrapper], imports: [HelloModule]});\n+       const fixture = TestBed.createComponent(App);\n+       fixture.detectChanges();\n+\n+       const instance = fixture.componentInstance;\n+       const factory = instance.componentFactoryResolver.resolveComponentFactory(HelloComponent);\n+       instance.viewContainerRef.createComponent(factory);\n+\n+       expect(fixture.nativeElement.textContent.trim()).toBe('hello');\n+     });\n+\n   // TODO: add tests with Native once tests run in real browser (domino doesn't support shadow root)\n   describe('encapsulation', () => {\n     @Component({"
+        },
+        {
+            "sha": "b914fe39c793c124b5cc78d1cf6fef5cc59208b9",
+            "filename": "packages/core/test/bundling/forms/bundle.golden_symbols.json",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 6,
+            "changes": 6,
+            "blob_url": "https://github.com/angular/angular/blob/b015d3e9505b530bff1f4a0424394a785a013a0a/packages%2Fcore%2Ftest%2Fbundling%2Fforms%2Fbundle.golden_symbols.json",
+            "raw_url": "https://github.com/angular/angular/raw/b015d3e9505b530bff1f4a0424394a785a013a0a/packages%2Fcore%2Ftest%2Fbundling%2Fforms%2Fbundle.golden_symbols.json",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcore%2Ftest%2Fbundling%2Fforms%2Fbundle.golden_symbols.json?ref=b015d3e9505b530bff1f4a0424394a785a013a0a",
+            "patch": "@@ -824,9 +824,6 @@\n   {\n     \"name\": \"createPlatformFactory\"\n   },\n-  {\n-    \"name\": \"createTNode\"\n-  },\n   {\n     \"name\": \"createTView\"\n   },\n@@ -1244,9 +1241,6 @@\n   {\n     \"name\": \"isPropertyUpdated\"\n   },\n-  {\n-    \"name\": \"isRootView\"\n-  },\n   {\n     \"name\": \"isScheduler\"\n   },"
+        },
+        {
+            "sha": "529768219afc7630037a032af6e4a61fcde2acf6",
+            "filename": "packages/core/test/bundling/router/bundle.golden_symbols.json",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 6,
+            "changes": 6,
+            "blob_url": "https://github.com/angular/angular/blob/b015d3e9505b530bff1f4a0424394a785a013a0a/packages%2Fcore%2Ftest%2Fbundling%2Frouter%2Fbundle.golden_symbols.json",
+            "raw_url": "https://github.com/angular/angular/raw/b015d3e9505b530bff1f4a0424394a785a013a0a/packages%2Fcore%2Ftest%2Fbundling%2Frouter%2Fbundle.golden_symbols.json",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcore%2Ftest%2Fbundling%2Frouter%2Fbundle.golden_symbols.json?ref=b015d3e9505b530bff1f4a0424394a785a013a0a",
+            "patch": "@@ -1070,9 +1070,6 @@\n   {\n     \"name\": \"createRouterScroller\"\n   },\n-  {\n-    \"name\": \"createTNode\"\n-  },\n   {\n     \"name\": \"createTView\"\n   },\n@@ -1568,9 +1565,6 @@\n   {\n     \"name\": \"isPromise\"\n   },\n-  {\n-    \"name\": \"isRootView\"\n-  },\n   {\n     \"name\": \"isScheduler\"\n   },"
+        },
+        {
+            "sha": "ec637ff1f1d047759043f8fcbe293fe14590f19a",
+            "filename": "packages/core/test/bundling/todo/bundle.golden_symbols.json",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 6,
+            "changes": 6,
+            "blob_url": "https://github.com/angular/angular/blob/b015d3e9505b530bff1f4a0424394a785a013a0a/packages%2Fcore%2Ftest%2Fbundling%2Ftodo%2Fbundle.golden_symbols.json",
+            "raw_url": "https://github.com/angular/angular/raw/b015d3e9505b530bff1f4a0424394a785a013a0a/packages%2Fcore%2Ftest%2Fbundling%2Ftodo%2Fbundle.golden_symbols.json",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcore%2Ftest%2Fbundling%2Ftodo%2Fbundle.golden_symbols.json?ref=b015d3e9505b530bff1f4a0424394a785a013a0a",
+            "patch": "@@ -260,9 +260,6 @@\n   {\n     \"name\": \"createLView\"\n   },\n-  {\n-    \"name\": \"createTNode\"\n-  },\n   {\n     \"name\": \"createTView\"\n   },\n@@ -518,9 +515,6 @@\n   {\n     \"name\": \"isProceduralRenderer\"\n   },\n-  {\n-    \"name\": \"isRootView\"\n-  },\n   {\n     \"name\": \"isStylingMatch\"\n   },"
+        }
+    ],
+    "stats": {
+        "total": 105,
+        "additions": 60,
+        "deletions": 45
+    }
+}

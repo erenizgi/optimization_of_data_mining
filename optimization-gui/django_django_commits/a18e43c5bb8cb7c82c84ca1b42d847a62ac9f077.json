@@ -1,0 +1,96 @@
+{
+    "author": "akaariai",
+    "message": "Made get_indexes() consistent across backends.\n\nFixed #15933, #18082 -- the get_indexes() method introspection was\ndone inconsitently depending on the backend. For example SQLite\nincluded all the columns in the table in the returned dictionary,\nwhile MySQL introspected also multicolumn indexes.\n\nAll backends return now consistenly only single-column indexes.\n\nThanks to andi for the MySQL report, and ikelly for comments on\nOracle's get_indexes() changes.",
+    "sha": "a18e43c5bb8cb7c82c84ca1b42d847a62ac9f077",
+    "files": [
+        {
+            "sha": "27623505e5de6071edec92ca6c488c04890083a8",
+            "filename": "django/db/backends/__init__.py",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 0,
+            "changes": 11,
+            "blob_url": "https://github.com/django/django/blob/a18e43c5bb8cb7c82c84ca1b42d847a62ac9f077/django%2Fdb%2Fbackends%2F__init__.py",
+            "raw_url": "https://github.com/django/django/raw/a18e43c5bb8cb7c82c84ca1b42d847a62ac9f077/django%2Fdb%2Fbackends%2F__init__.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fbackends%2F__init__.py?ref=a18e43c5bb8cb7c82c84ca1b42d847a62ac9f077",
+            "patch": "@@ -997,6 +997,17 @@ def get_primary_key_column(self, cursor, table_name):\n         \"\"\"\n         raise NotImplementedError\n \n+    def get_indexes(self, cursor, table_name):\n+        \"\"\"\n+        Returns a dictionary of indexed fieldname -> infodict for the given\n+        table, where each infodict is in the format:\n+            {'primary_key': boolean representing whether it's the primary key,\n+             'unique': boolean representing whether it's a unique index}\n+\n+        Only single-column indexes are introspected.\n+        \"\"\"\n+        raise NotImplementedError\n+\n class BaseDatabaseClient(object):\n     \"\"\"\n     This class encapsulates all backend-specific methods for opening a"
+        },
+        {
+            "sha": "e6f18b819f6bc0683264a127690438492a8db7d8",
+            "filename": "django/db/backends/mysql/introspection.py",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 7,
+            "changes": 18,
+            "blob_url": "https://github.com/django/django/blob/a18e43c5bb8cb7c82c84ca1b42d847a62ac9f077/django%2Fdb%2Fbackends%2Fmysql%2Fintrospection.py",
+            "raw_url": "https://github.com/django/django/raw/a18e43c5bb8cb7c82c84ca1b42d847a62ac9f077/django%2Fdb%2Fbackends%2Fmysql%2Fintrospection.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fbackends%2Fmysql%2Fintrospection.py?ref=a18e43c5bb8cb7c82c84ca1b42d847a62ac9f077",
+            "patch": "@@ -85,15 +85,19 @@ def get_primary_key_column(self, cursor, table_name):\n         return None\n \n     def get_indexes(self, cursor, table_name):\n-        \"\"\"\n-        Returns a dictionary of fieldname -> infodict for the given table,\n-        where each infodict is in the format:\n-            {'primary_key': boolean representing whether it's the primary key,\n-             'unique': boolean representing whether it's a unique index}\n-        \"\"\"\n         cursor.execute(\"SHOW INDEX FROM %s\" % self.connection.ops.quote_name(table_name))\n+        # Do a two-pass search for indexes: on first pass check which indexes\n+        # are multicolumn, on second pass check which single-column indexes\n+        # are present.\n+        rows = list(cursor.fetchall())\n+        multicol_indexes = set()\n+        for row in rows:\n+            if row[3] > 1:\n+                multicol_indexes.add(row[2])\n         indexes = {}\n-        for row in cursor.fetchall():\n+        for row in rows:\n+            if row[2] in multicol_indexes:\n+                continue\n             indexes[row[4]] = {'primary_key': (row[2] == 'PRIMARY'), 'unique': not bool(row[1])}\n         return indexes\n "
+        },
+        {
+            "sha": "7d477f6924b36fbe6cfaf8226fa168ac5a640666",
+            "filename": "django/db/backends/oracle/introspection.py",
+            "status": "modified",
+            "additions": 26,
+            "deletions": 31,
+            "changes": 57,
+            "blob_url": "https://github.com/django/django/blob/a18e43c5bb8cb7c82c84ca1b42d847a62ac9f077/django%2Fdb%2Fbackends%2Foracle%2Fintrospection.py",
+            "raw_url": "https://github.com/django/django/raw/a18e43c5bb8cb7c82c84ca1b42d847a62ac9f077/django%2Fdb%2Fbackends%2Foracle%2Fintrospection.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fbackends%2Foracle%2Fintrospection.py?ref=a18e43c5bb8cb7c82c84ca1b42d847a62ac9f077",
+            "patch": "@@ -72,51 +72,46 @@ def get_relations(self, cursor, table_name):\n     FROM   user_constraints, USER_CONS_COLUMNS ca, USER_CONS_COLUMNS cb,\n            user_tab_cols ta, user_tab_cols tb\n     WHERE  user_constraints.table_name = %s AND\n-           ta.table_name = %s AND\n+           ta.table_name = user_constraints.table_name AND\n            ta.column_name = ca.column_name AND\n-           ca.table_name = %s AND\n+           ca.table_name = ta.table_name AND\n            user_constraints.constraint_name = ca.constraint_name AND\n            user_constraints.r_constraint_name = cb.constraint_name AND\n            cb.table_name = tb.table_name AND\n            cb.column_name = tb.column_name AND\n-           ca.position = cb.position\"\"\", [table_name, table_name, table_name])\n+           ca.position = cb.position\"\"\", [table_name])\n \n         relations = {}\n         for row in cursor.fetchall():\n             relations[row[0]] = (row[2], row[1].lower())\n         return relations\n \n     def get_indexes(self, cursor, table_name):\n+        sql = \"\"\"\n+    SELECT LOWER(uic1.column_name) AS column_name,\n+           CASE user_constraints.constraint_type\n+               WHEN 'P' THEN 1 ELSE 0\n+           END AS is_primary_key,\n+           CASE user_indexes.uniqueness\n+               WHEN 'UNIQUE' THEN 1 ELSE 0\n+           END AS is_unique\n+    FROM   user_constraints, user_indexes, user_ind_columns uic1\n+    WHERE  user_constraints.constraint_type (+) = 'P'\n+      AND  user_constraints.index_name (+) = uic1.index_name\n+      AND  user_indexes.uniqueness (+) = 'UNIQUE'\n+      AND  user_indexes.index_name (+) = uic1.index_name\n+      AND  uic1.table_name = UPPER(%s)\n+      AND  uic1.column_position = 1\n+      AND  NOT EXISTS (\n+              SELECT 1\n+              FROM   user_ind_columns uic2\n+              WHERE  uic2.index_name = uic1.index_name\n+                AND  uic2.column_position = 2\n+           )\n         \"\"\"\n-        Returns a dictionary of fieldname -> infodict for the given table,\n-        where each infodict is in the format:\n-            {'primary_key': boolean representing whether it's the primary key,\n-             'unique': boolean representing whether it's a unique index}\n-        \"\"\"\n-        # This query retrieves each index on the given table, including the\n-        # first associated field name\n-        # \"We were in the nick of time; you were in great peril!\"\n-        sql = \"\"\"\\\n-SELECT LOWER(all_tab_cols.column_name) AS column_name,\n-       CASE user_constraints.constraint_type\n-           WHEN 'P' THEN 1 ELSE 0\n-       END AS is_primary_key,\n-       CASE user_indexes.uniqueness\n-           WHEN 'UNIQUE' THEN 1 ELSE 0\n-       END AS is_unique\n-FROM   all_tab_cols, user_cons_columns, user_constraints, user_ind_columns, user_indexes\n-WHERE  all_tab_cols.column_name = user_cons_columns.column_name (+)\n-  AND  all_tab_cols.table_name = user_cons_columns.table_name (+)\n-  AND  user_cons_columns.constraint_name = user_constraints.constraint_name (+)\n-  AND  user_constraints.constraint_type (+) = 'P'\n-  AND  user_ind_columns.column_name (+) = all_tab_cols.column_name\n-  AND  user_ind_columns.table_name (+) = all_tab_cols.table_name\n-  AND  user_indexes.uniqueness (+) = 'UNIQUE'\n-  AND  user_indexes.index_name (+) = user_ind_columns.index_name\n-  AND  all_tab_cols.table_name = UPPER(%s)\n-\"\"\"\n         cursor.execute(sql, [table_name])\n         indexes = {}\n         for row in cursor.fetchall():\n-            indexes[row[0]] = {'primary_key': row[1], 'unique': row[2]}\n+            indexes[row[0]] = {'primary_key': bool(row[1]),\n+                               'unique': bool(row[2])}\n         return indexes"
+        },
+        {
+            "sha": "fbf7a22769a13b9d5f36772b47be918f6d7f96ae",
+            "filename": "django/db/backends/postgresql_psycopg2/introspection.py",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 6,
+            "changes": 6,
+            "blob_url": "https://github.com/django/django/blob/a18e43c5bb8cb7c82c84ca1b42d847a62ac9f077/django%2Fdb%2Fbackends%2Fpostgresql_psycopg2%2Fintrospection.py",
+            "raw_url": "https://github.com/django/django/raw/a18e43c5bb8cb7c82c84ca1b42d847a62ac9f077/django%2Fdb%2Fbackends%2Fpostgresql_psycopg2%2Fintrospection.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fbackends%2Fpostgresql_psycopg2%2Fintrospection.py?ref=a18e43c5bb8cb7c82c84ca1b42d847a62ac9f077",
+            "patch": "@@ -65,12 +65,6 @@ def get_relations(self, cursor, table_name):\n         return relations\n \n     def get_indexes(self, cursor, table_name):\n-        \"\"\"\n-        Returns a dictionary of fieldname -> infodict for the given table,\n-        where each infodict is in the format:\n-            {'primary_key': boolean representing whether it's the primary key,\n-             'unique': boolean representing whether it's a unique index}\n-        \"\"\"\n         # This query retrieves each index on the given table, including the\n         # first associated field name\n         cursor.execute(\"\"\""
+        },
+        {
+            "sha": "8135f3548c39ea959cde84b825d88da05fe6fc4b",
+            "filename": "django/db/backends/sqlite3/introspection.py",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 11,
+            "changes": 16,
+            "blob_url": "https://github.com/django/django/blob/a18e43c5bb8cb7c82c84ca1b42d847a62ac9f077/django%2Fdb%2Fbackends%2Fsqlite3%2Fintrospection.py",
+            "raw_url": "https://github.com/django/django/raw/a18e43c5bb8cb7c82c84ca1b42d847a62ac9f077/django%2Fdb%2Fbackends%2Fsqlite3%2Fintrospection.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fbackends%2Fsqlite3%2Fintrospection.py?ref=a18e43c5bb8cb7c82c84ca1b42d847a62ac9f077",
+            "patch": "@@ -133,28 +133,22 @@ def get_key_columns(self, cursor, table_name):\n         return key_columns\n \n     def get_indexes(self, cursor, table_name):\n-        \"\"\"\n-        Returns a dictionary of fieldname -> infodict for the given table,\n-        where each infodict is in the format:\n-            {'primary_key': boolean representing whether it's the primary key,\n-             'unique': boolean representing whether it's a unique index}\n-        \"\"\"\n         indexes = {}\n         for info in self._table_info(cursor, table_name):\n-            indexes[info['name']] = {'primary_key': info['pk'] != 0,\n-                                     'unique': False}\n+            if info['pk'] != 0:\n+                indexes[info['name']] = {'primary_key': True,\n+                                         'unique': False}\n         cursor.execute('PRAGMA index_list(%s)' % self.connection.ops.quote_name(table_name))\n         # seq, name, unique\n         for index, unique in [(field[1], field[2]) for field in cursor.fetchall()]:\n-            if not unique:\n-                continue\n             cursor.execute('PRAGMA index_info(%s)' % self.connection.ops.quote_name(index))\n             info = cursor.fetchall()\n             # Skip indexes across multiple fields\n             if len(info) != 1:\n                 continue\n             name = info[0][2] # seqno, cid, name\n-            indexes[name]['unique'] = True\n+            indexes[name] = {'primary_key': False,\n+                             'unique': unique}\n         return indexes\n \n     def get_primary_key_column(self, cursor, table_name):"
+        },
+        {
+            "sha": "02a8d71549920457cd701e5094d2ceeeec9f3639",
+            "filename": "tests/regressiontests/introspection/models.py",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 1,
+            "changes": 5,
+            "blob_url": "https://github.com/django/django/blob/a18e43c5bb8cb7c82c84ca1b42d847a62ac9f077/tests%2Fregressiontests%2Fintrospection%2Fmodels.py",
+            "raw_url": "https://github.com/django/django/raw/a18e43c5bb8cb7c82c84ca1b42d847a62ac9f077/tests%2Fregressiontests%2Fintrospection%2Fmodels.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fintrospection%2Fmodels.py?ref=a18e43c5bb8cb7c82c84ca1b42d847a62ac9f077",
+            "patch": "@@ -7,6 +7,9 @@ class Reporter(models.Model):\n     email = models.EmailField()\n     facebook_user_id = models.BigIntegerField(null=True)\n \n+    class Meta:\n+        unique_together = ('first_name', 'last_name')\n+\n     def __unicode__(self):\n         return u\"%s %s\" % (self.first_name, self.last_name)\n \n@@ -19,4 +22,4 @@ def __unicode__(self):\n         return self.headline\n \n     class Meta:\n-        ordering = ('headline',)\n\\ No newline at end of file\n+        ordering = ('headline',)"
+        },
+        {
+            "sha": "ca58f0449401a83017ecdaa234007a88d4ce8019",
+            "filename": "tests/regressiontests/introspection/tests.py",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/django/django/blob/a18e43c5bb8cb7c82c84ca1b42d847a62ac9f077/tests%2Fregressiontests%2Fintrospection%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/a18e43c5bb8cb7c82c84ca1b42d847a62ac9f077/tests%2Fregressiontests%2Fintrospection%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fintrospection%2Ftests.py?ref=a18e43c5bb8cb7c82c84ca1b42d847a62ac9f077",
+            "patch": "@@ -137,6 +137,15 @@ def test_get_indexes(self):\n         indexes = connection.introspection.get_indexes(cursor, Article._meta.db_table)\n         self.assertEqual(indexes['reporter_id'], {'unique': False, 'primary_key': False})\n \n+    def test_get_indexes_multicol(self):\n+        \"\"\"\n+        Test that multicolumn indexes are not included in the introspection\n+        results.\n+        \"\"\"\n+        cursor = connection.cursor()\n+        indexes = connection.introspection.get_indexes(cursor, Reporter._meta.db_table)\n+        self.assertNotIn('first_name', indexes)\n+        self.assertIn('id', indexes)\n \n def datatype(dbtype, description):\n     \"\"\"Helper to convert a data type into a string.\"\"\""
+        }
+    ],
+    "stats": {
+        "total": 122,
+        "additions": 66,
+        "deletions": 56
+    }
+}

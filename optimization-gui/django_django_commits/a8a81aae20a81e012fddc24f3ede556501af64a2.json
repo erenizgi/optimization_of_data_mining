@@ -1,0 +1,60 @@
+{
+    "author": "akaariai",
+    "message": "Fixed #18343 -- Cleaned up deferred model implementation\n\nGeneric cleanup and dead code removal in deferred model field loading\nand model.__reduce__().\n\nAlso fixed an issue where if an inherited model with a parent field\nchain parent_ptr_id -> id would be deferred loaded, then accessing\nthe id field caused caused a database query, even if the id field's\nvalue is already loaded in the parent_ptr_id field.",
+    "sha": "a8a81aae20a81e012fddc24f3ede556501af64a2",
+    "files": [
+        {
+            "sha": "13238fc9dcfc33a36cd090da08e9394889722266",
+            "filename": "django/db/models/base.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 7,
+            "changes": 8,
+            "blob_url": "https://github.com/django/django/blob/a8a81aae20a81e012fddc24f3ede556501af64a2/django%2Fdb%2Fmodels%2Fbase.py",
+            "raw_url": "https://github.com/django/django/raw/a8a81aae20a81e012fddc24f3ede556501af64a2/django%2Fdb%2Fmodels%2Fbase.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fmodels%2Fbase.py?ref=a8a81aae20a81e012fddc24f3ede556501af64a2",
+            "patch": "@@ -404,20 +404,14 @@ def __reduce__(self):\n         # and as a result, the super call will cause an infinite recursion.\n         # See #10547 and #12121.\n         defers = []\n-        pk_val = None\n         if self._deferred:\n             from django.db.models.query_utils import deferred_class_factory\n             factory = deferred_class_factory\n             for field in self._meta.fields:\n                 if isinstance(self.__class__.__dict__.get(field.attname),\n                         DeferredAttribute):\n                     defers.append(field.attname)\n-                    if pk_val is None:\n-                        # The pk_val and model values are the same for all\n-                        # DeferredAttribute classes, so we only need to do this\n-                        # once.\n-                        obj = self.__class__.__dict__[field.attname]\n-                        model = obj.model_ref()\n+            model = self._meta.proxy_for_model\n         else:\n             factory = simple_class_factory\n         return (model_unpickle, (model, defers, factory), data)"
+        },
+        {
+            "sha": "5676fdce9a7deb0998fccfb6ad1d9ba0f6e9ddbd",
+            "filename": "django/db/models/query_utils.py",
+            "status": "modified",
+            "additions": 32,
+            "deletions": 17,
+            "changes": 49,
+            "blob_url": "https://github.com/django/django/blob/a8a81aae20a81e012fddc24f3ede556501af64a2/django%2Fdb%2Fmodels%2Fquery_utils.py",
+            "raw_url": "https://github.com/django/django/raw/a8a81aae20a81e012fddc24f3ede556501af64a2/django%2Fdb%2Fmodels%2Fquery_utils.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fmodels%2Fquery_utils.py?ref=a8a81aae20a81e012fddc24f3ede556501af64a2",
+            "patch": "@@ -6,8 +6,6 @@\n circular import difficulties.\n \"\"\"\n \n-import weakref\n-\n from django.db.backends import util\n from django.utils import tree\n \n@@ -70,36 +68,39 @@ class DeferredAttribute(object):\n     \"\"\"\n     def __init__(self, field_name, model):\n         self.field_name = field_name\n-        self.model_ref = weakref.ref(model)\n-        self.loaded = False\n \n     def __get__(self, instance, owner):\n         \"\"\"\n         Retrieves and caches the value from the datastore on the first lookup.\n         Returns the cached value.\n         \"\"\"\n         from django.db.models.fields import FieldDoesNotExist\n+        non_deferred_model = instance._meta.proxy_for_model\n+        opts = non_deferred_model._meta\n \n         assert instance is not None\n-        cls = self.model_ref()\n         data = instance.__dict__\n         if data.get(self.field_name, self) is self:\n             # self.field_name is the attname of the field, but only() takes the\n             # actual name, so we need to translate it here.\n             try:\n-                cls._meta.get_field_by_name(self.field_name)\n-                name = self.field_name\n+                f = opts.get_field_by_name(self.field_name)[0]\n             except FieldDoesNotExist:\n-                name = [f.name for f in cls._meta.fields\n-                    if f.attname == self.field_name][0]\n-            # We use only() instead of values() here because we want the\n-            # various data coersion methods (to_python(), etc.) to be called\n-            # here.\n-            val = getattr(\n-                cls._base_manager.filter(pk=instance.pk).only(name).using(\n-                    instance._state.db).get(),\n-                self.field_name\n-            )\n+                f = [f for f in opts.fields\n+                     if f.attname == self.field_name][0]\n+            name = f.name\n+            # Lets see if the field is part of the parent chain. If so we\n+            # might be able to reuse the already loaded value. Refs #18343.\n+            val = self._check_parent_chain(instance, name)\n+            if val is None:\n+                # We use only() instead of values() here because we want the\n+                # various data coersion methods (to_python(), etc.) to be\n+                # called here.\n+                val = getattr(\n+                    non_deferred_model._base_manager.only(name).using(\n+                        instance._state.db).get(pk=instance.pk),\n+                    self.field_name\n+                )\n             data[self.field_name] = val\n         return data[self.field_name]\n \n@@ -110,6 +111,20 @@ def __set__(self, instance, value):\n         \"\"\"\n         instance.__dict__[self.field_name] = value\n \n+    def _check_parent_chain(self, instance, name):\n+        \"\"\"\n+        Check if the field value can be fetched from a parent field already \n+        loaded in the instance. This can be done if the to-be fetched\n+        field is a primary key field.\n+        \"\"\"\n+        opts = instance._meta\n+        f = opts.get_field_by_name(name)[0]\n+        link_field = opts.get_ancestor_link(f.model)\n+        if f.primary_key and f != link_field:\n+            return getattr(instance, link_field.attname)\n+        return None\n+\n+\n def select_related_descend(field, restricted, requested, reverse=False):\n     \"\"\"\n     Returns True if this field should be used to descend deeper for"
+        },
+        {
+            "sha": "eb09162b01e5df51af72682d71a540582578b1ee",
+            "filename": "tests/modeltests/defer/tests.py",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 0,
+            "changes": 15,
+            "blob_url": "https://github.com/django/django/blob/a8a81aae20a81e012fddc24f3ede556501af64a2/tests%2Fmodeltests%2Fdefer%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/a8a81aae20a81e012fddc24f3ede556501af64a2/tests%2Fmodeltests%2Fdefer%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fmodeltests%2Fdefer%2Ftests.py?ref=a8a81aae20a81e012fddc24f3ede556501af64a2",
+            "patch": "@@ -158,3 +158,18 @@ def test_defer_proxy(self):\n         self.assert_delayed(child, 1)\n         self.assertEqual(child.name, 'p1')\n         self.assertEqual(child.value, 'xx')\n+\n+    def test_defer_inheritance_pk_chaining(self):\n+        \"\"\"\n+        When an inherited model is fetched from the DB, its PK is also fetched.\n+        When getting the PK of the parent model it is useful to use the already\n+        fetched parent model PK if it happens to be available. Tests that this\n+        is done.\n+        \"\"\"\n+        s1 = Secondary.objects.create(first=\"x1\", second=\"y1\")\n+        bc = BigChild.objects.create(name=\"b1\", value=\"foo\", related=s1,\n+                                     other=\"bar\")\n+        bc_deferred = BigChild.objects.only('name').get(pk=bc.pk)\n+        with self.assertNumQueries(0):\n+            bc_deferred.id\n+        self.assertEqual(bc_deferred.pk, bc_deferred.id)"
+        },
+        {
+            "sha": "48755123f2b55755487e2bc1b9b3214e8af17531",
+            "filename": "tests/modeltests/field_subclassing/tests.py",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/django/django/blob/a8a81aae20a81e012fddc24f3ede556501af64a2/tests%2Fmodeltests%2Ffield_subclassing%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/a8a81aae20a81e012fddc24f3ede556501af64a2/tests%2Fmodeltests%2Ffield_subclassing%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fmodeltests%2Ffield_subclassing%2Ftests.py?ref=a8a81aae20a81e012fddc24f3ede556501af64a2",
+            "patch": "@@ -17,6 +17,10 @@ def test_defer(self):\n         self.assertTrue(isinstance(d.data, list))\n         self.assertEqual(d.data, [1, 2, 3])\n \n+        d = DataModel.objects.defer(\"data\").get(pk=d.pk)\n+        self.assertTrue(isinstance(d.data, list))\n+        self.assertEqual(d.data, [1, 2, 3])\n+        # Refetch for save\n         d = DataModel.objects.defer(\"data\").get(pk=d.pk)\n         d.save()\n "
+        }
+    ],
+    "stats": {
+        "total": 76,
+        "additions": 52,
+        "deletions": 24
+    }
+}

@@ -1,0 +1,72 @@
+{
+    "author": "BridgeAR",
+    "message": "os: improve networkInterfaces performance\n\nThis algorithm uses less data transformations and is therefore\nsignificantly faster than the one before.\n\nPR-URL: https://github.com/nodejs/node/pull/22359\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Tiancheng \"Timothy\" Gu <timothygu99@gmail.com>\nReviewed-By: Luigi Pinca <luigipinca@gmail.com>",
+    "sha": "9bcb744ee58f7f53f0a9b77f6ee36a4477ab43b4",
+    "files": [
+        {
+            "sha": "74ed6e767ee16d60ac9c04fd7a9a6c6c6fd90e50",
+            "filename": "lib/internal/os.js",
+            "status": "removed",
+            "additions": 0,
+            "deletions": 41,
+            "changes": 41,
+            "blob_url": "https://github.com/nodejs/node/blob/104492bd8321ba1ba3309f60b108c8d80f046e4a/lib%2Finternal%2Fos.js",
+            "raw_url": "https://github.com/nodejs/node/raw/104492bd8321ba1ba3309f60b108c8d80f046e4a/lib%2Finternal%2Fos.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fos.js?ref=104492bd8321ba1ba3309f60b108c8d80f046e4a",
+            "patch": "@@ -1,41 +0,0 @@\n-'use strict';\n-\n-function getCIDRSuffix(mask, protocol = 'ipv4') {\n-  const isV6 = protocol === 'ipv6';\n-  const bitsString = mask\n-        .split(isV6 ? ':' : '.')\n-        .filter((v) => !!v)\n-        .map((v) => pad(parseInt(v, isV6 ? 16 : 10).toString(2), isV6))\n-        .join('');\n-\n-  if (isValidMask(bitsString)) {\n-    return countOnes(bitsString);\n-  } else {\n-    return null;\n-  }\n-}\n-\n-function pad(binaryString, isV6) {\n-  const groupLength = isV6 ? 16 : 8;\n-  const binLen = binaryString.length;\n-\n-  return binLen < groupLength ?\n-    `${'0'.repeat(groupLength - binLen)}${binaryString}` : binaryString;\n-}\n-\n-function isValidMask(bitsString) {\n-  const firstIndexOfZero = bitsString.indexOf(0);\n-  const lastIndexOfOne = bitsString.lastIndexOf(1);\n-\n-  return firstIndexOfZero < 0 || firstIndexOfZero > lastIndexOfOne;\n-}\n-\n-function countOnes(bitsString) {\n-  return bitsString\n-    .split('')\n-    .reduce((acc, bit) => acc += parseInt(bit, 10), 0);\n-}\n-\n-module.exports = {\n-  getCIDRSuffix\n-};"
+        },
+        {
+            "sha": "e65c11fc58ca7f8442968c0183fcbe5d1f0886e3",
+            "filename": "lib/os.js",
+            "status": "modified",
+            "additions": 57,
+            "deletions": 10,
+            "changes": 67,
+            "blob_url": "https://github.com/nodejs/node/blob/9bcb744ee58f7f53f0a9b77f6ee36a4477ab43b4/lib%2Fos.js",
+            "raw_url": "https://github.com/nodejs/node/raw/9bcb744ee58f7f53f0a9b77f6ee36a4477ab43b4/lib%2Fos.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Fos.js?ref=9bcb744ee58f7f53f0a9b77f6ee36a4477ab43b4",
+            "patch": "@@ -24,7 +24,6 @@\n const { pushValToArrayMax, safeGetenv } = process.binding('util');\n const constants = process.binding('constants').os;\n const { deprecate } = require('internal/util');\n-const { getCIDRSuffix } = require('internal/os');\n const isWindows = process.platform === 'win32';\n \n const { ERR_SYSTEM_ERROR } = require('internal/errors');\n@@ -144,19 +143,67 @@ function endianness() {\n }\n endianness[Symbol.toPrimitive] = () => kEndianness;\n \n+// Returns the number of ones in the binary representation of the decimal\n+// number.\n+function countBinaryOnes(n) {\n+  let count = 0;\n+  // Remove one \"1\" bit from n until n is the power of 2. This iterates k times\n+  // while k is the number of \"1\" in the binary representation.\n+  // For more check https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Operators/Bitwise_Operators\n+  while (n !== 0) {\n+    n = n & (n - 1);\n+    count++;\n+  }\n+  return count;\n+}\n+\n+function getCIDR({ address, netmask, family }) {\n+  let ones = 0;\n+  let split = '.';\n+  let range = 10;\n+  let groupLength = 8;\n+  let hasZeros = false;\n+\n+  if (family === 'IPv6') {\n+    split = ':';\n+    range = 16;\n+    groupLength = 16;\n+  }\n+\n+  const parts = netmask.split(split);\n+  for (var i = 0; i < parts.length; i++) {\n+    if (parts[i] !== '') {\n+      const binary = parseInt(parts[i], range);\n+      const tmp = countBinaryOnes(binary);\n+      ones += tmp;\n+      if (hasZeros) {\n+        if (tmp !== 0) {\n+          return null;\n+        }\n+      } else if (tmp !== groupLength) {\n+        if ((binary & 1) !== 0) {\n+          return null;\n+        }\n+        hasZeros = true;\n+      }\n+    }\n+  }\n+\n+  return `${address}/${ones}`;\n+}\n+\n function networkInterfaces() {\n   const interfaceAddresses = getInterfaceAddresses();\n \n-  return Object.entries(interfaceAddresses).reduce((acc, [key, val]) => {\n-    acc[key] = val.map((v) => {\n-      const protocol = v.family.toLowerCase();\n-      const suffix = getCIDRSuffix(v.netmask, protocol);\n-      const cidr = suffix ? `${v.address}/${suffix}` : null;\n+  const keys = Object.keys(interfaceAddresses);\n+  for (var i = 0; i < keys.length; i++) {\n+    const arr = interfaceAddresses[keys[i]];\n+    for (var j = 0; j < arr.length; j++) {\n+      arr[j].cidr = getCIDR(arr[j]);\n+    }\n+  }\n \n-      return Object.assign({}, v, { cidr });\n-    });\n-    return acc;\n-  }, {});\n+  return interfaceAddresses;\n }\n \n module.exports = {"
+        },
+        {
+            "sha": "a33dde4272e994a9cd17312a90f6a3483d0b32ff",
+            "filename": "node.gyp",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 1,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/9bcb744ee58f7f53f0a9b77f6ee36a4477ab43b4/node.gyp",
+            "raw_url": "https://github.com/nodejs/node/raw/9bcb744ee58f7f53f0a9b77f6ee36a4477ab43b4/node.gyp",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/node.gyp?ref=9bcb744ee58f7f53f0a9b77f6ee36a4477ab43b4",
+            "patch": "@@ -132,7 +132,6 @@\n       'lib/internal/modules/esm/translators.js',\n       'lib/internal/safe_globals.js',\n       'lib/internal/net.js',\n-      'lib/internal/os.js',\n       'lib/internal/priority_queue.js',\n       'lib/internal/process/esm_loader.js',\n       'lib/internal/process/main_thread_only.js',"
+        },
+        {
+            "sha": "c4014abc5b1c0ffb372866f2ee98ab2295fa71ba",
+            "filename": "test/parallel/test-internal-os.js",
+            "status": "removed",
+            "additions": 0,
+            "deletions": 32,
+            "changes": 32,
+            "blob_url": "https://github.com/nodejs/node/blob/104492bd8321ba1ba3309f60b108c8d80f046e4a/test%2Fparallel%2Ftest-internal-os.js",
+            "raw_url": "https://github.com/nodejs/node/raw/104492bd8321ba1ba3309f60b108c8d80f046e4a/test%2Fparallel%2Ftest-internal-os.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-internal-os.js?ref=104492bd8321ba1ba3309f60b108c8d80f046e4a",
+            "patch": "@@ -1,32 +0,0 @@\n-// Flags: --expose-internals\n-'use strict';\n-\n-require('../common');\n-const assert = require('assert');\n-const getCIDRSuffix = require('internal/os').getCIDRSuffix;\n-\n-const specs = [\n-  // valid\n-  ['128.0.0.0', 'ipv4', 1],\n-  ['255.0.0.0', 'ipv4', 8],\n-  ['255.255.255.128', 'ipv4', 25],\n-  ['255.255.255.255', 'ipv4', 32],\n-  ['ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff', 'ipv6', 128],\n-  ['ffff:ffff:ffff:ffff::', 'ipv6', 64],\n-  ['ffff:ffff:ffff:ff80::', 'ipv6', 57],\n-  // invalid\n-  ['255.0.0.1', 'ipv4', null],\n-  ['255.255.9.0', 'ipv4', null],\n-  ['255.255.1.0', 'ipv4', null],\n-  ['ffff:ffff:43::', 'ipv6', null],\n-  ['ffff:ffff:ffff:1::', 'ipv6', null]\n-];\n-\n-specs.forEach(([mask, protocol, expectedSuffix]) => {\n-  const actualSuffix = getCIDRSuffix(mask, protocol);\n-\n-  assert.strictEqual(\n-    actualSuffix, expectedSuffix,\n-    `Mask: ${mask}, expected: ${expectedSuffix}, actual: ${actualSuffix}`\n-  );\n-});"
+        },
+        {
+            "sha": "3591ee52104ea4e2cda1f34566ac228eb85309b9",
+            "filename": "test/parallel/test-os.js",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/nodejs/node/blob/9bcb744ee58f7f53f0a9b77f6ee36a4477ab43b4/test%2Fparallel%2Ftest-os.js",
+            "raw_url": "https://github.com/nodejs/node/raw/9bcb744ee58f7f53f0a9b77f6ee36a4477ab43b4/test%2Fparallel%2Ftest-os.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-os.js?ref=9bcb744ee58f7f53f0a9b77f6ee36a4477ab43b4",
+            "patch": "@@ -130,8 +130,8 @@ switch (platform) {\n     const expected = [{\n       address: '127.0.0.1',\n       netmask: '255.0.0.0',\n-      mac: '00:00:00:00:00:00',\n       family: 'IPv4',\n+      mac: '00:00:00:00:00:00',\n       internal: true,\n       cidr: '127.0.0.1/8'\n     }];\n@@ -146,8 +146,8 @@ switch (platform) {\n     const expected = [{\n       address: '127.0.0.1',\n       netmask: '255.0.0.0',\n-      mac: '00:00:00:00:00:00',\n       family: 'IPv4',\n+      mac: '00:00:00:00:00:00',\n       internal: true,\n       cidr: '127.0.0.1/8'\n     }];"
+        }
+    ],
+    "stats": {
+        "total": 145,
+        "additions": 59,
+        "deletions": 86
+    }
+}

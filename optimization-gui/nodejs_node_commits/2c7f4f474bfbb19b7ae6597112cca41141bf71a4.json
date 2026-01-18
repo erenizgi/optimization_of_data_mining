@@ -1,0 +1,168 @@
+{
+    "author": "joyeecheung",
+    "message": "process: allow StartExecution() to take a main script ID\n\nThe idea is to allow the C++ layer to run arbitrary scripts\nas the main script. This paves the way for\n\n- cctest of the execution of Node.js instances\n- Earlier handling of per-process CLI options that affect\n  execution modes (those usually do not make sense for the\n  embedders).\n- Targets like mkcodecache or mksnapshot.\n\nAlso moves the handling of `_third_party_main.js` into C++.\n\nPR-URL: https://github.com/nodejs/node/pull/25474\nReviewed-By: Anna Henningsen <anna@addaleax.net>\nReviewed-By: Minwoo Jung <minwoo@nodesource.com>",
+    "sha": "2c7f4f474bfbb19b7ae6597112cca41141bf71a4",
+    "files": [
+        {
+            "sha": "53bab24ef5df758ad5596535be9303ea608b7cf6",
+            "filename": "lib/internal/bootstrap/node.js",
+            "status": "modified",
+            "additions": 34,
+            "deletions": 20,
+            "changes": 54,
+            "blob_url": "https://github.com/nodejs/node/blob/2c7f4f474bfbb19b7ae6597112cca41141bf71a4/lib%2Finternal%2Fbootstrap%2Fnode.js",
+            "raw_url": "https://github.com/nodejs/node/raw/2c7f4f474bfbb19b7ae6597112cca41141bf71a4/lib%2Finternal%2Fbootstrap%2Fnode.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fbootstrap%2Fnode.js?ref=2c7f4f474bfbb19b7ae6597112cca41141bf71a4",
+            "patch": "@@ -301,33 +301,47 @@ function startup() {\n   } = perf.constants;\n   perf.markMilestone(NODE_PERFORMANCE_MILESTONE_BOOTSTRAP_COMPLETE);\n \n-  return startExecution;\n+  if (isMainThread) {\n+    return startMainThreadExecution;\n+  } else {\n+    return startWorkerThreadExecution;\n+  }\n+}\n+\n+function startWorkerThreadExecution() {\n+  prepareUserCodeExecution();\n+\n+  // If we are in a worker thread, execute the script sent through the\n+  // message port.\n+  const {\n+    getEnvMessagePort,\n+    threadId\n+  } = internalBinding('worker');\n+  const {\n+    createMessageHandler,\n+    createWorkerFatalExeception\n+  } = NativeModule.require('internal/process/worker_thread_only');\n+\n+  // Set up the message port and start listening\n+  const debug = NativeModule.require('util').debuglog('worker');\n+  debug(`[${threadId}] is setting up worker child environment`);\n+\n+  const port = getEnvMessagePort();\n+  port.on('message', createMessageHandler(port));\n+  port.start();\n+\n+  // Overwrite fatalException\n+  process._fatalException = createWorkerFatalExeception(port);\n }\n \n // There are various modes that Node can run in. The most common two\n // are running from a script and running the REPL - but there are a few\n // others like the debugger or running --eval arguments. Here we decide\n // which mode we run in.\n-function startExecution() {\n-  // This means we are in a Worker context, and any script execution\n-  // will be directed by the worker module.\n-  if (!isMainThread) {\n-    const workerThreadSetup = NativeModule.require(\n-      'internal/process/worker_thread_only'\n-    );\n-    // Set up the message port and start listening\n-    const { workerFatalExeception } = workerThreadSetup.setup();\n-    // Overwrite fatalException\n-    process._fatalException = workerFatalExeception;\n-    return;\n-  }\n-\n-  // To allow people to extend Node in different ways, this hook allows\n-  // one to drop a file lib/_third_party_main.js into the build\n-  // directory which will be executed instead of Node's normal loading.\n-  if (NativeModule.exists('_third_party_main')) {\n+function startMainThreadExecution(mainScript) {\n+  if (mainScript) {\n     process.nextTick(() => {\n-      NativeModule.require('_third_party_main');\n+      NativeModule.require(mainScript);\n     });\n     return;\n   }"
+        },
+        {
+            "sha": "3fcd052542d09d29d93359e2d66b57bf95a5478b",
+            "filename": "lib/internal/process/worker_thread_only.js",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 13,
+            "changes": 15,
+            "blob_url": "https://github.com/nodejs/node/blob/2c7f4f474bfbb19b7ae6597112cca41141bf71a4/lib%2Finternal%2Fprocess%2Fworker_thread_only.js",
+            "raw_url": "https://github.com/nodejs/node/raw/2c7f4f474bfbb19b7ae6597112cca41141bf71a4/lib%2Finternal%2Fprocess%2Fworker_thread_only.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fprocess%2Fworker_thread_only.js?ref=2c7f4f474bfbb19b7ae6597112cca41141bf71a4",
+            "patch": "@@ -118,19 +118,8 @@ function createWorkerFatalExeception(port) {\n   };\n }\n \n-function setup() {\n-  debug(`[${threadId}] is setting up worker child environment`);\n-\n-  const port = getEnvMessagePort();\n-  port.on('message', createMessageHandler(port));\n-  port.start();\n-\n-  return {\n-    workerFatalExeception: createWorkerFatalExeception(port)\n-  };\n-}\n-\n module.exports = {\n   initializeWorkerStdio,\n-  setup\n+  createMessageHandler,\n+  createWorkerFatalExeception\n };"
+        },
+        {
+            "sha": "0f668472442273f5ba0eac6b2a6e0986c8a22f81",
+            "filename": "src/node.cc",
+            "status": "modified",
+            "additions": 35,
+            "deletions": 3,
+            "changes": 38,
+            "blob_url": "https://github.com/nodejs/node/blob/2c7f4f474bfbb19b7ae6597112cca41141bf71a4/src%2Fnode.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/2c7f4f474bfbb19b7ae6597112cca41141bf71a4/src%2Fnode.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode.cc?ref=2c7f4f474bfbb19b7ae6597112cca41141bf71a4",
+            "patch": "@@ -647,7 +647,28 @@ static MaybeLocal<Value> ExecuteBootstrapper(\n \n void LoadEnvironment(Environment* env) {\n   RunBootstrapping(env);\n-  StartExecution(env);\n+\n+  // To allow people to extend Node in different ways, this hook allows\n+  // one to drop a file lib/_third_party_main.js into the build\n+  // directory which will be executed instead of Node's normal loading.\n+  if (per_process::native_module_loader.Exists(\"_third_party_main\")) {\n+    StartExecution(env, \"_third_party_main\");\n+  } else {\n+    // TODO(joyeecheung): create different scripts for different\n+    // execution modes:\n+    // - `main_thread_main.js` when env->is_main_thread()\n+    // - `worker_thread_main.js` when !env->is_main_thread()\n+    // - `run_third_party_main.js` for `_third_party_main`\n+    // - `inspect_main.js` for `node inspect`\n+    // - `mkcodecache_main.js` for the code cache generator\n+    // - `print_help_main.js` for --help\n+    // - `bash_completion_main.js` for --completion-bash\n+    // - `internal/v8_prof_processor` for --prof-process\n+    // And leave bootstrap/node.js dedicated to the setup of the environment.\n+    // We may want to move this switch out of LoadEnvironment, especially for\n+    // the per-process options.\n+    StartExecution(env, nullptr);\n+  }\n }\n \n void RunBootstrapping(Environment* env) {\n@@ -724,7 +745,7 @@ void RunBootstrapping(Environment* env) {\n     env->set_start_execution_function(start_execution.As<Function>());\n }\n \n-void StartExecution(Environment* env) {\n+void StartExecution(Environment* env, const char* main_script_id) {\n   HandleScope handle_scope(env->isolate());\n   // We have to use Local<>::New because of the optimized way in which we access\n   // the object in the env->...() getters, which does not play well with\n@@ -734,8 +755,19 @@ void StartExecution(Environment* env) {\n   env->set_start_execution_function(Local<Function>());\n \n   if (start_execution.IsEmpty()) return;\n+\n+  Local<Value> main_script_v;\n+  if (main_script_id == nullptr) {\n+    // TODO(joyeecheung): make this mandatory - we may also create an overload\n+    // for main_script that is a Local<Function>.\n+    main_script_v = Undefined(env->isolate());\n+  } else {\n+    main_script_v = OneByteString(env->isolate(), main_script_id);\n+  }\n+\n+  Local<Value> argv[] = {main_script_v};\n   USE(start_execution->Call(\n-      env->context(), Undefined(env->isolate()), 0, nullptr));\n+      env->context(), Undefined(env->isolate()), arraysize(argv), argv));\n }\n \n static void StartInspector(Environment* env, const char* path) {"
+        },
+        {
+            "sha": "70c82dd2fcd2ce9b2040e3d71930d3853072bbf2",
+            "filename": "src/node_internals.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/2c7f4f474bfbb19b7ae6597112cca41141bf71a4/src%2Fnode_internals.h",
+            "raw_url": "https://github.com/nodejs/node/raw/2c7f4f474bfbb19b7ae6597112cca41141bf71a4/src%2Fnode_internals.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_internals.h?ref=2c7f4f474bfbb19b7ae6597112cca41141bf71a4",
+            "patch": "@@ -369,7 +369,7 @@ bool SafeGetenv(const char* key, std::string* text);\n void DefineZlibConstants(v8::Local<v8::Object> target);\n \n void RunBootstrapping(Environment* env);\n-void StartExecution(Environment* env);\n+void StartExecution(Environment* env, const char* main_script_id);\n \n }  // namespace node\n "
+        },
+        {
+            "sha": "00775885d6569ceb1218e2590ffc4b24b70531cd",
+            "filename": "src/node_native_module.cc",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/nodejs/node/blob/2c7f4f474bfbb19b7ae6597112cca41141bf71a4/src%2Fnode_native_module.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/2c7f4f474bfbb19b7ae6597112cca41141bf71a4/src%2Fnode_native_module.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_native_module.cc?ref=2c7f4f474bfbb19b7ae6597112cca41141bf71a4",
+            "patch": "@@ -61,6 +61,10 @@ Local<Set> ToJsSet(Local<Context> context,\n   return out;\n }\n \n+bool NativeModuleLoader::Exists(const char* id) {\n+  return source_.find(id) != source_.end();\n+}\n+\n void NativeModuleLoader::GetCacheUsage(\n     const FunctionCallbackInfo<Value>& args) {\n   Environment* env = Environment::GetCurrent(args);"
+        },
+        {
+            "sha": "62c417a0b61474e2d4f8ba4de8a169b28ae3d917",
+            "filename": "src/node_native_module.h",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/2c7f4f474bfbb19b7ae6597112cca41141bf71a4/src%2Fnode_native_module.h",
+            "raw_url": "https://github.com/nodejs/node/raw/2c7f4f474bfbb19b7ae6597112cca41141bf71a4/src%2Fnode_native_module.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_native_module.h?ref=2c7f4f474bfbb19b7ae6597112cca41141bf71a4",
+            "patch": "@@ -54,6 +54,8 @@ class NativeModuleLoader {\n       std::vector<v8::Local<v8::Value>>* arguments,\n       Environment* optional_env);\n \n+  bool Exists(const char* id);\n+\n  private:\n   static void GetCacheUsage(const v8::FunctionCallbackInfo<v8::Value>& args);\n   // Passing ids of builtin module source code into JS land as"
+        },
+        {
+            "sha": "dab7945aae35517412e3e9d2e6ae5fda2debe13d",
+            "filename": "src/node_worker.cc",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 2,
+            "changes": 6,
+            "blob_url": "https://github.com/nodejs/node/blob/2c7f4f474bfbb19b7ae6597112cca41141bf71a4/src%2Fnode_worker.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/2c7f4f474bfbb19b7ae6597112cca41141bf71a4/src%2Fnode_worker.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_worker.cc?ref=2c7f4f474bfbb19b7ae6597112cca41141bf71a4",
+            "patch": "@@ -185,8 +185,10 @@ void Worker::Run() {\n         HandleScope handle_scope(isolate_);\n         Environment::AsyncCallbackScope callback_scope(env_.get());\n         env_->async_hooks()->push_async_ids(1, 0);\n-        // This loads the Node bootstrapping code.\n-        LoadEnvironment(env_.get());\n+        RunBootstrapping(env_.get());\n+        // TODO(joyeecheung): create a main script for worker threads\n+        // that starts listening on the message port.\n+        StartExecution(env_.get(), nullptr);\n         env_->async_hooks()->pop_async_id(1);\n \n         Debug(this, \"Loaded environment for worker %llu\", thread_id_);"
+        },
+        {
+            "sha": "7e0112d586cecb222677eeb30f342b97e67db5b0",
+            "filename": "test/message/error_exit.out",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/2c7f4f474bfbb19b7ae6597112cca41141bf71a4/test%2Fmessage%2Ferror_exit.out",
+            "raw_url": "https://github.com/nodejs/node/raw/2c7f4f474bfbb19b7ae6597112cca41141bf71a4/test%2Fmessage%2Ferror_exit.out",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fmessage%2Ferror_exit.out?ref=2c7f4f474bfbb19b7ae6597112cca41141bf71a4",
+            "patch": "@@ -15,4 +15,4 @@ AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:\n     at Function.Module._load (internal/modules/cjs/loader.js:*:*)\n     at Function.Module.runMain (internal/modules/cjs/loader.js:*:*)\n     at executeUserCode (internal/bootstrap/node.js:*:*)\n-    at startExecution (internal/bootstrap/node.js:*:*)\n+    at startMainThreadExecution (internal/bootstrap/node.js:*:*)"
+        },
+        {
+            "sha": "3af7c9792121b9bfdcfdb1f44b7bb55fafd64fe2",
+            "filename": "test/message/eval_messages.out",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 4,
+            "changes": 8,
+            "blob_url": "https://github.com/nodejs/node/blob/2c7f4f474bfbb19b7ae6597112cca41141bf71a4/test%2Fmessage%2Feval_messages.out",
+            "raw_url": "https://github.com/nodejs/node/raw/2c7f4f474bfbb19b7ae6597112cca41141bf71a4/test%2Fmessage%2Feval_messages.out",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fmessage%2Feval_messages.out?ref=2c7f4f474bfbb19b7ae6597112cca41141bf71a4",
+            "patch": "@@ -10,7 +10,7 @@ SyntaxError: Strict mode code may not include a with statement\n     at Module._compile (internal/modules/cjs/loader.js:*:*)\n     at evalScript (internal/process/execution.js:*:*)\n     at executeUserCode (internal/bootstrap/node.js:*:*)\n-    at startExecution (internal/bootstrap/node.js:*:*)\n+    at startMainThreadExecution (internal/bootstrap/node.js:*:*)\n 42\n 42\n [eval]:1\n@@ -25,7 +25,7 @@ Error: hello\n     at Module._compile (internal/modules/cjs/loader.js:*:*)\n     at evalScript (internal/process/execution.js:*:*)\n     at executeUserCode (internal/bootstrap/node.js:*:*)\n-    at startExecution (internal/bootstrap/node.js:*:*)\n+    at startMainThreadExecution (internal/bootstrap/node.js:*:*)\n \n [eval]:1\n throw new Error(\"hello\")\n@@ -39,7 +39,7 @@ Error: hello\n     at Module._compile (internal/modules/cjs/loader.js:*:*)\n     at evalScript (internal/process/execution.js:*:*)\n     at executeUserCode (internal/bootstrap/node.js:*:*)\n-    at startExecution (internal/bootstrap/node.js:*:*)\n+    at startMainThreadExecution (internal/bootstrap/node.js:*:*)\n 100\n [eval]:1\n var x = 100; y = x;\n@@ -53,7 +53,7 @@ ReferenceError: y is not defined\n     at Module._compile (internal/modules/cjs/loader.js:*:*)\n     at evalScript (internal/process/execution.js:*:*)\n     at executeUserCode (internal/bootstrap/node.js:*:*)\n-    at startExecution (internal/bootstrap/node.js:*:*)\n+    at startMainThreadExecution (internal/bootstrap/node.js:*:*)\n \n [eval]:1\n var ______________________________________________; throw 10"
+        },
+        {
+            "sha": "331d669272320cb693c7f1d903de3cd4644c6b07",
+            "filename": "test/message/events_unhandled_error_common_trace.out",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/2c7f4f474bfbb19b7ae6597112cca41141bf71a4/test%2Fmessage%2Fevents_unhandled_error_common_trace.out",
+            "raw_url": "https://github.com/nodejs/node/raw/2c7f4f474bfbb19b7ae6597112cca41141bf71a4/test%2Fmessage%2Fevents_unhandled_error_common_trace.out",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fmessage%2Fevents_unhandled_error_common_trace.out?ref=2c7f4f474bfbb19b7ae6597112cca41141bf71a4",
+            "patch": "@@ -19,4 +19,4 @@ Emitted 'error' event at:\n     at Module._compile (internal/modules/cjs/loader.js:*:*)\n     [... lines matching original stack trace ...]\n     at executeUserCode (internal/bootstrap/node.js:*:*)\n-    at startExecution (internal/bootstrap/node.js:*:*)\n+    at startMainThreadExecution (internal/bootstrap/node.js:*:*)"
+        },
+        {
+            "sha": "8875eda532882f7a41d0fe9fe47f4893f9153bd7",
+            "filename": "test/message/events_unhandled_error_nexttick.out",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/nodejs/node/blob/2c7f4f474bfbb19b7ae6597112cca41141bf71a4/test%2Fmessage%2Fevents_unhandled_error_nexttick.out",
+            "raw_url": "https://github.com/nodejs/node/raw/2c7f4f474bfbb19b7ae6597112cca41141bf71a4/test%2Fmessage%2Fevents_unhandled_error_nexttick.out",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fmessage%2Fevents_unhandled_error_nexttick.out?ref=2c7f4f474bfbb19b7ae6597112cca41141bf71a4",
+            "patch": "@@ -11,11 +11,11 @@ Error\n     at Function.Module._load (internal/modules/cjs/loader.js:*:*)\n     at Function.Module.runMain (internal/modules/cjs/loader.js:*:*)\n     at executeUserCode (internal/bootstrap/node.js:*:*)\n-    at startExecution (internal/bootstrap/node.js:*:*)\n+    at startMainThreadExecution (internal/bootstrap/node.js:*:*)\n Emitted 'error' event at:\n     at process.nextTick (*events_unhandled_error_nexttick.js:*:*)\n     at processTicksAndRejections (internal/process/next_tick.js:*:*)\n     at process.runNextTicks [as _tickCallback] (internal/process/next_tick.js:*:*)\n     at Function.Module.runMain (internal/modules/cjs/loader.js:*:*)\n     at executeUserCode (internal/bootstrap/node.js:*:*)\n-    at startExecution (internal/bootstrap/node.js:*:*)\n+    at startMainThreadExecution (internal/bootstrap/node.js:*:*)"
+        },
+        {
+            "sha": "ff024c826eb5dab0728f43dd3f2433c5cb98d250",
+            "filename": "test/message/events_unhandled_error_sameline.out",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/nodejs/node/blob/2c7f4f474bfbb19b7ae6597112cca41141bf71a4/test%2Fmessage%2Fevents_unhandled_error_sameline.out",
+            "raw_url": "https://github.com/nodejs/node/raw/2c7f4f474bfbb19b7ae6597112cca41141bf71a4/test%2Fmessage%2Fevents_unhandled_error_sameline.out",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fmessage%2Fevents_unhandled_error_sameline.out?ref=2c7f4f474bfbb19b7ae6597112cca41141bf71a4",
+            "patch": "@@ -11,9 +11,9 @@ Error\n     at Function.Module._load (internal/modules/cjs/loader.js:*:*)\n     at Function.Module.runMain (internal/modules/cjs/loader.js:*:*)\n     at executeUserCode (internal/bootstrap/node.js:*:*)\n-    at startExecution (internal/bootstrap/node.js:*:*)\n+    at startMainThreadExecution (internal/bootstrap/node.js:*:*)\n Emitted 'error' event at:\n     at Object.<anonymous> (*events_unhandled_error_sameline.js:*:*)\n     at Module._compile (internal/modules/cjs/loader.js:*:*)\n     [... lines matching original stack trace ...]\n-    at startExecution (internal/bootstrap/node.js:*:*)\n+    at startMainThreadExecution (internal/bootstrap/node.js:*:*)"
+        },
+        {
+            "sha": "4bcdcaa62c8bc526e754a0a4ac0a935577bbc7a1",
+            "filename": "test/message/nexttick_throw.out",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/2c7f4f474bfbb19b7ae6597112cca41141bf71a4/test%2Fmessage%2Fnexttick_throw.out",
+            "raw_url": "https://github.com/nodejs/node/raw/2c7f4f474bfbb19b7ae6597112cca41141bf71a4/test%2Fmessage%2Fnexttick_throw.out",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fmessage%2Fnexttick_throw.out?ref=2c7f4f474bfbb19b7ae6597112cca41141bf71a4",
+            "patch": "@@ -8,4 +8,4 @@ ReferenceError: undefined_reference_error_maker is not defined\n     at process.runNextTicks [as _tickCallback] (internal/process/next_tick.js:*:*)\n     at Function.Module.runMain (internal/modules/cjs/loader.js:*:*)\n     at executeUserCode (internal/bootstrap/node.js:*:*)\n-    at startExecution (internal/bootstrap/node.js:*:*)\n+    at startMainThreadExecution (internal/bootstrap/node.js:*:*)"
+        }
+    ],
+    "stats": {
+        "total": 143,
+        "additions": 93,
+        "deletions": 50
+    }
+}

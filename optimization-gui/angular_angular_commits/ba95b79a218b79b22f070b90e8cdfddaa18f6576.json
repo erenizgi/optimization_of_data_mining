@@ -1,0 +1,72 @@
+{
+    "author": "JoostK",
+    "message": "perf(compiler-cli): optimize computation of type-check scope information (#38539)\n\nWhen type-checking a component, the declaring NgModule scope is used\nto create a directive matcher that contains flattened directive metadata,\ni.e. the metadata of a directive and its base classes. This computation\nis done for all components, whereas the type-check scope is constant per\nNgModule. Additionally, the flattening of metadata is constant per\ndirective instance so doesn't necessarily have to be recomputed for\neach component.\n\nThis commit introduces a `TypeCheckScopes` class that is responsible\nfor flattening directives and computing the scope per NgModule. It\ncaches the computed results as appropriate to avoid repeated computation.\n\nPR Close #38539",
+    "sha": "ba95b79a218b79b22f070b90e8cdfddaa18f6576",
+    "files": [
+        {
+            "sha": "7c2d673034f7b0e44453e3045e38a2587da0f00a",
+            "filename": "packages/compiler-cli/src/ngtsc/annotations/src/component.ts",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 25,
+            "changes": 30,
+            "blob_url": "https://github.com/angular/angular/blob/ba95b79a218b79b22f070b90e8cdfddaa18f6576/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fannotations%2Fsrc%2Fcomponent.ts",
+            "raw_url": "https://github.com/angular/angular/raw/ba95b79a218b79b22f070b90e8cdfddaa18f6576/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fannotations%2Fsrc%2Fcomponent.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fannotations%2Fsrc%2Fcomponent.ts?ref=ba95b79a218b79b22f070b90e8cdfddaa18f6576",
+            "patch": "@@ -16,7 +16,6 @@ import {DefaultImportRecorder, ModuleResolver, Reference, ReferenceEmitter} from\n import {DependencyTracker} from '../../incremental/api';\n import {IndexingContext} from '../../indexer';\n import {ClassPropertyMapping, DirectiveMeta, DirectiveTypeCheckMeta, extractDirectiveTypeCheckMeta, InjectableClassRegistry, MetadataReader, MetadataRegistry} from '../../metadata';\n-import {flattenInheritedDirectiveMetadata} from '../../metadata/src/inheritance';\n import {EnumValue, PartialEvaluator} from '../../partial_evaluator';\n import {ClassDeclaration, Decorator, ReflectionHost, reflectObjectLiteral} from '../../reflection';\n import {ComponentScopeReader, LocalModuleScopeRegistry} from '../../scope';\n@@ -31,6 +30,7 @@ import {createValueHasWrongTypeError, getDirectiveDiagnostics, getProviderDiagno\n import {extractDirectiveMetadata, parseFieldArrayValue} from './directive';\n import {compileNgFactoryDefField} from './factory';\n import {generateSetClassMetadataCall} from './metadata';\n+import {TypeCheckScopes} from './typecheck_scopes';\n import {findAngularDecorator, isAngularCoreReference, isExpressionForwardReference, readBaseClass, resolveProvidersRequiringFactory, unwrapExpression, wrapFunctionExpressionsInParens} from './util';\n \n const EMPTY_MAP = new Map<string, Expression>();\n@@ -95,6 +95,7 @@ export class ComponentDecoratorHandler implements\n \n   private literalCache = new Map<Decorator, ts.ObjectLiteralExpression>();\n   private elementSchemaRegistry = new DomElementSchemaRegistry();\n+  private typeCheckScopes = new TypeCheckScopes(this.scopeReader, this.metaReader);\n \n   /**\n    * During the asynchronous preanalyze phase, it's necessary to parse the template to extract\n@@ -423,36 +424,15 @@ export class ComponentDecoratorHandler implements\n       return;\n     }\n \n-    const matcher = new SelectorMatcher<DirectiveMeta>();\n-    const pipes = new Map<string, Reference<ClassDeclaration<ts.ClassDeclaration>>>();\n-    let schemas: SchemaMetadata[] = [];\n-\n-    const scope = this.scopeReader.getScopeForComponent(node);\n+    const scope = this.typeCheckScopes.getTypeCheckScope(node);\n     if (scope === 'error') {\n       // Don't type-check components that had errors in their scopes.\n       return;\n     }\n \n-    if (scope !== null) {\n-      for (const meta of scope.compilation.directives) {\n-        if (meta.selector !== null) {\n-          const extMeta = flattenInheritedDirectiveMetadata(this.metaReader, meta.ref);\n-          matcher.addSelectables(CssSelector.parse(meta.selector), extMeta);\n-        }\n-      }\n-      for (const {name, ref} of scope.compilation.pipes) {\n-        if (!ts.isClassDeclaration(ref.node)) {\n-          throw new Error(`Unexpected non-class declaration ${\n-              ts.SyntaxKind[ref.node.kind]} for pipe ${ref.debugName}`);\n-        }\n-        pipes.set(name, ref as Reference<ClassDeclaration<ts.ClassDeclaration>>);\n-      }\n-      schemas = scope.schemas;\n-    }\n-\n-    const binder = new R3TargetBinder(matcher);\n+    const binder = new R3TargetBinder(scope.matcher);\n     ctx.addTemplate(\n-        new Reference(node), binder, meta.template.diagNodes, pipes, schemas,\n+        new Reference(node), binder, meta.template.diagNodes, scope.pipes, scope.schemas,\n         meta.template.sourceMapping, meta.template.file);\n   }\n "
+        },
+        {
+            "sha": "aada9e0df4e55d6602250dffcbfa113f5c3deca3",
+            "filename": "packages/compiler-cli/src/ngtsc/annotations/src/typecheck_scopes.ts",
+            "status": "added",
+            "additions": 105,
+            "deletions": 0,
+            "changes": 105,
+            "blob_url": "https://github.com/angular/angular/blob/ba95b79a218b79b22f070b90e8cdfddaa18f6576/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fannotations%2Fsrc%2Ftypecheck_scopes.ts",
+            "raw_url": "https://github.com/angular/angular/raw/ba95b79a218b79b22f070b90e8cdfddaa18f6576/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fannotations%2Fsrc%2Ftypecheck_scopes.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fannotations%2Fsrc%2Ftypecheck_scopes.ts?ref=ba95b79a218b79b22f070b90e8cdfddaa18f6576",
+            "patch": "@@ -0,0 +1,105 @@\n+/**\n+ * @license\n+ * Copyright Google LLC All Rights Reserved.\n+ *\n+ * Use of this source code is governed by an MIT-style license that can be\n+ * found in the LICENSE file at https://angular.io/license\n+ */\n+\n+import {CssSelector, SchemaMetadata, SelectorMatcher} from '@angular/compiler';\n+import * as ts from 'typescript';\n+\n+import {Reference} from '../../imports';\n+import {DirectiveMeta, flattenInheritedDirectiveMetadata, MetadataReader} from '../../metadata';\n+import {ClassDeclaration} from '../../reflection';\n+import {ComponentScopeReader} from '../../scope';\n+\n+/**\n+ * The scope that is used for type-check code generation of a component template.\n+ */\n+export interface TypeCheckScope {\n+  /**\n+   * A `SelectorMatcher` instance that contains the flattened directive metadata of all directives\n+   * that are in the compilation scope of the declaring NgModule.\n+   */\n+  matcher: SelectorMatcher<DirectiveMeta>;\n+\n+  /**\n+   * The pipes that are available in the compilation scope.\n+   */\n+  pipes: Map<string, Reference<ClassDeclaration<ts.ClassDeclaration>>>;\n+\n+  /**\n+   * The schemas that are used in this scope.\n+   */\n+  schemas: SchemaMetadata[];\n+}\n+\n+/**\n+ * Computes scope information to be used in template type checking.\n+ */\n+export class TypeCheckScopes {\n+  /**\n+   * Cache of flattened directive metadata. Because flattened metadata is scope-invariant it's\n+   * cached individually, such that all scopes refer to the same flattened metadata.\n+   */\n+  private flattenedDirectiveMetaCache = new Map<ClassDeclaration, DirectiveMeta>();\n+\n+  /**\n+   * Cache of the computed type check scope per NgModule declaration.\n+   */\n+  private scopeCache = new Map<ClassDeclaration, TypeCheckScope>();\n+\n+  constructor(private scopeReader: ComponentScopeReader, private metaReader: MetadataReader) {}\n+\n+  /**\n+   * Computes the type-check scope information for the component declaration. If the NgModule\n+   * contains an error, then 'error' is returned. If the component is not declared in any NgModule,\n+   * an empty type-check scope is returned.\n+   */\n+  getTypeCheckScope(node: ClassDeclaration): TypeCheckScope|'error' {\n+    const matcher = new SelectorMatcher<DirectiveMeta>();\n+    const pipes = new Map<string, Reference<ClassDeclaration<ts.ClassDeclaration>>>();\n+\n+    const scope = this.scopeReader.getScopeForComponent(node);\n+    if (scope === null) {\n+      return {matcher, pipes, schemas: []};\n+    } else if (scope === 'error') {\n+      return scope;\n+    }\n+\n+    if (this.scopeCache.has(scope.ngModule)) {\n+      return this.scopeCache.get(scope.ngModule)!;\n+    }\n+\n+    for (const meta of scope.compilation.directives) {\n+      if (meta.selector !== null) {\n+        const extMeta = this.getInheritedDirectiveMetadata(meta.ref);\n+        matcher.addSelectables(CssSelector.parse(meta.selector), extMeta);\n+      }\n+    }\n+\n+    for (const {name, ref} of scope.compilation.pipes) {\n+      if (!ts.isClassDeclaration(ref.node)) {\n+        throw new Error(`Unexpected non-class declaration ${\n+            ts.SyntaxKind[ref.node.kind]} for pipe ${ref.debugName}`);\n+      }\n+      pipes.set(name, ref as Reference<ClassDeclaration<ts.ClassDeclaration>>);\n+    }\n+\n+    const typeCheckScope: TypeCheckScope = {matcher, pipes, schemas: scope.schemas};\n+    this.scopeCache.set(scope.ngModule, typeCheckScope);\n+    return typeCheckScope;\n+  }\n+\n+  private getInheritedDirectiveMetadata(ref: Reference<ClassDeclaration>): DirectiveMeta {\n+    const clazz = ref.node;\n+    if (this.flattenedDirectiveMetaCache.has(clazz)) {\n+      return this.flattenedDirectiveMetaCache.get(clazz)!;\n+    }\n+\n+    const meta = flattenInheritedDirectiveMetadata(this.metaReader, ref);\n+    this.flattenedDirectiveMetaCache.set(clazz, meta);\n+    return meta;\n+  }\n+}"
+        },
+        {
+            "sha": "9ee4e1a977ac44a0445aa5e9e50c0cd9897346a8",
+            "filename": "packages/compiler-cli/src/ngtsc/metadata/index.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/angular/angular/blob/ba95b79a218b79b22f070b90e8cdfddaa18f6576/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fmetadata%2Findex.ts",
+            "raw_url": "https://github.com/angular/angular/raw/ba95b79a218b79b22f070b90e8cdfddaa18f6576/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fmetadata%2Findex.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fmetadata%2Findex.ts?ref=ba95b79a218b79b22f070b90e8cdfddaa18f6576",
+            "patch": "@@ -8,6 +8,7 @@\n \n export * from './src/api';\n export {DtsMetadataReader} from './src/dts';\n+export {flattenInheritedDirectiveMetadata} from './src/inheritance';\n export {CompoundMetadataRegistry, LocalMetadataRegistry, InjectableClassRegistry} from './src/registry';\n export {extractDirectiveTypeCheckMeta, CompoundMetadataReader} from './src/util';\n export {BindingPropertyName, ClassPropertyMapping, ClassPropertyName, InputOrOutput} from './src/property_mapping';"
+        },
+        {
+            "sha": "b923de6e2a589335291364025318ac1216dd343c",
+            "filename": "packages/compiler-cli/src/ngtsc/metadata/src/inheritance.ts",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/angular/angular/blob/ba95b79a218b79b22f070b90e8cdfddaa18f6576/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fmetadata%2Fsrc%2Finheritance.ts",
+            "raw_url": "https://github.com/angular/angular/raw/ba95b79a218b79b22f070b90e8cdfddaa18f6576/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fmetadata%2Fsrc%2Finheritance.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fmetadata%2Fsrc%2Finheritance.ts?ref=ba95b79a218b79b22f070b90e8cdfddaa18f6576",
+            "patch": "@@ -26,6 +26,9 @@ export function flattenInheritedDirectiveMetadata(\n   if (topMeta === null) {\n     throw new Error(`Metadata not found for directive: ${dir.debugName}`);\n   }\n+  if (topMeta.baseClass === null) {\n+    return topMeta;\n+  }\n \n   const coercedInputFields = new Set<ClassPropertyName>();\n   const undeclaredInputFields = new Set<ClassPropertyName>();"
+        },
+        {
+            "sha": "da7f3aa9397c1d654cdedb49d6e737b66747765d",
+            "filename": "packages/compiler-cli/src/ngtsc/scope/src/local.ts",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 1,
+            "changes": 4,
+            "blob_url": "https://github.com/angular/angular/blob/ba95b79a218b79b22f070b90e8cdfddaa18f6576/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fscope%2Fsrc%2Flocal.ts",
+            "raw_url": "https://github.com/angular/angular/raw/ba95b79a218b79b22f070b90e8cdfddaa18f6576/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fscope%2Fsrc%2Flocal.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fscope%2Fsrc%2Flocal.ts?ref=ba95b79a218b79b22f070b90e8cdfddaa18f6576",
+            "patch": "@@ -26,6 +26,7 @@ export interface LocalNgModuleData {\n }\n \n export interface LocalModuleScope extends ExportScope {\n+  ngModule: ClassDeclaration;\n   compilation: ScopeData;\n   reexports: Reexport[]|null;\n   schemas: SchemaMetadata[];\n@@ -433,7 +434,8 @@ export class LocalModuleScopeRegistry implements MetadataRegistry, ComponentScop\n     }\n \n     // Finally, produce the `LocalModuleScope` with both the compilation and export scopes.\n-    const scope = {\n+    const scope: LocalModuleScope = {\n+      ngModule: ngModule.ref.node,\n       compilation: {\n         directives: Array.from(compilationDirectives.values()),\n         pipes: Array.from(compilationPipes.values()),"
+        }
+    ],
+    "stats": {
+        "total": 143,
+        "additions": 117,
+        "deletions": 26
+    }
+}

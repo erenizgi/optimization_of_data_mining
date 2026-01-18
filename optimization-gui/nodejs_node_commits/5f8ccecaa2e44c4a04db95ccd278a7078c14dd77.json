@@ -1,0 +1,168 @@
+{
+    "author": "ryzokuken",
+    "message": "module: revert module._compile to original state if module is patched\n\nPR-URL: https://github.com/nodejs/node/pull/21573\nFixes: https://github.com/nodejs/node/issues/17396\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Ruben Bridgewater <ruben@bridgewater.de>\nReviewed-By: Gus Caplan <me@gus.host>\nReviewed-By: Joyee Cheung <joyeec9h3@gmail.com>\nReviewed-By: Anna Henningsen <anna@addaleax.net>",
+    "sha": "5f8ccecaa2e44c4a04db95ccd278a7078c14dd77",
+    "files": [
+        {
+            "sha": "94e9406393bf67a265db55c8449f0a34396a8568",
+            "filename": "lib/assert.js",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 11,
+            "changes": 11,
+            "blob_url": "https://github.com/nodejs/node/blob/5f8ccecaa2e44c4a04db95ccd278a7078c14dd77/lib%2Fassert.js",
+            "raw_url": "https://github.com/nodejs/node/raw/5f8ccecaa2e44c4a04db95ccd278a7078c14dd77/lib%2Fassert.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Fassert.js?ref=5f8ccecaa2e44c4a04db95ccd278a7078c14dd77",
+            "patch": "@@ -39,7 +39,6 @@ let isDeepEqual;\n let isDeepStrictEqual;\n let parseExpressionAt;\n let findNodeAround;\n-let columnOffset = 0;\n let decoder;\n \n function lazyLoadComparison() {\n@@ -256,16 +255,6 @@ function getErrMessage(message, fn) {\n   const line = call.getLineNumber() - 1;\n   let column = call.getColumnNumber() - 1;\n \n-  // Line number one reports the wrong column due to being wrapped in a\n-  // function. Remove that offset to get the actual call.\n-  if (line === 0) {\n-    if (columnOffset === 0) {\n-      const { wrapper } = require('internal/modules/cjs/loader');\n-      columnOffset = wrapper[0].length;\n-    }\n-    column -= columnOffset;\n-  }\n-\n   const identifier = `${filename}${line}${column}`;\n \n   if (errorCache.has(identifier)) {"
+        },
+        {
+            "sha": "2e5290b4520a2727ba8e6c209364649096862e45",
+            "filename": "lib/internal/modules/cjs/helpers.js",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 0,
+            "changes": 11,
+            "blob_url": "https://github.com/nodejs/node/blob/5f8ccecaa2e44c4a04db95ccd278a7078c14dd77/lib%2Finternal%2Fmodules%2Fcjs%2Fhelpers.js",
+            "raw_url": "https://github.com/nodejs/node/raw/5f8ccecaa2e44c4a04db95ccd278a7078c14dd77/lib%2Finternal%2Fmodules%2Fcjs%2Fhelpers.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fmodules%2Fcjs%2Fhelpers.js?ref=5f8ccecaa2e44c4a04db95ccd278a7078c14dd77",
+            "patch": "@@ -1,6 +1,9 @@\n 'use strict';\n \n const { validateString } = require('internal/validators');\n+const path = require('path');\n+const { pathToFileURL } = require('internal/url');\n+const { URL } = require('url');\n \n const {\n   CHAR_LINE_FEED,\n@@ -145,10 +148,18 @@ function addBuiltinLibsToObject(object) {\n   });\n }\n \n+function normalizeReferrerURL(referrer) {\n+  if (typeof referrer === 'string' && path.isAbsolute(referrer)) {\n+    return pathToFileURL(referrer).href;\n+  }\n+  return new URL(referrer).href;\n+}\n+\n module.exports = exports = {\n   addBuiltinLibsToObject,\n   builtinLibs,\n   makeRequireFunction,\n+  normalizeReferrerURL,\n   requireDepth: 0,\n   stripBOM,\n   stripShebang"
+        },
+        {
+            "sha": "e22294f337698c5b477abb26c3d15c767c6384d8",
+            "filename": "lib/internal/modules/cjs/loader.js",
+            "status": "modified",
+            "additions": 83,
+            "deletions": 17,
+            "changes": 100,
+            "blob_url": "https://github.com/nodejs/node/blob/5f8ccecaa2e44c4a04db95ccd278a7078c14dd77/lib%2Finternal%2Fmodules%2Fcjs%2Floader.js",
+            "raw_url": "https://github.com/nodejs/node/raw/5f8ccecaa2e44c4a04db95ccd278a7078c14dd77/lib%2Finternal%2Fmodules%2Fcjs%2Floader.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fmodules%2Fcjs%2Floader.js?ref=5f8ccecaa2e44c4a04db95ccd278a7078c14dd77",
+            "patch": "@@ -29,14 +29,14 @@ const assert = require('internal/assert');\n const fs = require('fs');\n const internalFS = require('internal/fs/utils');\n const path = require('path');\n-const { URL } = require('url');\n const {\n   internalModuleReadJSON,\n   internalModuleStat\n } = internalBinding('fs');\n const { safeGetenv } = internalBinding('credentials');\n const {\n   makeRequireFunction,\n+  normalizeReferrerURL,\n   requireDepth,\n   stripBOM,\n   stripShebang\n@@ -48,6 +48,7 @@ const experimentalModules = getOptionValue('--experimental-modules');\n const manifest = getOptionValue('--experimental-policy') ?\n   require('internal/process/policy').manifest :\n   null;\n+const { compileFunction } = internalBinding('contextify');\n \n const {\n   ERR_INVALID_ARG_VALUE,\n@@ -129,15 +130,52 @@ Module._extensions = Object.create(null);\n var modulePaths = [];\n Module.globalPaths = [];\n \n-Module.wrap = function(script) {\n+let patched = false;\n+\n+// eslint-disable-next-line func-style\n+let wrap = function(script) {\n   return Module.wrapper[0] + script + Module.wrapper[1];\n };\n \n-Module.wrapper = [\n+const wrapper = [\n   '(function (exports, require, module, __filename, __dirname) { ',\n   '\\n});'\n ];\n \n+let wrapperProxy = new Proxy(wrapper, {\n+  set(target, property, value, receiver) {\n+    patched = true;\n+    return Reflect.set(target, property, value, receiver);\n+  },\n+\n+  defineProperty(target, property, descriptor) {\n+    patched = true;\n+    return Object.defineProperty(target, property, descriptor);\n+  }\n+});\n+\n+Object.defineProperty(Module, 'wrap', {\n+  get() {\n+    return wrap;\n+  },\n+\n+  set(value) {\n+    patched = true;\n+    wrap = value;\n+  }\n+});\n+\n+Object.defineProperty(Module, 'wrapper', {\n+  get() {\n+    return wrapperProxy;\n+  },\n+\n+  set(value) {\n+    patched = true;\n+    wrapperProxy = value;\n+  }\n+});\n+\n const debug = util.debuglog('module');\n \n Module._debug = util.deprecate(debug, 'Module._debug is deprecated.',\n@@ -680,13 +718,6 @@ Module.prototype.require = function(id) {\n // (needed for setting breakpoint when called with --inspect-brk)\n var resolvedArgv;\n \n-function normalizeReferrerURL(referrer) {\n-  if (typeof referrer === 'string' && path.isAbsolute(referrer)) {\n-    return pathToFileURL(referrer).href;\n-  }\n-  return new URL(referrer).href;\n-}\n-\n \n // Run the file contents in the correct scope or sandbox. Expose\n // the correct helper variables (require, module, exports) to\n@@ -700,13 +731,48 @@ Module.prototype._compile = function(content, filename) {\n \n   content = stripShebang(content);\n \n-  const compiledWrapper = vm.compileFunction(content, [\n-    'exports',\n-    'require',\n-    'module',\n-    '__filename',\n-    '__dirname',\n-  ], { filename });\n+  let compiledWrapper;\n+  if (patched) {\n+    const wrapper = Module.wrap(content);\n+    compiledWrapper = vm.runInThisContext(wrapper, {\n+      filename,\n+      lineOffset: 0,\n+      displayErrors: true,\n+      importModuleDynamically: experimentalModules ? async (specifier) => {\n+        if (asyncESM === undefined) lazyLoadESM();\n+        const loader = await asyncESM.loaderPromise;\n+        return loader.import(specifier, normalizeReferrerURL(filename));\n+      } : undefined,\n+    });\n+  } else {\n+    compiledWrapper = compileFunction(\n+      content,\n+      filename,\n+      0,\n+      0,\n+      undefined,\n+      false,\n+      undefined,\n+      [],\n+      [\n+        'exports',\n+        'require',\n+        'module',\n+        '__filename',\n+        '__dirname',\n+      ]\n+    );\n+    if (experimentalModules) {\n+      const { callbackMap } = internalBinding('module_wrap');\n+      callbackMap.set(compiledWrapper, {\n+        importModuleDynamically: async (specifier) => {\n+          if (asyncESM === undefined) lazyLoadESM();\n+          const loader = await asyncESM.loaderPromise;\n+          return loader.import(specifier, normalizeReferrerURL(filename));\n+        }\n+      });\n+    }\n+  }\n \n   var inspectorWrapper = null;\n   if (process._breakFirstLine && process._eval == null) {"
+        },
+        {
+            "sha": "47331a619547264ab3b5048cd955716ed64704f8",
+            "filename": "src/env-inl.h",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/nodejs/node/blob/5f8ccecaa2e44c4a04db95ccd278a7078c14dd77/src%2Fenv-inl.h",
+            "raw_url": "https://github.com/nodejs/node/raw/5f8ccecaa2e44c4a04db95ccd278a7078c14dd77/src%2Fenv-inl.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv-inl.h?ref=5f8ccecaa2e44c4a04db95ccd278a7078c14dd77",
+            "patch": "@@ -461,6 +461,9 @@ inline uint32_t Environment::get_next_module_id() {\n inline uint32_t Environment::get_next_script_id() {\n   return script_id_counter_++;\n }\n+inline uint32_t Environment::get_next_function_id() {\n+  return function_id_counter_++;\n+}\n \n Environment::ShouldNotAbortOnUncaughtScope::ShouldNotAbortOnUncaughtScope(\n     Environment* env)"
+        },
+        {
+            "sha": "63c5d6500189760ce81ef8d94f442169a35e81b0",
+            "filename": "src/env.cc",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 0,
+            "changes": 11,
+            "blob_url": "https://github.com/nodejs/node/blob/5f8ccecaa2e44c4a04db95ccd278a7078c14dd77/src%2Fenv.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/5f8ccecaa2e44c4a04db95ccd278a7078c14dd77/src%2Fenv.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv.cc?ref=5f8ccecaa2e44c4a04db95ccd278a7078c14dd77",
+            "patch": "@@ -252,6 +252,11 @@ Environment::Environment(IsolateData* isolate_data,\n   isolate()->SetPromiseRejectCallback(task_queue::PromiseRejectCallback);\n }\n \n+CompileFnEntry::CompileFnEntry(Environment* env, uint32_t id)\n+    : env(env), id(id) {\n+  env->compile_fn_entries.insert(this);\n+}\n+\n Environment::~Environment() {\n   isolate()->GetHeapProfiler()->RemoveBuildEmbedderGraphCallback(\n       BuildEmbedderGraph, this);\n@@ -260,6 +265,12 @@ Environment::~Environment() {\n   // CleanupHandles() should have removed all of them.\n   CHECK(file_handle_read_wrap_freelist_.empty());\n \n+  // dispose the Persistent references to the compileFunction\n+  // wrappers used in the dynamic import callback\n+  for (auto& entry : compile_fn_entries) {\n+    delete entry;\n+  }\n+\n   HandleScope handle_scope(isolate());\n \n #if HAVE_INSPECTOR"
+        },
+        {
+            "sha": "26d448c4506d5ea16fdc10e96314a67ec39dec87",
+            "filename": "src/env.h",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 0,
+            "changes": 10,
+            "blob_url": "https://github.com/nodejs/node/blob/5f8ccecaa2e44c4a04db95ccd278a7078c14dd77/src%2Fenv.h",
+            "raw_url": "https://github.com/nodejs/node/raw/5f8ccecaa2e44c4a04db95ccd278a7078c14dd77/src%2Fenv.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv.h?ref=5f8ccecaa2e44c4a04db95ccd278a7078c14dd77",
+            "patch": "@@ -450,6 +450,12 @@ struct ContextInfo {\n   bool is_default = false;\n };\n \n+struct CompileFnEntry {\n+  Environment* env;\n+  uint32_t id;\n+  CompileFnEntry(Environment* env, uint32_t id);\n+};\n+\n // Listing the AsyncWrap provider types first enables us to cast directly\n // from a provider type to a debug category.\n #define DEBUG_CATEGORY_NAMES(V)                                                \\\n@@ -720,9 +726,12 @@ class Environment {\n   std::unordered_map<uint32_t, loader::ModuleWrap*> id_to_module_map;\n   std::unordered_map<uint32_t, contextify::ContextifyScript*>\n       id_to_script_map;\n+  std::unordered_set<CompileFnEntry*> compile_fn_entries;\n+  std::unordered_map<uint32_t, Persistent<v8::Function>> id_to_function_map;\n \n   inline uint32_t get_next_module_id();\n   inline uint32_t get_next_script_id();\n+  inline uint32_t get_next_function_id();\n \n   std::unordered_map<std::string, const loader::PackageConfig>\n       package_json_cache;\n@@ -1006,6 +1015,7 @@ class Environment {\n \n   uint32_t module_id_counter_ = 0;\n   uint32_t script_id_counter_ = 0;\n+  uint32_t function_id_counter_ = 0;\n \n   AliasedBuffer<uint32_t, v8::Uint32Array> should_abort_on_uncaught_toggle_;\n   int should_not_abort_scope_counter_ = 0;"
+        },
+        {
+            "sha": "f642440bff5a882f676eb457a0bf6378396b28f3",
+            "filename": "src/module_wrap.cc",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/5f8ccecaa2e44c4a04db95ccd278a7078c14dd77/src%2Fmodule_wrap.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/5f8ccecaa2e44c4a04db95ccd278a7078c14dd77/src%2Fmodule_wrap.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fmodule_wrap.cc?ref=5f8ccecaa2e44c4a04db95ccd278a7078c14dd77",
+            "patch": "@@ -752,6 +752,8 @@ static MaybeLocal<Promise> ImportModuleDynamically(\n   } else if (type == ScriptType::kModule) {\n     ModuleWrap* wrap = ModuleWrap::GetFromID(env, id);\n     object = wrap->object();\n+  } else if (type == ScriptType::kFunction) {\n+    object = env->id_to_function_map.find(id)->second.Get(iso);\n   } else {\n     UNREACHABLE();\n   }"
+        },
+        {
+            "sha": "dc34685fedadbce7c4255539b34bd4ff5949fdb6",
+            "filename": "src/module_wrap.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/5f8ccecaa2e44c4a04db95ccd278a7078c14dd77/src%2Fmodule_wrap.h",
+            "raw_url": "https://github.com/nodejs/node/raw/5f8ccecaa2e44c4a04db95ccd278a7078c14dd77/src%2Fmodule_wrap.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fmodule_wrap.h?ref=5f8ccecaa2e44c4a04db95ccd278a7078c14dd77",
+            "patch": "@@ -20,6 +20,7 @@ enum PackageMainCheck : bool {\n enum ScriptType : int {\n   kScript,\n   kModule,\n+  kFunction,\n };\n \n enum HostDefinedOptions : int {"
+        },
+        {
+            "sha": "61f60576d2f2a46b75955483774d4a7b5765b87c",
+            "filename": "src/node_contextify.cc",
+            "status": "modified",
+            "additions": 47,
+            "deletions": 8,
+            "changes": 55,
+            "blob_url": "https://github.com/nodejs/node/blob/5f8ccecaa2e44c4a04db95ccd278a7078c14dd77/src%2Fnode_contextify.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/5f8ccecaa2e44c4a04db95ccd278a7078c14dd77/src%2Fnode_contextify.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_contextify.cc?ref=5f8ccecaa2e44c4a04db95ccd278a7078c14dd77",
+            "patch": "@@ -285,6 +285,15 @@ void ContextifyContext::WeakCallback(\n   delete context;\n }\n \n+void ContextifyContext::WeakCallbackCompileFn(\n+    const WeakCallbackInfo<CompileFnEntry>& data) {\n+  CompileFnEntry* entry = data.GetParameter();\n+  if (entry->env->compile_fn_entries.erase(entry) != 0) {\n+    entry->env->id_to_function_map.erase(entry->id);\n+    delete entry;\n+  }\n+}\n+\n // static\n ContextifyContext* ContextifyContext::ContextFromContextifiedSandbox(\n     Environment* env,\n@@ -1027,7 +1036,30 @@ void ContextifyContext::CompileFunction(\n       data + cached_data_buf->ByteOffset(), cached_data_buf->ByteLength());\n   }\n \n-  ScriptOrigin origin(filename, line_offset, column_offset, True(isolate));\n+  // Get the function id\n+  uint32_t id = env->get_next_function_id();\n+\n+  // Set host_defined_options\n+  Local<PrimitiveArray> host_defined_options =\n+      PrimitiveArray::New(isolate, loader::HostDefinedOptions::kLength);\n+  host_defined_options->Set(\n+      isolate,\n+      loader::HostDefinedOptions::kType,\n+      Number::New(isolate, loader::ScriptType::kFunction));\n+  host_defined_options->Set(\n+      isolate, loader::HostDefinedOptions::kID, Number::New(isolate, id));\n+\n+  ScriptOrigin origin(filename,\n+                      line_offset,       // line offset\n+                      column_offset,     // column offset\n+                      True(isolate),     // is cross origin\n+                      Local<Integer>(),  // script id\n+                      Local<Value>(),    // source map URL\n+                      False(isolate),    // is opaque (?)\n+                      False(isolate),    // is WASM\n+                      False(isolate),    // is ES Module\n+                      host_defined_options);\n+\n   ScriptCompiler::Source source(code, origin, cached_data);\n   ScriptCompiler::CompileOptions options;\n   if (source.GetCachedData() == nullptr) {\n@@ -1061,38 +1093,45 @@ void ContextifyContext::CompileFunction(\n     }\n   }\n \n-  MaybeLocal<Function> maybe_fun = ScriptCompiler::CompileFunctionInContext(\n+  MaybeLocal<Function> maybe_fn = ScriptCompiler::CompileFunctionInContext(\n       parsing_context, &source, params.size(), params.data(),\n       context_extensions.size(), context_extensions.data(), options);\n \n-  Local<Function> fun;\n-  if (maybe_fun.IsEmpty() || !maybe_fun.ToLocal(&fun)) {\n+  if (maybe_fn.IsEmpty()) {\n     DecorateErrorStack(env, try_catch);\n     try_catch.ReThrow();\n     return;\n   }\n+  Local<Function> fn = maybe_fn.ToLocalChecked();\n+  env->id_to_function_map.emplace(std::piecewise_construct,\n+                                  std::make_tuple(id),\n+                                  std::make_tuple(isolate, fn));\n+  CompileFnEntry* gc_entry = new CompileFnEntry(env, id);\n+  env->id_to_function_map[id].SetWeak(gc_entry,\n+      WeakCallbackCompileFn,\n+      v8::WeakCallbackType::kParameter);\n \n   if (produce_cached_data) {\n     const std::unique_ptr<ScriptCompiler::CachedData> cached_data(\n-        ScriptCompiler::CreateCodeCacheForFunction(fun));\n+        ScriptCompiler::CreateCodeCacheForFunction(fn));\n     bool cached_data_produced = cached_data != nullptr;\n     if (cached_data_produced) {\n       MaybeLocal<Object> buf = Buffer::Copy(\n           env,\n           reinterpret_cast<const char*>(cached_data->data),\n           cached_data->length);\n-      if (fun->Set(\n+      if (fn->Set(\n           parsing_context,\n           env->cached_data_string(),\n           buf.ToLocalChecked()).IsNothing()) return;\n     }\n-    if (fun->Set(\n+    if (fn->Set(\n         parsing_context,\n         env->cached_data_produced_string(),\n         Boolean::New(isolate, cached_data_produced)).IsNothing()) return;\n   }\n \n-  args.GetReturnValue().Set(fun);\n+  args.GetReturnValue().Set(fn);\n }\n \n "
+        },
+        {
+            "sha": "4186e5190f8ef91aedeb1d4f571b824c8b24dda2",
+            "filename": "src/node_contextify.h",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/5f8ccecaa2e44c4a04db95ccd278a7078c14dd77/src%2Fnode_contextify.h",
+            "raw_url": "https://github.com/nodejs/node/raw/5f8ccecaa2e44c4a04db95ccd278a7078c14dd77/src%2Fnode_contextify.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_contextify.h?ref=5f8ccecaa2e44c4a04db95ccd278a7078c14dd77",
+            "patch": "@@ -61,6 +61,8 @@ class ContextifyContext {\n       const v8::FunctionCallbackInfo<v8::Value>& args);\n   static void WeakCallback(\n       const v8::WeakCallbackInfo<ContextifyContext>& data);\n+  static void WeakCallbackCompileFn(\n+      const v8::WeakCallbackInfo<CompileFnEntry>& data);\n   static void PropertyGetterCallback(\n       v8::Local<v8::Name> property,\n       const v8::PropertyCallbackInfo<v8::Value>& args);"
+        },
+        {
+            "sha": "2e11cc1a3b3231e20ac100a07429ef295f60d681",
+            "filename": "test/fixtures/cjs-module-wrap.js",
+            "status": "added",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/nodejs/node/blob/5f8ccecaa2e44c4a04db95ccd278a7078c14dd77/test%2Ffixtures%2Fcjs-module-wrap.js",
+            "raw_url": "https://github.com/nodejs/node/raw/5f8ccecaa2e44c4a04db95ccd278a7078c14dd77/test%2Ffixtures%2Fcjs-module-wrap.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Ffixtures%2Fcjs-module-wrap.js?ref=5f8ccecaa2e44c4a04db95ccd278a7078c14dd77",
+            "patch": "@@ -0,0 +1,9 @@\n+const assert = require('assert');\n+const m = require('module');\n+\n+global.mwc = 0;\n+m.wrapper[0] += 'global.mwc = (global.mwc || 0 ) + 1;';\n+\n+require('./not-main-module.js');\n+assert.strictEqual(mwc, 1);\n+delete global.mwc;"
+        },
+        {
+            "sha": "639300cb6af66a8a5a2e56a52c12e8bb59627050",
+            "filename": "test/parallel/test-module-wrap.js",
+            "status": "added",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/nodejs/node/blob/5f8ccecaa2e44c4a04db95ccd278a7078c14dd77/test%2Fparallel%2Ftest-module-wrap.js",
+            "raw_url": "https://github.com/nodejs/node/raw/5f8ccecaa2e44c4a04db95ccd278a7078c14dd77/test%2Fparallel%2Ftest-module-wrap.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-module-wrap.js?ref=5f8ccecaa2e44c4a04db95ccd278a7078c14dd77",
+            "patch": "@@ -0,0 +1,9 @@\n+'use strict';\n+require('../common');\n+const fixtures = require('../common/fixtures');\n+const { execFileSync } = require('child_process');\n+\n+const cjsModuleWrapTest = fixtures.path('cjs-module-wrap.js');\n+const node = process.argv[0];\n+\n+execFileSync(node, [cjsModuleWrapTest], { stdio: 'pipe' });"
+        },
+        {
+            "sha": "5be68bf4b7947f7a9eec4bfa72b94d47265b1f16",
+            "filename": "test/parallel/test-v8-coverage.js",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 13,
+            "changes": 26,
+            "blob_url": "https://github.com/nodejs/node/blob/5f8ccecaa2e44c4a04db95ccd278a7078c14dd77/test%2Fparallel%2Ftest-v8-coverage.js",
+            "raw_url": "https://github.com/nodejs/node/raw/5f8ccecaa2e44c4a04db95ccd278a7078c14dd77/test%2Fparallel%2Ftest-v8-coverage.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-v8-coverage.js?ref=5f8ccecaa2e44c4a04db95ccd278a7078c14dd77",
+            "patch": "@@ -27,9 +27,9 @@ function nextdir() {\n   const fixtureCoverage = getFixtureCoverage('basic.js', coverageDirectory);\n   assert.ok(fixtureCoverage);\n   // first branch executed.\n-  assert.strictEqual(fixtureCoverage.functions[1].ranges[0].count, 1);\n+  assert.strictEqual(fixtureCoverage.functions[0].ranges[0].count, 1);\n   // second branch did not execute.\n-  assert.strictEqual(fixtureCoverage.functions[1].ranges[1].count, 0);\n+  assert.strictEqual(fixtureCoverage.functions[0].ranges[1].count, 0);\n }\n \n // Outputs coverage when process.exit(1) exits process.\n@@ -43,9 +43,9 @@ function nextdir() {\n   const fixtureCoverage = getFixtureCoverage('exit-1.js', coverageDirectory);\n   assert.ok(fixtureCoverage, 'coverage not found for file');\n   // first branch executed.\n-  assert.strictEqual(fixtureCoverage.functions[1].ranges[0].count, 1);\n+  assert.strictEqual(fixtureCoverage.functions[0].ranges[0].count, 1);\n   // second branch did not execute.\n-  assert.strictEqual(fixtureCoverage.functions[1].ranges[1].count, 0);\n+  assert.strictEqual(fixtureCoverage.functions[0].ranges[1].count, 0);\n }\n \n // Outputs coverage when process.kill(process.pid, \"SIGINT\"); exits process.\n@@ -61,9 +61,9 @@ function nextdir() {\n   const fixtureCoverage = getFixtureCoverage('sigint.js', coverageDirectory);\n   assert.ok(fixtureCoverage);\n   // first branch executed.\n-  assert.strictEqual(fixtureCoverage.functions[1].ranges[0].count, 1);\n+  assert.strictEqual(fixtureCoverage.functions[0].ranges[0].count, 1);\n   // second branch did not execute.\n-  assert.strictEqual(fixtureCoverage.functions[1].ranges[1].count, 0);\n+  assert.strictEqual(fixtureCoverage.functions[0].ranges[1].count, 0);\n }\n \n // outputs coverage from subprocess.\n@@ -78,9 +78,9 @@ function nextdir() {\n                                              coverageDirectory);\n   assert.ok(fixtureCoverage);\n   // first branch executed.\n-  assert.strictEqual(fixtureCoverage.functions[2].ranges[0].count, 1);\n+  assert.strictEqual(fixtureCoverage.functions[1].ranges[0].count, 1);\n   // second branch did not execute.\n-  assert.strictEqual(fixtureCoverage.functions[2].ranges[1].count, 0);\n+  assert.strictEqual(fixtureCoverage.functions[1].ranges[1].count, 0);\n }\n \n // outputs coverage from worker.\n@@ -95,9 +95,9 @@ function nextdir() {\n                                              coverageDirectory);\n   assert.ok(fixtureCoverage);\n   // first branch executed.\n-  assert.strictEqual(fixtureCoverage.functions[2].ranges[0].count, 1);\n+  assert.strictEqual(fixtureCoverage.functions[1].ranges[0].count, 1);\n   // second branch did not execute.\n-  assert.strictEqual(fixtureCoverage.functions[2].ranges[1].count, 0);\n+  assert.strictEqual(fixtureCoverage.functions[1].ranges[1].count, 0);\n }\n \n // Does not output coverage if NODE_V8_COVERAGE is empty.\n@@ -125,7 +125,7 @@ function nextdir() {\n                                              coverageDirectory);\n   assert.ok(fixtureCoverage);\n   // first branch executed.\n-  assert.strictEqual(fixtureCoverage.functions[1].ranges[0].count, 1);\n+  assert.strictEqual(fixtureCoverage.functions[0].ranges[0].count, 1);\n }\n \n // Outputs coverage when the coverage directory is not absolute.\n@@ -144,9 +144,9 @@ function nextdir() {\n                                              absoluteCoverageDirectory);\n   assert.ok(fixtureCoverage);\n   // first branch executed.\n-  assert.strictEqual(fixtureCoverage.functions[1].ranges[0].count, 1);\n+  assert.strictEqual(fixtureCoverage.functions[0].ranges[0].count, 1);\n   // second branch did not execute.\n-  assert.strictEqual(fixtureCoverage.functions[1].ranges[1].count, 0);\n+  assert.strictEqual(fixtureCoverage.functions[0].ranges[1].count, 0);\n }\n \n // Extracts the coverage object for a given fixture name."
+        }
+    ],
+    "stats": {
+        "total": 250,
+        "additions": 201,
+        "deletions": 49
+    }
+}

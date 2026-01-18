@@ -1,0 +1,84 @@
+{
+    "author": "addaleax",
+    "message": "net: track bytesWritten in C++ land\n\nMove tracking of `socket.bytesWritten` to C++ land.\n\nThis makes it easier to provide this functionality for all\n`StreamBase` instances, and in particular should keep working\nwhen they have been 'consumed' in C++ in some way (e.g. for\nthe network sockets that are underlying to TLS or HTTP2 streams).\n\nAlso, this parallels `socket.bytesRead` a lot more now.\n\nPR-URL: https://github.com/nodejs/node/pull/19551\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "923fb5cc1861422291d135177770f94f473f4d6f",
+    "files": [
+        {
+            "sha": "78e155e055a8202ef02ac1d278f53da423977de4",
+            "filename": "lib/internal/net.js",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/923fb5cc1861422291d135177770f94f473f4d6f/lib%2Finternal%2Fnet.js",
+            "raw_url": "https://github.com/nodejs/node/raw/923fb5cc1861422291d135177770f94f473f4d6f/lib%2Finternal%2Fnet.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fnet.js?ref=923fb5cc1861422291d135177770f94f473f4d6f",
+            "patch": "@@ -32,7 +32,7 @@ function makeSyncWrite(fd) {\n     if (enc !== 'buffer')\n       chunk = Buffer.from(chunk, enc);\n \n-    this._bytesDispatched += chunk.length;\n+    this._handle.bytesWritten += chunk.length;\n \n     const ctx = {};\n     writeBuffer(fd, chunk, 0, chunk.length, null, undefined, ctx);"
+        },
+        {
+            "sha": "5b460befa49374c36704375f7830524d73ad5f1c",
+            "filename": "lib/net.js",
+            "status": "modified",
+            "additions": 20,
+            "deletions": 8,
+            "changes": 28,
+            "blob_url": "https://github.com/nodejs/node/blob/923fb5cc1861422291d135177770f94f473f4d6f/lib%2Fnet.js",
+            "raw_url": "https://github.com/nodejs/node/raw/923fb5cc1861422291d135177770f94f473f4d6f/lib%2Fnet.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Fnet.js?ref=923fb5cc1861422291d135177770f94f473f4d6f",
+            "patch": "@@ -206,7 +206,6 @@ function normalizeArgs(args) {\n // called when creating new Socket, or when re-using a closed Socket\n function initSocketHandle(self) {\n   self._undestroy();\n-  self._bytesDispatched = 0;\n   self._sockname = null;\n \n   // Handle creation may be deferred to bind() or connect() time.\n@@ -222,7 +221,8 @@ function initSocketHandle(self) {\n }\n \n \n-const BYTES_READ = Symbol('bytesRead');\n+const kBytesRead = Symbol('kBytesRead');\n+const kBytesWritten = Symbol('kBytesWritten');\n \n \n function Socket(options) {\n@@ -278,6 +278,11 @@ function Socket(options) {\n \n       this._writev = null;\n       this._write = makeSyncWrite(fd);\n+      // makeSyncWrite adjusts this value like the original handle would, so\n+      // we need to let it do that by turning it into a writable, own property.\n+      Object.defineProperty(this._handle, 'bytesWritten', {\n+        value: 0, writable: true\n+      });\n     }\n   } else {\n     // these will be set once there is a connection\n@@ -316,7 +321,8 @@ function Socket(options) {\n   this._server = null;\n \n   // Used after `.destroy()`\n-  this[BYTES_READ] = 0;\n+  this[kBytesRead] = 0;\n+  this[kBytesWritten] = 0;\n }\n util.inherits(Socket, stream.Duplex);\n \n@@ -588,8 +594,9 @@ Socket.prototype._destroy = function(exception, cb) {\n     if (this !== process.stderr)\n       debug('close handle');\n     var isException = exception ? true : false;\n-    // `bytesRead` should be accessible after `.destroy()`\n-    this[BYTES_READ] = this._handle.bytesRead;\n+    // `bytesRead` and `kBytesWritten` should be accessible after `.destroy()`\n+    this[kBytesRead] = this._handle.bytesRead;\n+    this[kBytesWritten] = this._handle.bytesWritten;\n \n     this._handle.close(() => {\n       debug('emit close');\n@@ -689,7 +696,7 @@ function protoGetter(name, callback) {\n }\n \n protoGetter('bytesRead', function bytesRead() {\n-  return this._handle ? this._handle.bytesRead : this[BYTES_READ];\n+  return this._handle ? this._handle.bytesRead : this[kBytesRead];\n });\n \n protoGetter('remoteAddress', function remoteAddress() {\n@@ -761,8 +768,6 @@ Socket.prototype._writeGeneric = function(writev, data, encoding, cb) {\n   // Bail out if handle.write* returned an error\n   if (ret) return ret;\n \n-  this._bytesDispatched += req.bytes;\n-\n   if (!req.async) {\n     cb();\n     return;\n@@ -782,6 +787,13 @@ Socket.prototype._write = function(data, encoding, cb) {\n   this._writeGeneric(false, data, encoding, cb);\n };\n \n+\n+// Legacy alias. Having this is probably being overly cautious, but it doesn't\n+// really hurt anyone either. This can probably be removed safely if desired.\n+protoGetter('_bytesDispatched', function _bytesDispatched() {\n+  return this._handle ? this._handle.bytesWritten : this[kBytesWritten];\n+});\n+\n protoGetter('bytesWritten', function bytesWritten() {\n   var bytes = this._bytesDispatched;\n   const state = this._writableState;"
+        },
+        {
+            "sha": "75c530af45457262b7f7ffb45abfaa2bc8c1e998",
+            "filename": "src/env.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/923fb5cc1861422291d135177770f94f473f4d6f/src%2Fenv.h",
+            "raw_url": "https://github.com/nodejs/node/raw/923fb5cc1861422291d135177770f94f473f4d6f/src%2Fenv.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv.h?ref=923fb5cc1861422291d135177770f94f473f4d6f",
+            "patch": "@@ -117,6 +117,7 @@ struct PackageConfig {\n   V(bytes_string, \"bytes\")                                                    \\\n   V(bytes_parsed_string, \"bytesParsed\")                                       \\\n   V(bytes_read_string, \"bytesRead\")                                           \\\n+  V(bytes_written_string, \"bytesWritten\")                                     \\\n   V(cached_data_string, \"cachedData\")                                         \\\n   V(cached_data_produced_string, \"cachedDataProduced\")                        \\\n   V(cached_data_rejected_string, \"cachedDataRejected\")                        \\"
+        },
+        {
+            "sha": "35e49dfea2c721c441521c2a10fdd54d050e415c",
+            "filename": "src/stream_base-inl.h",
+            "status": "modified",
+            "additions": 27,
+            "deletions": 1,
+            "changes": 28,
+            "blob_url": "https://github.com/nodejs/node/blob/923fb5cc1861422291d135177770f94f473f4d6f/src%2Fstream_base-inl.h",
+            "raw_url": "https://github.com/nodejs/node/raw/923fb5cc1861422291d135177770f94f473f4d6f/src%2Fstream_base-inl.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fstream_base-inl.h?ref=923fb5cc1861422291d135177770f94f473f4d6f",
+            "patch": "@@ -193,6 +193,10 @@ inline StreamWriteResult StreamBase::Write(\n     v8::Local<v8::Object> req_wrap_obj) {\n   Environment* env = stream_env();\n   int err;\n+\n+  for (size_t i = 0; i < count; ++i)\n+    bytes_written_ += bufs[i].len;\n+\n   if (send_handle == nullptr) {\n     err = DoTryWrite(&bufs, &count);\n     if (err != 0 || count == 0) {\n@@ -301,6 +305,12 @@ void StreamBase::AddMethods(Environment* env,\n                             env->as_external(),\n                             signature);\n \n+  Local<FunctionTemplate> get_bytes_written_templ =\n+      FunctionTemplate::New(env->isolate(),\n+                            GetBytesWritten<Base>,\n+                            env->as_external(),\n+                            signature);\n+\n   t->PrototypeTemplate()->SetAccessorProperty(env->fd_string(),\n                                               get_fd_templ,\n                                               Local<FunctionTemplate>(),\n@@ -316,6 +326,11 @@ void StreamBase::AddMethods(Environment* env,\n                                               Local<FunctionTemplate>(),\n                                               attributes);\n \n+  t->PrototypeTemplate()->SetAccessorProperty(env->bytes_written_string(),\n+                                              get_bytes_written_templ,\n+                                              Local<FunctionTemplate>(),\n+                                              attributes);\n+\n   env->SetProtoMethod(t, \"readStart\", JSMethod<Base, &StreamBase::ReadStartJS>);\n   env->SetProtoMethod(t, \"readStop\", JSMethod<Base, &StreamBase::ReadStopJS>);\n   if ((flags & kFlagNoShutdown) == 0)\n@@ -357,7 +372,6 @@ void StreamBase::GetFD(const FunctionCallbackInfo<Value>& args) {\n \n template <class Base>\n void StreamBase::GetBytesRead(const FunctionCallbackInfo<Value>& args) {\n-  // The handle instance hasn't been set. So no bytes could have been read.\n   Base* handle;\n   ASSIGN_OR_RETURN_UNWRAP(&handle,\n                           args.This(),\n@@ -368,6 +382,18 @@ void StreamBase::GetBytesRead(const FunctionCallbackInfo<Value>& args) {\n   args.GetReturnValue().Set(static_cast<double>(wrap->bytes_read_));\n }\n \n+template <class Base>\n+void StreamBase::GetBytesWritten(const FunctionCallbackInfo<Value>& args) {\n+  Base* handle;\n+  ASSIGN_OR_RETURN_UNWRAP(&handle,\n+                          args.This(),\n+                          args.GetReturnValue().Set(0));\n+\n+  StreamBase* wrap = static_cast<StreamBase*>(handle);\n+  // uint64_t -> double. 53bits is enough for all real cases.\n+  args.GetReturnValue().Set(static_cast<double>(wrap->bytes_written_));\n+}\n+\n template <class Base>\n void StreamBase::GetExternal(const FunctionCallbackInfo<Value>& args) {\n   Base* handle;"
+        },
+        {
+            "sha": "7b27a48c16f4a4f7d231ff0f3d7add9ace6e564d",
+            "filename": "src/stream_base.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/923fb5cc1861422291d135177770f94f473f4d6f/src%2Fstream_base.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/923fb5cc1861422291d135177770f94f473f4d6f/src%2Fstream_base.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fstream_base.cc?ref=923fb5cc1861422291d135177770f94f473f4d6f",
+            "patch": "@@ -243,6 +243,7 @@ int StreamBase::WriteString(const FunctionCallbackInfo<Value>& args) {\n     uv_buf_t* bufs = &buf;\n     size_t count = 1;\n     err = DoTryWrite(&bufs, &count);\n+    bytes_written_ += data_size;\n \n     // Immediate failure or success\n     if (err != 0 || count == 0) {"
+        },
+        {
+            "sha": "4fe4a8c48c31bc8b8a20719ae45172e646c7f7ea",
+            "filename": "src/stream_base.h",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/nodejs/node/blob/923fb5cc1861422291d135177770f94f473f4d6f/src%2Fstream_base.h",
+            "raw_url": "https://github.com/nodejs/node/raw/923fb5cc1861422291d135177770f94f473f4d6f/src%2Fstream_base.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fstream_base.h?ref=923fb5cc1861422291d135177770f94f473f4d6f",
+            "patch": "@@ -247,6 +247,7 @@ class StreamResource {\n \n   StreamListener* listener_ = nullptr;\n   uint64_t bytes_read_ = 0;\n+  uint64_t bytes_written_ = 0;\n \n   friend class StreamListener;\n };\n@@ -324,6 +325,9 @@ class StreamBase : public StreamResource {\n   template <class Base>\n   static void GetBytesRead(const v8::FunctionCallbackInfo<v8::Value>& args);\n \n+  template <class Base>\n+  static void GetBytesWritten(const v8::FunctionCallbackInfo<v8::Value>& args);\n+\n   template <class Base,\n             int (StreamBase::*Method)(\n       const v8::FunctionCallbackInfo<v8::Value>& args)>"
+        }
+    ],
+    "stats": {
+        "total": 64,
+        "additions": 54,
+        "deletions": 10
+    }
+}

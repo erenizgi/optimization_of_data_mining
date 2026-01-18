@@ -1,0 +1,60 @@
+{
+    "author": "TimothyGu",
+    "message": "src: implement query callbacks for vm\n\nThis allows using a Proxy object as the sandbox for a VM context.\n\nPR-URL: https://github.com/nodejs/node/pull/22390\nFixes: https://github.com/nodejs/node/issues/17480\nFixes: https://github.com/nodejs/node/issues/17481\nReviewed-By: Anna Henningsen <anna@addaleax.net>\nReviewed-By: Gus Caplan <me@gus.host>\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "85c356c10eec14f96eaf92ffc9a8481b591e3652",
+    "files": [
+        {
+            "sha": "defa029821aa00013c623199a5f08e18cb0b0734",
+            "filename": "doc/api/vm.md",
+            "status": "modified",
+            "additions": 42,
+            "deletions": 0,
+            "changes": 42,
+            "blob_url": "https://github.com/nodejs/node/blob/85c356c10eec14f96eaf92ffc9a8481b591e3652/doc%2Fapi%2Fvm.md",
+            "raw_url": "https://github.com/nodejs/node/raw/85c356c10eec14f96eaf92ffc9a8481b591e3652/doc%2Fapi%2Fvm.md",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/doc%2Fapi%2Fvm.md?ref=85c356c10eec14f96eaf92ffc9a8481b591e3652",
+            "patch": "@@ -916,6 +916,48 @@ within which it can operate. The process of creating the V8 Context and\n associating it with the `sandbox` object is what this document refers to as\n \"contextifying\" the `sandbox`.\n \n+## vm module and Proxy object\n+\n+Leveraging a `Proxy` object as the sandbox of a VM context could result in a\n+very powerful runtime environment that intercepts all accesses to the global\n+object. However, there are some restrictions in the JavaScript engine that one\n+needs to be aware of to prevent unexpected results. In particular, providing a\n+`Proxy` object with a `get` handler could disallow any access to the original\n+global properties of the new VM context, as the `get` hook does not distinguish\n+between the `undefined` value and \"requested property is not present\" &ndash;\n+the latter of which would ordinarily trigger a lookup on the context global\n+object.\n+\n+Included below is a sample for how to work around this restriction. It\n+initializes the sandbox as a `Proxy` object without any hooks, only to add them\n+after the relevant properties have been saved.\n+\n+```js\n+'use strict';\n+const { createContext, runInContext } = require('vm');\n+\n+function createProxySandbox(handlers) {\n+  // Create a VM context with a Proxy object with no hooks specified.\n+  const sandbox = {};\n+  const proxyHandlers = {};\n+  const contextifiedProxy = createContext(new Proxy(sandbox, proxyHandlers));\n+\n+  // Save the initial globals onto our sandbox object.\n+  const contextThis = runInContext('this', contextifiedProxy);\n+  for (const prop of Reflect.ownKeys(contextThis)) {\n+    const descriptor = Object.getOwnPropertyDescriptor(contextThis, prop);\n+    Object.defineProperty(sandbox, prop, descriptor);\n+  }\n+\n+  // Now that `sandbox` contains all the initial global properties, assign the\n+  // provided handlers to the handlers we used to create the Proxy.\n+  Object.assign(proxyHandlers, handlers);\n+\n+  // Return the created contextified Proxy object.\n+  return contextifiedProxy;\n+}\n+```\n+\n [`Error`]: errors.html#errors_class_error\n [`URL`]: url.html#url_class_url\n [`eval()`]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/eval"
+        },
+        {
+            "sha": "6ba2cb593a8bc49323800a2af7696f0a5c84b5bf",
+            "filename": "src/node_contextify.cc",
+            "status": "modified",
+            "additions": 40,
+            "deletions": 2,
+            "changes": 42,
+            "blob_url": "https://github.com/nodejs/node/blob/85c356c10eec14f96eaf92ffc9a8481b591e3652/src%2Fnode_contextify.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/85c356c10eec14f96eaf92ffc9a8481b591e3652/src%2Fnode_contextify.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_contextify.cc?ref=85c356c10eec14f96eaf92ffc9a8481b591e3652",
+            "patch": "@@ -143,19 +143,21 @@ Local<Context> ContextifyContext::CreateV8Context(\n \n   NamedPropertyHandlerConfiguration config(PropertyGetterCallback,\n                                            PropertySetterCallback,\n-                                           PropertyDescriptorCallback,\n+                                           PropertyQueryCallback,\n                                            PropertyDeleterCallback,\n                                            PropertyEnumeratorCallback,\n                                            PropertyDefinerCallback,\n+                                           PropertyDescriptorCallback,\n                                            CreateDataWrapper(env));\n \n   IndexedPropertyHandlerConfiguration indexed_config(\n       IndexedPropertyGetterCallback,\n       IndexedPropertySetterCallback,\n-      IndexedPropertyDescriptorCallback,\n+      IndexedPropertyQueryCallback,\n       IndexedPropertyDeleterCallback,\n       PropertyEnumeratorCallback,\n       IndexedPropertyDefinerCallback,\n+      IndexedPropertyDescriptorCallback,\n       CreateDataWrapper(env));\n \n   object_template->SetHandler(config);\n@@ -390,6 +392,28 @@ void ContextifyContext::PropertySetterCallback(\n   ctx->sandbox()->Set(property, value);\n }\n \n+// static\n+void ContextifyContext::PropertyQueryCallback(\n+    Local<Name> property,\n+    const PropertyCallbackInfo<Integer>& args) {\n+  ContextifyContext* ctx = ContextifyContext::Get(args);\n+\n+  // Still initializing\n+  if (ctx->context_.IsEmpty())\n+    return;\n+\n+  Local<Context> context = ctx->context();\n+\n+  Local<Object> sandbox = ctx->sandbox();\n+\n+  PropertyAttribute attributes;\n+  if (sandbox->HasOwnProperty(context, property).FromMaybe(false) &&\n+      sandbox->GetPropertyAttributes(context, property).To(&attributes)) {\n+    args.GetReturnValue().Set(attributes);\n+  }\n+}\n+\n+\n // static\n void ContextifyContext::PropertyDescriptorCallback(\n     Local<Name> property,\n@@ -535,6 +559,20 @@ void ContextifyContext::IndexedPropertySetterCallback(\n       Uint32ToName(ctx->context(), index), value, args);\n }\n \n+// static\n+void ContextifyContext::IndexedPropertyQueryCallback(\n+    uint32_t index,\n+    const PropertyCallbackInfo<Integer>& args) {\n+  ContextifyContext* ctx = ContextifyContext::Get(args);\n+\n+  // Still initializing\n+  if (ctx->context_.IsEmpty())\n+    return;\n+\n+  ContextifyContext::PropertyQueryCallback(\n+      Uint32ToName(ctx->context(), index), args);\n+}\n+\n // static\n void ContextifyContext::IndexedPropertyDescriptorCallback(\n     uint32_t index,"
+        },
+        {
+            "sha": "d094692186167ed05313be80d0da3716a8578d71",
+            "filename": "src/node_contextify.h",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/nodejs/node/blob/85c356c10eec14f96eaf92ffc9a8481b591e3652/src%2Fnode_contextify.h",
+            "raw_url": "https://github.com/nodejs/node/raw/85c356c10eec14f96eaf92ffc9a8481b591e3652/src%2Fnode_contextify.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_contextify.h?ref=85c356c10eec14f96eaf92ffc9a8481b591e3652",
+            "patch": "@@ -65,6 +65,9 @@ class ContextifyContext {\n       v8::Local<v8::Name> property,\n       v8::Local<v8::Value> value,\n       const v8::PropertyCallbackInfo<v8::Value>& args);\n+  static void PropertyQueryCallback(\n+      v8::Local<v8::Name> property,\n+      const v8::PropertyCallbackInfo<v8::Integer>& args);\n   static void PropertyDescriptorCallback(\n       v8::Local<v8::Name> property,\n       const v8::PropertyCallbackInfo<v8::Value>& args);\n@@ -84,6 +87,9 @@ class ContextifyContext {\n       uint32_t index,\n       v8::Local<v8::Value> value,\n       const v8::PropertyCallbackInfo<v8::Value>& args);\n+  static void IndexedPropertyQueryCallback(\n+      uint32_t index,\n+      const v8::PropertyCallbackInfo<v8::Integer>& args);\n   static void IndexedPropertyDescriptorCallback(\n       uint32_t index,\n       const v8::PropertyCallbackInfo<v8::Value>& args);"
+        },
+        {
+            "sha": "e83ba0dee95aed4e4ac74e56eebba5c28b730cf0",
+            "filename": "test/parallel/test-vm-proxy.js",
+            "status": "added",
+            "additions": 83,
+            "deletions": 0,
+            "changes": 83,
+            "blob_url": "https://github.com/nodejs/node/blob/85c356c10eec14f96eaf92ffc9a8481b591e3652/test%2Fparallel%2Ftest-vm-proxy.js",
+            "raw_url": "https://github.com/nodejs/node/raw/85c356c10eec14f96eaf92ffc9a8481b591e3652/test%2Fparallel%2Ftest-vm-proxy.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-vm-proxy.js?ref=85c356c10eec14f96eaf92ffc9a8481b591e3652",
+            "patch": "@@ -0,0 +1,83 @@\n+'use strict';\n+require('../common');\n+const assert = require('assert');\n+const vm = require('vm');\n+\n+const sandbox = {};\n+const proxyHandlers = {};\n+const contextifiedProxy = vm.createContext(new Proxy(sandbox, proxyHandlers));\n+\n+// One must get the globals and manually assign it to our own global object, to\n+// mitigate against https://github.com/nodejs/node/issues/17465.\n+const contextThis = vm.runInContext('this', contextifiedProxy);\n+for (const prop of Reflect.ownKeys(contextThis)) {\n+  const descriptor = Object.getOwnPropertyDescriptor(contextThis, prop);\n+  Object.defineProperty(sandbox, prop, descriptor);\n+}\n+\n+// Finally, activate the proxy.\n+const numCalled = {};\n+for (const hook of Reflect.ownKeys(Reflect)) {\n+  numCalled[hook] = 0;\n+  proxyHandlers[hook] = (...args) => {\n+    numCalled[hook]++;\n+    return Reflect[hook](...args);\n+  };\n+}\n+\n+{\n+  // Make sure the `in` operator only calls `getOwnPropertyDescriptor` and not\n+  // `get`.\n+  // Refs: https://github.com/nodejs/node/issues/17480\n+  assert.strictEqual(vm.runInContext('\"a\" in this', contextifiedProxy), false);\n+  assert.deepStrictEqual(numCalled, {\n+    defineProperty: 0,\n+    deleteProperty: 0,\n+    apply: 0,\n+    construct: 0,\n+    get: 0,\n+    getOwnPropertyDescriptor: 1,\n+    getPrototypeOf: 0,\n+    has: 0,\n+    isExtensible: 0,\n+    ownKeys: 0,\n+    preventExtensions: 0,\n+    set: 0,\n+    setPrototypeOf: 0\n+  });\n+}\n+\n+{\n+  // Make sure `Object.getOwnPropertyDescriptor` only calls\n+  // `getOwnPropertyDescriptor` and not `get`.\n+  // Refs: https://github.com/nodejs/node/issues/17481\n+\n+  // Get and store the function in a lexically scoped variable to avoid\n+  // interfering with the actual test.\n+  vm.runInContext(\n+    'const { getOwnPropertyDescriptor } = Object;',\n+    contextifiedProxy);\n+\n+  for (const p of Reflect.ownKeys(numCalled)) {\n+    numCalled[p] = 0;\n+  }\n+\n+  assert.strictEqual(\n+    vm.runInContext('getOwnPropertyDescriptor(this, \"a\")', contextifiedProxy),\n+    undefined);\n+  assert.deepStrictEqual(numCalled, {\n+    defineProperty: 0,\n+    deleteProperty: 0,\n+    apply: 0,\n+    construct: 0,\n+    get: 0,\n+    getOwnPropertyDescriptor: 1,\n+    getPrototypeOf: 0,\n+    has: 0,\n+    isExtensible: 0,\n+    ownKeys: 0,\n+    preventExtensions: 0,\n+    set: 0,\n+    setPrototypeOf: 0\n+  });\n+}"
+        }
+    ],
+    "stats": {
+        "total": 173,
+        "additions": 171,
+        "deletions": 2
+    }
+}

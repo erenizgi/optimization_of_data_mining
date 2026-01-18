@@ -1,0 +1,36 @@
+{
+    "author": "mgechev",
+    "message": "fix(devtools): handle ngFor and ngIf contexts in the profiler\n\nCurrently, we skip the time spent in evaluation of embedded view\ntemplates because the passed context is either an NgIf or an NgForOf.\n\nThis change generalizes the implementation to work with views embedded\ninto a component.",
+    "sha": "ff78c66ae917c1cf02a83b30aae375860119710a",
+    "files": [
+        {
+            "sha": "e698b1f8e6e0a2aec35986363367222164221152",
+            "filename": "projects/ng-devtools-backend/src/lib/hooks/capture.ts",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 3,
+            "changes": 7,
+            "blob_url": "https://github.com/angular/angular/blob/ff78c66ae917c1cf02a83b30aae375860119710a/projects%2Fng-devtools-backend%2Fsrc%2Flib%2Fhooks%2Fcapture.ts",
+            "raw_url": "https://github.com/angular/angular/raw/ff78c66ae917c1cf02a83b30aae375860119710a/projects%2Fng-devtools-backend%2Fsrc%2Flib%2Fhooks%2Fcapture.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/projects%2Fng-devtools-backend%2Fsrc%2Flib%2Fhooks%2Fcapture.ts?ref=ff78c66ae917c1cf02a83b30aae375860119710a",
+            "patch": "@@ -31,20 +31,20 @@ export const stop = (): ProfilerFrame => {\n   return result;\n };\n \n-const startEvent = (map: { [key: string]: number }, directive: any, label: string) => {\n+const startEvent = (map: Record<string, number>, directive: any, label: string) => {\n   const name = getDirectiveName(directive);\n   const key = `${name}#${label}`;\n   map[key] = performance.now();\n };\n \n-const getEventStart = (map: { [key: string]: number }, directive: any, label: string) => {\n+const getEventStart = (map: Record<string, number>, directive: any, label: string) => {\n   const name = getDirectiveName(directive);\n   const key = `${name}#${label}`;\n   return map[key];\n };\n \n const getHooks = (onFrame: (frame: ProfilerFrame) => void): Partial<Hooks> => {\n-  const timeStartMap: { [key: string]: number } = {};\n+  const timeStartMap: Record<string, number> = {};\n   return {\n     // We flush here because it's possible the current node to overwrite\n     // an existing removed node.\n@@ -82,6 +82,7 @@ const getHooks = (onFrame: (frame: ProfilerFrame) => void): Partial<Hooks> => {\n     },\n     onChangeDetectionEnd(component: any): void {\n       const profile = eventMap.get(component);\n+\n       if (profile) {\n         let current = profile.changeDetection;\n         if (current === undefined) {"
+        },
+        {
+            "sha": "d86a0fcc8f129696c1849b214908d4e688796c12",
+            "filename": "projects/ng-devtools-backend/src/lib/hooks/profiler/native.ts",
+            "status": "modified",
+            "additions": 35,
+            "deletions": 9,
+            "changes": 44,
+            "blob_url": "https://github.com/angular/angular/blob/ff78c66ae917c1cf02a83b30aae375860119710a/projects%2Fng-devtools-backend%2Fsrc%2Flib%2Fhooks%2Fprofiler%2Fnative.ts",
+            "raw_url": "https://github.com/angular/angular/raw/ff78c66ae917c1cf02a83b30aae375860119710a/projects%2Fng-devtools-backend%2Fsrc%2Flib%2Fhooks%2Fprofiler%2Fnative.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/projects%2Fng-devtools-backend%2Fsrc%2Flib%2Fhooks%2Fprofiler%2Fnative.ts?ref=ff78c66ae917c1cf02a83b30aae375860119710a",
+            "patch": "@@ -10,6 +10,7 @@ type ProfilerCallback = (event: ɵProfilerEvent, instanceOrLView: {}, hookOrList\n export class NgProfiler extends Profiler {\n   private _tracker = IdentityTracker.getInstance();\n   private _callbacks: ProfilerCallback[] = [];\n+  private _lastDirectiveInstance: {} | null = null;\n \n   constructor(config: Partial<Hooks> = {}) {\n     super(config);\n@@ -66,7 +67,7 @@ export class NgProfiler extends Profiler {\n     return;\n   }\n \n-  [ɵProfilerEvent.TemplateUpdateStart](directive: any, _hookOrListener: any): void {\n+  [ɵProfilerEvent.TemplateUpdateStart](context: any, _hookOrListener: any): void {\n     if (!this._inChangeDetection) {\n       this._inChangeDetection = true;\n       runOutsideAngular(() => {\n@@ -77,19 +78,44 @@ export class NgProfiler extends Profiler {\n       });\n     }\n \n-    const position = this._tracker.getDirectivePosition(directive);\n-    const id = this._tracker.getDirectiveId(directive);\n+    const position = this._tracker.getDirectivePosition(context);\n+    const id = this._tracker.getDirectiveId(context);\n+\n+    // If we can find the position and the ID we assume that this is a component instance.\n+    // Alternatively, if we can't find the ID or the position, we assume that this is a\n+    // context of an embedded view (for example, NgForOfContext, NgIfContext, or a custom one).\n+    if (position !== undefined && id !== undefined) {\n+      this._lastDirectiveInstance = context;\n+    }\n+\n+    if (id !== undefined && position !== undefined) {\n+      this._onChangeDetectionStart(context, getDirectiveHostElement(context), id, position);\n+      return;\n+    }\n \n-    this._onChangeDetectionStart(directive, getDirectiveHostElement(directive), id, position);\n+    this._onChangeDetectionStart(\n+      this._lastDirectiveInstance,\n+      getDirectiveHostElement(this._lastDirectiveInstance),\n+      this._tracker.getDirectiveId(this._lastDirectiveInstance),\n+      this._tracker.getDirectivePosition(this._lastDirectiveInstance)\n+    );\n   }\n \n-  [ɵProfilerEvent.TemplateUpdateEnd](directive: any, _hookOrListener: any): void {\n-    const position = this._tracker.getDirectivePosition(directive);\n-    const id = this._tracker.getDirectiveId(directive);\n+  [ɵProfilerEvent.TemplateUpdateEnd](context: any, _hookOrListener: any): void {\n+    const position = this._tracker.getDirectivePosition(context);\n+    const id = this._tracker.getDirectiveId(context);\n \n-    if (this._tracker.hasDirective(directive) && id !== undefined && position !== undefined) {\n-      this._onChangeDetectionEnd(directive, getDirectiveHostElement(directive), id, position);\n+    if (this._tracker.hasDirective(context) && id !== undefined && position !== undefined) {\n+      this._onChangeDetectionEnd(context, getDirectiveHostElement(context), id, position);\n+      return;\n     }\n+\n+    this._onChangeDetectionEnd(\n+      this._lastDirectiveInstance,\n+      getDirectiveHostElement(this._lastDirectiveInstance),\n+      this._tracker.getDirectiveId(this._lastDirectiveInstance),\n+      this._tracker.getDirectivePosition(this._lastDirectiveInstance)\n+    );\n   }\n \n   [ɵProfilerEvent.LifecycleHookStart](directive: any, hook: any): void {"
+        }
+    ],
+    "stats": {
+        "total": 51,
+        "additions": 39,
+        "deletions": 12
+    }
+}

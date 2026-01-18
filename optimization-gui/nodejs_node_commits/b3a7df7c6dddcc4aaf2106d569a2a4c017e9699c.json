@@ -1,0 +1,48 @@
+{
+    "author": "joyeecheung",
+    "message": "fs: throw errors from fs.ftruncateSync in JS\n\nPR-URL: https://github.com/nodejs/node/pull/18348\nRefs: https://github.com/nodejs/node/issues/18106\nReviewed-By: Michaël Zasso <targos@protonmail.com>\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "b3a7df7c6dddcc4aaf2106d569a2a4c017e9699c",
+    "files": [
+        {
+            "sha": "8eaba7984cca16bcd8c641cddd75c127eef3934b",
+            "filename": "lib/fs.js",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 1,
+            "changes": 6,
+            "blob_url": "https://github.com/nodejs/node/blob/b3a7df7c6dddcc4aaf2106d569a2a4c017e9699c/lib%2Ffs.js",
+            "raw_url": "https://github.com/nodejs/node/raw/b3a7df7c6dddcc4aaf2106d569a2a4c017e9699c/lib%2Ffs.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Ffs.js?ref=b3a7df7c6dddcc4aaf2106d569a2a4c017e9699c",
+            "patch": "@@ -995,7 +995,11 @@ fs.ftruncateSync = function(fd, len = 0) {\n   validateUint32(fd, 'fd');\n   validateLen(len);\n   len = Math.max(0, len);\n-  return binding.ftruncate(fd, len);\n+  const ctx = {};\n+  binding.ftruncate(fd, len, undefined, ctx);\n+  if (ctx.errno !== undefined) {\n+    throw new errors.uvException(ctx);\n+  }\n };\n \n fs.rmdir = function(path, callback) {"
+        },
+        {
+            "sha": "10149b403e29b2ed1d616f991c803d3f0b78ad2c",
+            "filename": "src/node_file.cc",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 7,
+            "changes": 20,
+            "blob_url": "https://github.com/nodejs/node/blob/b3a7df7c6dddcc4aaf2106d569a2a4c017e9699c/src%2Fnode_file.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/b3a7df7c6dddcc4aaf2106d569a2a4c017e9699c/src%2Fnode_file.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_file.cc?ref=b3a7df7c6dddcc4aaf2106d569a2a4c017e9699c",
+            "patch": "@@ -711,18 +711,24 @@ static void Rename(const FunctionCallbackInfo<Value>& args) {\n static void FTruncate(const FunctionCallbackInfo<Value>& args) {\n   Environment* env = Environment::GetCurrent(args);\n \n+  const int argc = args.Length();\n+  CHECK_GE(argc, 3);\n+\n   CHECK(args[0]->IsInt32());\n-  CHECK(args[1]->IsNumber());\n+  const int fd = args[0].As<Int32>()->Value();\n \n-  int fd = args[0]->Int32Value();\n-  const int64_t len = args[1]->IntegerValue();\n+  CHECK(args[1]->IsNumber());\n+  const int64_t len = args[1].As<Integer>()->Value();\n \n-  if (args[2]->IsObject()) {\n-    CHECK_EQ(args.Length(), 3);\n+  if (args[2]->IsObject()) {  // ftruncate(fd, len, req)\n+    CHECK_EQ(argc, 3);\n     AsyncCall(env, args, \"ftruncate\", UTF8, AfterNoArgs,\n               uv_fs_ftruncate, fd, len);\n-  } else {\n-    SYNC_CALL(ftruncate, 0, fd, len)\n+  } else {  // ftruncate(fd, len, undefined, ctx)\n+    CHECK_EQ(argc, 4);\n+    fs_req_wrap req_wrap;\n+    SyncCall(env, args[3], &req_wrap, \"ftruncate\",\n+             uv_fs_ftruncate, fd, len);\n   }\n }\n "
+        },
+        {
+            "sha": "b7e7ab6a2cc089dfe2375daa02dff1d9dbd6888f",
+            "filename": "test/parallel/test-fs-error-messages.js",
+            "status": "modified",
+            "additions": 27,
+            "deletions": 0,
+            "changes": 27,
+            "blob_url": "https://github.com/nodejs/node/blob/b3a7df7c6dddcc4aaf2106d569a2a4c017e9699c/test%2Fparallel%2Ftest-fs-error-messages.js",
+            "raw_url": "https://github.com/nodejs/node/raw/b3a7df7c6dddcc4aaf2106d569a2a4c017e9699c/test%2Fparallel%2Ftest-fs-error-messages.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-fs-error-messages.js?ref=b3a7df7c6dddcc4aaf2106d569a2a4c017e9699c",
+            "patch": "@@ -455,3 +455,30 @@ function re(literals, ...values) {\n     validateError\n   );\n }\n+\n+// ftruncate\n+{\n+  const validateError = (err) => {\n+    assert.strictEqual(err.syscall, 'ftruncate');\n+    // Could be EBADF or EINVAL, depending on the platform\n+    if (err.code === 'EBADF') {\n+      assert.strictEqual(err.message, 'EBADF: bad file descriptor, ftruncate');\n+      assert.strictEqual(err.errno, uv.UV_EBADF);\n+    } else {\n+      assert.strictEqual(err.message, 'EINVAL: invalid argument, ftruncate');\n+      assert.strictEqual(err.errno, uv.UV_EINVAL);\n+      assert.strictEqual(err.code, 'EINVAL');\n+    }\n+    return true;\n+  };\n+\n+  const fd = fs.openSync(existingFile, 'r');\n+  fs.closeSync(fd);\n+\n+  fs.ftruncate(fd, 4, common.mustCall(validateError));\n+\n+  assert.throws(\n+    () => fs.ftruncateSync(fd, 4),\n+    validateError\n+  );\n+}"
+        }
+    ],
+    "stats": {
+        "total": 53,
+        "additions": 45,
+        "deletions": 8
+    }
+}

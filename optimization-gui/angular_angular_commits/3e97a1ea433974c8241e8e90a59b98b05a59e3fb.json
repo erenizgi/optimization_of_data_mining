@@ -1,0 +1,72 @@
+{
+    "author": "atscott",
+    "message": "fix(language-service): fix go to definition for template variables and references (#40455)\n\nThe current \"go to definition\" is broken for template variables and\nreferences when a template is overridden. This is because we get the\nfile url from the source span, which uses the overridden name\n'override.html'. Instead, we can retrieve the template file from the\ncompiler in the same manner that is done for references.\n\nAnother way to fix this would have been to use the real template file path when\noverriding a template, but this was the more straightforward fix since\nthe strategy was already used in find references and rename locations.\n\nfixes https://github.com/angular/vscode-ng-language-service/issues/1054\n\nPR Close #40455",
+    "sha": "3e97a1ea433974c8241e8e90a59b98b05a59e3fb",
+    "files": [
+        {
+            "sha": "e78068bcf75f2b9f9f5ab266e338bbbae1d5eee7",
+            "filename": "packages/language-service/ivy/definitions.ts",
+            "status": "modified",
+            "additions": 17,
+            "deletions": 10,
+            "changes": 27,
+            "blob_url": "https://github.com/angular/angular/blob/3e97a1ea433974c8241e8e90a59b98b05a59e3fb/packages%2Flanguage-service%2Fivy%2Fdefinitions.ts",
+            "raw_url": "https://github.com/angular/angular/raw/3e97a1ea433974c8241e8e90a59b98b05a59e3fb/packages%2Flanguage-service%2Fivy%2Fdefinitions.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Flanguage-service%2Fivy%2Fdefinitions.ts?ref=3e97a1ea433974c8241e8e90a59b98b05a59e3fb",
+            "patch": "@@ -14,7 +14,7 @@ import * as ts from 'typescript';\n \n import {getTargetAtPosition, TargetNodeKind} from './template_target';\n import {findTightestNode, getParentClassDeclaration} from './ts_utils';\n-import {flatMap, getDirectiveMatchesForAttribute, getDirectiveMatchesForElementTag, getTemplateInfoAtPosition, getTextSpanOfNode, isDollarEvent, isTypeScriptFile, TemplateInfo, toTextSpan} from './utils';\n+import {flatMap, getDirectiveMatchesForAttribute, getDirectiveMatchesForElementTag, getTemplateInfoAtPosition, getTemplateLocationFromShimLocation, getTextSpanOfNode, isDollarEvent, isTypeScriptFile, TemplateInfo, toTextSpan} from './utils';\n \n interface DefinitionMeta {\n   node: AST|TmplAstNode;\n@@ -100,15 +100,22 @@ export class DefinitionBuilder {\n       case SymbolKind.Reference: {\n         const definitions: ts.DefinitionInfo[] = [];\n         if (symbol.declaration !== node) {\n-          definitions.push({\n-            name: symbol.declaration.name,\n-            containerName: '',\n-            containerKind: ts.ScriptElementKind.unknown,\n-            kind: ts.ScriptElementKind.variableElement,\n-            textSpan: getTextSpanOfNode(symbol.declaration),\n-            contextSpan: toTextSpan(symbol.declaration.sourceSpan),\n-            fileName: symbol.declaration.sourceSpan.start.file.url,\n-          });\n+          const shimLocation = symbol.kind === SymbolKind.Variable ? symbol.localVarLocation :\n+                                                                     symbol.referenceVarLocation;\n+          const mapping = getTemplateLocationFromShimLocation(\n+              this.compiler.getTemplateTypeChecker(), shimLocation.shimPath,\n+              shimLocation.positionInShimFile);\n+          if (mapping !== null) {\n+            definitions.push({\n+              name: symbol.declaration.name,\n+              containerName: '',\n+              containerKind: ts.ScriptElementKind.unknown,\n+              kind: ts.ScriptElementKind.variableElement,\n+              textSpan: getTextSpanOfNode(symbol.declaration),\n+              contextSpan: toTextSpan(symbol.declaration.sourceSpan),\n+              fileName: mapping.templateUrl,\n+            });\n+          }\n         }\n         if (symbol.kind === SymbolKind.Variable) {\n           definitions.push("
+        },
+        {
+            "sha": "114385e5fd768d26366265cc9abbed519b042585",
+            "filename": "packages/language-service/ivy/references.ts",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 18,
+            "changes": 23,
+            "blob_url": "https://github.com/angular/angular/blob/3e97a1ea433974c8241e8e90a59b98b05a59e3fb/packages%2Flanguage-service%2Fivy%2Freferences.ts",
+            "raw_url": "https://github.com/angular/angular/raw/3e97a1ea433974c8241e8e90a59b98b05a59e3fb/packages%2Flanguage-service%2Fivy%2Freferences.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Flanguage-service%2Fivy%2Freferences.ts?ref=3e97a1ea433974c8241e8e90a59b98b05a59e3fb",
+            "patch": "@@ -14,7 +14,7 @@ import * as ts from 'typescript';\n \n import {getTargetAtPosition, TargetNodeKind} from './template_target';\n import {findTightestNode} from './ts_utils';\n-import {getDirectiveMatchesForAttribute, getDirectiveMatchesForElementTag, getTemplateInfoAtPosition, isWithin, TemplateInfo, toTextSpan} from './utils';\n+import {getDirectiveMatchesForAttribute, getDirectiveMatchesForElementTag, getTemplateInfoAtPosition, getTemplateLocationFromShimLocation, isWithin, TemplateInfo, toTextSpan} from './utils';\n \n interface FilePosition {\n   fileName: string;\n@@ -376,27 +376,14 @@ export class ReferencesAndRenameBuilder {\n     // TODO(atscott): Determine how to consistently resolve paths. i.e. with the project\n     // serverHost or LSParseConfigHost in the adapter. We should have a better defined way to\n     // normalize paths.\n-    const mapping = templateTypeChecker.getTemplateMappingAtShimLocation({\n-      shimPath: absoluteFrom(shimDocumentSpan.fileName),\n-      positionInShimFile: shimDocumentSpan.textSpan.start,\n-    });\n+    const mapping = getTemplateLocationFromShimLocation(\n+        templateTypeChecker, absoluteFrom(shimDocumentSpan.fileName),\n+        shimDocumentSpan.textSpan.start);\n     if (mapping === null) {\n       return null;\n     }\n-    const {templateSourceMapping, span} = mapping;\n-\n-    let templateUrl: AbsoluteFsPath;\n-    if (templateSourceMapping.type === 'direct') {\n-      templateUrl = absoluteFromSourceFile(templateSourceMapping.node.getSourceFile());\n-    } else if (templateSourceMapping.type === 'external') {\n-      templateUrl = absoluteFrom(templateSourceMapping.templateUrl);\n-    } else {\n-      // This includes indirect mappings, which are difficult to map directly to the code\n-      // location. Diagnostics similarly return a synthetic template string for this case rather\n-      // than a real location.\n-      return null;\n-    }\n \n+    const {span, templateUrl} = mapping;\n     if (requiredNodeText !== undefined && span.toString() !== requiredNodeText) {\n       return null;\n     }"
+        },
+        {
+            "sha": "5b0cd19aaaa6ce428f299bd5294ab82584d68596",
+            "filename": "packages/language-service/ivy/test/definitions_spec.ts",
+            "status": "modified",
+            "additions": 22,
+            "deletions": 0,
+            "changes": 22,
+            "blob_url": "https://github.com/angular/angular/blob/3e97a1ea433974c8241e8e90a59b98b05a59e3fb/packages%2Flanguage-service%2Fivy%2Ftest%2Fdefinitions_spec.ts",
+            "raw_url": "https://github.com/angular/angular/raw/3e97a1ea433974c8241e8e90a59b98b05a59e3fb/packages%2Flanguage-service%2Fivy%2Ftest%2Fdefinitions_spec.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Flanguage-service%2Fivy%2Ftest%2Fdefinitions_spec.ts?ref=3e97a1ea433974c8241e8e90a59b98b05a59e3fb",
+            "patch": "@@ -13,6 +13,28 @@ import {extractCursorInfo, LanguageServiceTestEnvironment} from './env';\n import {assertFileNames, createModuleWithDeclarations, humanizeDocumentSpanLike} from './test_utils';\n \n describe('definitions', () => {\n+  it('gets definition for template reference in overridden template', () => {\n+    initMockFileSystem('Native');\n+    const templateFile = {contents: '', name: absoluteFrom('/app.html')};\n+    const appFile = {\n+      name: absoluteFrom('/app.ts'),\n+      contents: `\n+        import {Component} from '@angular/core';\n+\n+        @Component({templateUrl: '/app.html'})\n+        export class AppCmp {}\n+      `,\n+    };\n+\n+    const env = createModuleWithDeclarations([appFile], [templateFile]);\n+    const {cursor} = env.overrideTemplateWithCursor(\n+        absoluteFrom('/app.ts'), 'AppCmp', '<input #myInput /> {{myIn¦put.value}}');\n+    env.expectNoSourceDiagnostics();\n+    const {definitions} = env.ngLS.getDefinitionAndBoundSpan(absoluteFrom('/app.html'), cursor)!;\n+    expect(definitions![0].name).toEqual('myInput');\n+    assertFileNames(Array.from(definitions!), ['app.html']);\n+  });\n+\n   it('returns the pipe class as definition when checkTypeOfPipes is false', () => {\n     initMockFileSystem('Native');\n     const {cursor, text} = extractCursorInfo('{{\"1/1/2020\" | dat¦e}}');"
+        },
+        {
+            "sha": "4ddb57d80a7bec26f84859d3bdc431b6cae93181",
+            "filename": "packages/language-service/ivy/test/test_utils.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/angular/angular/blob/3e97a1ea433974c8241e8e90a59b98b05a59e3fb/packages%2Flanguage-service%2Fivy%2Ftest%2Ftest_utils.ts",
+            "raw_url": "https://github.com/angular/angular/raw/3e97a1ea433974c8241e8e90a59b98b05a59e3fb/packages%2Flanguage-service%2Fivy%2Ftest%2Ftest_utils.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Flanguage-service%2Fivy%2Ftest%2Ftest_utils.ts?ref=3e97a1ea433974c8241e8e90a59b98b05a59e3fb",
+            "patch": "@@ -60,7 +60,7 @@ export function humanizeDocumentSpanLike<T extends ts.DocumentSpan>(\n                                                        env.host.readFile(item.fileName)) ??\n       '';\n   if (!fileContents) {\n-    throw new Error('Could not read file ${entry.fileName}');\n+    throw new Error(`Could not read file ${item.fileName}`);\n   }\n   return {\n     ...item,"
+        },
+        {
+            "sha": "a7ab8156b87fa3c2b69f8f7e9627aec3a97c3216",
+            "filename": "packages/language-service/ivy/utils.ts",
+            "status": "modified",
+            "additions": 30,
+            "deletions": 1,
+            "changes": 31,
+            "blob_url": "https://github.com/angular/angular/blob/3e97a1ea433974c8241e8e90a59b98b05a59e3fb/packages%2Flanguage-service%2Fivy%2Futils.ts",
+            "raw_url": "https://github.com/angular/angular/raw/3e97a1ea433974c8241e8e90a59b98b05a59e3fb/packages%2Flanguage-service%2Fivy%2Futils.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Flanguage-service%2Fivy%2Futils.ts?ref=3e97a1ea433974c8241e8e90a59b98b05a59e3fb",
+            "patch": "@@ -7,9 +7,10 @@\n  */\n import {AbsoluteSourceSpan, CssSelector, ParseSourceSpan, SelectorMatcher, TmplAstBoundEvent} from '@angular/compiler';\n import {NgCompiler} from '@angular/compiler-cli/src/ngtsc/core';\n+import {absoluteFrom, absoluteFromSourceFile, AbsoluteFsPath} from '@angular/compiler-cli/src/ngtsc/file_system';\n import {isExternalResource} from '@angular/compiler-cli/src/ngtsc/metadata';\n import {DeclarationNode} from '@angular/compiler-cli/src/ngtsc/reflection';\n-import {DirectiveSymbol} from '@angular/compiler-cli/src/ngtsc/typecheck/api';\n+import {DirectiveSymbol, TemplateTypeChecker} from '@angular/compiler-cli/src/ngtsc/typecheck/api';\n import * as e from '@angular/compiler/src/expression_parser/ast';  // e for expression AST\n import * as t from '@angular/compiler/src/render3/r3_ast';         // t for template AST\n import * as ts from 'typescript';\n@@ -346,3 +347,31 @@ export function isWithin(position: number, span: AbsoluteSourceSpan|ParseSourceS\n   // like ¦start and end¦ where ¦ is the cursor.\n   return start <= position && position <= end;\n }\n+\n+/**\n+ * For a given location in a shim file, retrieves the corresponding file url for the template and\n+ * the span in the template.\n+ */\n+export function getTemplateLocationFromShimLocation(\n+    templateTypeChecker: TemplateTypeChecker, shimPath: AbsoluteFsPath,\n+    positionInShimFile: number): {templateUrl: AbsoluteFsPath, span: ParseSourceSpan}|null {\n+  const mapping =\n+      templateTypeChecker.getTemplateMappingAtShimLocation({shimPath, positionInShimFile});\n+  if (mapping === null) {\n+    return null;\n+  }\n+  const {templateSourceMapping, span} = mapping;\n+\n+  let templateUrl: AbsoluteFsPath;\n+  if (templateSourceMapping.type === 'direct') {\n+    templateUrl = absoluteFromSourceFile(templateSourceMapping.node.getSourceFile());\n+  } else if (templateSourceMapping.type === 'external') {\n+    templateUrl = absoluteFrom(templateSourceMapping.templateUrl);\n+  } else {\n+    // This includes indirect mappings, which are difficult to map directly to the code\n+    // location. Diagnostics similarly return a synthetic template string for this case rather\n+    // than a real location.\n+    return null;\n+  }\n+  return {templateUrl, span};\n+}\n\\ No newline at end of file"
+        }
+    ],
+    "stats": {
+        "total": 105,
+        "additions": 75,
+        "deletions": 30
+    }
+}

@@ -1,0 +1,36 @@
+{
+    "author": "aaugustin",
+    "message": "Fixed #17062 -- Ensured that the effect of SET TIME ZONE isn't lost when the first transation is rolled back under PostgreSQL. Thanks Anssi for the patch.\n\n\ngit-svn-id: http://code.djangoproject.com/svn/django/trunk@17128 bcc190cf-cafb-0310-a4f2-bffc1f526a37",
+    "sha": "74b836abf541bb83047c5f07fbb6f49783d46475",
+    "files": [
+        {
+            "sha": "c81623720e1b4f1916f3fa8c411b1887d007ea71",
+            "filename": "django/db/backends/postgresql_psycopg2/base.py",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 7,
+            "changes": 14,
+            "blob_url": "https://github.com/django/django/blob/74b836abf541bb83047c5f07fbb6f49783d46475/django%2Fdb%2Fbackends%2Fpostgresql_psycopg2%2Fbase.py",
+            "raw_url": "https://github.com/django/django/raw/74b836abf541bb83047c5f07fbb6f49783d46475/django%2Fdb%2Fbackends%2Fpostgresql_psycopg2%2Fbase.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fbackends%2Fpostgresql_psycopg2%2Fbase.py?ref=74b836abf541bb83047c5f07fbb6f49783d46475",
+            "patch": "@@ -153,10 +153,8 @@ def _get_pg_version(self):\n     pg_version = property(_get_pg_version)\n \n     def _cursor(self):\n-        new_connection = False\n         settings_dict = self.settings_dict\n         if self.connection is None:\n-            new_connection = True\n             if settings_dict['NAME'] == '':\n                 from django.core.exceptions import ImproperlyConfigured\n                 raise ImproperlyConfigured(\"You need to specify NAME in your Django settings file.\")\n@@ -176,15 +174,17 @@ def _cursor(self):\n                 conn_params['port'] = settings_dict['PORT']\n             self.connection = Database.connect(**conn_params)\n             self.connection.set_client_encoding('UTF8')\n+            # Set the time zone in autocommit mode (see #17062)\n+            tz = 'UTC' if settings.USE_TZ else settings_dict.get('TIME_ZONE')\n+            if tz:\n+                self.connection.set_isolation_level(\n+                        psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)\n+                self.connection.cursor().execute(\"SET TIME ZONE %s\", [tz])\n             self.connection.set_isolation_level(self.isolation_level)\n+            self._get_pg_version()\n             connection_created.send(sender=self.__class__, connection=self)\n         cursor = self.connection.cursor()\n         cursor.tzinfo_factory = utc_tzinfo_factory if settings.USE_TZ else None\n-        if new_connection:\n-            tz = 'UTC' if settings.USE_TZ else settings_dict.get('TIME_ZONE')\n-            if tz:\n-                cursor.execute(\"SET TIME ZONE %s\", [tz])\n-            self._get_pg_version()\n         return CursorWrapper(cursor)\n \n     def _enter_transaction_management(self, managed):"
+        },
+        {
+            "sha": "a37d56604817038287299071dab5c9edaea30ac9",
+            "filename": "tests/regressiontests/backends/tests.py",
+            "status": "modified",
+            "additions": 42,
+            "deletions": 0,
+            "changes": 42,
+            "blob_url": "https://github.com/django/django/blob/74b836abf541bb83047c5f07fbb6f49783d46475/tests%2Fregressiontests%2Fbackends%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/74b836abf541bb83047c5f07fbb6f49783d46475/tests%2Fregressiontests%2Fbackends%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fbackends%2Ftests.py?ref=74b836abf541bb83047c5f07fbb6f49783d46475",
+            "patch": "@@ -10,6 +10,7 @@\n     IntegrityError, transaction)\n from django.db.backends.signals import connection_created\n from django.db.backends.postgresql_psycopg2 import version as pg_version\n+from django.db.utils import ConnectionHandler, DatabaseError\n from django.test import TestCase, skipUnlessDBFeature, TransactionTestCase\n from django.utils import unittest\n \n@@ -229,6 +230,47 @@ def cursor(self):\n         conn = OlderConnectionMock()\n         self.assertEqual(pg_version.get_version(conn), 80300)\n \n+class PostgresNewConnectionTest(TestCase):\n+    \"\"\"\n+    #17062: PostgreSQL shouldn't roll back SET TIME ZONE, even if the first\n+    transaction is rolled back.\n+    \"\"\"\n+    @unittest.skipUnless(connection.vendor == 'postgresql',\n+                         \"Test valid only for PostgreSQL\")\n+    @unittest.skipUnless(connection.isolation_level > 0,\n+                         \"Test valid only if not using autocommit\")\n+    def test_connect_and_rollback(self):\n+        new_connections = ConnectionHandler(settings.DATABASES)\n+        new_connection = new_connections[DEFAULT_DB_ALIAS]\n+        try:\n+            # Ensure the database default time zone is different than\n+            # the time zone in new_connection.settings_dict. We can\n+            # get the default time zone by reset & show.\n+            cursor = new_connection.cursor()\n+            cursor.execute(\"RESET TIMEZONE\")\n+            cursor.execute(\"SHOW TIMEZONE\")\n+            db_default_tz = cursor.fetchone()[0]\n+            new_tz = 'Europe/Paris' if db_default_tz == 'UTC' else 'UTC'\n+            new_connection.close()\n+\n+            # Fetch a new connection with the new_tz as default\n+            # time zone, run a query and rollback.\n+            new_connection.settings_dict['TIME_ZONE'] = new_tz\n+            new_connection.enter_transaction_management()\n+            cursor = new_connection.cursor()\n+            new_connection.rollback()\n+\n+            # Now let's see if the rollback rolled back the SET TIME ZONE.\n+            cursor.execute(\"SHOW TIMEZONE\")\n+            tz = cursor.fetchone()[0]\n+            self.assertEqual(new_tz, tz)\n+        finally:\n+            try:\n+                new_connection.close()\n+            except DatabaseError:\n+                pass\n+\n+\n # Unfortunately with sqlite3 the in-memory test database cannot be\n # closed, and so it cannot be re-opened during testing, and so we\n # sadly disable this test for now."
+        }
+    ],
+    "stats": {
+        "total": 56,
+        "additions": 49,
+        "deletions": 7
+    }
+}

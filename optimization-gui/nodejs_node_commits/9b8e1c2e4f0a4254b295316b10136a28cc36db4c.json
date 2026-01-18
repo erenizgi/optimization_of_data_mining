@@ -1,0 +1,84 @@
+{
+    "author": "apapirovski",
+    "message": "timers: refactor error handling\n\nInstead of using nextTick to process failed lists, just attempt to\nprocess them again from C++ if the process is still alive.\n\nThis also allows the removal of domain specific code in timers.\n\nThe current behaviour is not quite ideal as it means that all lists\nafter the failed one will process on an arbitrary nextTick, even if\nthey're — say — not due to fire for another 2 days...\n\nPR-URL: https://github.com/nodejs/node/pull/18486\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Ruben Bridgewater <ruben@bridgewater.de>\nReviewed-By: Jeremiah Senkpiel <fishrock123@rocketmail.com>",
+    "sha": "9b8e1c2e4f0a4254b295316b10136a28cc36db4c",
+    "files": [
+        {
+            "sha": "a91de76d7f95bdb2946e3614e818209940df280e",
+            "filename": "lib/timers.js",
+            "status": "modified",
+            "additions": 17,
+            "deletions": 44,
+            "changes": 61,
+            "blob_url": "https://github.com/nodejs/node/blob/9b8e1c2e4f0a4254b295316b10136a28cc36db4c/lib%2Ftimers.js",
+            "raw_url": "https://github.com/nodejs/node/raw/9b8e1c2e4f0a4254b295316b10136a28cc36db4c/lib%2Ftimers.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Ftimers.js?ref=9b8e1c2e4f0a4254b295316b10136a28cc36db4c",
+            "patch": "@@ -212,7 +212,6 @@ function TimersList(msecs, unrefed) {\n   this._idlePrev = this; // prevent any unnecessary hidden class changes.\n   this._unrefed = unrefed;\n   this.msecs = msecs;\n-  this.nextTick = false;\n \n   const timer = this._timer = new TimerWrap();\n   timer._list = this;\n@@ -228,12 +227,6 @@ TimerWrap.prototype[kOnTimeout] = function listOnTimeout() {\n   var list = this._list;\n   var msecs = list.msecs;\n \n-  if (list.nextTick) {\n-    list.nextTick = false;\n-    process.nextTick(listOnTimeoutNT, list);\n-    return;\n-  }\n-\n   debug('timeout callback %d', msecs);\n \n   var now = TimerWrap.now();\n@@ -252,7 +245,7 @@ TimerWrap.prototype[kOnTimeout] = function listOnTimeout() {\n       }\n       this.start(timeRemaining);\n       debug('%d list wait because diff is %d', msecs, diff);\n-      return;\n+      return true;\n     }\n \n     // The actual logic for when a timeout happens.\n@@ -289,10 +282,10 @@ TimerWrap.prototype[kOnTimeout] = function listOnTimeout() {\n \n   // Do not close the underlying handle if its ownership has changed\n   // (e.g it was unrefed in its callback).\n-  if (this.owner)\n-    return;\n+  if (!this.owner)\n+    this.close();\n \n-  this.close();\n+  return true;\n };\n \n \n@@ -318,34 +311,10 @@ function tryOnTimeout(timer, list) {\n         timer._destroyed = true;\n       }\n     }\n-\n-    if (!threw) return;\n-\n-    // Postpone all later list events to next tick. We need to do this\n-    // so that the events are called in the order they were created.\n-    const lists = list._unrefed === true ? unrefedLists : refedLists;\n-    for (var key in lists) {\n-      if (key > list.msecs) {\n-        lists[key].nextTick = true;\n-      }\n-    }\n-    // We need to continue processing after domain error handling\n-    // is complete, but not by using whatever domain was left over\n-    // when the timeout threw its exception.\n-    const domain = process.domain;\n-    process.domain = null;\n-    // If we threw, we need to process the rest of the list in nextTick.\n-    process.nextTick(listOnTimeoutNT, list);\n-    process.domain = domain;\n   }\n }\n \n \n-function listOnTimeoutNT(list) {\n-  list._timer[kOnTimeout]();\n-}\n-\n-\n // A convenience function for re-using TimerWrap handles more easily.\n //\n // This mostly exists to fix https://github.com/nodejs/node/issues/1264.\n@@ -550,17 +519,21 @@ exports.clearInterval = function(timer) {\n \n \n function unrefdHandle() {\n-  // Don't attempt to call the callback if it is not a function.\n-  if (typeof this.owner._onTimeout === 'function') {\n-    ontimeout(this.owner);\n+  try {\n+    // Don't attempt to call the callback if it is not a function.\n+    if (typeof this.owner._onTimeout === 'function') {\n+      ontimeout(this.owner);\n+    }\n+  } finally {\n+    // Make sure we clean up if the callback is no longer a function\n+    // even if the timer is an interval.\n+    if (!this.owner._repeat ||\n+        typeof this.owner._onTimeout !== 'function') {\n+      this.owner.close();\n+    }\n   }\n \n-  // Make sure we clean up if the callback is no longer a function\n-  // even if the timer is an interval.\n-  if (!this.owner._repeat ||\n-      typeof this.owner._onTimeout !== 'function') {\n-    this.owner.close();\n-  }\n+  return true;\n }\n \n "
+        },
+        {
+            "sha": "5643fffb6f8b6abd4bc5beea7a6efa8d4e302fa9",
+            "filename": "src/env-inl.h",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 0,
+            "changes": 8,
+            "blob_url": "https://github.com/nodejs/node/blob/9b8e1c2e4f0a4254b295316b10136a28cc36db4c/src%2Fenv-inl.h",
+            "raw_url": "https://github.com/nodejs/node/raw/9b8e1c2e4f0a4254b295316b10136a28cc36db4c/src%2Fenv-inl.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv-inl.h?ref=9b8e1c2e4f0a4254b295316b10136a28cc36db4c",
+            "patch": "@@ -264,6 +264,10 @@ inline bool Environment::TickInfo::has_scheduled() const {\n   return fields_[kHasScheduled] == 1;\n }\n \n+inline bool Environment::TickInfo::has_thrown() const {\n+  return fields_[kHasThrown] == 1;\n+}\n+\n inline bool Environment::TickInfo::has_promise_rejections() const {\n   return fields_[kHasPromiseRejections] == 1;\n }\n@@ -272,6 +276,10 @@ inline void Environment::TickInfo::promise_rejections_toggle_on() {\n   fields_[kHasPromiseRejections] = 1;\n }\n \n+inline void Environment::TickInfo::set_has_thrown(bool state) {\n+  fields_[kHasThrown] = state ? 1 : 0;\n+}\n+\n inline void Environment::AssignToContext(v8::Local<v8::Context> context,\n                                          const ContextInfo& info) {\n   context->SetAlignedPointerInEmbedderData(kContextEmbedderDataIndex, this);"
+        },
+        {
+            "sha": "7e0152916161bf7b7dd7669d89efb96678f2019e",
+            "filename": "src/env.h",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/nodejs/node/blob/9b8e1c2e4f0a4254b295316b10136a28cc36db4c/src%2Fenv.h",
+            "raw_url": "https://github.com/nodejs/node/raw/9b8e1c2e4f0a4254b295316b10136a28cc36db4c/src%2Fenv.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv.h?ref=9b8e1c2e4f0a4254b295316b10136a28cc36db4c",
+            "patch": "@@ -484,8 +484,10 @@ class Environment {\n     inline AliasedBuffer<uint8_t, v8::Uint8Array>& fields();\n     inline bool has_scheduled() const;\n     inline bool has_promise_rejections() const;\n+    inline bool has_thrown() const;\n \n     inline void promise_rejections_toggle_on();\n+    inline void set_has_thrown(bool state);\n \n    private:\n     friend class Environment;  // So we can call the constructor.\n@@ -494,6 +496,7 @@ class Environment {\n     enum Fields {\n       kHasScheduled,\n       kHasPromiseRejections,\n+      kHasThrown,\n       kFieldsCount\n     };\n "
+        },
+        {
+            "sha": "4e3638b886fcb8cab977aaaf06c754034a43b828",
+            "filename": "src/node.cc",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/nodejs/node/blob/9b8e1c2e4f0a4254b295316b10136a28cc36db4c/src%2Fnode.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/9b8e1c2e4f0a4254b295316b10136a28cc36db4c/src%2Fnode.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode.cc?ref=9b8e1c2e4f0a4254b295316b10136a28cc36db4c",
+            "patch": "@@ -937,6 +937,10 @@ InternalCallbackScope::InternalCallbackScope(Environment* env,\n     AsyncWrap::EmitBefore(env, asyncContext.async_id);\n   }\n \n+  if (!IsInnerMakeCallback()) {\n+    env->tick_info()->set_has_thrown(false);\n+  }\n+\n   env->async_hooks()->push_async_ids(async_context_.async_id,\n                                async_context_.trigger_async_id);\n   pushed_ids_ = true;\n@@ -984,6 +988,7 @@ void InternalCallbackScope::Close() {\n   Local<Object> process = env_->process_object();\n \n   if (env_->tick_callback_function()->Call(process, 0, nullptr).IsEmpty()) {\n+    env_->tick_info()->set_has_thrown(true);\n     failed_ = true;\n   }\n }"
+        },
+        {
+            "sha": "8b596eb435235806dad61da7e3fb35f195dc3284",
+            "filename": "src/timer_wrap.cc",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 1,
+            "changes": 9,
+            "blob_url": "https://github.com/nodejs/node/blob/9b8e1c2e4f0a4254b295316b10136a28cc36db4c/src%2Ftimer_wrap.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/9b8e1c2e4f0a4254b295316b10136a28cc36db4c/src%2Ftimer_wrap.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Ftimer_wrap.cc?ref=9b8e1c2e4f0a4254b295316b10136a28cc36db4c",
+            "patch": "@@ -138,7 +138,14 @@ class TimerWrap : public HandleWrap {\n     Environment* env = wrap->env();\n     HandleScope handle_scope(env->isolate());\n     Context::Scope context_scope(env->context());\n-    wrap->MakeCallback(kOnTimeout, 0, nullptr);\n+    Local<Value> ret;\n+    do {\n+      ret = wrap->MakeCallback(kOnTimeout, 0, nullptr).ToLocalChecked();\n+    } while (ret->IsUndefined() &&\n+             !env->tick_info()->has_thrown() &&\n+             wrap->object()->Get(env->context(),\n+                                 env->owner_string()).ToLocalChecked()\n+                                                     ->IsUndefined());\n   }\n \n   static void Now(const FunctionCallbackInfo<Value>& args) {"
+        },
+        {
+            "sha": "d3ae27e83551c7c534f9a6bfda380894346a7408",
+            "filename": "test/parallel/test-timers-unref-throw-then-ref.js",
+            "status": "added",
+            "additions": 17,
+            "deletions": 0,
+            "changes": 17,
+            "blob_url": "https://github.com/nodejs/node/blob/9b8e1c2e4f0a4254b295316b10136a28cc36db4c/test%2Fparallel%2Ftest-timers-unref-throw-then-ref.js",
+            "raw_url": "https://github.com/nodejs/node/raw/9b8e1c2e4f0a4254b295316b10136a28cc36db4c/test%2Fparallel%2Ftest-timers-unref-throw-then-ref.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-timers-unref-throw-then-ref.js?ref=9b8e1c2e4f0a4254b295316b10136a28cc36db4c",
+            "patch": "@@ -0,0 +1,17 @@\n+'use strict';\n+const common = require('../common');\n+const assert = require('assert');\n+\n+process.once('uncaughtException', common.expectsError({\n+  message: 'Timeout Error'\n+}));\n+\n+let called = false;\n+const t = setTimeout(() => {\n+  assert(!called);\n+  called = true;\n+  t.ref();\n+  throw new Error('Timeout Error');\n+}, 1).unref();\n+\n+setTimeout(common.mustCall(), 1);"
+        }
+    ],
+    "stats": {
+        "total": 103,
+        "additions": 58,
+        "deletions": 45
+    }
+}

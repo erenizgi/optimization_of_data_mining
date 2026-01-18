@@ -1,0 +1,96 @@
+{
+    "author": "ayazhafiz",
+    "message": "fix(language-service): do not treat file URIs as general URLs (#39917)\n\nIn the past, the legacy (VE-based) language service would use a\n`UrlResolver` instance to resolve file paths, primarily for compiler\nresources like external templates. The problem with this is that the\nUrlResolver is designed to resolve URLs in general, and so for a path\nlike `/a/b/#c`, `#c` is treated as hash/fragment rather than as part\nof the path, which can lead to unexpected path resolution (f.x.,\n`resolve('a/b/#c/d.ts', './d.html')` would produce `'a/b/d.html'` rather\nthan the expected `'a/b/#c/d.html'`).\n\nThis commit resolves the issue by using Node's `path` module to resolve\nfile paths directly, which aligns more with how resources are resolved\nin the Ivy compiler.\n\nThe testing story here is not great, and the API for validating a file\npath could be a little bit prettier/robust. However, since the VE-based\nlanguage service is going into more of a \"maintenance mode\" now that\nthere is a clear path for the Ivy-based LS moving forward, I think it is\nokay not to spend too much time here.\n\nCloses https://github.com/angular/vscode-ng-language-service/issues/892\nCloses https://github.com/angular/vscode-ng-language-service/issues/1001\n\nPR Close #39917",
+    "sha": "3b700985f0e7623b190bb1ce0aa0fb00ab159322",
+    "files": [
+        {
+            "sha": "5bc657e0cca6e4f8275a2017b57a02599a5de0e6",
+            "filename": "packages/language-service/src/typescript_host.ts",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 5,
+            "changes": 20,
+            "blob_url": "https://github.com/angular/angular/blob/3b700985f0e7623b190bb1ce0aa0fb00ab159322/packages%2Flanguage-service%2Fsrc%2Ftypescript_host.ts",
+            "raw_url": "https://github.com/angular/angular/raw/3b700985f0e7623b190bb1ce0aa0fb00ab159322/packages%2Flanguage-service%2Fsrc%2Ftypescript_host.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Flanguage-service%2Fsrc%2Ftypescript_host.ts?ref=3b700985f0e7623b190bb1ce0aa0fb00ab159322",
+            "patch": "@@ -6,8 +6,9 @@\n  * found in the LICENSE file at https://angular.io/license\n  */\n \n-import {analyzeNgModules, AotSummaryResolver, CompileDirectiveSummary, CompileMetadataResolver, CompileNgModuleMetadata, CompilePipeSummary, CompilerConfig, createOfflineCompileUrlResolver, DirectiveNormalizer, DirectiveResolver, DomElementSchemaRegistry, FormattedError, FormattedMessageChain, HtmlParser, isFormattedError, JitSummaryResolver, Lexer, NgAnalyzedModules, NgModuleResolver, Parser, ParseTreeResult, PipeResolver, ResourceLoader, StaticReflector, StaticSymbol, StaticSymbolCache, StaticSymbolResolver, TemplateParser} from '@angular/compiler';\n+import {analyzeNgModules, AotSummaryResolver, CompileDirectiveSummary, CompileMetadataResolver, CompileNgModuleMetadata, CompilePipeSummary, CompilerConfig, DirectiveNormalizer, DirectiveResolver, DomElementSchemaRegistry, FormattedError, FormattedMessageChain, HtmlParser, isFormattedError, JitSummaryResolver, Lexer, NgAnalyzedModules, NgModuleResolver, Parser, ParseTreeResult, PipeResolver, ResourceLoader, StaticReflector, StaticSymbol, StaticSymbolCache, StaticSymbolResolver, TemplateParser, UrlResolver} from '@angular/compiler';\n import {SchemaMetadata, ViewEncapsulation, ɵConsole as Console} from '@angular/core';\n+import * as path from 'path';\n import * as tss from 'typescript/lib/tsserverlibrary';\n \n import {createLanguageService} from './language_service';\n@@ -64,6 +65,7 @@ export class TypeScriptServiceHost implements LanguageServiceHost {\n   private readonly fileToComponent = new Map<string, StaticSymbol>();\n   private readonly collectedErrors = new Map<string, any[]>();\n   private readonly fileVersions = new Map<string, string>();\n+  private readonly urlResolver: UrlResolver;\n \n   private lastProgram: tss.Program|undefined = undefined;\n   private analyzedModules: NgAnalyzedModules = {\n@@ -93,6 +95,16 @@ export class TypeScriptServiceHost implements LanguageServiceHost {\n     this.staticSymbolResolver = new StaticSymbolResolver(\n         this.reflectorHost, this.staticSymbolCache, this.summaryResolver,\n         (e, filePath) => this.collectError(e, filePath));\n+    this.urlResolver = {\n+      resolve: (baseUrl: string, url: string) => {\n+        // In practice, `directoryExists` is always defined.\n+        // https://github.com/microsoft/TypeScript/blob/0b6c9254a850dd07056259d4eefca7721745af75/src/server/project.ts#L1608-L1614\n+        if (tsLsHost.directoryExists!(baseUrl)) {\n+          return path.resolve(baseUrl, url);\n+        }\n+        return path.resolve(path.dirname(baseUrl), url);\n+      }\n+    };\n   }\n \n   // The resolver is instantiated lazily and should not be accessed directly.\n@@ -125,7 +137,6 @@ export class TypeScriptServiceHost implements LanguageServiceHost {\n     const pipeResolver = new PipeResolver(staticReflector);\n     const elementSchemaRegistry = new DomElementSchemaRegistry();\n     const resourceLoader = new DummyResourceLoader();\n-    const urlResolver = createOfflineCompileUrlResolver();\n     const htmlParser = new DummyHtmlParser();\n     // This tracks the CompileConfig in codegen.ts. Currently these options\n     // are hard-coded.\n@@ -134,7 +145,7 @@ export class TypeScriptServiceHost implements LanguageServiceHost {\n       useJit: false,\n     });\n     const directiveNormalizer =\n-        new DirectiveNormalizer(resourceLoader, urlResolver, htmlParser, config);\n+        new DirectiveNormalizer(resourceLoader, this.urlResolver, htmlParser, config);\n     this._resolver = new CompileMetadataResolver(\n         config, htmlParser, moduleResolver, directiveResolver, pipeResolver,\n         new JitSummaryResolver(), elementSchemaRegistry, directiveNormalizer, new Console(),\n@@ -192,12 +203,11 @@ export class TypeScriptServiceHost implements LanguageServiceHost {\n     }\n \n     // update template references and fileToComponent\n-    const urlResolver = createOfflineCompileUrlResolver();\n     for (const ngModule of this.analyzedModules.ngModules) {\n       for (const directive of ngModule.declaredDirectives) {\n         const {metadata} = this.resolver.getNonNormalizedDirectiveMetadata(directive.reference)!;\n         if (metadata.isComponent && metadata.template && metadata.template.templateUrl) {\n-          const templateName = urlResolver.resolve(\n+          const templateName = this.urlResolver.resolve(\n               this.reflector.componentModuleUrl(directive.reference),\n               metadata.template.templateUrl);\n           this.fileToComponent.set(templateName, directive.reference);"
+        },
+        {
+            "sha": "59a256721bd807b98289e554ffae1d96915e6a4c",
+            "filename": "packages/language-service/test/project/app/#inner/component.ts",
+            "status": "added",
+            "additions": 16,
+            "deletions": 0,
+            "changes": 16,
+            "blob_url": "https://github.com/angular/angular/blob/3b700985f0e7623b190bb1ce0aa0fb00ab159322/packages%2Flanguage-service%2Ftest%2Fproject%2Fapp%2F%23inner%2Fcomponent.ts",
+            "raw_url": "https://github.com/angular/angular/raw/3b700985f0e7623b190bb1ce0aa0fb00ab159322/packages%2Flanguage-service%2Ftest%2Fproject%2Fapp%2F%23inner%2Fcomponent.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Flanguage-service%2Ftest%2Fproject%2Fapp%2F%23inner%2Fcomponent.ts?ref=3b700985f0e7623b190bb1ce0aa0fb00ab159322",
+            "patch": "@@ -0,0 +1,16 @@\n+/**\n+ * @license\n+ * Copyright Google LLC All Rights Reserved.\n+ *\n+ * Use of this source code is governed by an MIT-style license that can be\n+ * found in the LICENSE file at https://angular.io/license\n+ */\n+\n+import {Component} from '@angular/core';\n+\n+@Component({\n+  selector: 'inner',\n+  templateUrl: './inner.html',\n+})\n+export class InnerComponent {\n+}"
+        },
+        {
+            "sha": "0fd9beb678ff42799c9b21c12a254d8b3d51d802",
+            "filename": "packages/language-service/test/project/app/#inner/inner.html",
+            "status": "added",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/angular/angular/blob/3b700985f0e7623b190bb1ce0aa0fb00ab159322/packages%2Flanguage-service%2Ftest%2Fproject%2Fapp%2F%23inner%2Finner.html",
+            "raw_url": "https://github.com/angular/angular/raw/3b700985f0e7623b190bb1ce0aa0fb00ab159322/packages%2Flanguage-service%2Ftest%2Fproject%2Fapp%2F%23inner%2Finner.html",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Flanguage-service%2Ftest%2Fproject%2Fapp%2F%23inner%2Finner.html?ref=3b700985f0e7623b190bb1ce0aa0fb00ab159322",
+            "patch": "@@ -0,0 +1 @@\n+<div>Hello</div>"
+        },
+        {
+            "sha": "0599c9a523c6ba59094087a48c4e29aa96d59400",
+            "filename": "packages/language-service/test/project/app/main.ts",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/angular/angular/blob/3b700985f0e7623b190bb1ce0aa0fb00ab159322/packages%2Flanguage-service%2Ftest%2Fproject%2Fapp%2Fmain.ts",
+            "raw_url": "https://github.com/angular/angular/raw/3b700985f0e7623b190bb1ce0aa0fb00ab159322/packages%2Flanguage-service%2Ftest%2Fproject%2Fapp%2Fmain.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Flanguage-service%2Ftest%2Fproject%2Fapp%2Fmain.ts?ref=3b700985f0e7623b190bb1ce0aa0fb00ab159322",
+            "patch": "@@ -9,13 +9,15 @@\n import {CommonModule} from '@angular/common';\n import {NgModule} from '@angular/core';\n import {FormsModule} from '@angular/forms';\n+import {InnerComponent} from './#inner/component';\n import {AppComponent} from './app.component';\n import * as ParsingCases from './parsing-cases';\n \n @NgModule({\n   imports: [CommonModule, FormsModule],\n   declarations: [\n     AppComponent,\n+    InnerComponent,\n     ParsingCases.CounterDirective,\n     ParsingCases.HintModel,\n     ParsingCases.NumberModel,"
+        },
+        {
+            "sha": "39e7497e0a2fc6c7a99a439316063f32515e54d9",
+            "filename": "packages/language-service/test/test_utils.ts",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/angular/angular/blob/3b700985f0e7623b190bb1ce0aa0fb00ab159322/packages%2Flanguage-service%2Ftest%2Ftest_utils.ts",
+            "raw_url": "https://github.com/angular/angular/raw/3b700985f0e7623b190bb1ce0aa0fb00ab159322/packages%2Flanguage-service%2Ftest%2Ftest_utils.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Flanguage-service%2Ftest%2Ftest_utils.ts?ref=3b700985f0e7623b190bb1ce0aa0fb00ab159322",
+            "patch": "@@ -69,7 +69,7 @@ function loadTourOfHeroes(): ReadonlyMap<string, string> {\n         const value = fs.readFileSync(absPath, 'utf8');\n         files.set(key, value);\n       } else {\n-        const key = path.join('/', filePath);\n+        const key = path.join('/', path.relative(root, absPath));\n         files.set(key, '[[directory]]');\n         dirs.push(absPath);\n       }\n@@ -189,7 +189,7 @@ export class MockTypescriptHost implements ts.LanguageServiceHost {\n     if (this.overrideDirectory.has(directoryName)) return true;\n     const effectiveName = this.getEffectiveName(directoryName);\n     if (effectiveName === directoryName) {\n-      return TOH.has(directoryName);\n+      return TOH.get(directoryName) === '[[directory]]';\n     }\n     if (effectiveName === '/' + this.node_modules) {\n       return true;"
+        },
+        {
+            "sha": "a6a4e506b895c93133f4396febeeb321a780e768",
+            "filename": "packages/language-service/test/ts_plugin_spec.ts",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 4,
+            "changes": 9,
+            "blob_url": "https://github.com/angular/angular/blob/3b700985f0e7623b190bb1ce0aa0fb00ab159322/packages%2Flanguage-service%2Ftest%2Fts_plugin_spec.ts",
+            "raw_url": "https://github.com/angular/angular/raw/3b700985f0e7623b190bb1ce0aa0fb00ab159322/packages%2Flanguage-service%2Ftest%2Fts_plugin_spec.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Flanguage-service%2Ftest%2Fts_plugin_spec.ts?ref=3b700985f0e7623b190bb1ce0aa0fb00ab159322",
+            "patch": "@@ -58,8 +58,8 @@ describe('plugin', () => {\n     const compilerDiags = tsLS.getCompilerOptionsDiagnostics();\n     expect(compilerDiags).toEqual([]);\n     const sourceFiles = program.getSourceFiles().filter(f => !f.fileName.endsWith('.d.ts'));\n-    // there are three .ts files in the test project\n-    expect(sourceFiles.length).toBe(3);\n+    // there are four .ts files in the test project\n+    expect(sourceFiles.length).toBe(4);\n     for (const {fileName} of sourceFiles) {\n       const syntacticDiags = tsLS.getSyntacticDiagnostics(fileName);\n       expect(syntacticDiags).toEqual([]);\n@@ -133,9 +133,10 @@ describe('plugin', () => {\n \n   it('should return external templates when getExternalFiles() is called', () => {\n     const externalTemplates = getExternalFiles(mockProject);\n-    expect(externalTemplates).toEqual([\n+    expect(new Set(externalTemplates)).toEqual(new Set([\n       '/app/test.ng',\n-    ]);\n+      '/app/#inner/inner.html',\n+    ]));\n   });\n \n   it('should not return external template that does not exist', () => {"
+        },
+        {
+            "sha": "f1bab4d1bc34dc725dcee9da531d6d9aee70fa7a",
+            "filename": "packages/language-service/test/typescript_host_spec.ts",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 1,
+            "changes": 10,
+            "blob_url": "https://github.com/angular/angular/blob/3b700985f0e7623b190bb1ce0aa0fb00ab159322/packages%2Flanguage-service%2Ftest%2Ftypescript_host_spec.ts",
+            "raw_url": "https://github.com/angular/angular/raw/3b700985f0e7623b190bb1ce0aa0fb00ab159322/packages%2Flanguage-service%2Ftest%2Ftypescript_host_spec.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Flanguage-service%2Ftest%2Ftypescript_host_spec.ts?ref=3b700985f0e7623b190bb1ce0aa0fb00ab159322",
+            "patch": "@@ -6,7 +6,6 @@\n  * found in the LICENSE file at https://angular.io/license\n  */\n \n-import * as ngc from '@angular/compiler';\n import * as ts from 'typescript';\n \n import {TypeScriptServiceHost} from '../src/typescript_host';\n@@ -109,6 +108,15 @@ describe('TypeScriptServiceHost', () => {\n     expect(template.source).toContain('<h2>{{hero.name}} details!</h2>');\n   });\n \n+  // https://github.com/angular/vscode-ng-language-service/issues/892\n+  it('should resolve external templates with `#` in the path', () => {\n+    const tsLSHost = new MockTypescriptHost(['/app/main.ts']);\n+    const tsLS = ts.createLanguageService(tsLSHost);\n+    const ngLSHost = new TypeScriptServiceHost(tsLSHost, tsLS);\n+    ngLSHost.getAnalyzedModules();\n+    expect(ngLSHost.getExternalTemplates()).toContain('/app/#inner/inner.html');\n+  });\n+\n   // https://github.com/angular/angular/issues/32301\n   it('should clear caches when program changes', () => {\n     const tsLSHost = new MockTypescriptHost(['/app/main.ts']);"
+        }
+    ],
+    "stats": {
+        "total": 62,
+        "additions": 50,
+        "deletions": 12
+    }
+}

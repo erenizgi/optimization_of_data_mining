@@ -1,0 +1,84 @@
+{
+    "author": "jbronn",
+    "message": "Fixed #13788 -- `GEOSGeometry.transform` no longer silently no-ops when GDAL isn't available.  Thanks, Rob Coup.\n\ngit-svn-id: http://code.djangoproject.com/svn/django/trunk@15025 bcc190cf-cafb-0310-a4f2-bffc1f526a37",
+    "sha": "5fddfda5593d0f8c244f640ae63a17035ade0e3e",
+    "files": [
+        {
+            "sha": "a9d126481a3e802c8c266175d7638b3895099a1e",
+            "filename": "django/contrib/gis/geos/geometry.py",
+            "status": "modified",
+            "additions": 33,
+            "deletions": 15,
+            "changes": 48,
+            "blob_url": "https://github.com/django/django/blob/5fddfda5593d0f8c244f640ae63a17035ade0e3e/django%2Fcontrib%2Fgis%2Fgeos%2Fgeometry.py",
+            "raw_url": "https://github.com/django/django/raw/5fddfda5593d0f8c244f640ae63a17035ade0e3e/django%2Fcontrib%2Fgis%2Fgeos%2Fgeometry.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fcontrib%2Fgis%2Fgeos%2Fgeometry.py?ref=5fddfda5593d0f8c244f640ae63a17035ade0e3e",
+            "patch": "@@ -4,6 +4,7 @@\n \"\"\"\n # Python, ctypes and types dependencies.\n import re\n+import warnings\n from ctypes import addressof, byref, c_double, c_size_t\n \n # super-class for mutable list behavior\n@@ -498,23 +499,40 @@ def transform(self, ct, clone=False):\n         instead.\n         \"\"\"\n         srid = self.srid\n-        if gdal.HAS_GDAL and srid:\n-            # Creating an OGR Geometry, which is then transformed.\n-            g = gdal.OGRGeometry(self.wkb, srid)\n-            g.transform(ct)\n-            # Getting a new GEOS pointer\n-            ptr = wkb_r().read(g.wkb)\n+\n+        if ct == srid:\n+            # short-circuit where source & dest SRIDs match\n             if clone:\n-                # User wants a cloned transformed geometry returned.\n-                return GEOSGeometry(ptr, srid=g.srid)\n-            if ptr:\n-                # Reassigning pointer, and performing post-initialization setup\n-                # again due to the reassignment.\n-                capi.destroy_geom(self.ptr)\n-                self.ptr = ptr\n-                self._post_init(g.srid)\n+                return self.clone()\n             else:\n-                raise GEOSException('Transformed WKB was invalid.')\n+                return\n+\n+        if (srid is None) or (srid < 0):\n+            warnings.warn(\"Calling transform() with no SRID set does no transformation!\",\n+                          stacklevel=2)\n+            warnings.warn(\"Calling transform() with no SRID will raise GEOSException in v1.5\",\n+                          FutureWarning, stacklevel=2)\n+            return\n+\n+        if not gdal.HAS_GDAL:\n+            raise GEOSException(\"GDAL library is not available to transform() geometry.\")\n+\n+        # Creating an OGR Geometry, which is then transformed.\n+        g = gdal.OGRGeometry(self.wkb, srid)\n+        g.transform(ct)\n+        # Getting a new GEOS pointer\n+        ptr = wkb_r().read(g.wkb)\n+        if clone:\n+            # User wants a cloned transformed geometry returned.\n+            return GEOSGeometry(ptr, srid=g.srid)\n+        if ptr:\n+            # Reassigning pointer, and performing post-initialization setup\n+            # again due to the reassignment.\n+            capi.destroy_geom(self.ptr)\n+            self.ptr = ptr\n+            self._post_init(g.srid)\n+        else:\n+            raise GEOSException('Transformed WKB was invalid.')\n \n     #### Topology Routines ####\n     def _topology(self, gptr):"
+        },
+        {
+            "sha": "cc54becd3f86e66675ba423d89391048aac14b4b",
+            "filename": "django/contrib/gis/geos/tests/test_geos.py",
+            "status": "modified",
+            "additions": 108,
+            "deletions": 0,
+            "changes": 108,
+            "blob_url": "https://github.com/django/django/blob/5fddfda5593d0f8c244f640ae63a17035ade0e3e/django%2Fcontrib%2Fgis%2Fgeos%2Ftests%2Ftest_geos.py",
+            "raw_url": "https://github.com/django/django/raw/5fddfda5593d0f8c244f640ae63a17035ade0e3e/django%2Fcontrib%2Fgis%2Fgeos%2Ftests%2Ftest_geos.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fcontrib%2Fgis%2Fgeos%2Ftests%2Ftest_geos.py?ref=5fddfda5593d0f8c244f640ae63a17035ade0e3e",
+            "patch": "@@ -852,6 +852,114 @@ def test23_transform(self):\n             self.assertAlmostEqual(trans.x, p.x, prec)\n             self.assertAlmostEqual(trans.y, p.y, prec)\n \n+    def test23_transform_noop(self):\n+        \"\"\" Testing `transform` method (SRID match) \"\"\"\n+        # transform() should no-op if source & dest SRIDs match,\n+        # regardless of whether GDAL is available.\n+        if gdal.HAS_GDAL:\n+            g = GEOSGeometry('POINT (-104.609 38.255)', 4326)\n+            gt = g.tuple\n+            g.transform(4326)\n+            self.assertEqual(g.tuple, gt)\n+            self.assertEqual(g.srid, 4326)\n+\n+            g = GEOSGeometry('POINT (-104.609 38.255)', 4326)\n+            g1 = g.transform(4326, clone=True)\n+            self.assertEqual(g1.tuple, g.tuple)\n+            self.assertEqual(g1.srid, 4326)\n+            self.assert_(g1 is not g, \"Clone didn't happen\")\n+\n+        old_has_gdal = gdal.HAS_GDAL\n+        try:\n+            gdal.HAS_GDAL = False\n+\n+            g = GEOSGeometry('POINT (-104.609 38.255)', 4326)\n+            gt = g.tuple\n+            g.transform(4326)\n+            self.assertEqual(g.tuple, gt)\n+            self.assertEqual(g.srid, 4326)\n+\n+            g = GEOSGeometry('POINT (-104.609 38.255)', 4326)\n+            g1 = g.transform(4326, clone=True)\n+            self.assertEqual(g1.tuple, g.tuple)\n+            self.assertEqual(g1.srid, 4326)\n+            self.assert_(g1 is not g, \"Clone didn't happen\")\n+        finally:\n+            gdal.HAS_GDAL = old_has_gdal\n+\n+    def test23_transform_nosrid(self):\n+        \"\"\" Testing `transform` method (no SRID) \"\"\"\n+        # raise a warning if SRID <0/None\n+        import warnings\n+        print \"\\nBEGIN - expecting Warnings; safe to ignore.\\n\"\n+\n+        # test for do-nothing behaviour.\n+        try:\n+            # Keeping line-noise down by only printing the relevant\n+            # warnings once.\n+            warnings.simplefilter('once', UserWarning)\n+            warnings.simplefilter('once', FutureWarning)    \n+\n+            g = GEOSGeometry('POINT (-104.609 38.255)', srid=None)\n+            g.transform(2774)\n+            self.assertEqual(g.tuple, (-104.609, 38.255))\n+            self.assertEqual(g.srid, None)\n+\n+            g = GEOSGeometry('POINT (-104.609 38.255)', srid=None)\n+            g1 = g.transform(2774, clone=True)\n+            self.assert_(g1 is None)\n+\n+            g = GEOSGeometry('POINT (-104.609 38.255)', srid=-1)\n+            g.transform(2774)\n+            self.assertEqual(g.tuple, (-104.609, 38.255))\n+            self.assertEqual(g.srid, -1)\n+\n+            g = GEOSGeometry('POINT (-104.609 38.255)', srid=-1)\n+            g1 = g.transform(2774, clone=True)\n+            self.assert_(g1 is None)\n+\n+        finally:\n+            warnings.simplefilter('default', UserWarning)\n+            warnings.simplefilter('default', FutureWarning)\n+\n+        print \"\\nEND - expecting Warnings; safe to ignore.\\n\"\n+\n+\n+        # test warning is raised\n+        try:\n+            warnings.simplefilter('error', FutureWarning)\n+            warnings.simplefilter('ignore', UserWarning)\n+\n+            g = GEOSGeometry('POINT (-104.609 38.255)', srid=None)\n+            self.assertRaises(FutureWarning, g.transform, 2774)\n+\n+            g = GEOSGeometry('POINT (-104.609 38.255)', srid=None)\n+            self.assertRaises(FutureWarning, g.transform, 2774, clone=True)\n+\n+            g = GEOSGeometry('POINT (-104.609 38.255)', srid=-1)\n+            self.assertRaises(FutureWarning, g.transform, 2774)\n+\n+            g = GEOSGeometry('POINT (-104.609 38.255)', srid=-1)\n+            self.assertRaises(FutureWarning, g.transform, 2774, clone=True)\n+        finally:\n+            warnings.simplefilter('default', FutureWarning)\n+            warnings.simplefilter('default', UserWarning)\n+\n+\n+    def test23_transform_nogdal(self):\n+        \"\"\" Testing `transform` method (GDAL not available) \"\"\"\n+        old_has_gdal = gdal.HAS_GDAL\n+        try:\n+            gdal.HAS_GDAL = False\n+\n+            g = GEOSGeometry('POINT (-104.609 38.255)', 4326)\n+            self.assertRaises(GEOSException, g.transform, 2774)\n+\n+            g = GEOSGeometry('POINT (-104.609 38.255)', 4326)\n+            self.assertRaises(GEOSException, g.transform, 2774, clone=True)\n+        finally:\n+            gdal.HAS_GDAL = old_has_gdal\n+\n     def test24_extent(self):\n         \"Testing `extent` method.\"\n         # The xmin, ymin, xmax, ymax of the MultiPoint should be returned."
+        },
+        {
+            "sha": "508e6f2a6ef1eb0ff8eec7b59b63c3db9136623f",
+            "filename": "docs/internals/deprecation.txt",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/django/django/blob/5fddfda5593d0f8c244f640ae63a17035ade0e3e/docs%2Finternals%2Fdeprecation.txt",
+            "raw_url": "https://github.com/django/django/raw/5fddfda5593d0f8c244f640ae63a17035ade0e3e/docs%2Finternals%2Fdeprecation.txt",
+            "contents_url": "https://api.github.com/repos/django/django/contents/docs%2Finternals%2Fdeprecation.txt?ref=5fddfda5593d0f8c244f640ae63a17035ade0e3e",
+            "patch": "@@ -147,6 +147,10 @@ their deprecation, as per the :ref:`Django deprecation policy\n           The ``supports_inactive_user`` variable is not checked any\n           longer and can be removed.\n \n+        * :meth:`~django.contrib.gis.geos.GEOSGeometry.transform` will raise \n+          a :class:`~django.contrib.gis.geos.GEOSException` when called \n+          on a geometry with no SRID value.\n+\n     * 2.0\n         * ``django.views.defaults.shortcut()``. This function has been moved\n           to ``django.contrib.contenttypes.views.shortcut()`` as part of the"
+        },
+        {
+            "sha": "95ba7e55e3def1d09eb4899f12d8d8370bc84ec5",
+            "filename": "docs/ref/contrib/gis/geos.txt",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 1,
+            "changes": 14,
+            "blob_url": "https://github.com/django/django/blob/5fddfda5593d0f8c244f640ae63a17035ade0e3e/docs%2Fref%2Fcontrib%2Fgis%2Fgeos.txt",
+            "raw_url": "https://github.com/django/django/raw/5fddfda5593d0f8c244f640ae63a17035ade0e3e/docs%2Fref%2Fcontrib%2Fgis%2Fgeos.txt",
+            "contents_url": "https://api.github.com/repos/django/django/contents/docs%2Fref%2Fcontrib%2Fgis%2Fgeos.txt?ref=5fddfda5593d0f8c244f640ae63a17035ade0e3e",
+            "patch": "@@ -523,7 +523,9 @@ corresponding to the SRID of the geometry or ``None``.\n \n     Requires GDAL.\n \n-.. method:: transform(ct, clone=False)\n+.. method:: GEOSGeometry.transform(ct, clone=False)\n+\n+.. versionchanged:: 1.3\n \n Transforms the geometry according to the given coordinate transformation paramter\n (``ct``), which may be an integer SRID, spatial reference WKT string,\n@@ -537,6 +539,16 @@ is returned instead.\n \n     Requires GDAL.\n \n+.. note::\n+\n+   Prior to 1.3, this method would silently no-op if GDAL was not available.\n+   Now, a :class:`~django.contrib.gis.geos.GEOSException` is raised as\n+   application code relying on this behavior is in error. In addition,\n+   use of this method when the SRID is ``None`` or less than 0 now generates\n+   a warning because a :class:`~django.contrib.gis.geos.GEOSException` will\n+   be raised instead in version 1.5.\n+\n+\n ``Point``\n ---------\n "
+        },
+        {
+            "sha": "a1485d1b5480b9d8e35868a2765f217fce7c36d9",
+            "filename": "docs/ref/contrib/gis/install.txt",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 5,
+            "changes": 11,
+            "blob_url": "https://github.com/django/django/blob/5fddfda5593d0f8c244f640ae63a17035ade0e3e/docs%2Fref%2Fcontrib%2Fgis%2Finstall.txt",
+            "raw_url": "https://github.com/django/django/raw/5fddfda5593d0f8c244f640ae63a17035ade0e3e/docs%2Fref%2Fcontrib%2Fgis%2Finstall.txt",
+            "contents_url": "https://api.github.com/repos/django/django/contents/docs%2Fref%2Fcontrib%2Fgis%2Finstall.txt?ref=5fddfda5593d0f8c244f640ae63a17035ade0e3e",
+            "patch": "@@ -98,8 +98,9 @@ Program                   Description                           Required\n .. admonition::  Install GDAL\n \n     While :ref:`gdalbuild` is technically not required, it is *recommended*.\n-    Some features of GeoDjango (including the :ref:`ref-layermapping` and the geographic\n-    admin) depend on its functionality.\n+    Important features of GeoDjango (including the :ref:`ref-layermapping`, \n+    geometry reprojection, and the geographic admin) depend on its \n+    functionality.\n \n .. note::\n \n@@ -273,9 +274,9 @@ supports :ref:`GDAL's vector data <ref-gdal>` capabilities [#]_.\n \n First download the latest GDAL release version and untar the archive::\n \n-    $ wget http://download.osgeo.org/gdal/gdal-1.7.2.tar.gz\n-    $ tar xzf gdal-1.7.2.tar.gz\n-    $ cd gdal-1.7.2\n+    $ wget http://download.osgeo.org/gdal/gdal-1.7.3.tar.gz\n+    $ tar xzf gdal-1.7.3.tar.gz\n+    $ cd gdal-1.7.3\n \n Configure, make and install::\n "
+        },
+        {
+            "sha": "af4015641059cf943bcaae151a6e3f2999fcad47",
+            "filename": "docs/releases/1.3.txt",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 3,
+            "changes": 14,
+            "blob_url": "https://github.com/django/django/blob/5fddfda5593d0f8c244f640ae63a17035ade0e3e/docs%2Freleases%2F1.3.txt",
+            "raw_url": "https://github.com/django/django/raw/5fddfda5593d0f8c244f640ae63a17035ade0e3e/docs%2Freleases%2F1.3.txt",
+            "contents_url": "https://api.github.com/repos/django/django/contents/docs%2Freleases%2F1.3.txt?ref=5fddfda5593d0f8c244f640ae63a17035ade0e3e",
+            "patch": "@@ -528,6 +528,14 @@ statements manually.\n GeoDjango\n ~~~~~~~~~\n \n-The :setting:`TEST_RUNNER` previously used to execute the GeoDjango test suite,\n-:func:`django.contrib.gis.tests.run_gis_tests`, is deprecated in favor of\n-the :class:`django.contrib.gis.tests.GeoDjangoTestSuiteRunner` class.\n+  * The function-based :setting:`TEST_RUNNER` previously used to execute\n+    the GeoDjango test suite, :func:`django.contrib.gis.tests.run_gis_tests`,\n+    was deprecated for the class-bassed runner,\n+    :class:`django.contrib.gis.tests.GeoDjangoTestSuiteRunner`.\n+\n+  * Previously, calling :meth:`~django.contrib.gis.geos.GEOSGeometry.transform`\n+    would silently do nothing when GDAL wasn't available.  Now,\n+    a :class:`~django.contrib.gis.geos.GEOSException` is properly raised\n+    to indicate possible faulty application code.  A warning is now raised\n+    if :meth:`~django.contrib.gis.geos.GEOSGeometry.transform` is called when\n+    the SRID of the geometry is less than 0 or ``None``."
+        }
+    ],
+    "stats": {
+        "total": 199,
+        "additions": 175,
+        "deletions": 24
+    }
+}

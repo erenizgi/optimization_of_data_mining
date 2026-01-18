@@ -1,0 +1,72 @@
+{
+    "author": "ulan",
+    "message": "src: limit foreground tasks draining loop\n\nForeground tasks that repost themselves can force the draining loop\nto run indefinitely long without giving other tasks chance to run.\n\nThis limits the foreground task draining loop to run only the tasks\nthat were in the tasks queue at the beginning of the loop.\n\nPR-URL: https://github.com/nodejs/node/pull/19987\nFixes: https://github.com/nodejs/node/issues/19937\nReviewed-By: Anna Henningsen <anna@addaleax.net>\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Yang Guo <yangguo@chromium.org>\nReviewed-By: Colin Ihrig <cjihrig@gmail.com>\nReviewed-By: Tiancheng \"Timothy\" Gu <timothygu99@gmail.com>\nReviewed-By: Ben Noordhuis <info@bnoordhuis.nl>\nReviewed-By: Anatoli Papirovski <apapirovski@mac.com>\nReviewed-By: Khaidi Chu <i@2333.moe>",
+    "sha": "d3edf2fcde0c37206dc339aab7333212d20aa0f1",
+    "files": [
+        {
+            "sha": "abed8ad4c48c10ddd2cca1b2eadcc378cdebb5c5",
+            "filename": "node.gyp",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/d3edf2fcde0c37206dc339aab7333212d20aa0f1/node.gyp",
+            "raw_url": "https://github.com/nodejs/node/raw/d3edf2fcde0c37206dc339aab7333212d20aa0f1/node.gyp",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/node.gyp?ref=d3edf2fcde0c37206dc339aab7333212d20aa0f1",
+            "patch": "@@ -961,6 +961,7 @@\n         'test/cctest/test_base64.cc',\n         'test/cctest/test_node_postmortem_metadata.cc',\n         'test/cctest/test_environment.cc',\n+        'test/cctest/test_platform.cc',\n         'test/cctest/test_util.cc',\n         'test/cctest/test_url.cc'\n       ],"
+        },
+        {
+            "sha": "fffaecdef3ddfa87afbf1aabf53189d7abcf404e",
+            "filename": "src/inspector_agent.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/d3edf2fcde0c37206dc339aab7333212d20aa0f1/src%2Finspector_agent.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/d3edf2fcde0c37206dc339aab7333212d20aa0f1/src%2Finspector_agent.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Finspector_agent.cc?ref=d3edf2fcde0c37206dc339aab7333212d20aa0f1",
+            "patch": "@@ -316,7 +316,7 @@ class NodeInspectorClient : public V8InspectorClient {\n     terminated_ = false;\n     running_nested_loop_ = true;\n     while (!terminated_ && channel_->waitForFrontendMessage()) {\n-      platform_->FlushForegroundTasks(env_->isolate());\n+      while (platform_->FlushForegroundTasks(env_->isolate())) {}\n     }\n     terminated_ = false;\n     running_nested_loop_ = false;"
+        },
+        {
+            "sha": "b8f1344727cfd645b7d647a02e0b37e30d96f9ed",
+            "filename": "src/node_platform.cc",
+            "status": "modified",
+            "additions": 18,
+            "deletions": 4,
+            "changes": 22,
+            "blob_url": "https://github.com/nodejs/node/blob/d3edf2fcde0c37206dc339aab7333212d20aa0f1/src%2Fnode_platform.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/d3edf2fcde0c37206dc339aab7333212d20aa0f1/src%2Fnode_platform.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_platform.cc?ref=d3edf2fcde0c37206dc339aab7333212d20aa0f1",
+            "patch": "@@ -95,7 +95,7 @@ void PerIsolatePlatformData::PostDelayedTask(\n }\n \n PerIsolatePlatformData::~PerIsolatePlatformData() {\n-  FlushForegroundTasksInternal();\n+  while (FlushForegroundTasksInternal()) {}\n   CancelPendingDelayedTasks();\n \n   uv_close(reinterpret_cast<uv_handle_t*>(flush_tasks_),\n@@ -223,7 +223,13 @@ bool PerIsolatePlatformData::FlushForegroundTasksInternal() {\n       });\n     });\n   }\n-  while (std::unique_ptr<Task> task = foreground_tasks_.Pop()) {\n+  // Move all foreground tasks into a separate queue and flush that queue.\n+  // This way tasks that are posted while flushing the queue will be run on the\n+  // next call of FlushForegroundTasksInternal.\n+  std::queue<std::unique_ptr<Task>> tasks = foreground_tasks_.PopAll();\n+  while (!tasks.empty()) {\n+    std::unique_ptr<Task> task = std::move(tasks.front());\n+    tasks.pop();\n     did_work = true;\n     RunForegroundTask(std::move(task));\n   }\n@@ -254,8 +260,8 @@ void NodePlatform::CallDelayedOnForegroundThread(Isolate* isolate,\n     std::unique_ptr<Task>(task), delay_in_seconds);\n }\n \n-void NodePlatform::FlushForegroundTasks(v8::Isolate* isolate) {\n-  ForIsolate(isolate)->FlushForegroundTasksInternal();\n+bool NodePlatform::FlushForegroundTasks(v8::Isolate* isolate) {\n+  return ForIsolate(isolate)->FlushForegroundTasksInternal();\n }\n \n void NodePlatform::CancelPendingDelayedTasks(v8::Isolate* isolate) {\n@@ -348,4 +354,12 @@ void TaskQueue<T>::Stop() {\n   tasks_available_.Broadcast(scoped_lock);\n }\n \n+template <class T>\n+std::queue<std::unique_ptr<T>> TaskQueue<T>::PopAll() {\n+  Mutex::ScopedLock scoped_lock(lock_);\n+  std::queue<std::unique_ptr<T>> result;\n+  result.swap(task_queue_);\n+  return result;\n+}\n+\n }  // namespace node"
+        },
+        {
+            "sha": "8f6ff89f491fe3ddfb2cb8d6a34e376964293cf6",
+            "filename": "src/node_platform.h",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 2,
+            "changes": 10,
+            "blob_url": "https://github.com/nodejs/node/blob/d3edf2fcde0c37206dc339aab7333212d20aa0f1/src%2Fnode_platform.h",
+            "raw_url": "https://github.com/nodejs/node/raw/d3edf2fcde0c37206dc339aab7333212d20aa0f1/src%2Fnode_platform.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_platform.h?ref=d3edf2fcde0c37206dc339aab7333212d20aa0f1",
+            "patch": "@@ -26,6 +26,7 @@ class TaskQueue {\n   void Push(std::unique_ptr<T> task);\n   std::unique_ptr<T> Pop();\n   std::unique_ptr<T> BlockingPop();\n+  std::queue<std::unique_ptr<T>> PopAll();\n   void NotifyOfCompletion();\n   void BlockingDrain();\n   void Stop();\n@@ -65,7 +66,9 @@ class PerIsolatePlatformData :\n   void ref();\n   int unref();\n \n-  // Returns true iff work was dispatched or executed.\n+  // Returns true if work was dispatched or executed. New tasks that are\n+  // posted during flushing of the queue are postponed until the next\n+  // flushing.\n   bool FlushForegroundTasksInternal();\n   void CancelPendingDelayedTasks();\n \n@@ -130,7 +133,10 @@ class NodePlatform : public MultiIsolatePlatform {\n   double CurrentClockTimeMillis() override;\n   v8::TracingController* GetTracingController() override;\n \n-  void FlushForegroundTasks(v8::Isolate* isolate);\n+  // Returns true if work was dispatched or executed. New tasks that are\n+  // posted during flushing of the queue are postponed until the next\n+  // flushing.\n+  bool FlushForegroundTasks(v8::Isolate* isolate);\n \n   void RegisterIsolate(IsolateData* isolate_data, uv_loop_t* loop) override;\n   void UnregisterIsolate(IsolateData* isolate_data) override;"
+        },
+        {
+            "sha": "876547480b70325c579be155c50c9e9468ae7347",
+            "filename": "test/cctest/test_platform.cc",
+            "status": "added",
+            "additions": 55,
+            "deletions": 0,
+            "changes": 55,
+            "blob_url": "https://github.com/nodejs/node/blob/d3edf2fcde0c37206dc339aab7333212d20aa0f1/test%2Fcctest%2Ftest_platform.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/d3edf2fcde0c37206dc339aab7333212d20aa0f1/test%2Fcctest%2Ftest_platform.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fcctest%2Ftest_platform.cc?ref=d3edf2fcde0c37206dc339aab7333212d20aa0f1",
+            "patch": "@@ -0,0 +1,55 @@\n+#include \"node_internals.h\"\n+#include \"libplatform/libplatform.h\"\n+\n+#include <string>\n+#include \"gtest/gtest.h\"\n+#include \"node_test_fixture.h\"\n+\n+// This task increments the given run counter and reposts itself until the\n+// repost counter reaches zero.\n+class RepostingTask : public v8::Task {\n+ public:\n+  explicit RepostingTask(int repost_count,\n+                         int* run_count,\n+                         v8::Isolate* isolate,\n+                         node::NodePlatform* platform)\n+      : repost_count_(repost_count),\n+        run_count_(run_count),\n+        isolate_(isolate),\n+        platform_(platform) {}\n+\n+  // v8::Task implementation\n+  void Run() final {\n+    ++*run_count_;\n+    if (repost_count_ > 0) {\n+      --repost_count_;\n+      platform_->CallOnForegroundThread(isolate_,\n+          new RepostingTask(repost_count_, run_count_, isolate_, platform_));\n+    }\n+  }\n+\n+ private:\n+  int repost_count_;\n+  int* run_count_;\n+  v8::Isolate* isolate_;\n+  node::NodePlatform* platform_;\n+};\n+\n+class PlatformTest : public EnvironmentTestFixture {};\n+\n+TEST_F(PlatformTest, SkipNewTasksInFlushForegroundTasks) {\n+  v8::Isolate::Scope isolate_scope(isolate_);\n+  const v8::HandleScope handle_scope(isolate_);\n+  const Argv argv;\n+  Env env {handle_scope, argv};\n+  int run_count = 0;\n+  platform->CallOnForegroundThread(\n+      isolate_, new RepostingTask(2, &run_count, isolate_, platform.get()));\n+  EXPECT_TRUE(platform->FlushForegroundTasks(isolate_));\n+  EXPECT_EQ(1, run_count);\n+  EXPECT_TRUE(platform->FlushForegroundTasks(isolate_));\n+  EXPECT_EQ(2, run_count);\n+  EXPECT_TRUE(platform->FlushForegroundTasks(isolate_));\n+  EXPECT_EQ(3, run_count);\n+  EXPECT_FALSE(platform->FlushForegroundTasks(isolate_));\n+}"
+        }
+    ],
+    "stats": {
+        "total": 90,
+        "additions": 83,
+        "deletions": 7
+    }
+}

@@ -1,0 +1,36 @@
+{
+    "author": "addaleax",
+    "message": "worker: correct (de)initialization order\n\n- Initialize `thread_exit_async_` only once the thread has been\n  started. This is done since it is only triggered from the\n  thread when it is exiting.\n- Move the final `uv_run` to the `Worker` destructor.\n  This makes sure that it is always run, regardless of whether\n  the thread is actually started or not.\n- Always dispose the `Isolate` before cleaning up the libuv event\n  loop. This now matches the reverse order of initialization.\n\nFixes: https://github.com/nodejs/node/issues/22736\nPR-URL: https://github.com/nodejs/node/pull/22773\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "df7ebfab4e9575eeeb133826c54907053115a0b7",
+    "files": [
+        {
+            "sha": "80beac8aec973b2cafff06373037fa2cc0e620e7",
+            "filename": "src/node_worker.cc",
+            "status": "modified",
+            "additions": 22,
+            "deletions": 13,
+            "changes": 35,
+            "blob_url": "https://github.com/nodejs/node/blob/df7ebfab4e9575eeeb133826c54907053115a0b7/src%2Fnode_worker.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/df7ebfab4e9575eeeb133826c54907053115a0b7/src%2Fnode_worker.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_worker.cc?ref=df7ebfab4e9575eeeb133826c54907053115a0b7",
+            "patch": "@@ -71,14 +71,6 @@ Worker::Worker(Environment* env, Local<Object> wrap)\n   isolate_ = NewIsolate(array_buffer_allocator_.get(), &loop_);\n   CHECK_NE(isolate_, nullptr);\n \n-  thread_exit_async_.reset(new uv_async_t);\n-  thread_exit_async_->data = this;\n-  CHECK_EQ(uv_async_init(env->event_loop(),\n-                         thread_exit_async_.get(),\n-                         [](uv_async_t* handle) {\n-    static_cast<Worker*>(handle->data)->OnThreadStopped();\n-  }), 0);\n-\n   {\n     // Enter an environment capable of executing code in the child Isolate\n     // (and only in it).\n@@ -242,9 +234,6 @@ void Worker::Run() {\n \n   DisposeIsolate();\n \n-  // Need to run the loop one more time to close the platform's uv_async_t\n-  uv_run(&loop_, UV_RUN_ONCE);\n-\n   {\n     Mutex::ScopedLock lock(mutex_);\n     CHECK(thread_exit_async_);\n@@ -256,6 +245,13 @@ void Worker::Run() {\n }\n \n void Worker::DisposeIsolate() {\n+  if (env_) {\n+    CHECK_NOT_NULL(isolate_);\n+    Locker locker(isolate_);\n+    Isolate::Scope isolate_scope(isolate_);\n+    env_.reset();\n+  }\n+\n   if (isolate_ == nullptr)\n     return;\n \n@@ -332,12 +328,16 @@ Worker::~Worker() {\n   CHECK(stopped_);\n   CHECK(thread_joined_);\n   CHECK_EQ(child_port_, nullptr);\n-  CheckedUvLoopClose(&loop_);\n \n   // This has most likely already happened within the worker thread -- this\n   // is just in case Worker creation failed early.\n   DisposeIsolate();\n \n+  // Need to run the loop one more time to close the platform's uv_async_t\n+  uv_run(&loop_, UV_RUN_ONCE);\n+\n+  CheckedUvLoopClose(&loop_);\n+\n   Debug(this, \"Worker %llu destroyed\", thread_id_);\n }\n \n@@ -361,10 +361,19 @@ void Worker::StartThread(const FunctionCallbackInfo<Value>& args) {\n \n   w->env()->add_sub_worker_context(w);\n   w->stopped_ = false;\n+  w->thread_joined_ = false;\n+\n+  w->thread_exit_async_.reset(new uv_async_t);\n+  w->thread_exit_async_->data = w;\n+  CHECK_EQ(uv_async_init(w->env()->event_loop(),\n+                         w->thread_exit_async_.get(),\n+                         [](uv_async_t* handle) {\n+    static_cast<Worker*>(handle->data)->OnThreadStopped();\n+  }), 0);\n+\n   CHECK_EQ(uv_thread_create(&w->tid_, [](void* arg) {\n     static_cast<Worker*>(arg)->Run();\n   }, static_cast<void*>(w)), 0);\n-  w->thread_joined_ = false;\n }\n \n void Worker::StopThread(const FunctionCallbackInfo<Value>& args) {"
+        },
+        {
+            "sha": "d0cb1753eb4b6464a4cea00c22cfbccc78fdb28b",
+            "filename": "test/parallel/test-worker-invalid-workerdata.js",
+            "status": "added",
+            "additions": 15,
+            "deletions": 0,
+            "changes": 15,
+            "blob_url": "https://github.com/nodejs/node/blob/df7ebfab4e9575eeeb133826c54907053115a0b7/test%2Fparallel%2Ftest-worker-invalid-workerdata.js",
+            "raw_url": "https://github.com/nodejs/node/raw/df7ebfab4e9575eeeb133826c54907053115a0b7/test%2Fparallel%2Ftest-worker-invalid-workerdata.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-worker-invalid-workerdata.js?ref=df7ebfab4e9575eeeb133826c54907053115a0b7",
+            "patch": "@@ -0,0 +1,15 @@\n+// Flags: --experimental-worker\n+'use strict';\n+require('../common');\n+const assert = require('assert');\n+const { Worker } = require('worker_threads');\n+\n+// This tests verifies that failing to serialize workerData does not keep\n+// the process alive.\n+// Refs: https://github.com/nodejs/node/issues/22736\n+\n+assert.throws(() => {\n+  new Worker('./worker.js', {\n+    workerData: { fn: () => {} }\n+  });\n+}, /DataCloneError/);"
+        }
+    ],
+    "stats": {
+        "total": 50,
+        "additions": 37,
+        "deletions": 13
+    }
+}

@@ -1,0 +1,108 @@
+{
+    "author": "aaugustin",
+    "message": "Fixed #19099 -- Split broken link emails out of common middleware.",
+    "sha": "50a985b09b439a0d52aad8694d377a3483cb02e1",
+    "files": [
+        {
+            "sha": "740c792dcfe21b93989ec9daf84ad20da335840a",
+            "filename": "django/conf/global_settings.py",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/django/django/blob/50a985b09b439a0d52aad8694d377a3483cb02e1/django%2Fconf%2Fglobal_settings.py",
+            "raw_url": "https://github.com/django/django/raw/50a985b09b439a0d52aad8694d377a3483cb02e1/django%2Fconf%2Fglobal_settings.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fconf%2Fglobal_settings.py?ref=50a985b09b439a0d52aad8694d377a3483cb02e1",
+            "patch": "@@ -146,7 +146,7 @@\n # Email address that error messages come from.\n SERVER_EMAIL = 'root@localhost'\n \n-# Whether to send broken-link emails.\n+# Whether to send broken-link emails. Deprecated, must be removed in 1.8.\n SEND_BROKEN_LINK_EMAILS = False\n \n # Database connection info. If left empty, will default to the dummy backend.\n@@ -245,7 +245,7 @@\n ADMIN_FOR = ()\n \n # List of compiled regular expression objects representing URLs that need not\n-# be reported when SEND_BROKEN_LINK_EMAILS is True. Here are a few examples:\n+# be reported by BrokenLinkEmailsMiddleware. Here are a few examples:\n #    import re\n #    IGNORABLE_404_URLS = (\n #        re.compile(r'^/apple-touch-icon.*\\.png$'),"
+        },
+        {
+            "sha": "92f8cb39922acc046621fe8c35011e065540d6be",
+            "filename": "django/middleware/common.py",
+            "status": "modified",
+            "additions": 46,
+            "deletions": 32,
+            "changes": 78,
+            "blob_url": "https://github.com/django/django/blob/50a985b09b439a0d52aad8694d377a3483cb02e1/django%2Fmiddleware%2Fcommon.py",
+            "raw_url": "https://github.com/django/django/raw/50a985b09b439a0d52aad8694d377a3483cb02e1/django%2Fmiddleware%2Fcommon.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fmiddleware%2Fcommon.py?ref=50a985b09b439a0d52aad8694d377a3483cb02e1",
+            "patch": "@@ -1,13 +1,14 @@\n import hashlib\n import logging\n import re\n+import warnings\n \n from django.conf import settings\n-from django import http\n from django.core.mail import mail_managers\n+from django.core import urlresolvers\n+from django import http\n from django.utils.http import urlquote\n from django.utils import six\n-from django.core import urlresolvers\n \n \n logger = logging.getLogger('django.request')\n@@ -102,25 +103,15 @@ def process_request(self, request):\n         return http.HttpResponsePermanentRedirect(newurl)\n \n     def process_response(self, request, response):\n-        \"Send broken link emails and calculate the Etag, if needed.\"\n-        if response.status_code == 404:\n-            if settings.SEND_BROKEN_LINK_EMAILS and not settings.DEBUG:\n-                # If the referrer was from an internal link or a non-search-engine site,\n-                # send a note to the managers.\n-                domain = request.get_host()\n-                referer = request.META.get('HTTP_REFERER', None)\n-                is_internal = _is_internal_request(domain, referer)\n-                path = request.get_full_path()\n-                if referer and not _is_ignorable_404(path) and (is_internal or '?' not in referer):\n-                    ua = request.META.get('HTTP_USER_AGENT', '<none>')\n-                    ip = request.META.get('REMOTE_ADDR', '<none>')\n-                    mail_managers(\"Broken %slink on %s\" % ((is_internal and 'INTERNAL ' or ''), domain),\n-                        \"Referrer: %s\\nRequested URL: %s\\nUser agent: %s\\nIP address: %s\\n\" \\\n-                                  % (referer, request.get_full_path(), ua, ip),\n-                                  fail_silently=True)\n-                return response\n-\n-        # Use ETags, if requested.\n+        \"\"\"\n+        Calculate the ETag, if needed.\n+        \"\"\"\n+        if settings.SEND_BROKEN_LINK_EMAILS:\n+            warnings.warn(\"SEND_BROKEN_LINK_EMAILS is deprecated. \"\n+                \"Use BrokenLinkEmailsMiddleware instead.\",\n+                PendingDeprecationWarning, stacklevel=2)\n+            BrokenLinkEmailsMiddleware().process_response(request, response)\n+\n         if settings.USE_ETAGS:\n             if response.has_header('ETag'):\n                 etag = response['ETag']\n@@ -139,15 +130,38 @@ def process_response(self, request, response):\n \n         return response\n \n-def _is_ignorable_404(uri):\n-    \"\"\"\n-    Returns True if a 404 at the given URL *shouldn't* notify the site managers.\n-    \"\"\"\n-    return any(pattern.search(uri) for pattern in settings.IGNORABLE_404_URLS)\n \n-def _is_internal_request(domain, referer):\n-    \"\"\"\n-    Returns true if the referring URL is the same domain as the current request.\n-    \"\"\"\n-    # Different subdomains are treated as different domains.\n-    return referer is not None and re.match(\"^https?://%s/\" % re.escape(domain), referer)\n+class BrokenLinkEmailsMiddleware(object):\n+\n+    def process_response(self, request, response):\n+        \"\"\"\n+        Send broken link emails for relevant 404 NOT FOUND responses.\n+        \"\"\"\n+        if response.status_code == 404 and not settings.DEBUG:\n+            domain = request.get_host()\n+            path = request.get_full_path()\n+            referer = request.META.get('HTTP_REFERER', '')\n+            is_internal = self.is_internal_request(domain, referer)\n+            is_not_search_engine = '?' not in referer\n+            is_ignorable = self.is_ignorable_404(path)\n+            if referer and (is_internal or is_not_search_engine) and not is_ignorable:\n+                ua = request.META.get('HTTP_USER_AGENT', '<none>')\n+                ip = request.META.get('REMOTE_ADDR', '<none>')\n+                mail_managers(\n+                    \"Broken %slink on %s\" % (('INTERNAL ' if is_internal else ''), domain),\n+                    \"Referrer: %s\\nRequested URL: %s\\nUser agent: %s\\nIP address: %s\\n\" % (referer, path, ua, ip),\n+                    fail_silently=True)\n+        return response\n+\n+    def is_internal_request(self, domain, referer):\n+        \"\"\"\n+        Returns True if the referring URL is the same domain as the current request.\n+        \"\"\"\n+        # Different subdomains are treated as different domains.\n+        return re.match(\"^https?://%s/\" % re.escape(domain), referer)\n+\n+    def is_ignorable_404(self, uri):\n+        \"\"\"\n+        Returns True if a 404 at the given URL *shouldn't* notify the site managers.\n+        \"\"\"\n+        return any(pattern.search(uri) for pattern in settings.IGNORABLE_404_URLS)"
+        },
+        {
+            "sha": "7f3c68c1366f367b9eb23da664fd4c39e2b048f1",
+            "filename": "docs/howto/error-reporting.txt",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 8,
+            "changes": 19,
+            "blob_url": "https://github.com/django/django/blob/50a985b09b439a0d52aad8694d377a3483cb02e1/docs%2Fhowto%2Ferror-reporting.txt",
+            "raw_url": "https://github.com/django/django/raw/50a985b09b439a0d52aad8694d377a3483cb02e1/docs%2Fhowto%2Ferror-reporting.txt",
+            "contents_url": "https://api.github.com/repos/django/django/contents/docs%2Fhowto%2Ferror-reporting.txt?ref=50a985b09b439a0d52aad8694d377a3483cb02e1",
+            "patch": "@@ -54,18 +54,24 @@ setting.\n Django can also be configured to email errors about broken links (404 \"page\n not found\" errors). Django sends emails about 404 errors when:\n \n-* :setting:`DEBUG` is ``False``\n+* :setting:`DEBUG` is ``False``;\n \n-* :setting:`SEND_BROKEN_LINK_EMAILS` is ``True``\n-\n-* Your :setting:`MIDDLEWARE_CLASSES` setting includes ``CommonMiddleware``\n-  (which it does by default).\n+* Your :setting:`MIDDLEWARE_CLASSES` setting includes\n+  :class:`django.middleware.common.BrokenLinkEmailsMiddleware`.\n \n If those conditions are met, Django will email the users listed in the\n :setting:`MANAGERS` setting whenever your code raises a 404 and the request has\n a referer. (It doesn't bother to email for 404s that don't have a referer --\n those are usually just people typing in broken URLs or broken Web 'bots).\n \n+.. note::\n+\n+    :class:`~django.middleware.common.BrokenLinkEmailsMiddleware` must appear\n+    before other middleware that intercepts 404 errors, such as\n+    :class:`~django.middleware.locale.LocaleMiddleware` or\n+    :class:`~django.contrib.flatpages.middleware.FlatpageFallbackMiddleware`.\n+    Put it towards the top of your :setting:`MIDDLEWARE_CLASSES` setting.\n+\n You can tell Django to stop reporting particular 404s by tweaking the\n :setting:`IGNORABLE_404_URLS` setting. It should be a tuple of compiled\n regular expression objects. For example::\n@@ -92,9 +98,6 @@ crawlers often request::\n (Note that these are regular expressions, so we put a backslash in front of\n periods to escape them.)\n \n-The best way to disable this behavior is to set\n-:setting:`SEND_BROKEN_LINK_EMAILS` to ``False``.\n-\n .. seealso::\n \n    404 errors are logged using the logging framework. By default, these log"
+        },
+        {
+            "sha": "63d65d1e4a7087a99c0938ed0fd1561d6aec2b8c",
+            "filename": "docs/internals/deprecation.txt",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/django/django/blob/50a985b09b439a0d52aad8694d377a3483cb02e1/docs%2Finternals%2Fdeprecation.txt",
+            "raw_url": "https://github.com/django/django/raw/50a985b09b439a0d52aad8694d377a3483cb02e1/docs%2Finternals%2Fdeprecation.txt",
+            "contents_url": "https://api.github.com/repos/django/django/contents/docs%2Finternals%2Fdeprecation.txt?ref=50a985b09b439a0d52aad8694d377a3483cb02e1",
+            "patch": "@@ -308,6 +308,13 @@ these changes.\n * The ``depth`` keyword argument will be removed from\n   :meth:`~django.db.models.query.QuerySet.select_related`.\n \n+1.8\n+---\n+\n+* The ``SEND_BROKEN_LINK_EMAILS`` setting will be removed. Add the\n+  :class:`django.middleware.common.BrokenLinkEmailsMiddleware` middleware to\n+  your :setting:`MIDDLEWARE_CLASSES` setting instead.\n+\n 2.0\n ---\n "
+        },
+        {
+            "sha": "1e6e57f72067711d1cf60adbd591289eca48f0da",
+            "filename": "docs/ref/middleware.txt",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 3,
+            "changes": 8,
+            "blob_url": "https://github.com/django/django/blob/50a985b09b439a0d52aad8694d377a3483cb02e1/docs%2Fref%2Fmiddleware.txt",
+            "raw_url": "https://github.com/django/django/raw/50a985b09b439a0d52aad8694d377a3483cb02e1/docs%2Fref%2Fmiddleware.txt",
+            "contents_url": "https://api.github.com/repos/django/django/contents/docs%2Fref%2Fmiddleware.txt?ref=50a985b09b439a0d52aad8694d377a3483cb02e1",
+            "patch": "@@ -61,14 +61,16 @@ Adds a few conveniences for perfectionists:\n   indexer would treat them as separate URLs -- so it's best practice to\n   normalize URLs.\n \n-* Sends broken link notification emails to :setting:`MANAGERS` if\n-  :setting:`SEND_BROKEN_LINK_EMAILS` is set to ``True``.\n-\n * Handles ETags based on the :setting:`USE_ETAGS` setting. If\n   :setting:`USE_ETAGS` is set to ``True``, Django will calculate an ETag\n   for each request by MD5-hashing the page content, and it'll take care of\n   sending ``Not Modified`` responses, if appropriate.\n \n+.. class:: BrokenLinkEmailsMiddleware\n+\n+* Sends broken link notification emails to :setting:`MANAGERS` (see\n+  :doc:`/howto/error-reporting`).\n+\n View metadata middleware\n ------------------------\n "
+        },
+        {
+            "sha": "d057323c065c54164fb0678095c387846cb349cc",
+            "filename": "docs/ref/settings.txt",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 3,
+            "changes": 13,
+            "blob_url": "https://github.com/django/django/blob/50a985b09b439a0d52aad8694d377a3483cb02e1/docs%2Fref%2Fsettings.txt",
+            "raw_url": "https://github.com/django/django/raw/50a985b09b439a0d52aad8694d377a3483cb02e1/docs%2Fref%2Fsettings.txt",
+            "contents_url": "https://api.github.com/repos/django/django/contents/docs%2Fref%2Fsettings.txt?ref=50a985b09b439a0d52aad8694d377a3483cb02e1",
+            "patch": "@@ -1090,8 +1090,9 @@ query string, if any). Use this if your site does not provide a commonly\n requested file such as ``favicon.ico`` or ``robots.txt``, or if it gets\n hammered by script kiddies.\n \n-This is only used if :setting:`SEND_BROKEN_LINK_EMAILS` is set to ``True`` and\n-``CommonMiddleware`` is installed (see :doc:`/topics/http/middleware`).\n+This is only used if\n+:class:`~django.middleware.common.BrokenLinkEmailsMiddleware` is enabled (see\n+:doc:`/topics/http/middleware`).\n \n .. setting:: INSTALLED_APPS\n \n@@ -1250,7 +1251,8 @@ MANAGERS\n Default: ``()`` (Empty tuple)\n \n A tuple in the same format as :setting:`ADMINS` that specifies who should get\n-broken-link notifications when :setting:`SEND_BROKEN_LINK_EMAILS` is ``True``.\n+broken link notifications when\n+:class:`~django.middleware.common.BrokenLinkEmailsMiddleware` is enabled.\n \n .. setting:: MEDIA_ROOT\n \n@@ -1448,6 +1450,11 @@ available in ``request.META``.)\n SEND_BROKEN_LINK_EMAILS\n -----------------------\n \n+.. deprecated:: 1.6\n+    Since :class:`~django.middleware.common.BrokenLinkEmailsMiddleware`\n+    was split from :class:`~django.middleware.common.CommonMiddleware`,\n+    this setting no longer serves a purpose.\n+\n Default: ``False``\n \n Whether to send an email to the :setting:`MANAGERS` each time somebody visits"
+        },
+        {
+            "sha": "dcf6f2604a2bc6a450cd28cbff648144050081c2",
+            "filename": "docs/releases/1.6.txt",
+            "status": "modified",
+            "additions": 18,
+            "deletions": 0,
+            "changes": 18,
+            "blob_url": "https://github.com/django/django/blob/50a985b09b439a0d52aad8694d377a3483cb02e1/docs%2Freleases%2F1.6.txt",
+            "raw_url": "https://github.com/django/django/raw/50a985b09b439a0d52aad8694d377a3483cb02e1/docs%2Freleases%2F1.6.txt",
+            "contents_url": "https://api.github.com/repos/django/django/contents/docs%2Freleases%2F1.6.txt?ref=50a985b09b439a0d52aad8694d377a3483cb02e1",
+            "patch": "@@ -46,3 +46,21 @@ Backwards incompatible changes in 1.6\n \n Features deprecated in 1.6\n ==========================\n+\n+``SEND_BROKEN_LINK_EMAILS`` setting\n+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n+\n+:class:`~django.middleware.common.CommonMiddleware` used to provide basic\n+reporting of broken links by email when ``SEND_BROKEN_LINK_EMAILS`` is set to\n+``True``.\n+\n+Because of intractable ordering problems between\n+:class:`~django.middleware.common.CommonMiddleware` and\n+:class:`~django.middleware.locale.LocaleMiddleware`, this feature was split\n+out into a new middleware:\n+:class:`~django.middleware.common.BrokenLinkEmailsMiddleware`.\n+\n+If you're relying on this feature, you should add\n+``'django.middleware.common.BrokenLinkEmailsMiddleware'`` to your\n+:setting:`MIDDLEWARE_CLASSES` setting and remove ``SEND_BROKEN_LINK_EMAILS``\n+from your settings."
+        },
+        {
+            "sha": "c6d42a6964bb67b947e927987cc49119357a3c1e",
+            "filename": "tests/regressiontests/middleware/tests.py",
+            "status": "modified",
+            "additions": 48,
+            "deletions": 13,
+            "changes": 61,
+            "blob_url": "https://github.com/django/django/blob/50a985b09b439a0d52aad8694d377a3483cb02e1/tests%2Fregressiontests%2Fmiddleware%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/50a985b09b439a0d52aad8694d377a3483cb02e1/tests%2Fregressiontests%2Fmiddleware%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fmiddleware%2Ftests.py?ref=50a985b09b439a0d52aad8694d377a3483cb02e1",
+            "patch": "@@ -1,16 +1,17 @@\n # -*- coding: utf-8 -*-\n \n import gzip\n-import re\n-import random\n from io import BytesIO\n+import random\n+import re\n+import warnings\n \n from django.conf import settings\n from django.core import mail\n from django.http import HttpRequest\n from django.http import HttpResponse, StreamingHttpResponse\n from django.middleware.clickjacking import XFrameOptionsMiddleware\n-from django.middleware.common import CommonMiddleware\n+from django.middleware.common import CommonMiddleware, BrokenLinkEmailsMiddleware\n from django.middleware.http import ConditionalGetMiddleware\n from django.middleware.gzip import GZipMiddleware\n from django.test import TestCase, RequestFactory\n@@ -232,33 +233,39 @@ def test_prepend_www_append_slash_slashless_custom_urlconf(self):\n         self.assertEqual(r['Location'],\n                           'http://www.testserver/middleware/customurlconf/slash/')\n \n-    # Tests for the 404 error reporting via email\n+    # Legacy tests for the 404 error reporting via email (to be removed in 1.8)\n \n     @override_settings(IGNORABLE_404_URLS=(re.compile(r'foo'),),\n-                       SEND_BROKEN_LINK_EMAILS = True)\n+                       SEND_BROKEN_LINK_EMAILS=True)\n     def test_404_error_reporting(self):\n         request = self._get_request('regular_url/that/does/not/exist')\n         request.META['HTTP_REFERER'] = '/another/url/'\n-        response = self.client.get(request.path)\n-        CommonMiddleware().process_response(request, response)\n+        with warnings.catch_warnings():\n+            warnings.simplefilter(\"ignore\", PendingDeprecationWarning)\n+            response = self.client.get(request.path)\n+            CommonMiddleware().process_response(request, response)\n         self.assertEqual(len(mail.outbox), 1)\n         self.assertIn('Broken', mail.outbox[0].subject)\n \n     @override_settings(IGNORABLE_404_URLS=(re.compile(r'foo'),),\n-                       SEND_BROKEN_LINK_EMAILS = True)\n+                       SEND_BROKEN_LINK_EMAILS=True)\n     def test_404_error_reporting_no_referer(self):\n         request = self._get_request('regular_url/that/does/not/exist')\n-        response = self.client.get(request.path)\n-        CommonMiddleware().process_response(request, response)\n+        with warnings.catch_warnings():\n+            warnings.simplefilter(\"ignore\", PendingDeprecationWarning)\n+            response = self.client.get(request.path)\n+            CommonMiddleware().process_response(request, response)\n         self.assertEqual(len(mail.outbox), 0)\n \n     @override_settings(IGNORABLE_404_URLS=(re.compile(r'foo'),),\n-                       SEND_BROKEN_LINK_EMAILS = True)\n+                       SEND_BROKEN_LINK_EMAILS=True)\n     def test_404_error_reporting_ignored_url(self):\n         request = self._get_request('foo_url/that/does/not/exist/either')\n         request.META['HTTP_REFERER'] = '/another/url/'\n-        response = self.client.get(request.path)\n-        CommonMiddleware().process_response(request, response)\n+        with warnings.catch_warnings():\n+            warnings.simplefilter(\"ignore\", PendingDeprecationWarning)\n+            response = self.client.get(request.path)\n+            CommonMiddleware().process_response(request, response)\n         self.assertEqual(len(mail.outbox), 0)\n \n     # Other tests\n@@ -271,6 +278,34 @@ def test_non_ascii_query_string_does_not_crash(self):\n         self.assertEqual(response.status_code, 301)\n \n \n+@override_settings(IGNORABLE_404_URLS=(re.compile(r'foo'),))\n+class BrokenLinkEmailsMiddlewareTest(TestCase):\n+\n+    def setUp(self):\n+        self.req = HttpRequest()\n+        self.req.META = {\n+            'SERVER_NAME': 'testserver',\n+            'SERVER_PORT': 80,\n+        }\n+        self.req.path = self.req.path_info = 'regular_url/that/does/not/exist'\n+        self.resp = self.client.get(self.req.path)\n+\n+    def test_404_error_reporting(self):\n+        self.req.META['HTTP_REFERER'] = '/another/url/'\n+        BrokenLinkEmailsMiddleware().process_response(self.req, self.resp)\n+        self.assertEqual(len(mail.outbox), 1)\n+        self.assertIn('Broken', mail.outbox[0].subject)\n+\n+    def test_404_error_reporting_no_referer(self):\n+        BrokenLinkEmailsMiddleware().process_response(self.req, self.resp)\n+        self.assertEqual(len(mail.outbox), 0)\n+\n+    def test_404_error_reporting_ignored_url(self):\n+        self.req.path = self.req.path_info = 'foo_url/that/does/not/exist'\n+        BrokenLinkEmailsMiddleware().process_response(self.req, self.resp)\n+        self.assertEqual(len(mail.outbox), 0)\n+\n+\n class ConditionalGetMiddlewareTest(TestCase):\n     urls = 'regressiontests.middleware.cond_get_urls'\n     def setUp(self):"
+        }
+    ],
+    "stats": {
+        "total": 208,
+        "additions": 147,
+        "deletions": 61
+    }
+}

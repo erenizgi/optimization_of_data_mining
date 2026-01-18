@@ -1,0 +1,36 @@
+{
+    "author": "mcollina",
+    "message": "stream: async iteration should work with destroyed stream\n\nFixes https://github.com/nodejs/node/issues/23730.\n\nPR-URL: https://github.com/nodejs/node/pull/23785\nReviewed-By: Gus Caplan <me@gus.host>\nReviewed-By: Luigi Pinca <luigipinca@gmail.com>\nReviewed-By: Matheus Marchini <mat@mmarchini.me>",
+    "sha": "3ec8cec6483549a91d1c89bed3c15856b71850c3",
+    "files": [
+        {
+            "sha": "25b393d21f1fcb12950ebf67d09f089ea21d7d62",
+            "filename": "lib/internal/streams/async_iterator.js",
+            "status": "modified",
+            "additions": 43,
+            "deletions": 26,
+            "changes": 69,
+            "blob_url": "https://github.com/nodejs/node/blob/3ec8cec6483549a91d1c89bed3c15856b71850c3/lib%2Finternal%2Fstreams%2Fasync_iterator.js",
+            "raw_url": "https://github.com/nodejs/node/raw/3ec8cec6483549a91d1c89bed3c15856b71850c3/lib%2Finternal%2Fstreams%2Fasync_iterator.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fstreams%2Fasync_iterator.js?ref=3ec8cec6483549a91d1c89bed3c15856b71850c3",
+            "patch": "@@ -1,5 +1,7 @@\n 'use strict';\n \n+const finished = require('internal/streams/end-of-stream');\n+\n const kLastResolve = Symbol('lastResolve');\n const kLastReject = Symbol('lastReject');\n const kError = Symbol('error');\n@@ -34,30 +36,6 @@ function onReadable(iter) {\n   process.nextTick(readAndResolve, iter);\n }\n \n-function onEnd(iter) {\n-  const resolve = iter[kLastResolve];\n-  if (resolve !== null) {\n-    iter[kLastPromise] = null;\n-    iter[kLastResolve] = null;\n-    iter[kLastReject] = null;\n-    resolve(createIterResult(null, true));\n-  }\n-  iter[kEnded] = true;\n-}\n-\n-function onError(iter, err) {\n-  const reject = iter[kLastReject];\n-  // reject if we are waiting for data in the Promise\n-  // returned by next() and store the error\n-  if (reject !== null) {\n-    iter[kLastPromise] = null;\n-    iter[kLastResolve] = null;\n-    iter[kLastReject] = null;\n-    reject(err);\n-  }\n-  iter[kError] = err;\n-}\n-\n function wrapForNext(lastPromise, iter) {\n   return function(resolve, reject) {\n     lastPromise.then(function() {\n@@ -86,6 +64,22 @@ const ReadableStreamAsyncIteratorPrototype = Object.setPrototypeOf({\n       return Promise.resolve(createIterResult(null, true));\n     }\n \n+    if (this[kStream].destroyed) {\n+      // We need to defer via nextTick because if .destroy(err) is\n+      // called, the error will be emitted via nextTick, and\n+      // we cannot guarantee that there is no error lingering around\n+      // waiting to be emitted.\n+      return new Promise((resolve, reject) => {\n+        process.nextTick(() => {\n+          if (this[kError]) {\n+            reject(this[kError]);\n+          } else {\n+            resolve(createIterResult(null, true));\n+          }\n+        });\n+      });\n+    }\n+\n     // if we have multiple next() calls\n     // we will wait for the previous Promise to finish\n     // this logic is optimized to support for await loops,\n@@ -155,9 +149,32 @@ const createReadableStreamAsyncIterator = (stream) => {\n     },\n   });\n \n+  finished(stream, (err) => {\n+    if (err) {\n+      const reject = iterator[kLastReject];\n+      // reject if we are waiting for data in the Promise\n+      // returned by next() and store the error\n+      if (reject !== null) {\n+        iterator[kLastPromise] = null;\n+        iterator[kLastResolve] = null;\n+        iterator[kLastReject] = null;\n+        reject(err);\n+      }\n+      iterator[kError] = err;\n+      return;\n+    }\n+\n+    const resolve = iterator[kLastResolve];\n+    if (resolve !== null) {\n+      iterator[kLastPromise] = null;\n+      iterator[kLastResolve] = null;\n+      iterator[kLastReject] = null;\n+      resolve(createIterResult(null, true));\n+    }\n+    iterator[kEnded] = true;\n+  });\n+\n   stream.on('readable', onReadable.bind(null, iterator));\n-  stream.on('end', onEnd.bind(null, iterator));\n-  stream.on('error', onError.bind(null, iterator));\n \n   return iterator;\n };"
+        },
+        {
+            "sha": "ec558955c6ed1894a0095c6e35333b616c32deb4",
+            "filename": "test/parallel/test-stream-readable-async-iterators.js",
+            "status": "modified",
+            "additions": 39,
+            "deletions": 1,
+            "changes": 40,
+            "blob_url": "https://github.com/nodejs/node/blob/3ec8cec6483549a91d1c89bed3c15856b71850c3/test%2Fparallel%2Ftest-stream-readable-async-iterators.js",
+            "raw_url": "https://github.com/nodejs/node/raw/3ec8cec6483549a91d1c89bed3c15856b71850c3/test%2Fparallel%2Ftest-stream-readable-async-iterators.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-stream-readable-async-iterators.js?ref=3ec8cec6483549a91d1c89bed3c15856b71850c3",
+            "patch": "@@ -1,7 +1,7 @@\n 'use strict';\n \n const common = require('../common');\n-const { Readable } = require('stream');\n+const { Readable, PassThrough, pipeline } = require('stream');\n const assert = require('assert');\n \n async function tests() {\n@@ -324,6 +324,44 @@ async function tests() {\n \n     assert.strictEqual(data, expected);\n   })();\n+\n+  await (async function() {\n+    console.log('.next() on destroyed stream');\n+    const readable = new Readable({\n+      read() {\n+        // no-op\n+      }\n+    });\n+\n+    readable.destroy();\n+\n+    try {\n+      await readable[Symbol.asyncIterator]().next();\n+    } catch (e) {\n+      assert.strictEqual(e.code, 'ERR_STREAM_PREMATURE_CLOSE');\n+    }\n+  })();\n+\n+  await (async function() {\n+    console.log('.next() on pipelined stream');\n+    const readable = new Readable({\n+      read() {\n+        // no-op\n+      }\n+    });\n+\n+    const passthrough = new PassThrough();\n+    const err = new Error('kaboom');\n+    pipeline(readable, passthrough, common.mustCall((e) => {\n+      assert.strictEqual(e, err);\n+    }));\n+    readable.destroy(err);\n+    try {\n+      await readable[Symbol.asyncIterator]().next();\n+    } catch (e) {\n+      assert.strictEqual(e, err);\n+    }\n+  })();\n }\n \n // to avoid missing some tests if a promise does not resolve"
+        }
+    ],
+    "stats": {
+        "total": 109,
+        "additions": 82,
+        "deletions": 27
+    }
+}

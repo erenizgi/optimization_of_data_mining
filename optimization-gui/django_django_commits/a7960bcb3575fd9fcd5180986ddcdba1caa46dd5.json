@@ -1,0 +1,36 @@
+{
+    "author": "woodm1979",
+    "message": "Fixed #18972 -- Refactored bundled wsgi server's chunking algorithm.\n\nThanks to amosonn at yahoo.com for the report, @doda for the initial patch and\n@datagrok for the revamped logic and test case.",
+    "sha": "a7960bcb3575fd9fcd5180986ddcdba1caa46dd5",
+    "files": [
+        {
+            "sha": "d329221ce41958d0e67f5faedc21f10441bb022d",
+            "filename": "django/core/servers/basehttp.py",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 15,
+            "changes": 26,
+            "blob_url": "https://github.com/django/django/blob/a7960bcb3575fd9fcd5180986ddcdba1caa46dd5/django%2Fcore%2Fservers%2Fbasehttp.py",
+            "raw_url": "https://github.com/django/django/raw/a7960bcb3575fd9fcd5180986ddcdba1caa46dd5/django%2Fcore%2Fservers%2Fbasehttp.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fcore%2Fservers%2Fbasehttp.py?ref=a7960bcb3575fd9fcd5180986ddcdba1caa46dd5",
+            "patch": "@@ -9,7 +9,7 @@\n \n from __future__ import unicode_literals\n \n-import os\n+from io import BytesIO\n import socket\n import sys\n import traceback\n@@ -26,7 +26,13 @@\n from django.utils.module_loading import import_by_path\n from django.utils import six\n \n-__all__ = ['WSGIServer', 'WSGIRequestHandler']\n+__all__ = ('WSGIServer', 'WSGIRequestHandler', 'MAX_SOCKET_CHUNK_SIZE')\n+\n+\n+# If data is too large, socket will choke, so write chunks no larger than 32MB\n+# at a time. The rationale behind the 32MB can be found on Django's Trac:\n+# https://code.djangoproject.com/ticket/5596#comment:4\n+MAX_SOCKET_CHUNK_SIZE = 32 * 1024 * 1024  # 32 MB\n \n \n def get_internal_wsgi_application():\n@@ -78,19 +84,9 @@ def write(self, data):\n             self.bytes_sent += len(data)\n \n         # XXX check Content-Length and truncate if too many bytes written?\n-\n-        # If data is too large, socket will choke, so write chunks no larger\n-        # than 32MB at a time.\n-        length = len(data)\n-        if length > 33554432:\n-            offset = 0\n-            while offset < length:\n-                chunk_size = min(33554432, length)\n-                self._write(data[offset:offset+chunk_size])\n-                self._flush()\n-                offset += chunk_size\n-        else:\n-            self._write(data)\n+        data = BytesIO(data)\n+        for chunk in iter(lambda: data.read(MAX_SOCKET_CHUNK_SIZE), b''):\n+            self._write(chunk)\n             self._flush()\n \n     def error_output(self, environ, start_response):"
+        },
+        {
+            "sha": "662466a110ecd6bd3159851d79359688d104afa5",
+            "filename": "tests/builtin_server/tests.py",
+            "status": "modified",
+            "additions": 55,
+            "deletions": 8,
+            "changes": 63,
+            "blob_url": "https://github.com/django/django/blob/a7960bcb3575fd9fcd5180986ddcdba1caa46dd5/tests%2Fbuiltin_server%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/a7960bcb3575fd9fcd5180986ddcdba1caa46dd5/tests%2Fbuiltin_server%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fbuiltin_server%2Ftests.py?ref=a7960bcb3575fd9fcd5180986ddcdba1caa46dd5",
+            "patch": "@@ -2,40 +2,43 @@\n \n from io import BytesIO\n \n-from django.core.servers.basehttp import ServerHandler\n+from django.core.servers.basehttp import ServerHandler, MAX_SOCKET_CHUNK_SIZE\n from django.utils.unittest import TestCase\n \n-#\n-# Tests for #9659: wsgi.file_wrapper in the builtin server.\n-# We need to mock a couple of handlers and keep track of what\n-# gets called when using a couple kinds of WSGI apps.\n-#\n \n class DummyHandler(object):\n-    def log_request(*args, **kwargs):\n+    def log_request(self, *args, **kwargs):\n         pass\n \n+\n class FileWrapperHandler(ServerHandler):\n     def __init__(self, *args, **kwargs):\n-        ServerHandler.__init__(self, *args, **kwargs)\n+        super(FileWrapperHandler, self).__init__(*args, **kwargs)\n         self.request_handler = DummyHandler()\n         self._used_sendfile = False\n \n     def sendfile(self):\n         self._used_sendfile = True\n         return True\n \n+\n def wsgi_app(environ, start_response):\n     start_response(str('200 OK'), [(str('Content-Type'), str('text/plain'))])\n     return [b'Hello World!']\n \n+\n def wsgi_app_file_wrapper(environ, start_response):\n     start_response(str('200 OK'), [(str('Content-Type'), str('text/plain'))])\n     return environ['wsgi.file_wrapper'](BytesIO(b'foo'))\n \n+\n class WSGIFileWrapperTests(TestCase):\n     \"\"\"\n     Test that the wsgi.file_wrapper works for the builting server.\n+\n+    Tests for #9659: wsgi.file_wrapper in the builtin server.\n+    We need to mock a couple of handlers and keep track of what\n+    gets called when using a couple kinds of WSGI apps.\n     \"\"\"\n \n     def test_file_wrapper_uses_sendfile(self):\n@@ -53,3 +56,47 @@ def test_file_wrapper_no_sendfile(self):\n         self.assertFalse(handler._used_sendfile)\n         self.assertEqual(handler.stdout.getvalue().splitlines()[-1], b'Hello World!')\n         self.assertEqual(handler.stderr.getvalue(), b'')\n+\n+\n+class WriteChunkCounterHandler(ServerHandler):\n+    \"\"\"\n+    Server handler that counts the number of chunks written after headers were\n+    sent. Used to make sure large response body chunking works properly.\n+    \"\"\"\n+\n+    def __init__(self, *args, **kwargs):\n+        super(WriteChunkCounterHandler, self).__init__(*args, **kwargs)\n+        self.request_handler = DummyHandler()\n+        self.headers_written = False\n+        self.write_chunk_counter = 0\n+\n+    def send_headers(self):\n+        super(WriteChunkCounterHandler, self).send_headers()\n+        self.headers_written = True\n+\n+    def _write(self, data):\n+        if self.headers_written:\n+            self.write_chunk_counter += 1\n+        self.stdout.write(data)\n+\n+\n+def send_big_data_app(environ, start_response):\n+    start_response(str('200 OK'), [(str('Content-Type'), str('text/plain'))])\n+    # Return a blob of data that is 1.5 times the maximum chunk size.\n+    return [b'x' * (MAX_SOCKET_CHUNK_SIZE + MAX_SOCKET_CHUNK_SIZE // 2)]\n+\n+\n+class ServerHandlerChunksProperly(TestCase):\n+    \"\"\"\n+    Test that the ServerHandler chunks data properly.\n+\n+    Tests for #18972: The logic that performs the math to break data into\n+    32MB (MAX_SOCKET_CHUNK_SIZE) chunks was flawed, BUT it didn't actually\n+    cause any problems.\n+    \"\"\"\n+\n+    def test_chunked_data(self):\n+        env = {'SERVER_PROTOCOL': 'HTTP/1.0'}\n+        handler = WriteChunkCounterHandler(None, BytesIO(), BytesIO(), env)\n+        handler.run(send_big_data_app)\n+        self.assertEqual(handler.write_chunk_counter, 2)"
+        }
+    ],
+    "stats": {
+        "total": 89,
+        "additions": 66,
+        "deletions": 23
+    }
+}

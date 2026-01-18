@@ -1,0 +1,36 @@
+{
+    "author": "crisbeto",
+    "message": "fix(compiler-cli): generating invalid setClassMetadata call in ES5 for class with custom decorator (#39527)\n\nWhen a class with a custom decorator is transpiled to ES5, it looks something like this:\n\n```\nvar SomeClass = (function() {\n  function SomeClass() {...};\n  var SomeClass_1 = __decorate([Decorator()], SomeClass);\n  SomeClass = SomeClass_1;\n  return SomeClass;\n})();\n```\n\nThe problem is that if the class also has an Angular decorator that refers to the class itself\n(e.g. `{provide: someToken, useClass: SomeClass}`), the generated `setClassMetadata` code will\nbe emitted after the IIFE, but will still refer to the intermediate `SomeClass_1` variable from\ninside the IIFE. This happens, because we generate the `setClassMetadata` call directly from\nthe source AST which contains identifiers that TS will rename when it emits the ES5 code.\n\nThese changes resolve the issue by looking through the metadata AST and cloning any `Identifier`\nthat is referring to the class. Since TS doesn't have references to the clone, it won't rename\nit when transpiling to ES5.\n\nFixes #39509.\n\nPR Close #39527",
+    "sha": "7e33cb9626aac76527eeb8f05683167da7e029bf",
+    "files": [
+        {
+            "sha": "36701e189dd791191ffc63b650ff11b513d94560",
+            "filename": "packages/compiler-cli/src/ngtsc/annotations/src/metadata.ts",
+            "status": "modified",
+            "additions": 23,
+            "deletions": 2,
+            "changes": 25,
+            "blob_url": "https://github.com/angular/angular/blob/7e33cb9626aac76527eeb8f05683167da7e029bf/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fannotations%2Fsrc%2Fmetadata.ts",
+            "raw_url": "https://github.com/angular/angular/raw/7e33cb9626aac76527eeb8f05683167da7e029bf/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fannotations%2Fsrc%2Fmetadata.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fannotations%2Fsrc%2Fmetadata.ts?ref=7e33cb9626aac76527eeb8f05683167da7e029bf",
+            "patch": "@@ -39,8 +39,13 @@ export function generateSetClassMetadataCall(\n   }\n   const ngClassDecorators =\n       classDecorators.filter(dec => isAngularDecorator(dec, isCore))\n-          .map(\n-              (decorator: Decorator) => decoratorToMetadata(decorator, annotateForClosureCompiler));\n+          .map(decorator => decoratorToMetadata(decorator, annotateForClosureCompiler))\n+          // Since the `setClassMetadata` call is intended to be emitted after the class\n+          // declaration, we have to strip references to the existing identifiers or\n+          // TypeScript might generate invalid code when it emits to JS. In particular\n+          // this can break when emitting a class to ES5 which has a custom decorator\n+          // and is referenced inside of its own metadata (see #39509 for more information).\n+          .map(decorator => removeIdentifierReferences(decorator, id.text));\n   if (ngClassDecorators.length === 0) {\n     return null;\n   }\n@@ -166,3 +171,19 @@ function decoratorToMetadata(\n function isAngularDecorator(decorator: Decorator, isCore: boolean): boolean {\n   return isCore || (decorator.import !== null && decorator.import.from === '@angular/core');\n }\n+\n+/**\n+ * Recursively recreates all of the `Identifier` descendant nodes with a particular name inside\n+ * of an AST node, thus removing any references to them. Useful if a particular node has to be t\n+ * aken from one place any emitted to another one exactly as it has been written.\n+ */\n+function removeIdentifierReferences<T extends ts.Node>(node: T, name: string): T {\n+  const result = ts.transform(\n+      node, [context => root => ts.visitNode(root, function walk(current: ts.Node): ts.Node {\n+        return ts.isIdentifier(current) && current.text === name ?\n+            ts.createIdentifier(current.text) :\n+            ts.visitEachChild(current, walk, context);\n+      })]);\n+\n+  return result.transformed[0];\n+}"
+        },
+        {
+            "sha": "6241df64e362729b1fd69e720ca7aca501fa14d0",
+            "filename": "packages/compiler-cli/test/compliance/r3_compiler_compliance_spec.ts",
+            "status": "modified",
+            "additions": 42,
+            "deletions": 0,
+            "changes": 42,
+            "blob_url": "https://github.com/angular/angular/blob/7e33cb9626aac76527eeb8f05683167da7e029bf/packages%2Fcompiler-cli%2Ftest%2Fcompliance%2Fr3_compiler_compliance_spec.ts",
+            "raw_url": "https://github.com/angular/angular/raw/7e33cb9626aac76527eeb8f05683167da7e029bf/packages%2Fcompiler-cli%2Ftest%2Fcompliance%2Fr3_compiler_compliance_spec.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Ftest%2Fcompliance%2Fr3_compiler_compliance_spec.ts?ref=7e33cb9626aac76527eeb8f05683167da7e029bf",
+            "patch": "@@ -8,6 +8,7 @@\n \n import {AttributeMarker} from '@angular/compiler/src/core';\n import {setup} from '@angular/compiler/test/aot/test_util';\n+import * as ts from 'typescript';\n import {compile, expectEmit} from './mock_compile';\n \n \n@@ -3313,5 +3314,46 @@ describe('compiler compliance', () => {\n       const result = compile(files, angularFiles);\n       expectEmit(result.source, MyAppDeclaration, 'Invalid component definition');\n     });\n+\n+    it('should emit a valid setClassMetadata call in ES5 if a class with a custom decorator is referencing itself inside its own metadata',\n+       () => {\n+         const files = {\n+           app: {\n+             'spec.ts': `\n+                import {Component, InjectionToken} from \"@angular/core\";\n+\n+                const token = new InjectionToken('token');\n+\n+                export function Custom() {\n+                  return function(target: any) {};\n+                }\n+\n+                @Custom()\n+                @Component({\n+                  template: '',\n+                  providers: [{ provide: token, useExisting: Comp }],\n+                })\n+                export class Comp {}\n+              `\n+           }\n+         };\n+\n+         // The setClassMetadata call should look like this.\n+         const setClassMetadata = `\n+            …\n+            (function() {\n+              i0.ɵsetClassMetadata(Comp, [{\n+                type: Component,\n+                args: [{\n+                  template: '',\n+                  providers: [{ provide: token, useExisting: Comp }],\n+                }]\n+              }], null, null);\n+            })();\n+          `;\n+\n+         const result = compile(files, angularFiles, {target: ts.ScriptTarget.ES5});\n+         expectEmit(result.source, setClassMetadata, 'Incorrect setClassMetadata call');\n+       });\n   });\n });"
+        }
+    ],
+    "stats": {
+        "total": 67,
+        "additions": 65,
+        "deletions": 2
+    }
+}

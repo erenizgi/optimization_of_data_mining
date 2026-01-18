@@ -1,0 +1,48 @@
+{
+    "author": "aaugustin",
+    "message": "Used commit_on_success_unless_managed to make ORM operations atomic.",
+    "sha": "4dbd1b2dd8d997f439b0116748994fd538ff893a",
+    "files": [
+        {
+            "sha": "a04f05c73bf26466d9abe3400371a41b6c81fe06",
+            "filename": "django/db/models/deletion.py",
+            "status": "modified",
+            "additions": 32,
+            "deletions": 50,
+            "changes": 82,
+            "blob_url": "https://github.com/django/django/blob/4dbd1b2dd8d997f439b0116748994fd538ff893a/django%2Fdb%2Fmodels%2Fdeletion.py",
+            "raw_url": "https://github.com/django/django/raw/4dbd1b2dd8d997f439b0116748994fd538ff893a/django%2Fdb%2Fmodels%2Fdeletion.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fmodels%2Fdeletion.py?ref=4dbd1b2dd8d997f439b0116748994fd538ff893a",
+            "patch": "@@ -50,24 +50,6 @@ def DO_NOTHING(collector, field, sub_objs, using):\n     pass\n \n \n-def force_managed(func):\n-    @wraps(func)\n-    def decorated(self, *args, **kwargs):\n-        if transaction.get_autocommit(using=self.using):\n-            transaction.enter_transaction_management(using=self.using, forced=True)\n-            forced_managed = True\n-        else:\n-            forced_managed = False\n-        try:\n-            func(self, *args, **kwargs)\n-            if forced_managed:\n-                transaction.commit(using=self.using)\n-        finally:\n-            if forced_managed:\n-                transaction.leave_transaction_management(using=self.using)\n-    return decorated\n-\n-\n class Collector(object):\n     def __init__(self, using):\n         self.using = using\n@@ -260,7 +242,6 @@ def sort(self):\n         self.data = SortedDict([(model, self.data[model])\n                                 for model in sorted_models])\n \n-    @force_managed\n     def delete(self):\n         # sort instance collections\n         for model, instances in self.data.items():\n@@ -271,40 +252,41 @@ def delete(self):\n         # end of a transaction.\n         self.sort()\n \n-        # send pre_delete signals\n-        for model, obj in self.instances_with_model():\n-            if not model._meta.auto_created:\n-                signals.pre_delete.send(\n-                    sender=model, instance=obj, using=self.using\n-                )\n-\n-        # fast deletes\n-        for qs in self.fast_deletes:\n-            qs._raw_delete(using=self.using)\n-\n-        # update fields\n-        for model, instances_for_fieldvalues in six.iteritems(self.field_updates):\n-            query = sql.UpdateQuery(model)\n-            for (field, value), instances in six.iteritems(instances_for_fieldvalues):\n-                query.update_batch([obj.pk for obj in instances],\n-                                   {field.name: value}, self.using)\n-\n-        # reverse instance collections\n-        for instances in six.itervalues(self.data):\n-            instances.reverse()\n-\n-        # delete instances\n-        for model, instances in six.iteritems(self.data):\n-            query = sql.DeleteQuery(model)\n-            pk_list = [obj.pk for obj in instances]\n-            query.delete_batch(pk_list, self.using)\n-\n-            if not model._meta.auto_created:\n-                for obj in instances:\n-                    signals.post_delete.send(\n+        with transaction.commit_on_success_unless_managed(using=self.using):\n+            # send pre_delete signals\n+            for model, obj in self.instances_with_model():\n+                if not model._meta.auto_created:\n+                    signals.pre_delete.send(\n                         sender=model, instance=obj, using=self.using\n                     )\n \n+            # fast deletes\n+            for qs in self.fast_deletes:\n+                qs._raw_delete(using=self.using)\n+\n+            # update fields\n+            for model, instances_for_fieldvalues in six.iteritems(self.field_updates):\n+                query = sql.UpdateQuery(model)\n+                for (field, value), instances in six.iteritems(instances_for_fieldvalues):\n+                    query.update_batch([obj.pk for obj in instances],\n+                                       {field.name: value}, self.using)\n+\n+            # reverse instance collections\n+            for instances in six.itervalues(self.data):\n+                instances.reverse()\n+\n+            # delete instances\n+            for model, instances in six.iteritems(self.data):\n+                query = sql.DeleteQuery(model)\n+                pk_list = [obj.pk for obj in instances]\n+                query.delete_batch(pk_list, self.using)\n+\n+                if not model._meta.auto_created:\n+                    for obj in instances:\n+                        signals.post_delete.send(\n+                            sender=model, instance=obj, using=self.using\n+                        )\n+\n         # update collected instances\n         for model, instances_for_fieldvalues in six.iteritems(self.field_updates):\n             for (field, value), instances in six.iteritems(instances_for_fieldvalues):"
+        },
+        {
+            "sha": "22c7cfba323723fb0b011356e5d0b5a250b5f809",
+            "filename": "django/db/models/query.py",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 22,
+            "changes": 24,
+            "blob_url": "https://github.com/django/django/blob/4dbd1b2dd8d997f439b0116748994fd538ff893a/django%2Fdb%2Fmodels%2Fquery.py",
+            "raw_url": "https://github.com/django/django/raw/4dbd1b2dd8d997f439b0116748994fd538ff893a/django%2Fdb%2Fmodels%2Fquery.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fmodels%2Fquery.py?ref=4dbd1b2dd8d997f439b0116748994fd538ff893a",
+            "patch": "@@ -442,12 +442,7 @@ def bulk_create(self, objs, batch_size=None):\n         self._for_write = True\n         connection = connections[self.db]\n         fields = self.model._meta.local_fields\n-        if transaction.get_autocommit(using=self.db):\n-            transaction.enter_transaction_management(using=self.db, forced=True)\n-            forced_managed = True\n-        else:\n-            forced_managed = False\n-        try:\n+        with transaction.commit_on_success_unless_managed(using=self.db):\n             if (connection.features.can_combine_inserts_with_and_without_auto_increment_pk\n                 and self.model._meta.has_auto_field):\n                 self._batched_insert(objs, fields, batch_size)\n@@ -458,11 +453,6 @@ def bulk_create(self, objs, batch_size=None):\n                 if objs_without_pk:\n                     fields= [f for f in fields if not isinstance(f, AutoField)]\n                     self._batched_insert(objs_without_pk, fields, batch_size)\n-            if forced_managed:\n-                transaction.commit(using=self.db)\n-        finally:\n-            if forced_managed:\n-                transaction.leave_transaction_management(using=self.db)\n \n         return objs\n \n@@ -579,18 +569,8 @@ def update(self, **kwargs):\n         self._for_write = True\n         query = self.query.clone(sql.UpdateQuery)\n         query.add_update_values(kwargs)\n-        if transaction.get_autocommit(using=self.db):\n-            transaction.enter_transaction_management(using=self.db, forced=True)\n-            forced_managed = True\n-        else:\n-            forced_managed = False\n-        try:\n+        with transaction.commit_on_success_unless_managed(using=self.db):\n             rows = query.get_compiler(self.db).execute_sql(None)\n-            if forced_managed:\n-                transaction.commit(using=self.db)\n-        finally:\n-            if forced_managed:\n-                transaction.leave_transaction_management(using=self.db)\n         self._result_cache = None\n         return rows\n     update.alters_data = True"
+        },
+        {
+            "sha": "b8fc0d4efa435cf36ab7da074cf7002e6b5df306",
+            "filename": "docs/topics/db/transactions.txt",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 5,
+            "changes": 9,
+            "blob_url": "https://github.com/django/django/blob/4dbd1b2dd8d997f439b0116748994fd538ff893a/docs%2Ftopics%2Fdb%2Ftransactions.txt",
+            "raw_url": "https://github.com/django/django/raw/4dbd1b2dd8d997f439b0116748994fd538ff893a/docs%2Ftopics%2Fdb%2Ftransactions.txt",
+            "contents_url": "https://api.github.com/repos/django/django/contents/docs%2Ftopics%2Fdb%2Ftransactions.txt?ref=4dbd1b2dd8d997f439b0116748994fd538ff893a",
+            "patch": "@@ -16,11 +16,10 @@ Django's default behavior is to run in autocommit mode. Each query is\n immediately committed to the database. :ref:`See below for details\n <autocommit-details>`.\n \n-..\n-   Django uses transactions or savepoints automatically to guarantee the\n-   integrity of ORM operations that require multiple queries, especially\n-   :ref:`delete() <topics-db-queries-delete>` and :ref:`update()\n-   <topics-db-queries-update>` queries.\n+Django uses transactions or savepoints automatically to guarantee the\n+integrity of ORM operations that require multiple queries, especially\n+:ref:`delete() <topics-db-queries-delete>` and :ref:`update()\n+<topics-db-queries-update>` queries.\n \n .. versionchanged:: 1.6\n     Previous version of Django featured :ref:`a more complicated default"
+        }
+    ],
+    "stats": {
+        "total": 115,
+        "additions": 38,
+        "deletions": 77
+    }
+}

@@ -1,0 +1,72 @@
+{
+    "author": "devversion",
+    "message": "fix(dev-infra): use API pagination for retrieving project branches (#42666)\n\nWe rely on a Github API `/branches` request to determine the active\nrelease trains. Currently this logic is broken if more than 100\nprotected branches exist within a repository. This issue surfaced\nrecently where the `items_per_page` setting was set to `30`, causing\nthe merge tooling and release tooling to not detect the proper \"latest\"\nrelease train.\n\nThis commit uses Github pagination for retrieving branches to determine\nthe active release trains, and makes the logic more long-term proof.\n\nPR Close #42666",
+    "sha": "f29fe5ced02ec449cfefae3d6056aa594ae88bea",
+    "files": [
+        {
+            "sha": "ab87dd41df94837bb42784633cc695b1f95637ab",
+            "filename": "dev-infra/ng-dev.js",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 3,
+            "changes": 4,
+            "blob_url": "https://github.com/angular/angular/blob/f29fe5ced02ec449cfefae3d6056aa594ae88bea/dev-infra%2Fng-dev.js",
+            "raw_url": "https://github.com/angular/angular/raw/f29fe5ced02ec449cfefae3d6056aa594ae88bea/dev-infra%2Fng-dev.js",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/dev-infra%2Fng-dev.js?ref=f29fe5ced02ec449cfefae3d6056aa594ae88bea",
+            "patch": "@@ -899,9 +899,7 @@ function getVersionForVersionBranch(branchName) {\n  */\n function getBranchesForMajorVersions(repo, majorVersions) {\n     return tslib.__awaiter(this, void 0, void 0, function* () {\n-        // TODO(alxhub): actually paginate this, since eventually the number of branches we have will run\n-        // off the end of the first page of data returned by `listBranches`.\n-        const { data: branchData } = yield repo.api.repos.listBranches({ owner: repo.owner, repo: repo.name, protected: true, per_page: 100 });\n+        const branchData = yield repo.api.paginate(repo.api.repos.listBranches, { owner: repo.owner, repo: repo.name, protected: true });\n         const branches = [];\n         for (const { name } of branchData) {\n             if (!isVersionBranch(name)) {"
+        },
+        {
+            "sha": "8a8c21badaeb126127a74f0c382a270221112c76",
+            "filename": "dev-infra/pr/merge/BUILD.bazel",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/angular/angular/blob/f29fe5ced02ec449cfefae3d6056aa594ae88bea/dev-infra%2Fpr%2Fmerge%2FBUILD.bazel",
+            "raw_url": "https://github.com/angular/angular/raw/f29fe5ced02ec449cfefae3d6056aa594ae88bea/dev-infra%2Fpr%2Fmerge%2FBUILD.bazel",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/dev-infra%2Fpr%2Fmerge%2FBUILD.bazel?ref=f29fe5ced02ec449cfefae3d6056aa594ae88bea",
+            "patch": "@@ -38,6 +38,7 @@ ts_library(\n         \"//dev-infra/release/config\",\n         \"//dev-infra/release/versioning\",\n         \"//dev-infra/utils\",\n+        \"//dev-infra/utils/testing\",\n         \"@npm//@types/jasmine\",\n         \"@npm//@types/node\",\n         \"@npm//@types/node-fetch\","
+        },
+        {
+            "sha": "83a86bb2a8862ced404a9297ba3f89df3554bfcf",
+            "filename": "dev-infra/pr/merge/defaults/integration.spec.ts",
+            "status": "modified",
+            "additions": 37,
+            "deletions": 2,
+            "changes": 39,
+            "blob_url": "https://github.com/angular/angular/blob/f29fe5ced02ec449cfefae3d6056aa594ae88bea/dev-infra%2Fpr%2Fmerge%2Fdefaults%2Fintegration.spec.ts",
+            "raw_url": "https://github.com/angular/angular/raw/f29fe5ced02ec449cfefae3d6056aa594ae88bea/dev-infra%2Fpr%2Fmerge%2Fdefaults%2Fintegration.spec.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/dev-infra%2Fpr%2Fmerge%2Fdefaults%2Fintegration.spec.ts?ref=f29fe5ced02ec449cfefae3d6056aa594ae88bea",
+            "patch": "@@ -7,12 +7,14 @@\n  */\n \n import * as nock from 'nock';\n+import {ParsedUrlQuery} from 'querystring';\n \n import {ReleaseConfig} from '../../../release/config/index';\n import {_npmPackageInfoCache, NpmPackageInfo} from '../../../release/versioning/npm-registry';\n import {GithubConfig} from '../../../utils/config';\n import * as console from '../../../utils/console';\n import {GithubClient} from '../../../utils/git/github';\n+import {buildGithubPaginationResponseHeader} from '../../../utils/testing/github-pagination-header';\n import {TargetLabel} from '../config';\n import {getBranchesFromTargetLabel, getTargetLabelFromPullRequest} from '../target-label';\n \n@@ -79,7 +81,35 @@ describe('default target labels', () => {\n     nock(getRepoApiRequestUrl())\n         .get('/branches')\n         .query(true)\n-        .reply(200, branches.map(name => ({name})));\n+        .reply(200, branches.slice(0, 29).map(name => ({name})));\n+  }\n+\n+  /**\n+   * Mocks a repository branch list API request with pagination.\n+   * https://docs.github.com/en/rest/guides/traversing-with-pagination.\n+   * https://docs.github.com/en/rest/reference/repos#list-branches.\n+   */\n+  function interceptBranchesListRequestWithPagination(branches: string[]) {\n+    const apiUrl = getRepoApiRequestUrl();\n+\n+    // For each branch, create its own API page so that pagination is required\n+    // to resolve all given branches.\n+    for (let index = 0; index < branches.length; index++) {\n+      // Pages start with `1` as per the Github API specification.\n+      const pageNum = index + 1;\n+      const name = branches[index];\n+      const linkHeader =\n+          buildGithubPaginationResponseHeader(branches.length, pageNum, `${apiUrl}/branches`);\n+\n+      // For the first page, either `?page=1` needs to be set, or no `page` should be specified.\n+      const queryMatch = pageNum === 1 ?\n+          (params: ParsedUrlQuery) => params.page === '1' || params.page === undefined :\n+          {page: pageNum};\n+\n+      nock(getRepoApiRequestUrl()).get('/branches').query(queryMatch).reply(200, [{name}], {\n+        link: linkHeader,\n+      });\n+    }\n   }\n \n   async function getBranchesForLabel(\n@@ -99,7 +129,12 @@ describe('default target labels', () => {\n   it('should detect \"master\" as branch for target: minor', async () => {\n     interceptBranchVersionRequest('master', '11.0.0-next.0');\n     interceptBranchVersionRequest('10.2.x', '10.2.4');\n-    interceptBranchesListRequest(['10.2.x']);\n+\n+    // Note: We add a few more branches here to ensure that branches API requests are\n+    // paginated properly. In Angular projects, there are usually many branches so that\n+    // pagination is ultimately needed to detect the active release trains.\n+    // See: https://github.com/angular/angular/commit/261b060fa168754db00248d1c5c9574bb19a72b4.\n+    interceptBranchesListRequestWithPagination(['9.8.x', '10.1.x', '10.2.x']);\n \n     expect(await getBranchesForLabel('target: minor')).toEqual(['master']);\n   });"
+        },
+        {
+            "sha": "5f47dc117b5efe08b4347cb816437331baa313b5",
+            "filename": "dev-infra/release/versioning/version-branches.ts",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 4,
+            "changes": 6,
+            "blob_url": "https://github.com/angular/angular/blob/f29fe5ced02ec449cfefae3d6056aa594ae88bea/dev-infra%2Frelease%2Fversioning%2Fversion-branches.ts",
+            "raw_url": "https://github.com/angular/angular/raw/f29fe5ced02ec449cfefae3d6056aa594ae88bea/dev-infra%2Frelease%2Fversioning%2Fversion-branches.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/dev-infra%2Frelease%2Fversioning%2Fversion-branches.ts?ref=f29fe5ced02ec449cfefae3d6056aa594ae88bea",
+            "patch": "@@ -72,10 +72,8 @@ export function getVersionForVersionBranch(branchName: string): semver.SemVer|nu\n  */\n export async function getBranchesForMajorVersions(\n     repo: GithubRepoWithApi, majorVersions: number[]): Promise<VersionBranch[]> {\n-  // TODO(alxhub): actually paginate this, since eventually the number of branches we have will run\n-  // off the end of the first page of data returned by `listBranches`.\n-  const {data: branchData} = await repo.api.repos.listBranches(\n-      {owner: repo.owner, repo: repo.name, protected: true, per_page: 100});\n+  const branchData = await repo.api.paginate(\n+      repo.api.repos.listBranches, {owner: repo.owner, repo: repo.name, protected: true});\n   const branches: VersionBranch[] = [];\n \n   for (const {name} of branchData) {"
+        },
+        {
+            "sha": "094250cbf50f954ff886999920c559714ebd0831",
+            "filename": "dev-infra/utils/testing/github-pagination-header.ts",
+            "status": "added",
+            "additions": 28,
+            "deletions": 0,
+            "changes": 28,
+            "blob_url": "https://github.com/angular/angular/blob/f29fe5ced02ec449cfefae3d6056aa594ae88bea/dev-infra%2Futils%2Ftesting%2Fgithub-pagination-header.ts",
+            "raw_url": "https://github.com/angular/angular/raw/f29fe5ced02ec449cfefae3d6056aa594ae88bea/dev-infra%2Futils%2Ftesting%2Fgithub-pagination-header.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/dev-infra%2Futils%2Ftesting%2Fgithub-pagination-header.ts?ref=f29fe5ced02ec449cfefae3d6056aa594ae88bea",
+            "patch": "@@ -0,0 +1,28 @@\n+/**\n+ * @license\n+ * Copyright Google LLC All Rights Reserved.\n+ *\n+ * Use of this source code is governed by an MIT-style license that can be\n+ * found in the LICENSE file at https://angular.io/license\n+ */\n+\n+/**\n+ * Builds the `Link` response header to indicate an API response that is suitable\n+ * for pagination. This follows the specification as outlined within:\n+ * https://docs.github.com/en/rest/guides/traversing-with-pagination\n+ */\n+export function buildGithubPaginationResponseHeader(\n+    totalPages: number, currentPage: number, baseUrl: string) {\n+  const links = [`<${baseUrl}?page=1>; rel=\"first\"`, `<${baseUrl}?page=${totalPages}>; rel=\"last\"`];\n+\n+  if (currentPage < totalPages) {\n+    links.push(`<${baseUrl}?page=${currentPage + 1}>; rel=\"next\"`);\n+  }\n+\n+  // Pages start with `1` as per the Github API specification.\n+  if (currentPage > 1) {\n+    links.push(`<${baseUrl}?page=${currentPage - 1}>; rel=\"prev\"`);\n+  }\n+\n+  return links.join(',');\n+}"
+        }
+    ],
+    "stats": {
+        "total": 78,
+        "additions": 69,
+        "deletions": 9
+    }
+}

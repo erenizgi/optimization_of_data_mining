@@ -1,0 +1,60 @@
+{
+    "author": "addaleax",
+    "message": "net: use `_final` instead of `on('finish')`\n\nShutting down the connection is what `_final` is there for.\n\nPR-URL: https://github.com/nodejs/node/pull/18608\nReviewed-By: Luigi Pinca <luigipinca@gmail.com>\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Matteo Collina <matteo.collina@gmail.com>",
+    "sha": "03ddd13d8a72190aa22194eb535e9cb683f4f815",
+    "files": [
+        {
+            "sha": "985332ac4607a8532cbc17798fd5bf3ca915ff62",
+            "filename": "lib/internal/streams/destroy.js",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/03ddd13d8a72190aa22194eb535e9cb683f4f815/lib%2Finternal%2Fstreams%2Fdestroy.js",
+            "raw_url": "https://github.com/nodejs/node/raw/03ddd13d8a72190aa22194eb535e9cb683f4f815/lib%2Finternal%2Fstreams%2Fdestroy.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fstreams%2Fdestroy.js?ref=03ddd13d8a72190aa22194eb535e9cb683f4f815",
+            "patch": "@@ -55,6 +55,8 @@ function undestroy() {\n     this._writableState.destroyed = false;\n     this._writableState.ended = false;\n     this._writableState.ending = false;\n+    this._writableState.finalCalled = false;\n+    this._writableState.prefinished = false;\n     this._writableState.finished = false;\n     this._writableState.errorEmitted = false;\n   }"
+        },
+        {
+            "sha": "edf8a6c0bc545baf83ada7da636f9e9d91174cdb",
+            "filename": "lib/net.js",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 12,
+            "changes": 28,
+            "blob_url": "https://github.com/nodejs/node/blob/03ddd13d8a72190aa22194eb535e9cb683f4f815/lib%2Fnet.js",
+            "raw_url": "https://github.com/nodejs/node/raw/03ddd13d8a72190aa22194eb535e9cb683f4f815/lib%2Fnet.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Fnet.js?ref=03ddd13d8a72190aa22194eb535e9cb683f4f815",
+            "patch": "@@ -256,7 +256,6 @@ function Socket(options) {\n   }\n \n   // shut down the socket when we're finished with it.\n-  this.on('finish', onSocketFinish);\n   this.on('_socketEnd', onSocketEnd);\n \n   initSocketHandle(this);\n@@ -303,39 +302,42 @@ Socket.prototype._unrefTimer = function _unrefTimer() {\n \n function shutdownSocket(self, callback) {\n   var req = new ShutdownWrap();\n-  req.oncomplete = callback;\n+  req.oncomplete = afterShutdown;\n   req.handle = self._handle;\n+  req.callback = callback;\n   return self._handle.shutdown(req);\n }\n \n // the user has called .end(), and all the bytes have been\n // sent out to the other side.\n-function onSocketFinish() {\n-  // If still connecting - defer handling 'finish' until 'connect' will happen\n+Socket.prototype._final = function(cb) {\n+  // If still connecting - defer handling `_final` until 'connect' will happen\n   if (this.connecting) {\n-    debug('osF: not yet connected');\n-    return this.once('connect', onSocketFinish);\n+    debug('_final: not yet connected');\n+    return this.once('connect', () => this._final(cb));\n   }\n \n-  debug('onSocketFinish');\n   if (!this.readable || this._readableState.ended) {\n-    debug('oSF: ended, destroy', this._readableState);\n+    debug('_final: ended, destroy', this._readableState);\n+    cb();\n     return this.destroy();\n   }\n \n-  debug('oSF: not ended, call shutdown()');\n+  debug('_final: not ended, call shutdown()');\n \n   // otherwise, just shutdown, or destroy() if not possible\n-  if (!this._handle || !this._handle.shutdown)\n+  if (!this._handle || !this._handle.shutdown) {\n+    cb();\n     return this.destroy();\n+  }\n \n   var err = defaultTriggerAsyncIdScope(\n-    this[async_id_symbol], shutdownSocket, this, afterShutdown\n+    this[async_id_symbol], shutdownSocket, this, cb\n   );\n \n   if (err)\n     return this.destroy(errnoException(err, 'shutdown'));\n-}\n+};\n \n \n function afterShutdown(status, handle) {\n@@ -344,6 +346,8 @@ function afterShutdown(status, handle) {\n   debug('afterShutdown destroyed=%j', self.destroyed,\n         self._readableState);\n \n+  this.callback();\n+\n   // callback may come after call to destroy.\n   if (self.destroyed)\n     return;"
+        },
+        {
+            "sha": "fea4a3a166a270f51f9d63caed75079b3c99c259",
+            "filename": "test/async-hooks/test-shutdownwrap.js",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 5,
+            "changes": 12,
+            "blob_url": "https://github.com/nodejs/node/blob/03ddd13d8a72190aa22194eb535e9cb683f4f815/test%2Fasync-hooks%2Ftest-shutdownwrap.js",
+            "raw_url": "https://github.com/nodejs/node/raw/03ddd13d8a72190aa22194eb535e9cb683f4f815/test%2Fasync-hooks%2Ftest-shutdownwrap.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fasync-hooks%2Ftest-shutdownwrap.js?ref=03ddd13d8a72190aa22194eb535e9cb683f4f815",
+            "patch": "@@ -24,11 +24,13 @@ let endedConnection = false;\n function onconnection(c) {\n   assert.strictEqual(hooks.activitiesOfTypes('SHUTDOWNWRAP').length, 0);\n   c.end();\n-  endedConnection = true;\n-  const as = hooks.activitiesOfTypes('SHUTDOWNWRAP');\n-  assert.strictEqual(as.length, 1);\n-  checkInvocations(as[0], { init: 1 }, 'after ending client connection');\n-  this.close(onserverClosed);\n+  process.nextTick(() => {\n+    endedConnection = true;\n+    const as = hooks.activitiesOfTypes('SHUTDOWNWRAP');\n+    assert.strictEqual(as.length, 1);\n+    checkInvocations(as[0], { init: 1 }, 'after ending client connection');\n+    this.close(onserverClosed);\n+  });\n }\n \n function onconnected() {"
+        },
+        {
+            "sha": "46c485111778139006ed407ccfeada1de967958f",
+            "filename": "test/parallel/test-stream-writable-destroy.js",
+            "status": "modified",
+            "additions": 14,
+            "deletions": 0,
+            "changes": 14,
+            "blob_url": "https://github.com/nodejs/node/blob/03ddd13d8a72190aa22194eb535e9cb683f4f815/test%2Fparallel%2Ftest-stream-writable-destroy.js",
+            "raw_url": "https://github.com/nodejs/node/raw/03ddd13d8a72190aa22194eb535e9cb683f4f815/test%2Fparallel%2Ftest-stream-writable-destroy.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-stream-writable-destroy.js?ref=03ddd13d8a72190aa22194eb535e9cb683f4f815",
+            "patch": "@@ -185,3 +185,17 @@ const { inherits } = require('util');\n     assert.strictEqual(expected, err);\n   }));\n }\n+\n+{\n+  // Checks that `._undestroy()` restores the state so that `final` will be\n+  // called again.\n+  const write = new Writable({\n+    write: common.mustNotCall(),\n+    final: common.mustCall((cb) => cb(), 2)\n+  });\n+\n+  write.end();\n+  write.destroy();\n+  write._undestroy();\n+  write.end();\n+}"
+        }
+    ],
+    "stats": {
+        "total": 56,
+        "additions": 39,
+        "deletions": 17
+    }
+}

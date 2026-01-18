@@ -1,0 +1,24 @@
+{
+    "author": "rvagg",
+    "message": "deps: float a9cfb8c2 from openssl (CVE-2018-0734)\n\nLow severity timing vulnerability in the DSA signature algorithm\n\nPublicly disclosed but unreleased, pending OpenSSL 1.1.0j\n\nRef: https://github.com/openssl/openssl/pull/7486\nRef: https://www.openssl.org/news/secadv/20181030.txt\nPR-URL: https://github.com/nodejs/node/pull/???\nUpstream: https://github.com/openssl/openssl/commit/a9cfb8c2\n\nOriginal commit message:\n\n    Avoid a timing attack that leaks information via a side channel that\n    triggers when a BN is resized.  Increasing the size of the BNs\n    prior to doing anything with them suppresses the attack.\n\n    Thanks due to Samuel Weiser for finding and locating this.\n\n    Reviewed-by: Bernd Edlinger <bernd.edlinger@hotmail.de>\n    (Merged from https://github.com/openssl/openssl/pull/7486)\n\nPR-URL: https://github.com/nodejs/node/pull/23965\nReviewed-By: Ujjwal Sharma <usharma1998@gmail.com>\nReviewed-By: Tobias Nießen <tniessen@tnie.de>\nReviewed-By: Franziska Hinkelmann <franziska.hinkelmann@gmail.com>\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "213c7d2d6465de7c8ac416da678b8b2d7445e614",
+    "files": [
+        {
+            "sha": "be58625db3b1629e52fbf196589818edf1d722a6",
+            "filename": "deps/openssl/openssl/crypto/dsa/dsa_ossl.c",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 13,
+            "changes": 28,
+            "blob_url": "https://github.com/nodejs/node/blob/213c7d2d6465de7c8ac416da678b8b2d7445e614/deps%2Fopenssl%2Fopenssl%2Fcrypto%2Fdsa%2Fdsa_ossl.c",
+            "raw_url": "https://github.com/nodejs/node/raw/213c7d2d6465de7c8ac416da678b8b2d7445e614/deps%2Fopenssl%2Fopenssl%2Fcrypto%2Fdsa%2Fdsa_ossl.c",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/deps%2Fopenssl%2Fopenssl%2Fcrypto%2Fdsa%2Fdsa_ossl.c?ref=213c7d2d6465de7c8ac416da678b8b2d7445e614",
+            "patch": "@@ -11,6 +11,7 @@\n \n #include <stdio.h>\n #include \"internal/cryptlib.h\"\n+#include \"internal/bn_int.h\"\n #include <openssl/bn.h>\n #include <openssl/sha.h>\n #include \"dsa_locl.h\"\n@@ -182,9 +183,9 @@ static int dsa_sign_setup(DSA *dsa, BN_CTX *ctx_in,\n {\n     BN_CTX *ctx = NULL;\n     BIGNUM *k, *kinv = NULL, *r = *rp;\n-    BIGNUM *l, *m;\n+    BIGNUM *l;\n     int ret = 0;\n-    int q_bits;\n+    int q_bits, q_words;\n \n     if (!dsa->p || !dsa->q || !dsa->g) {\n         DSAerr(DSA_F_DSA_SIGN_SETUP, DSA_R_MISSING_PARAMETERS);\n@@ -193,8 +194,7 @@ static int dsa_sign_setup(DSA *dsa, BN_CTX *ctx_in,\n \n     k = BN_new();\n     l = BN_new();\n-    m = BN_new();\n-    if (k == NULL || l == NULL || m == NULL)\n+    if (k == NULL || l == NULL)\n         goto err;\n \n     if (ctx_in == NULL) {\n@@ -205,9 +205,9 @@ static int dsa_sign_setup(DSA *dsa, BN_CTX *ctx_in,\n \n     /* Preallocate space */\n     q_bits = BN_num_bits(dsa->q);\n-    if (!BN_set_bit(k, q_bits)\n-        || !BN_set_bit(l, q_bits)\n-        || !BN_set_bit(m, q_bits))\n+    q_words = bn_get_top(dsa->q);\n+    if (!bn_wexpand(k, q_words + 2)\n+        || !bn_wexpand(l, q_words + 2))\n         goto err;\n \n     /* Get random k */\n@@ -242,14 +242,17 @@ static int dsa_sign_setup(DSA *dsa, BN_CTX *ctx_in,\n      * small timing information leakage.  We then choose the sum that is\n      * one bit longer than the modulus.\n      *\n-     * TODO: revisit the BN_copy aiming for a memory access agnostic\n-     * conditional copy.\n+     * There are some concerns about the efficacy of doing this.  More\n+     * specificly refer to the discussion starting with:\n+     *     https://github.com/openssl/openssl/pull/7486#discussion_r228323705\n+     * The fix is to rework BN so these gymnastics aren't required.\n      */\n     if (!BN_add(l, k, dsa->q)\n-        || !BN_add(m, l, dsa->q)\n-        || !BN_copy(k, BN_num_bits(l) > q_bits ? l : m))\n+        || !BN_add(k, l, dsa->q))\n         goto err;\n \n+    BN_consttime_swap(BN_is_bit_set(l, q_bits), k, l, q_words + 2);\n+\n     if ((dsa)->meth->bn_mod_exp != NULL) {\n             if (!dsa->meth->bn_mod_exp(dsa, r, dsa->g, k, dsa->p, ctx,\n                                        dsa->method_mont_p))\n@@ -262,7 +265,7 @@ static int dsa_sign_setup(DSA *dsa, BN_CTX *ctx_in,\n     if (!BN_mod(r, r, dsa->q, ctx))\n         goto err;\n \n-    /* Compute  part of 's = inv(k) (m + xr) mod q' */\n+    /* Compute part of 's = inv(k) (m + xr) mod q' */\n     if ((kinv = dsa_mod_inverse_fermat(k, dsa->q, ctx)) == NULL)\n         goto err;\n \n@@ -277,7 +280,6 @@ static int dsa_sign_setup(DSA *dsa, BN_CTX *ctx_in,\n         BN_CTX_free(ctx);\n     BN_clear_free(k);\n     BN_clear_free(l);\n-    BN_clear_free(m);\n     return ret;\n }\n "
+        }
+    ],
+    "stats": {
+        "total": 28,
+        "additions": 15,
+        "deletions": 13
+    }
+}

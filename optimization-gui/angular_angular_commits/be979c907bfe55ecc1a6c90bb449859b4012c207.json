@@ -1,0 +1,108 @@
+{
+    "author": "alxhub",
+    "message": "perf(compiler-cli): introduce fast path for resource-only updates (#40561)\n\nThis commit adds a new `IncrementalResourceCompilationTicket` which reuses\nan existing `NgCompiler` instance and updates it to optimally process\ntemplate-only and style-only changes. Performing this update involves both\ninstructing `DecoratorHandler`s to react to the resource changes, as well as\ninvalidating `TemplateTypeChecker` state for the component(s) in question.\nThat way, querying the `TemplateTypeChecker` will trigger new TCB generation\nfor the changed template(s).\n\nPR Close #40561",
+    "sha": "be979c907bfe55ecc1a6c90bb449859b4012c207",
+    "files": [
+        {
+            "sha": "f68f4bc21d0435e3fbfb636644a579298ce4ec8f",
+            "filename": "packages/compiler-cli/src/ngtsc/annotations/src/component.ts",
+            "status": "modified",
+            "additions": 45,
+            "deletions": 0,
+            "changes": 45,
+            "blob_url": "https://github.com/angular/angular/blob/be979c907bfe55ecc1a6c90bb449859b4012c207/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fannotations%2Fsrc%2Fcomponent.ts",
+            "raw_url": "https://github.com/angular/angular/raw/be979c907bfe55ecc1a6c90bb449859b4012c207/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fannotations%2Fsrc%2Fcomponent.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fannotations%2Fsrc%2Fcomponent.ts?ref=be979c907bfe55ecc1a6c90bb449859b4012c207",
+            "patch": "@@ -71,6 +71,16 @@ export interface ComponentAnalysisData {\n \n   resources: ComponentResources;\n \n+  /**\n+   * The literal `styleUrls` extracted from the decorator, if present.\n+   */\n+  styleUrls: string[]|null;\n+\n+  /**\n+   * Inline stylesheets extracted from the decorator, if present.\n+   */\n+  inlineStyles: string[]|null;\n+\n   isPoisoned: boolean;\n }\n \n@@ -275,9 +285,11 @@ export class ComponentDecoratorHandler implements\n         }\n       }\n     }\n+    let inlineStyles: string[]|null = null;\n     if (component.has('styles')) {\n       const litStyles = parseFieldArrayValue(component, 'styles', this.evaluator);\n       if (litStyles !== null) {\n+        inlineStyles = [...litStyles];\n         if (styles === null) {\n           styles = litStyles;\n         } else {\n@@ -333,6 +345,8 @@ export class ComponentDecoratorHandler implements\n         template,\n         providersRequiringFactory,\n         viewProvidersRequiringFactory,\n+        inlineStyles,\n+        styleUrls,\n         resources: {\n           styles: styleResources,\n           template: templateResource,\n@@ -581,6 +595,37 @@ export class ComponentDecoratorHandler implements\n     return {data};\n   }\n \n+  updateResources(node: ClassDeclaration, analysis: ComponentAnalysisData): void {\n+    const containingFile = node.getSourceFile().fileName;\n+\n+    // If the template is external, re-parse it.\n+    const templateDecl = analysis.template.declaration;\n+    if (!templateDecl.isInline) {\n+      analysis.template = this.extractTemplate(node, templateDecl);\n+    }\n+\n+    // Update any external stylesheets and rebuild the combined 'styles' list.\n+    // TODO(alxhub): write tests for styles when the primary compiler uses the updateResources path\n+    let styles: string[] = [];\n+    if (analysis.styleUrls !== null) {\n+      for (const styleUrl of analysis.styleUrls) {\n+        const resolvedStyleUrl = this.resourceLoader.resolve(styleUrl, containingFile);\n+        const styleText = this.resourceLoader.load(resolvedStyleUrl);\n+        styles.push(styleText);\n+      }\n+    }\n+    if (analysis.inlineStyles !== null) {\n+      for (const styleText of analysis.inlineStyles) {\n+        styles.push(styleText);\n+      }\n+    }\n+    for (const styleText of analysis.template.styles) {\n+      styles.push(styleText);\n+    }\n+\n+    analysis.meta.styles = styles;\n+  }\n+\n   compileFull(\n       node: ClassDeclaration, analysis: Readonly<ComponentAnalysisData>,\n       resolution: Readonly<ComponentResolutionData>, pool: ConstantPool): CompileResult[] {"
+        },
+        {
+            "sha": "3f55b98f97d436a6fb2dfef5c54e684574547a02",
+            "filename": "packages/compiler-cli/src/ngtsc/core/src/compiler.ts",
+            "status": "modified",
+            "additions": 52,
+            "deletions": 1,
+            "changes": 53,
+            "blob_url": "https://github.com/angular/angular/blob/be979c907bfe55ecc1a6c90bb449859b4012c207/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fcore%2Fsrc%2Fcompiler.ts",
+            "raw_url": "https://github.com/angular/angular/raw/be979c907bfe55ecc1a6c90bb449859b4012c207/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fcore%2Fsrc%2Fcompiler.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fcore%2Fsrc%2Fcompiler.ts?ref=be979c907bfe55ecc1a6c90bb449859b4012c207",
+            "patch": "@@ -63,6 +63,7 @@ interface LazyCompilationState {\n export enum CompilationTicketKind {\n   Fresh,\n   IncrementalTypeScript,\n+  IncrementalResource,\n }\n \n /**\n@@ -93,14 +94,21 @@ export interface IncrementalTypeScriptCompilationTicket {\n   usePoisonedData: boolean;\n }\n \n+export interface IncrementalResourceCompilationTicket {\n+  kind: CompilationTicketKind.IncrementalResource;\n+  compiler: NgCompiler;\n+  modifiedResourceFiles: Set<string>;\n+}\n+\n /**\n  * A request to begin Angular compilation, either starting from scratch or from a known prior state.\n  *\n  * `CompilationTicket`s are used to initialize (or update) an `NgCompiler` instance, the core of the\n  * Angular compiler. They abstract the starting state of compilation and allow `NgCompiler` to be\n  * managed independently of any incremental compilation lifecycle.\n  */\n-export type CompilationTicket = FreshCompilationTicket|IncrementalTypeScriptCompilationTicket;\n+export type CompilationTicket = FreshCompilationTicket|IncrementalTypeScriptCompilationTicket|\n+    IncrementalResourceCompilationTicket;\n \n /**\n  * Create a `CompilationTicket` for a brand new compilation, using no prior state.\n@@ -180,6 +188,15 @@ export function incrementalFromDriverTicket(\n   };\n }\n \n+export function resourceChangeTicket(compiler: NgCompiler, modifiedResourceFiles: Set<string>):\n+    IncrementalResourceCompilationTicket {\n+  return {\n+    kind: CompilationTicketKind.IncrementalResource,\n+    compiler,\n+    modifiedResourceFiles,\n+  };\n+}\n+\n \n /**\n  * The heart of the Angular Ivy compiler.\n@@ -260,6 +277,10 @@ export class NgCompiler {\n             ticket.usePoisonedData,\n             perfRecorder,\n         );\n+      case CompilationTicketKind.IncrementalResource:\n+        const compiler = ticket.compiler;\n+        compiler.updateWithChangedResources(ticket.modifiedResourceFiles);\n+        return compiler;\n     }\n   }\n \n@@ -306,6 +327,36 @@ export class NgCompiler {\n     this.ignoreForEmit = this.adapter.ignoreForEmit;\n   }\n \n+  private updateWithChangedResources(changedResources: Set<string>): void {\n+    if (this.compilation === null) {\n+      // Analysis hasn't happened yet, so no update is necessary - any changes to resources will be\n+      // captured by the inital analysis pass itself.\n+      return;\n+    }\n+\n+    this.resourceManager.invalidate();\n+\n+    const classesToUpdate = new Set<DeclarationNode>();\n+    for (const resourceFile of changedResources) {\n+      for (const templateClass of this.getComponentsWithTemplateFile(resourceFile)) {\n+        classesToUpdate.add(templateClass);\n+      }\n+\n+      for (const styleClass of this.getComponentsWithStyleFile(resourceFile)) {\n+        classesToUpdate.add(styleClass);\n+      }\n+    }\n+\n+    for (const clazz of classesToUpdate) {\n+      this.compilation.traitCompiler.updateResources(clazz);\n+      if (!ts.isClassDeclaration(clazz)) {\n+        continue;\n+      }\n+\n+      this.compilation.templateTypeChecker.invalidateClass(clazz);\n+    }\n+  }\n+\n   /**\n    * Get the resource dependencies of a file.\n    *"
+        },
+        {
+            "sha": "785499527d1199100378e015160132d13f989bf6",
+            "filename": "packages/compiler-cli/src/ngtsc/core/test/compiler_test.ts",
+            "status": "modified",
+            "additions": 49,
+            "deletions": 1,
+            "changes": 50,
+            "blob_url": "https://github.com/angular/angular/blob/be979c907bfe55ecc1a6c90bb449859b4012c207/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fcore%2Ftest%2Fcompiler_test.ts",
+            "raw_url": "https://github.com/angular/angular/raw/be979c907bfe55ecc1a6c90bb449859b4012c207/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fcore%2Ftest%2Fcompiler_test.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fcore%2Ftest%2Fcompiler_test.ts?ref=be979c907bfe55ecc1a6c90bb449859b4012c207",
+            "patch": "@@ -17,7 +17,7 @@ import {OptimizeFor, TypeCheckingProgramStrategy} from '../../typecheck/api';\n \n import {NgCompilerOptions} from '../api';\n \n-import {freshCompilationTicket, NgCompiler} from '../src/compiler';\n+import {freshCompilationTicket, NgCompiler, resourceChangeTicket} from '../src/compiler';\n import {NgCompilerHost} from '../src/host';\n \n function makeFreshCompiler(\n@@ -111,6 +111,7 @@ runInEachFileSystem(() => {\n         const program = ts.createProgram({host, options, rootNames: host.inputFiles});\n         const CmpA = getClass(getSourceFileOrError(program, cmpAFile), 'CmpA');\n         const CmpC = getClass(getSourceFileOrError(program, cmpCFile), 'CmpC');\n+\n         const compiler = makeFreshCompiler(\n             host, options, program, new ReusedProgramStrategy(program, host, options, []),\n             new NoopIncrementalBuildStrategy(), /** enableTemplateTypeChecker */ false,\n@@ -278,6 +279,53 @@ runInEachFileSystem(() => {\n         ]));\n       });\n     });\n+\n+    describe('resource-only changes', () => {\n+      it('should reuse the full compilation state for a resource-only change', () => {\n+        const COMPONENT = _('/cmp.ts');\n+        const TEMPLATE = _('/template.html');\n+        fs.writeFile(COMPONENT, `\n+          import {Component} from '@angular/core';\n+          @Component({\n+            selector: 'test-cmp',\n+            templateUrl: './template.html',\n+          })\n+          export class Cmp {}\n+        `);\n+        fs.writeFile(TEMPLATE, `<h1>Resource</h1>`);\n+\n+        const options: NgCompilerOptions = {\n+          strictTemplates: true,\n+        };\n+        const baseHost = new NgtscCompilerHost(getFileSystem(), options);\n+        const host = NgCompilerHost.wrap(baseHost, [COMPONENT], options, /* oldProgram */ null);\n+        const program = ts.createProgram({host, options, rootNames: host.inputFiles});\n+        const compilerA = makeFreshCompiler(\n+            host, options, program, new ReusedProgramStrategy(program, host, options, []),\n+            new NoopIncrementalBuildStrategy(), /** enableTemplateTypeChecker */ false,\n+            /* usePoisonedData */ false);\n+\n+        const componentSf = getSourceFileOrError(program, COMPONENT);\n+\n+        // There should be no diagnostics for the component.\n+        expect(compilerA.getDiagnosticsForFile(componentSf, OptimizeFor.WholeProgram).length)\n+            .toBe(0);\n+\n+        // Change the resource file and introduce an error.\n+        fs.writeFile(TEMPLATE, `<h1>Resource</h2>`);\n+\n+        // Perform a resource-only incremental step.\n+        const resourceTicket = resourceChangeTicket(compilerA, new Set([TEMPLATE]));\n+        const compilerB = NgCompiler.fromTicket(resourceTicket, host);\n+\n+        // A resource-only update should reuse the same compiler instance.\n+        expect(compilerB).toBe(compilerA);\n+\n+        // The new template error should be reported in component diagnostics.\n+        expect(compilerB.getDiagnosticsForFile(componentSf, OptimizeFor.WholeProgram).length)\n+            .toBe(1);\n+      });\n+    });\n   });\n });\n "
+        },
+        {
+            "sha": "d4abec76ffd0c56b1b814e2f0ff84c18ad07abad",
+            "filename": "packages/compiler-cli/src/ngtsc/resource/src/loader.ts",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/angular/angular/blob/be979c907bfe55ecc1a6c90bb449859b4012c207/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fresource%2Fsrc%2Floader.ts",
+            "raw_url": "https://github.com/angular/angular/raw/be979c907bfe55ecc1a6c90bb449859b4012c207/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fresource%2Fsrc%2Floader.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fresource%2Fsrc%2Floader.ts?ref=be979c907bfe55ecc1a6c90bb449859b4012c207",
+            "patch": "@@ -113,6 +113,13 @@ export class AdapterResourceLoader implements ResourceLoader {\n     return result;\n   }\n \n+  /**\n+   * Invalidate the entire resource cache.\n+   */\n+  invalidate(): void {\n+    this.cache.clear();\n+  }\n+\n   /**\n    * Attempt to resolve `url` in the context of `fromFile`, while respecting the rootDirs\n    * option from the tsconfig. First, normalize the file name."
+        },
+        {
+            "sha": "f8ed438530ffde815c87379e7b25d39cea91210d",
+            "filename": "packages/compiler-cli/src/ngtsc/transform/src/api.ts",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/angular/angular/blob/be979c907bfe55ecc1a6c90bb449859b4012c207/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftransform%2Fsrc%2Fapi.ts",
+            "raw_url": "https://github.com/angular/angular/raw/be979c907bfe55ecc1a6c90bb449859b4012c207/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftransform%2Fsrc%2Fapi.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftransform%2Fsrc%2Fapi.ts?ref=be979c907bfe55ecc1a6c90bb449859b4012c207",
+            "patch": "@@ -128,6 +128,12 @@ export interface DecoratorHandler<D, A, R> {\n   analyze(node: ClassDeclaration, metadata: Readonly<D>, handlerFlags?: HandlerFlags):\n       AnalysisOutput<A>;\n \n+  /**\n+   * React to a change in a resource file by updating the `analysis` or `resolution`, under the\n+   * assumption that nothing in the TypeScript code has changed.\n+   */\n+  updateResources?(node: ClassDeclaration, analysis: A, resolution: R): void;\n+\n   /**\n    * Post-process the analysis of a decorator/class combination and record any necessary information\n    * in the larger compilation."
+        },
+        {
+            "sha": "7e3ded3822cf8cefc885c0396c98b38cc2055e0d",
+            "filename": "packages/compiler-cli/src/ngtsc/transform/src/compilation.ts",
+            "status": "modified",
+            "additions": 14,
+            "deletions": 0,
+            "changes": 14,
+            "blob_url": "https://github.com/angular/angular/blob/be979c907bfe55ecc1a6c90bb449859b4012c207/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftransform%2Fsrc%2Fcompilation.ts",
+            "raw_url": "https://github.com/angular/angular/raw/be979c907bfe55ecc1a6c90bb449859b4012c207/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftransform%2Fsrc%2Fcompilation.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftransform%2Fsrc%2Fcompilation.ts?ref=be979c907bfe55ecc1a6c90bb449859b4012c207",
+            "patch": "@@ -453,6 +453,20 @@ export class TraitCompiler implements ProgramTypeCheckAdapter {\n     }\n   }\n \n+  updateResources(clazz: DeclarationNode): void {\n+    if (!this.reflector.isClass(clazz) || !this.classes.has(clazz)) {\n+      return;\n+    }\n+    const record = this.classes.get(clazz)!;\n+    for (const trait of record.traits) {\n+      if (trait.state !== TraitState.Resolved || trait.handler.updateResources === undefined) {\n+        continue;\n+      }\n+\n+      trait.handler.updateResources(clazz, trait.analysis, trait.resolution);\n+    }\n+  }\n+\n   compile(clazz: DeclarationNode, constantPool: ConstantPool): CompileResult[]|null {\n     const original = ts.getOriginalNode(clazz) as typeof clazz;\n     if (!this.reflector.isClass(clazz) || !this.reflector.isClass(original) ||"
+        },
+        {
+            "sha": "06f55664f75b6a5dc9985bdb499fe89dafb04633",
+            "filename": "packages/compiler-cli/src/ngtsc/typecheck/api/checker.ts",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/angular/angular/blob/be979c907bfe55ecc1a6c90bb449859b4012c207/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Fapi%2Fchecker.ts",
+            "raw_url": "https://github.com/angular/angular/raw/be979c907bfe55ecc1a6c90bb449859b4012c207/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Fapi%2Fchecker.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Fapi%2Fchecker.ts?ref=be979c907bfe55ecc1a6c90bb449859b4012c207",
+            "patch": "@@ -165,6 +165,12 @@ export interface TemplateTypeChecker {\n    * Retrieve the type checking engine's metadata for the given directive class, if available.\n    */\n   getDirectiveMetadata(dir: ts.ClassDeclaration): TypeCheckableDirectiveMeta|null;\n+\n+  /**\n+   * Reset the `TemplateTypeChecker`'s state for the given class, so that it will be recomputed on\n+   * the next request.\n+   */\n+  invalidateClass(clazz: ts.ClassDeclaration): void;\n }\n \n /**"
+        },
+        {
+            "sha": "68ff907a026d330a8f716e7dd5ee4f5511365f5d",
+            "filename": "packages/compiler-cli/src/ngtsc/typecheck/src/checker.ts",
+            "status": "modified",
+            "additions": 19,
+            "deletions": 0,
+            "changes": 19,
+            "blob_url": "https://github.com/angular/angular/blob/be979c907bfe55ecc1a6c90bb449859b4012c207/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Fsrc%2Fchecker.ts",
+            "raw_url": "https://github.com/angular/angular/raw/be979c907bfe55ecc1a6c90bb449859b4012c207/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Fsrc%2Fchecker.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Fsrc%2Fchecker.ts?ref=be979c907bfe55ecc1a6c90bb449859b4012c207",
+            "patch": "@@ -318,6 +318,25 @@ export class TemplateTypeCheckerImpl implements TemplateTypeChecker {\n     return engine.getExpressionCompletionLocation(ast);\n   }\n \n+  invalidateClass(clazz: ts.ClassDeclaration): void {\n+    this.completionCache.delete(clazz);\n+    this.symbolBuilderCache.delete(clazz);\n+    this.scopeCache.delete(clazz);\n+    this.elementTagCache.delete(clazz);\n+\n+    const sf = clazz.getSourceFile();\n+    const sfPath = absoluteFromSourceFile(sf);\n+    const shimPath = this.typeCheckingStrategy.shimPathForComponent(clazz);\n+    const fileData = this.getFileData(sfPath);\n+    const templateId = fileData.sourceManager.getTemplateId(clazz);\n+\n+    fileData.shimData.delete(shimPath);\n+    fileData.isComplete = false;\n+    fileData.templateOverrides?.delete(templateId);\n+\n+    this.isComplete = false;\n+  }\n+\n   private getOrCreateCompletionEngine(component: ts.ClassDeclaration): CompletionEngine|null {\n     if (this.completionCache.has(component)) {\n       return this.completionCache.get(component)!;"
+        }
+    ],
+    "stats": {
+        "total": 200,
+        "additions": 198,
+        "deletions": 2
+    }
+}

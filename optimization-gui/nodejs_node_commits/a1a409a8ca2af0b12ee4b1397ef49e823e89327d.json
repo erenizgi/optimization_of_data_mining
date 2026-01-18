@@ -1,0 +1,48 @@
+{
+    "author": "joyeecheung",
+    "message": "src: simplify Environment::HandleCleanup\n\n- Make the HandleCleanup a struct, and make the queue a\n  std::list, iterate over it in CleanupHandles() and clear\n  it after that.\n- Put the handle cleanup registration into a method and\n  document that they will not be called in the one environemt\n  per process setup.\n\nPR-URL: https://github.com/nodejs/node/pull/19319\nReviewed-By: Anna Henningsen <anna@addaleax.net>\nReviewed-By: Jackson Tian <shyvo1987@gmail.com>\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "a1a409a8ca2af0b12ee4b1397ef49e823e89327d",
+    "files": [
+        {
+            "sha": "e94b8b95cb0ec3f0b235de76c062f08e1946a24b",
+            "filename": "src/env-inl.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/a1a409a8ca2af0b12ee4b1397ef49e823e89327d/src%2Fenv-inl.h",
+            "raw_url": "https://github.com/nodejs/node/raw/a1a409a8ca2af0b12ee4b1397ef49e823e89327d/src%2Fenv-inl.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv-inl.h?ref=a1a409a8ca2af0b12ee4b1397ef49e823e89327d",
+            "patch": "@@ -341,7 +341,7 @@ inline uv_idle_t* Environment::immediate_idle_handle() {\n inline void Environment::RegisterHandleCleanup(uv_handle_t* handle,\n                                                HandleCleanupCb cb,\n                                                void *arg) {\n-  handle_cleanup_queue_.PushBack(new HandleCleanup(handle, cb, arg));\n+  handle_cleanup_queue_.push_back(HandleCleanup{handle, cb, arg});\n }\n \n inline void Environment::FinishHandleCleanup(uv_handle_t* handle) {"
+        },
+        {
+            "sha": "3d1e5d3ac1e5a7c1da23fc9811593e7ee04d9565",
+            "filename": "src/env.cc",
+            "status": "modified",
+            "additions": 31,
+            "deletions": 22,
+            "changes": 53,
+            "blob_url": "https://github.com/nodejs/node/blob/a1a409a8ca2af0b12ee4b1397ef49e823e89327d/src%2Fenv.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/a1a409a8ca2af0b12ee4b1397ef49e823e89327d/src%2Fenv.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv.cc?ref=a1a409a8ca2af0b12ee4b1397ef49e823e89327d",
+            "patch": "@@ -175,7 +175,34 @@ void Environment::Start(int argc,\n   uv_unref(reinterpret_cast<uv_handle_t*>(&idle_prepare_handle_));\n   uv_unref(reinterpret_cast<uv_handle_t*>(&idle_check_handle_));\n \n-  auto close_and_finish = [](Environment* env, uv_handle_t* handle, void* arg) {\n+  // Register clean-up cb to be called to clean up the handles\n+  // when the environment is freed, note that they are not cleaned in\n+  // the one environment per process setup, but will be called in\n+  // FreeEnvironment.\n+  RegisterHandleCleanups();\n+\n+  if (start_profiler_idle_notifier) {\n+    StartProfilerIdleNotifier();\n+  }\n+\n+  auto process_template = FunctionTemplate::New(isolate());\n+  process_template->SetClassName(FIXED_ONE_BYTE_STRING(isolate(), \"process\"));\n+\n+  auto process_object =\n+      process_template->GetFunction()->NewInstance(context()).ToLocalChecked();\n+  set_process_object(process_object);\n+\n+  SetupProcessObject(this, argc, argv, exec_argc, exec_argv);\n+  LoadAsyncWrapperInfo(this);\n+\n+  static uv_once_t init_once = UV_ONCE_INIT;\n+  uv_once(&init_once, InitThreadLocalOnce);\n+  uv_key_set(&thread_local_env, this);\n+}\n+\n+void Environment::RegisterHandleCleanups() {\n+  HandleCleanupCb close_and_finish = [](Environment* env, uv_handle_t* handle,\n+                                        void* arg) {\n     handle->data = env;\n \n     uv_close(handle, [](uv_handle_t* handle) {\n@@ -199,32 +226,14 @@ void Environment::Start(int argc,\n       reinterpret_cast<uv_handle_t*>(&idle_check_handle_),\n       close_and_finish,\n       nullptr);\n-\n-  if (start_profiler_idle_notifier) {\n-    StartProfilerIdleNotifier();\n-  }\n-\n-  auto process_template = FunctionTemplate::New(isolate());\n-  process_template->SetClassName(FIXED_ONE_BYTE_STRING(isolate(), \"process\"));\n-\n-  auto process_object =\n-      process_template->GetFunction()->NewInstance(context()).ToLocalChecked();\n-  set_process_object(process_object);\n-\n-  SetupProcessObject(this, argc, argv, exec_argc, exec_argv);\n-  LoadAsyncWrapperInfo(this);\n-\n-  static uv_once_t init_once = UV_ONCE_INIT;\n-  uv_once(&init_once, InitThreadLocalOnce);\n-  uv_key_set(&thread_local_env, this);\n }\n \n void Environment::CleanupHandles() {\n-  while (HandleCleanup* hc = handle_cleanup_queue_.PopFront()) {\n+  for (HandleCleanup& hc : handle_cleanup_queue_) {\n     handle_cleanup_waiting_++;\n-    hc->cb_(this, hc->handle_, hc->arg_);\n-    delete hc;\n+    hc.cb_(this, hc.handle_, hc.arg_);\n   }\n+  handle_cleanup_queue_.clear();\n \n   while (handle_cleanup_waiting_ != 0)\n     uv_run(event_loop(), UV_RUN_ONCE);"
+        },
+        {
+            "sha": "8ef4e187b525d8fb6031b9fd9581ae59df83b310",
+            "filename": "src/env.h",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 28,
+            "changes": 44,
+            "blob_url": "https://github.com/nodejs/node/blob/a1a409a8ca2af0b12ee4b1397ef49e823e89327d/src%2Fenv.h",
+            "raw_url": "https://github.com/nodejs/node/raw/a1a409a8ca2af0b12ee4b1397ef49e823e89327d/src%2Fenv.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv.h?ref=a1a409a8ca2af0b12ee4b1397ef49e823e89327d",
+            "patch": "@@ -540,26 +540,6 @@ class Environment {\n     DISALLOW_COPY_AND_ASSIGN(TickInfo);\n   };\n \n-  typedef void (*HandleCleanupCb)(Environment* env,\n-                                  uv_handle_t* handle,\n-                                  void* arg);\n-\n-  class HandleCleanup {\n-   private:\n-    friend class Environment;\n-\n-    HandleCleanup(uv_handle_t* handle, HandleCleanupCb cb, void* arg)\n-        : handle_(handle),\n-          cb_(cb),\n-          arg_(arg) {\n-    }\n-\n-    uv_handle_t* handle_;\n-    HandleCleanupCb cb_;\n-    void* arg_;\n-    ListNode<HandleCleanup> handle_cleanup_queue_;\n-  };\n-\n   static inline Environment* GetCurrent(v8::Isolate* isolate);\n   static inline Environment* GetCurrent(v8::Local<v8::Context> context);\n   static inline Environment* GetCurrent(\n@@ -580,7 +560,22 @@ class Environment {\n              int exec_argc,\n              const char* const* exec_argv,\n              bool start_profiler_idle_notifier);\n+\n+  typedef void (*HandleCleanupCb)(Environment* env,\n+                                  uv_handle_t* handle,\n+                                  void* arg);\n+  struct HandleCleanup {\n+    uv_handle_t* handle_;\n+    HandleCleanupCb cb_;\n+    void* arg_;\n+  };\n+\n+  void RegisterHandleCleanups();\n   void CleanupHandles();\n+  inline void RegisterHandleCleanup(uv_handle_t* handle,\n+                                    HandleCleanupCb cb,\n+                                    void *arg);\n+  inline void FinishHandleCleanup(uv_handle_t* handle);\n \n   inline void AssignToContext(v8::Local<v8::Context> context,\n                               const ContextInfo& info);\n@@ -596,12 +591,6 @@ class Environment {\n   inline uv_check_t* immediate_check_handle();\n   inline uv_idle_t* immediate_idle_handle();\n \n-  // Register clean-up cb to be called on environment destruction.\n-  inline void RegisterHandleCleanup(uv_handle_t* handle,\n-                                    HandleCleanupCb cb,\n-                                    void *arg);\n-  inline void FinishHandleCleanup(uv_handle_t* handle);\n-\n   inline AsyncHooks* async_hooks();\n   inline ImmediateInfo* immediate_info();\n   inline TickInfo* tick_info();\n@@ -822,8 +811,7 @@ class Environment {\n   friend int GenDebugSymbols();\n   HandleWrapQueue handle_wrap_queue_;\n   ReqWrapQueue req_wrap_queue_;\n-  ListHead<HandleCleanup,\n-           &HandleCleanup::handle_cleanup_queue_> handle_cleanup_queue_;\n+  std::list<HandleCleanup> handle_cleanup_queue_;\n   int handle_cleanup_waiting_;\n \n   double* heap_statistics_buffer_ = nullptr;"
+        }
+    ],
+    "stats": {
+        "total": 99,
+        "additions": 48,
+        "deletions": 51
+    }
+}

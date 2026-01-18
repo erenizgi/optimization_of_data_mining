@@ -1,0 +1,72 @@
+{
+    "author": "joyeecheung",
+    "message": "console: move the inspector console wrapping in a separate file\n\nMove the wrapping of the inspector console in a separate file\nfor clarity. In addition, save the original console from the\nVM explicitly via an exported property\n`require('internal/console/inspector').consoleFromVM`\nthat `require('inspector').console` can alias to it later,\ninstead of hanging the original console onto `per_thread.js`\nduring bootstrap and counting on that `per_thread.js`\nonly gets evaluated once and gets cached.\n\nPR-URL: https://github.com/nodejs/node/pull/24709\nReviewed-By: Gus Caplan <me@gus.host>\nReviewed-By: Anna Henningsen <anna@addaleax.net>\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "edb8f228a27378e59aed3b9632895f8c13799863",
+    "files": [
+        {
+            "sha": "14ea01e6adc6c70cbfe918cbd3b8314bb6bfd91d",
+            "filename": "lib/inspector.js",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 2,
+            "changes": 5,
+            "blob_url": "https://github.com/nodejs/node/blob/edb8f228a27378e59aed3b9632895f8c13799863/lib%2Finspector.js",
+            "raw_url": "https://github.com/nodejs/node/raw/edb8f228a27378e59aed3b9632895f8c13799863/lib%2Finspector.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finspector.js?ref=edb8f228a27378e59aed3b9632895f8c13799863",
+            "patch": "@@ -12,7 +12,6 @@ const {\n const { validateString } = require('internal/validators');\n const util = require('util');\n const { Connection, open, url } = process.binding('inspector');\n-const { originalConsole } = require('internal/process/per_thread');\n \n if (!Connection)\n   throw new ERR_INSPECTOR_NOT_AVAILABLE();\n@@ -103,6 +102,8 @@ module.exports = {\n   open: (port, host, wait) => open(port, host, !!wait),\n   close: process._debugEnd,\n   url: url,\n-  console: originalConsole,\n+  // This is dynamically added during bootstrap,\n+  // where the console from the VM is still available\n+  console: require('internal/console/inspector').consoleFromVM,\n   Session\n };"
+        },
+        {
+            "sha": "220b706d7c9b0d9cf4c9119044a6510be445de3a",
+            "filename": "lib/internal/bootstrap/node.js",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 53,
+            "changes": 68,
+            "blob_url": "https://github.com/nodejs/node/blob/edb8f228a27378e59aed3b9632895f8c13799863/lib%2Finternal%2Fbootstrap%2Fnode.js",
+            "raw_url": "https://github.com/nodejs/node/raw/edb8f228a27378e59aed3b9632895f8c13799863/lib%2Finternal%2Fbootstrap%2Fnode.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fbootstrap%2Fnode.js?ref=edb8f228a27378e59aed3b9632895f8c13799863",
+            "patch": "@@ -121,8 +121,6 @@\n \n     const browserGlobals = !process._noBrowserGlobals;\n     if (browserGlobals) {\n-      // we are setting this here to forward it to the inspector later\n-      perThreadSetup.originalConsole = global.console;\n       setupGlobalTimeouts();\n       setupGlobalConsole();\n       setupGlobalURL();\n@@ -487,16 +485,25 @@\n   }\n \n   function setupGlobalConsole() {\n-    const originalConsole = global.console;\n-    // Setup Node.js global.console.\n-    const wrappedConsole = NativeModule.require('console');\n+    const consoleFromVM = global.console;\n+    const consoleFromNode =\n+      NativeModule.require('internal/console/global');\n+    // Override global console from the one provided by the VM\n+    // to the one implemented by Node.js\n     Object.defineProperty(global, 'console', {\n       configurable: true,\n       enumerable: false,\n-      value: wrappedConsole,\n+      value: consoleFromNode,\n       writable: true\n     });\n-    setupInspector(originalConsole, wrappedConsole);\n+    // TODO(joyeecheung): can we skip this if inspector is not active?\n+    if (process.config.variables.v8_enable_inspector) {\n+      const inspector =\n+        NativeModule.require('internal/console/inspector');\n+      inspector.addInspectorApis(consoleFromNode, consoleFromVM);\n+      // This will be exposed by `require('inspector').console` later.\n+      inspector.consoleFromVM = consoleFromVM;\n+    }\n   }\n \n   function setupGlobalURL() {\n@@ -571,41 +578,6 @@\n     registerDOMException(DOMException);\n   }\n \n-  function setupInspector(originalConsole, wrappedConsole) {\n-    if (!process.config.variables.v8_enable_inspector) {\n-      return;\n-    }\n-    const CJSModule = NativeModule.require('internal/modules/cjs/loader');\n-    const { addCommandLineAPI, consoleCall } = process.binding('inspector');\n-    // Setup inspector command line API.\n-    const { makeRequireFunction } =\n-      NativeModule.require('internal/modules/cjs/helpers');\n-    const path = NativeModule.require('path');\n-    const cwd = tryGetCwd(path);\n-\n-    const consoleAPIModule = new CJSModule('<inspector console>');\n-    consoleAPIModule.paths =\n-        CJSModule._nodeModulePaths(cwd).concat(CJSModule.globalPaths);\n-    addCommandLineAPI('require', makeRequireFunction(consoleAPIModule));\n-    const config = {};\n-    for (const key of Object.keys(wrappedConsole)) {\n-      if (!originalConsole.hasOwnProperty(key))\n-        continue;\n-      // If global console has the same method as inspector console,\n-      // then wrap these two methods into one. Native wrapper will preserve\n-      // the original stack.\n-      wrappedConsole[key] = consoleCall.bind(wrappedConsole,\n-                                             originalConsole[key],\n-                                             wrappedConsole[key],\n-                                             config);\n-    }\n-    for (const key of Object.keys(originalConsole)) {\n-      if (wrappedConsole.hasOwnProperty(key))\n-        continue;\n-      wrappedConsole[key] = originalConsole[key];\n-    }\n-  }\n-\n   function noop() {}\n \n   function setupProcessFatal() {\n@@ -684,17 +656,6 @@\n     }\n   }\n \n-  function tryGetCwd(path) {\n-    try {\n-      return process.cwd();\n-    } catch {\n-      // getcwd(3) can fail if the current working directory has been deleted.\n-      // Fall back to the directory name of the (absolute) executable path.\n-      // It's not really correct but what are the alternatives?\n-      return path.dirname(process.execPath);\n-    }\n-  }\n-\n   function wrapForBreakOnFirstLine(source) {\n     if (!process._breakFirstLine)\n       return source;\n@@ -705,6 +666,7 @@\n   function evalScript(name, body) {\n     const CJSModule = NativeModule.require('internal/modules/cjs/loader');\n     const path = NativeModule.require('path');\n+    const { tryGetCwd } = NativeModule.require('internal/util');\n     const cwd = tryGetCwd(path);\n \n     const module = new CJSModule(name);"
+        },
+        {
+            "sha": "5e04289be9ae6aeb796cac4a3b3e7f83e82f861a",
+            "filename": "lib/internal/console/inspector.js",
+            "status": "added",
+            "additions": 53,
+            "deletions": 0,
+            "changes": 53,
+            "blob_url": "https://github.com/nodejs/node/blob/edb8f228a27378e59aed3b9632895f8c13799863/lib%2Finternal%2Fconsole%2Finspector.js",
+            "raw_url": "https://github.com/nodejs/node/raw/edb8f228a27378e59aed3b9632895f8c13799863/lib%2Finternal%2Fconsole%2Finspector.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fconsole%2Finspector.js?ref=edb8f228a27378e59aed3b9632895f8c13799863",
+            "patch": "@@ -0,0 +1,53 @@\n+'use strict';\n+\n+const path = require('path');\n+const CJSModule = require('internal/modules/cjs/loader');\n+const { makeRequireFunction } = require('internal/modules/cjs/helpers');\n+const { tryGetCwd } = require('internal/util');\n+const { addCommandLineAPI, consoleCall } = process.binding('inspector');\n+\n+// Wrap a console implemented by Node.js with features from the VM inspector\n+function addInspectorApis(consoleFromNode, consoleFromVM) {\n+  // Setup inspector command line API.\n+  const cwd = tryGetCwd(path);\n+  const consoleAPIModule = new CJSModule('<inspector console>');\n+  consoleAPIModule.paths =\n+      CJSModule._nodeModulePaths(cwd).concat(CJSModule.globalPaths);\n+  addCommandLineAPI('require', makeRequireFunction(consoleAPIModule));\n+  const config = {};\n+\n+  // If global console has the same method as inspector console,\n+  // then wrap these two methods into one. Native wrapper will preserve\n+  // the original stack.\n+  for (const key of Object.keys(consoleFromNode)) {\n+    if (!consoleFromVM.hasOwnProperty(key))\n+      continue;\n+    consoleFromNode[key] = consoleCall.bind(consoleFromNode,\n+                                            consoleFromVM[key],\n+                                            consoleFromNode[key],\n+                                            config);\n+  }\n+\n+  // Add additional console APIs from the inspector\n+  for (const key of Object.keys(consoleFromVM)) {\n+    if (consoleFromNode.hasOwnProperty(key))\n+      continue;\n+    consoleFromNode[key] = consoleFromVM[key];\n+  }\n+}\n+\n+module.exports = {\n+  addInspectorApis\n+};\n+\n+// Stores the console from VM, should be set during bootstrap.\n+let consoleFromVM;\n+\n+Object.defineProperty(module.exports, 'consoleFromVM', {\n+  get() {\n+    return consoleFromVM;\n+  },\n+  set(val) {\n+    consoleFromVM = val;\n+  }\n+});"
+        },
+        {
+            "sha": "414d037a298ca6f081b0500f7e72e3c4a1517488",
+            "filename": "lib/internal/util.js",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 0,
+            "changes": 12,
+            "blob_url": "https://github.com/nodejs/node/blob/edb8f228a27378e59aed3b9632895f8c13799863/lib%2Finternal%2Futil.js",
+            "raw_url": "https://github.com/nodejs/node/raw/edb8f228a27378e59aed3b9632895f8c13799863/lib%2Finternal%2Futil.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Futil.js?ref=edb8f228a27378e59aed3b9632895f8c13799863",
+            "patch": "@@ -373,6 +373,17 @@ function once(callback) {\n   };\n }\n \n+function tryGetCwd(path) {\n+  try {\n+    return process.cwd();\n+  } catch {\n+    // getcwd(3) can fail if the current working directory has been deleted.\n+    // Fall back to the directory name of the (absolute) executable path.\n+    // It's not really correct but what are the alternatives?\n+    return path.dirname(process.execPath);\n+  }\n+}\n+\n module.exports = {\n   assertCrypto,\n   cachedResult,\n@@ -392,6 +403,7 @@ module.exports = {\n   once,\n   promisify,\n   spliceOne,\n+  tryGetCwd,\n   removeColors,\n \n   // Symbol used to customize promisify conversion"
+        },
+        {
+            "sha": "03b5203067081dd4921fc3836000527f9f2bee37",
+            "filename": "node.gyp",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/edb8f228a27378e59aed3b9632895f8c13799863/node.gyp",
+            "raw_url": "https://github.com/nodejs/node/raw/edb8f228a27378e59aed3b9632895f8c13799863/node.gyp",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/node.gyp?ref=edb8f228a27378e59aed3b9632895f8c13799863",
+            "patch": "@@ -97,6 +97,7 @@\n       'lib/internal/cluster/worker.js',\n       'lib/internal/console/constructor.js',\n       'lib/internal/console/global.js',\n+      'lib/internal/console/inspector.js',\n       'lib/internal/crypto/certificate.js',\n       'lib/internal/crypto/cipher.js',\n       'lib/internal/crypto/diffiehellman.js',"
+        }
+    ],
+    "stats": {
+        "total": 139,
+        "additions": 84,
+        "deletions": 55
+    }
+}

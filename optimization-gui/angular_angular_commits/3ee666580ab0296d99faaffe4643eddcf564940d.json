@@ -1,0 +1,48 @@
+{
+    "author": "devversion",
+    "message": "fix(dev-infra): merge script should not always require full repo permissions (#37718)\n\nWe recently added OAuth scope checking to the dev-infra Git client\nand started leveraging it for the merge script. We set the `repo` scope\nas required for running the merge script. We can loosen this requirement\nas in the Angular org where the script is consumed, only pull requests on\npublic repositories are merged through the script.\n\nThis should help with reducing the risk with compromised tokens as no\naccess had to be granted on `repo:invite`, `repo_deployment` etc.\n\nPR Close #37718",
+    "sha": "3ee666580ab0296d99faaffe4643eddcf564940d",
+    "files": [
+        {
+            "sha": "7b9a76ead2bb0f03bd6f50fee2b2de27c9438140",
+            "filename": "dev-infra/pr/merge/task.ts",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 5,
+            "changes": 18,
+            "blob_url": "https://github.com/angular/angular/blob/3ee666580ab0296d99faaffe4643eddcf564940d/dev-infra%2Fpr%2Fmerge%2Ftask.ts",
+            "raw_url": "https://github.com/angular/angular/raw/3ee666580ab0296d99faaffe4643eddcf564940d/dev-infra%2Fpr%2Fmerge%2Ftask.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/dev-infra%2Fpr%2Fmerge%2Ftask.ts?ref=3ee666580ab0296d99faaffe4643eddcf564940d",
+            "patch": "@@ -16,9 +16,6 @@ import {isPullRequest, loadAndValidatePullRequest,} from './pull-request';\n import {GithubApiMergeStrategy} from './strategies/api-merge';\n import {AutosquashMergeStrategy} from './strategies/autosquash-merge';\n \n-/** Github OAuth scopes required for the merge task. */\n-const REQUIRED_SCOPES = ['repo'];\n-\n /** Describes the status of a pull request merge. */\n export const enum MergeStatus {\n   UNKNOWN_GIT_ERROR,\n@@ -56,8 +53,19 @@ export class PullRequestMergeTask {\n    * @param force Whether non-critical pull request failures should be ignored.\n    */\n   async merge(prNumber: number, force = false): Promise<MergeResult> {\n-    // Assert the authenticated GitClient has access on the required scopes.\n-    const hasOauthScopes = await this.git.hasOauthScopes(...REQUIRED_SCOPES);\n+    // Check whether the given Github token has sufficient permissions for writing\n+    // to the configured repository. If the repository is not private, only the\n+    // reduced `public_repo` OAuth scope is sufficient for performing merges.\n+    const hasOauthScopes = await this.git.hasOauthScopes((scopes, missing) => {\n+      if (!scopes.includes('repo')) {\n+        if (this.config.remote.private) {\n+          missing.push('repo');\n+        } else if (!scopes.includes('public_repo')) {\n+          missing.push('public_repo');\n+        }\n+      }\n+    });\n+\n     if (hasOauthScopes !== true) {\n       return {\n         status: MergeStatus.GITHUB_ERROR,"
+        },
+        {
+            "sha": "bd08ee68e44e19e7596bfcb6adfbc48e0a389ede",
+            "filename": "dev-infra/utils/config.ts",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/angular/angular/blob/3ee666580ab0296d99faaffe4643eddcf564940d/dev-infra%2Futils%2Fconfig.ts",
+            "raw_url": "https://github.com/angular/angular/raw/3ee666580ab0296d99faaffe4643eddcf564940d/dev-infra%2Futils%2Fconfig.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/dev-infra%2Futils%2Fconfig.ts?ref=3ee666580ab0296d99faaffe4643eddcf564940d",
+            "patch": "@@ -21,6 +21,8 @@ export interface GitClientConfig {\n   name: string;\n   /** If SSH protocol should be used for git interactions. */\n   useSsh?: boolean;\n+  /** Whether the specified repository is private. */\n+  private?: boolean;\n }\n \n /**"
+        },
+        {
+            "sha": "88c626dc20af65b28d5fa2efb28ac26270dc564d",
+            "filename": "dev-infra/utils/git/index.ts",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 7,
+            "changes": 14,
+            "blob_url": "https://github.com/angular/angular/blob/3ee666580ab0296d99faaffe4643eddcf564940d/dev-infra%2Futils%2Fgit%2Findex.ts",
+            "raw_url": "https://github.com/angular/angular/raw/3ee666580ab0296d99faaffe4643eddcf564940d/dev-infra%2Futils%2Fgit%2Findex.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/dev-infra%2Futils%2Fgit%2Findex.ts?ref=3ee666580ab0296d99faaffe4643eddcf564940d",
+            "patch": "@@ -21,6 +21,9 @@ type RateLimitResponseWithOAuthScopeHeader = Octokit.Response<Octokit.RateLimitG\n   headers: {'x-oauth-scopes': string};\n };\n \n+/** Describes a function that can be used to test for given Github OAuth scopes. */\n+export type OAuthScopeTestFunction = (scopes: string[], missing: string[]) => void;\n+\n /** Error for failed Git commands. */\n export class GitCommandError extends Error {\n   constructor(client: GitClient, public args: string[]) {\n@@ -155,14 +158,11 @@ export class GitClient {\n    * Assert the GitClient instance is using a token with permissions for the all of the\n    * provided OAuth scopes.\n    */\n-  async hasOauthScopes(...requestedScopes: string[]): Promise<true|{error: string}> {\n-    const missingScopes: string[] = [];\n+  async hasOauthScopes(testFn: OAuthScopeTestFunction): Promise<true|{error: string}> {\n     const scopes = await this.getAuthScopesForToken();\n-    requestedScopes.forEach(scope => {\n-      if (!scopes.includes(scope)) {\n-        missingScopes.push(scope);\n-      }\n-    });\n+    const missingScopes: string[] = [];\n+    // Test Github OAuth scopes and collect missing ones.\n+    testFn(scopes, missingScopes);\n     // If no missing scopes are found, return true to indicate all OAuth Scopes are available.\n     if (missingScopes.length === 0) {\n       return true;"
+        }
+    ],
+    "stats": {
+        "total": 34,
+        "additions": 22,
+        "deletions": 12
+    }
+}

@@ -1,0 +1,60 @@
+{
+    "author": "addaleax",
+    "message": "src: add debugging array allocator\n\nAdd a subclass of `ArrayBufferAllocator` that performs additional\ndebug checking, which in particular verifies that:\n\n- All `ArrayBuffer` backing stores have been allocated with this\n  allocator, or have been explicitly marked as coming from a\n  compatible source.\n- All memory allocated by the allocator has been freed once it is\n  destroyed.\n\nPR-URL: https://github.com/nodejs/node/pull/26207\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Joyee Cheung <joyeec9h3@gmail.com>",
+    "sha": "376735345088d4b37e0e289c2eb7720419ed37ee",
+    "files": [
+        {
+            "sha": "6a56ddb51179584d7358f4b309cc41da2d57d115",
+            "filename": "src/api/environment.cc",
+            "status": "modified",
+            "additions": 75,
+            "deletions": 1,
+            "changes": 76,
+            "blob_url": "https://github.com/nodejs/node/blob/376735345088d4b37e0e289c2eb7720419ed37ee/src%2Fapi%2Fenvironment.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/376735345088d4b37e0e289c2eb7720419ed37ee/src%2Fapi%2Fenvironment.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fapi%2Fenvironment.cc?ref=376735345088d4b37e0e289c2eb7720419ed37ee",
+            "patch": "@@ -75,8 +75,82 @@ void* ArrayBufferAllocator::Allocate(size_t size) {\n     return UncheckedMalloc(size);\n }\n \n+DebuggingArrayBufferAllocator::~DebuggingArrayBufferAllocator() {\n+  CHECK(allocations_.empty());\n+}\n+\n+void* DebuggingArrayBufferAllocator::Allocate(size_t size) {\n+  Mutex::ScopedLock lock(mutex_);\n+  void* data = ArrayBufferAllocator::Allocate(size);\n+  RegisterPointerInternal(data, size);\n+  return data;\n+}\n+\n+void* DebuggingArrayBufferAllocator::AllocateUninitialized(size_t size) {\n+  Mutex::ScopedLock lock(mutex_);\n+  void* data = ArrayBufferAllocator::AllocateUninitialized(size);\n+  RegisterPointerInternal(data, size);\n+  return data;\n+}\n+\n+void DebuggingArrayBufferAllocator::Free(void* data, size_t size) {\n+  Mutex::ScopedLock lock(mutex_);\n+  UnregisterPointerInternal(data, size);\n+  ArrayBufferAllocator::Free(data, size);\n+}\n+\n+void* DebuggingArrayBufferAllocator::Reallocate(void* data,\n+                                                size_t old_size,\n+                                                size_t size) {\n+  Mutex::ScopedLock lock(mutex_);\n+  void* ret = ArrayBufferAllocator::Reallocate(data, old_size, size);\n+  if (ret == nullptr) {\n+    if (size == 0)  // i.e. equivalent to free().\n+      UnregisterPointerInternal(data, old_size);\n+    return nullptr;\n+  }\n+\n+  if (data != nullptr) {\n+    auto it = allocations_.find(data);\n+    CHECK_NE(it, allocations_.end());\n+    allocations_.erase(it);\n+  }\n+\n+  RegisterPointerInternal(ret, size);\n+  return ret;\n+}\n+\n+void DebuggingArrayBufferAllocator::RegisterPointer(void* data, size_t size) {\n+  Mutex::ScopedLock lock(mutex_);\n+  RegisterPointerInternal(data, size);\n+}\n+\n+void DebuggingArrayBufferAllocator::UnregisterPointer(void* data, size_t size) {\n+  Mutex::ScopedLock lock(mutex_);\n+  UnregisterPointerInternal(data, size);\n+}\n+\n+void DebuggingArrayBufferAllocator::UnregisterPointerInternal(void* data,\n+                                                              size_t size) {\n+  if (data == nullptr) return;\n+  auto it = allocations_.find(data);\n+  CHECK_NE(it, allocations_.end());\n+  CHECK_EQ(it->second, size);\n+  allocations_.erase(it);\n+}\n+\n+void DebuggingArrayBufferAllocator::RegisterPointerInternal(void* data,\n+                                                            size_t size) {\n+  if (data == nullptr) return;\n+  CHECK_EQ(allocations_.count(data), 0);\n+  allocations_[data] = size;\n+}\n+\n ArrayBufferAllocator* CreateArrayBufferAllocator() {\n-  return new ArrayBufferAllocator();\n+  if (per_process::cli_options->debug_arraybuffer_allocations)\n+    return new DebuggingArrayBufferAllocator();\n+  else\n+    return new ArrayBufferAllocator();\n }\n \n void FreeArrayBufferAllocator(ArrayBufferAllocator* allocator) {"
+        },
+        {
+            "sha": "9ac2b0a331c5310eba0c8d7bd594043e267ec81d",
+            "filename": "src/node_internals.h",
+            "status": "modified",
+            "additions": 23,
+            "deletions": 0,
+            "changes": 23,
+            "blob_url": "https://github.com/nodejs/node/blob/376735345088d4b37e0e289c2eb7720419ed37ee/src%2Fnode_internals.h",
+            "raw_url": "https://github.com/nodejs/node/raw/376735345088d4b37e0e289c2eb7720419ed37ee/src%2Fnode_internals.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_internals.h?ref=376735345088d4b37e0e289c2eb7720419ed37ee",
+            "patch": "@@ -109,11 +109,34 @@ class ArrayBufferAllocator : public v8::ArrayBuffer::Allocator {\n   void* AllocateUninitialized(size_t size) override\n     { return node::UncheckedMalloc(size); }\n   void Free(void* data, size_t) override { free(data); }\n+  virtual void* Reallocate(void* data, size_t old_size, size_t size) {\n+    return static_cast<void*>(\n+        UncheckedRealloc<char>(static_cast<char*>(data), size));\n+  }\n+  virtual void RegisterPointer(void* data, size_t size) {}\n+  virtual void UnregisterPointer(void* data, size_t size) {}\n \n  private:\n   uint32_t zero_fill_field_ = 1;  // Boolean but exposed as uint32 to JS land.\n };\n \n+class DebuggingArrayBufferAllocator final : public ArrayBufferAllocator {\n+ public:\n+  ~DebuggingArrayBufferAllocator() override;\n+  void* Allocate(size_t size) override;\n+  void* AllocateUninitialized(size_t size) override;\n+  void Free(void* data, size_t size) override;\n+  void* Reallocate(void* data, size_t old_size, size_t size) override;\n+  void RegisterPointer(void* data, size_t size) override;\n+  void UnregisterPointer(void* data, size_t size) override;\n+\n+ private:\n+  void RegisterPointerInternal(void* data, size_t size);\n+  void UnregisterPointerInternal(void* data, size_t size);\n+  Mutex mutex_;\n+  std::unordered_map<void*, size_t> allocations_;\n+};\n+\n namespace Buffer {\n v8::MaybeLocal<v8::Object> Copy(Environment* env, const char* data, size_t len);\n v8::MaybeLocal<v8::Object> New(Environment* env, size_t size);"
+        },
+        {
+            "sha": "bdd39d5d71fe903350ad01cd35937b56b4a15018",
+            "filename": "src/node_options.cc",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/nodejs/node/blob/376735345088d4b37e0e289c2eb7720419ed37ee/src%2Fnode_options.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/376735345088d4b37e0e289c2eb7720419ed37ee/src%2Fnode_options.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_options.cc?ref=376735345088d4b37e0e289c2eb7720419ed37ee",
+            "patch": "@@ -387,6 +387,10 @@ PerProcessOptionsParser::PerProcessOptionsParser() {\n             \"SlowBuffer instances\",\n             &PerProcessOptions::zero_fill_all_buffers,\n             kAllowedInEnvironment);\n+  AddOption(\"--debug-arraybuffer-allocations\",\n+            \"\", /* undocumented, only for debugging */\n+            &PerProcessOptions::debug_arraybuffer_allocations,\n+            kAllowedInEnvironment);\n \n   AddOption(\"--security-reverts\", \"\", &PerProcessOptions::security_reverts);\n   AddOption(\"--completion-bash\","
+        },
+        {
+            "sha": "9313c4a538466271565676a1f6b40a3a333382cc",
+            "filename": "src/node_options.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/376735345088d4b37e0e289c2eb7720419ed37ee/src%2Fnode_options.h",
+            "raw_url": "https://github.com/nodejs/node/raw/376735345088d4b37e0e289c2eb7720419ed37ee/src%2Fnode_options.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_options.h?ref=376735345088d4b37e0e289c2eb7720419ed37ee",
+            "patch": "@@ -158,6 +158,7 @@ class PerProcessOptions : public Options {\n   uint64_t max_http_header_size = 8 * 1024;\n   int64_t v8_thread_pool_size = 4;\n   bool zero_fill_all_buffers = false;\n+  bool debug_arraybuffer_allocations = false;\n \n   std::vector<std::string> security_reverts;\n   bool print_bash_completion = false;"
+        }
+    ],
+    "stats": {
+        "total": 104,
+        "additions": 103,
+        "deletions": 1
+    }
+}

@@ -1,0 +1,60 @@
+{
+    "author": "chux0519",
+    "message": "crypto: add support for chacha20-poly1305 for AEAD\n\nopenSSL supports AEAD_CHACHA20_POLY1305(rfc7539) since 1.1.\n\nPR-URL: https://github.com/nodejs/node/pull/24081\nFixes: https://github.com/nodejs/node/issues/24080\nRefs: https://tools.ietf.org/html/rfc7539\nReviewed-By: Ben Noordhuis <info@bnoordhuis.nl>\nReviewed-By: Sam Roberts <vieuxtech@gmail.com>\nReviewed-By: Tobias Nießen <tniessen@tnie.de>",
+    "sha": "5c596222433166a7c0274251cca1e55f3bf9560f",
+    "files": [
+        {
+            "sha": "81706157e62cac281a9a02f39723dbba24898bb8",
+            "filename": "doc/api/crypto.md",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/nodejs/node/blob/5c596222433166a7c0274251cca1e55f3bf9560f/doc%2Fapi%2Fcrypto.md",
+            "raw_url": "https://github.com/nodejs/node/raw/5c596222433166a7c0274251cca1e55f3bf9560f/doc%2Fapi%2Fcrypto.md",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/doc%2Fapi%2Fcrypto.md?ref=5c596222433166a7c0274251cca1e55f3bf9560f",
+            "patch": "@@ -1382,6 +1382,9 @@ Adversaries][] for details.\n <!-- YAML\n added: v0.1.94\n changes:\n+  - version: REPLACEME\n+    pr-url: https://github.com/nodejs/node/pull/24081\n+    description: The cipher `chacha20-poly1305` is now supported.\n   - version: v10.10.0\n     pr-url: https://github.com/nodejs/node/pull/21447\n     description: Ciphers in OCB mode are now supported.\n@@ -1468,6 +1471,9 @@ to create the `Decipher` object.\n <!-- YAML\n added: v0.1.94\n changes:\n+  - version: REPLACEME\n+    pr-url: https://github.com/nodejs/node/pull/24081\n+    description: The cipher `chacha20-poly1305` is now supported.\n   - version: v10.10.0\n     pr-url: https://github.com/nodejs/node/pull/21447\n     description: Ciphers in OCB mode are now supported."
+        },
+        {
+            "sha": "8e7d7d810f421cdc096546fdb9b49ace8075ecde",
+            "filename": "src/node_crypto.cc",
+            "status": "modified",
+            "additions": 30,
+            "deletions": 25,
+            "changes": 55,
+            "blob_url": "https://github.com/nodejs/node/blob/5c596222433166a7c0274251cca1e55f3bf9560f/src%2Fnode_crypto.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/5c596222433166a7c0274251cca1e55f3bf9560f/src%2Fnode_crypto.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_crypto.cc?ref=5c596222433166a7c0274251cca1e55f3bf9560f",
+            "patch": "@@ -2557,12 +2557,21 @@ int VerifyCallback(int preverify_ok, X509_STORE_CTX* ctx) {\n   return 1;\n }\n \n-static bool IsSupportedAuthenticatedMode(int mode) {\n-  return mode == EVP_CIPH_CCM_MODE ||\n+static bool IsSupportedAuthenticatedMode(const EVP_CIPHER* cipher) {\n+  const int mode = EVP_CIPHER_mode(cipher);\n+  // Check `chacha20-poly1305` separately, it is also an AEAD cipher,\n+  // but its mode is 0 which doesn't indicate\n+  return EVP_CIPHER_nid(cipher) == NID_chacha20_poly1305 ||\n+         mode == EVP_CIPH_CCM_MODE ||\n          mode == EVP_CIPH_GCM_MODE ||\n          IS_OCB_MODE(mode);\n }\n \n+static bool IsSupportedAuthenticatedMode(const EVP_CIPHER_CTX* ctx) {\n+  const EVP_CIPHER* cipher = EVP_CIPHER_CTX_cipher(ctx);\n+  return IsSupportedAuthenticatedMode(cipher);\n+}\n+\n void CipherBase::Initialize(Environment* env, Local<Object> target) {\n   Local<FunctionTemplate> t = env->NewFunctionTemplate(New);\n \n@@ -2610,7 +2619,7 @@ void CipherBase::CommonInit(const char* cipher_type,\n                             \"Failed to initialize cipher\");\n   }\n \n-  if (IsSupportedAuthenticatedMode(mode)) {\n+  if (IsSupportedAuthenticatedMode(cipher)) {\n     CHECK_GE(iv_len, 0);\n     if (!InitAuthenticated(cipher_type, iv_len, auth_tag_len))\n       return;\n@@ -2712,8 +2721,7 @@ void CipherBase::InitIv(const char* cipher_type,\n   }\n \n   const int expected_iv_len = EVP_CIPHER_iv_length(cipher);\n-  const int mode = EVP_CIPHER_mode(cipher);\n-  const bool is_authenticated_mode = IsSupportedAuthenticatedMode(mode);\n+  const bool is_authenticated_mode = IsSupportedAuthenticatedMode(cipher);\n   const bool has_iv = iv_len >= 0;\n \n   // Throw if no IV was passed and the cipher requires an IV\n@@ -2785,7 +2793,20 @@ bool CipherBase::InitAuthenticated(const char* cipher_type, int iv_len,\n   }\n \n   const int mode = EVP_CIPHER_CTX_mode(ctx_.get());\n-  if (mode == EVP_CIPH_CCM_MODE || IS_OCB_MODE(mode)) {\n+  if (mode == EVP_CIPH_GCM_MODE) {\n+    if (auth_tag_len != kNoAuthTagLength) {\n+      if (!IsValidGCMTagLength(auth_tag_len)) {\n+        char msg[50];\n+        snprintf(msg, sizeof(msg),\n+            \"Invalid authentication tag length: %u\", auth_tag_len);\n+        env()->ThrowError(msg);\n+        return false;\n+      }\n+\n+      // Remember the given authentication tag length for later.\n+      auth_tag_len_ = auth_tag_len;\n+    }\n+  } else {\n     if (auth_tag_len == kNoAuthTagLength) {\n       char msg[128];\n       snprintf(msg, sizeof(msg), \"authTagLength required for %s\", cipher_type);\n@@ -2818,21 +2839,6 @@ bool CipherBase::InitAuthenticated(const char* cipher_type, int iv_len,\n       if (iv_len == 12) max_message_size_ = 16777215;\n       if (iv_len == 13) max_message_size_ = 65535;\n     }\n-  } else {\n-    CHECK_EQ(mode, EVP_CIPH_GCM_MODE);\n-\n-    if (auth_tag_len != kNoAuthTagLength) {\n-      if (!IsValidGCMTagLength(auth_tag_len)) {\n-        char msg[50];\n-        snprintf(msg, sizeof(msg),\n-            \"Invalid authentication tag length: %u\", auth_tag_len);\n-        env()->ThrowError(msg);\n-        return false;\n-      }\n-\n-      // Remember the given authentication tag length for later.\n-      auth_tag_len_ = auth_tag_len;\n-    }\n   }\n \n   return true;\n@@ -2855,8 +2861,7 @@ bool CipherBase::CheckCCMMessageLength(int message_len) {\n bool CipherBase::IsAuthenticatedMode() const {\n   // Check if this cipher operates in an AEAD mode that we support.\n   CHECK(ctx_);\n-  const int mode = EVP_CIPHER_CTX_mode(ctx_.get());\n-  return IsSupportedAuthenticatedMode(mode);\n+  return IsSupportedAuthenticatedMode(ctx_.get());\n }\n \n \n@@ -2901,7 +2906,7 @@ void CipherBase::SetAuthTag(const FunctionCallbackInfo<Value>& args) {\n   } else {\n     // At this point, the tag length is already known and must match the\n     // length of the given authentication tag.\n-    CHECK(mode == EVP_CIPH_CCM_MODE || IS_OCB_MODE(mode));\n+    CHECK(IsSupportedAuthenticatedMode(cipher->ctx_.get()));\n     CHECK_NE(cipher->auth_tag_len_, kNoAuthTagLength);\n     is_valid = cipher->auth_tag_len_ == tag_len;\n   }\n@@ -3108,7 +3113,7 @@ bool CipherBase::Final(unsigned char** out, int* out_len) {\n   *out = Malloc<unsigned char>(\n       static_cast<size_t>(EVP_CIPHER_CTX_block_size(ctx_.get())));\n \n-  if (kind_ == kDecipher && IsSupportedAuthenticatedMode(mode)) {\n+  if (kind_ == kDecipher && IsSupportedAuthenticatedMode(ctx_.get())) {\n     MaybePassAuthTagToOpenSSL();\n   }\n "
+        },
+        {
+            "sha": "6b1d169b2a7a9f573fe852be759f85a53e324722",
+            "filename": "test/fixtures/aead-vectors.js",
+            "status": "modified",
+            "additions": 37,
+            "deletions": 0,
+            "changes": 37,
+            "blob_url": "https://github.com/nodejs/node/blob/5c596222433166a7c0274251cca1e55f3bf9560f/test%2Ffixtures%2Faead-vectors.js",
+            "raw_url": "https://github.com/nodejs/node/raw/5c596222433166a7c0274251cca1e55f3bf9560f/test%2Ffixtures%2Faead-vectors.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Ffixtures%2Faead-vectors.js?ref=5c596222433166a7c0274251cca1e55f3bf9560f",
+            "patch": "@@ -662,5 +662,42 @@ module.exports = [\n         '481529c76b6a',\n     tag: 'd0c515f4d1cdd4fdac4f02ab',\n     tampered: true\n+  },\n+\n+  // Test case from rfc7539 section 2.8.2\n+  { algo: 'chacha20-poly1305',\n+    key: '808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f',\n+    iv: '070000004041424344454647',\n+    plain: '4c616469657320616e642047656e746c656d656e206f662074686520636c6173' +\n+           '73206f66202739393a204966204920636f756c64206f6666657220796f75206f' +\n+           '6e6c79206f6e652074697020666f7220746865206675747572652c2073756e73' +\n+           '637265656e20776f756c642062652069742e',\n+    plainIsHex: true,\n+    aad: '50515253c0c1c2c3c4c5c6c7',\n+    ct: 'd31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5' +\n+        'a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e06' +\n+        '0b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fa' +\n+        'b324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d265' +\n+        '86cec64b6116',\n+    tag: '1ae10b594f09e26a7e902ecbd0600691',\n+    tampered: false\n+  },\n+\n+  { algo: 'chacha20-poly1305',\n+    key: '808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f',\n+    iv: '070000004041424344454647',\n+    plain: '4c616469657320616e642047656e746c656d656e206f662074686520636c6173' +\n+           '73206f66202739393a204966204920636f756c64206f6666657220796f75206f' +\n+           '6e6c79206f6e652074697020666f7220746865206675747572652c2073756e73' +\n+           '637265656e20776f756c642062652069742e',\n+    plainIsHex: true,\n+    aad: '50515253c0c1c2c3c4c5c6c7',\n+    ct: 'd31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5' +\n+        'a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e06' +\n+        '0b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fa' +\n+        'b324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d265' +\n+        '86cec64b6116',\n+    tag: '1ae10b594f09e26a7e902ecbd0600692',\n+    tampered: true\n   }\n ];"
+        },
+        {
+            "sha": "01ce1d9996863e6feab64282f60e95404c1e36a2",
+            "filename": "test/parallel/test-crypto-authenticated.js",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/nodejs/node/blob/5c596222433166a7c0274251cca1e55f3bf9560f/test%2Fparallel%2Ftest-crypto-authenticated.js",
+            "raw_url": "https://github.com/nodejs/node/raw/5c596222433166a7c0274251cca1e55f3bf9560f/test%2Fparallel%2Ftest-crypto-authenticated.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-crypto-authenticated.js?ref=5c596222433166a7c0274251cca1e55f3bf9560f",
+            "patch": "@@ -94,9 +94,10 @@ for (const test of TEST_CASES) {\n \n   const isCCM = /^aes-(128|192|256)-ccm$/.test(test.algo);\n   const isOCB = /^aes-(128|192|256)-ocb$/.test(test.algo);\n+  const isChacha20Poly1305 = test.algo === 'chacha20-poly1305';\n \n   let options;\n-  if (isCCM || isOCB)\n+  if (isCCM || isOCB || isChacha20Poly1305)\n     options = { authTagLength: test.tag.length / 2 };\n \n   const inputEncoding = test.plainIsHex ? 'hex' : 'ascii';"
+        }
+    ],
+    "stats": {
+        "total": 101,
+        "additions": 75,
+        "deletions": 26
+    }
+}

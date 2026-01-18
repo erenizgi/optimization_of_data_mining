@@ -1,0 +1,36 @@
+{
+    "author": "aaugustin",
+    "message": "Fixed #18796 -- Refactored conversion to bytes in HttpResponse\n\nThanks mrmachine for the review.",
+    "sha": "da56e1bac6449daef9aeab8d076d2594d9fd5b44",
+    "files": [
+        {
+            "sha": "56e3d00096563eb5be55f8f347e650e25ef402e4",
+            "filename": "django/http/response.py",
+            "status": "modified",
+            "additions": 27,
+            "deletions": 30,
+            "changes": 57,
+            "blob_url": "https://github.com/django/django/blob/da56e1bac6449daef9aeab8d076d2594d9fd5b44/django%2Fhttp%2Fresponse.py",
+            "raw_url": "https://github.com/django/django/raw/da56e1bac6449daef9aeab8d076d2594d9fd5b44/django%2Fhttp%2Fresponse.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fhttp%2Fresponse.py?ref=da56e1bac6449daef9aeab8d076d2594d9fd5b44",
+            "patch": "@@ -16,6 +16,7 @@\n from django.utils import six, timezone\n from django.utils.encoding import force_bytes, iri_to_uri\n from django.utils.http import cookie_date\n+from django.utils.six.moves import map\n \n \n class BadHeaderError(ValueError):\n@@ -191,18 +192,33 @@ def delete_cookie(self, key, path='/', domain=None):\n \n     def make_bytes(self, value):\n         \"\"\"Turn a value into a bytestring encoded in the output charset.\"\"\"\n-        # For backwards compatibility, this method supports values that are\n-        # unlikely to occur in real applications. It has grown complex and\n-        # should be refactored. It also overlaps __next__. See #18796.\n+        # Per PEP 3333, this response body must be bytes. To avoid returning\n+        # an instance of a subclass, this function returns `bytes(value)`.\n+        # This doesn't make a copy when `value` already contains bytes.\n+\n+        # If content is already encoded (eg. gzip), assume bytes.\n         if self.has_header('Content-Encoding'):\n-            if isinstance(value, int):\n-                value = six.text_type(value)\n-            if isinstance(value, six.text_type):\n-                value = value.encode('ascii')\n-            # force conversion to bytes in case chunk is a subclass\n             return bytes(value)\n-        else:\n-            return force_bytes(value, self._charset)\n+\n+        # Handle string types -- we can't rely on force_bytes here because:\n+        # - under Python 3 it attemps str conversion first\n+        # - when self._charset != 'utf-8' it re-encodes the content\n+        if isinstance(value, bytes):\n+            return bytes(value)\n+        if isinstance(value, six.text_type):\n+            return bytes(value.encode(self._charset))\n+\n+        # Handle non-string types (#16494)\n+        return force_bytes(value, self._charset)\n+\n+    def __iter__(self):\n+        return self\n+\n+    def __next__(self):\n+        # Subclasses must define self._iterator for this function.\n+        return self.make_bytes(next(self._iterator))\n+\n+    next = __next__             # Python 2 compatibility\n \n     # These methods partially implement the file-like object interface.\n     # See http://docs.python.org/lib/bltin-file-objects.html\n@@ -287,17 +303,6 @@ def __iter__(self):\n             self._iterator = iter(self._container)\n         return self\n \n-    def __next__(self):\n-        chunk = next(self._iterator)\n-        if isinstance(chunk, int):\n-            chunk = six.text_type(chunk)\n-        if isinstance(chunk, six.text_type):\n-            chunk = chunk.encode(self._charset)\n-        # force conversion to bytes in case chunk is a subclass\n-        return bytes(chunk)\n-\n-    next = __next__             # Python 2 compatibility\n-\n     def write(self, content):\n         self._consume_content()\n         self._container.append(content)\n@@ -331,7 +336,7 @@ def content(self):\n \n     @property\n     def streaming_content(self):\n-        return self._iterator\n+        return map(self.make_bytes, self._iterator)\n \n     @streaming_content.setter\n     def streaming_content(self, value):\n@@ -340,14 +345,6 @@ def streaming_content(self, value):\n         if hasattr(value, 'close'):\n             self._closable_objects.append(value)\n \n-    def __iter__(self):\n-        return self\n-\n-    def __next__(self):\n-        return self.make_bytes(next(self._iterator))\n-\n-    next = __next__             # Python 2 compatibility\n-\n \n class CompatibleStreamingHttpResponse(StreamingHttpResponse):\n     \"\"\""
+        },
+        {
+            "sha": "d908e33fb762c49c9e59dfdf0b0c715ef3b53c3b",
+            "filename": "tests/regressiontests/httpwrappers/tests.py",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 4,
+            "changes": 9,
+            "blob_url": "https://github.com/django/django/blob/da56e1bac6449daef9aeab8d076d2594d9fd5b44/tests%2Fregressiontests%2Fhttpwrappers%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/da56e1bac6449daef9aeab8d076d2594d9fd5b44/tests%2Fregressiontests%2Fhttpwrappers%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fhttpwrappers%2Ftests.py?ref=da56e1bac6449daef9aeab8d076d2594d9fd5b44",
+            "patch": "@@ -330,11 +330,12 @@ def test_iter_content(self):\n         self.assertEqual(r.content, b'123\\xde\\x9e')\n \n         #with Content-Encoding header\n-        r = HttpResponse([1,1,2,4,8])\n+        r = HttpResponse()\n         r['Content-Encoding'] = 'winning'\n-        self.assertEqual(r.content, b'11248')\n-        r.content = ['\\u079e',]\n-        self.assertRaises(UnicodeEncodeError,\n+        r.content = [b'abc', b'def']\n+        self.assertEqual(r.content, b'abcdef')\n+        r.content = ['\\u079e']\n+        self.assertRaises(TypeError if six.PY3 else UnicodeEncodeError,\n                           getattr, r, 'content')\n \n         # .content can safely be accessed multiple times."
+        }
+    ],
+    "stats": {
+        "total": 66,
+        "additions": 32,
+        "deletions": 34
+    }
+}

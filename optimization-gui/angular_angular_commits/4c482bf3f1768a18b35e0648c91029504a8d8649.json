@@ -1,0 +1,36 @@
+{
+    "author": "JoostK",
+    "message": "fix(compiler-cli): properly emit literal types when recreating type parameters in a different file (#42761)\n\nIn #42492 the template type checker became capable of replicating a\nwider range of generic type parameters for use in template type-check\nfiles. Any literal types within a type parameter would however emit\ninvalid code, as TypeScript was emitting the literals using the text as\nextracted from the template type-check file instead of the original\nsource file where the type node was taken from.\n\nThis commit works around the issue by cloning any literal types and\nmarking them as synthetic, signalling to TypeScript that the literal\ntext has to be extracted from the node itself instead from the source\nfile.\n\nThis commit also excludes `import()` type nodes from being supported,\nas their module specifier may potentially need to be rewritten.\n\nFixes #42667\n\nPR Close #42761",
+    "sha": "4c482bf3f1768a18b35e0648c91029504a8d8649",
+    "files": [
+        {
+            "sha": "b198be9f9f124f7c3ae18bdc3a831ff0767bd685",
+            "filename": "packages/compiler-cli/src/ngtsc/typecheck/src/type_emitter.ts",
+            "status": "modified",
+            "additions": 25,
+            "deletions": 5,
+            "changes": 30,
+            "blob_url": "https://github.com/angular/angular/blob/4c482bf3f1768a18b35e0648c91029504a8d8649/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Fsrc%2Ftype_emitter.ts",
+            "raw_url": "https://github.com/angular/angular/raw/4c482bf3f1768a18b35e0648c91029504a8d8649/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Fsrc%2Ftype_emitter.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Fsrc%2Ftype_emitter.ts?ref=4c482bf3f1768a18b35e0648c91029504a8d8649",
+            "patch": "@@ -46,12 +46,18 @@ export function canEmitType(type: ts.TypeNode, resolver: TypeReferenceResolver):\n   }\n \n   // To determine whether a type can be emitted, we have to recursively look through all type nodes.\n-  // If a type reference node is found at any position within the type and that type reference\n-  // cannot be emitted, then the `INELIGIBLE` constant is returned to stop the recursive walk as\n-  // the type as a whole cannot be emitted in that case. Otherwise, the result of visiting all child\n-  // nodes determines the result. If no ineligible type reference node is found then the walk\n-  // returns `undefined`, indicating that no type node was visited that could not be emitted.\n+  // If an unsupported type node is found at any position within the type, then the `INELIGIBLE`\n+  // constant is returned to stop the recursive walk as the type as a whole cannot be emitted in\n+  // that case. Otherwise, the result of visiting all child nodes determines the result. If no\n+  // ineligible type reference node is found then the walk returns `undefined`, indicating that\n+  // no type node was visited that could not be emitted.\n   function visitNode(node: ts.Node): INELIGIBLE|undefined {\n+    // `import('module')` type nodes are not supported, as it may require rewriting the module\n+    // specifier which is currently not done.\n+    if (ts.isImportTypeNode(node)) {\n+      return INELIGIBLE;\n+    }\n+\n     // Emitting a type reference node in a different context requires that an import for the type\n     // can be created. If a type reference node cannot be emitted, `INELIGIBLE` is returned to stop\n     // the walk.\n@@ -130,8 +136,22 @@ export class TypeEmitter {\n   emitType(type: ts.TypeNode): ts.TypeNode {\n     const typeReferenceTransformer: ts.TransformerFactory<ts.TypeNode> = context => {\n       const visitNode = (node: ts.Node): ts.Node => {\n+        if (ts.isImportTypeNode(node)) {\n+          throw new Error('Unable to emit import type');\n+        }\n+\n         if (ts.isTypeReferenceNode(node)) {\n           return this.emitTypeReference(node);\n+        } else if (ts.isLiteralExpression(node)) {\n+          // TypeScript would typically take the emit text for a literal expression from the source\n+          // file itself. As the type node is being emitted into a different file, however,\n+          // TypeScript would extract the literal text from the wrong source file. To mitigate this\n+          // issue the literal is cloned and explicitly marked as synthesized by setting its text\n+          // range to a negative range, forcing TypeScript to determine the node's literal text from\n+          // the synthesized node's text instead of the incorrect source file.\n+          const clone = ts.getMutableClone(node);\n+          ts.setTextRange(clone, {pos: -1, end: -1});\n+          return clone;\n         } else {\n           return ts.visitEachChild(node, visitNode, context);\n         }"
+        },
+        {
+            "sha": "27172b32e89229cb0de9285dcc67764e0b026e32",
+            "filename": "packages/compiler-cli/src/ngtsc/typecheck/test/type_parameter_emitter_spec.ts",
+            "status": "modified",
+            "additions": 22,
+            "deletions": 0,
+            "changes": 22,
+            "blob_url": "https://github.com/angular/angular/blob/4c482bf3f1768a18b35e0648c91029504a8d8649/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Ftest%2Ftype_parameter_emitter_spec.ts",
+            "raw_url": "https://github.com/angular/angular/raw/4c482bf3f1768a18b35e0648c91029504a8d8649/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Ftest%2Ftype_parameter_emitter_spec.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Ftest%2Ftype_parameter_emitter_spec.ts?ref=4c482bf3f1768a18b35e0648c91029504a8d8649",
+            "patch": "@@ -86,6 +86,28 @@ runInEachFileSystem(() => {\n           .toEqual('<T extends {\\n    [key: string]: boolean;\\n}>');\n     });\n \n+    it('can emit literal types', () => {\n+      expect(emit(createEmitter(`export class TestClass<T extends 'a\"a'> {}`)))\n+          .toEqual(`<T extends \"a\\\\\"a\">`);\n+      expect(emit(createEmitter(`export class TestClass<T extends \"b\\\\\\\"b\"> {}`)))\n+          .toEqual(`<T extends \"b\\\\\"b\">`);\n+      expect(emit(createEmitter(`export class TestClass<T extends \\`c\\\\\\`c\\`> {}`)))\n+          .toEqual(`<T extends \\`c\\\\\\`c\\`>`);\n+      expect(emit(createEmitter(`export class TestClass<T extends -1> {}`)))\n+          .toEqual(`<T extends -1>`);\n+      expect(emit(createEmitter(`export class TestClass<T extends 1> {}`)))\n+          .toEqual(`<T extends 1>`);\n+      expect(emit(createEmitter(`export class TestClass<T extends 1n> {}`)))\n+          .toEqual(`<T extends 1n>`);\n+    });\n+\n+    it('cannot emit import types', () => {\n+      const emitter = createEmitter(`export class TestClass<T extends import('module')> {}`);\n+\n+      expect(emitter.canEmit()).toBe(false);\n+      expect(() => emit(emitter)).toThrowError('Unable to emit import type');\n+    });\n+\n     it('can emit references into external modules', () => {\n       const emitter = createEmitter(`\n           import {NgIterable} from '@angular/core';"
+        }
+    ],
+    "stats": {
+        "total": 52,
+        "additions": 47,
+        "deletions": 5
+    }
+}

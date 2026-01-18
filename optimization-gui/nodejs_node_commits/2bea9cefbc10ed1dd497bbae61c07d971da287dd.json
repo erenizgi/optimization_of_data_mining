@@ -1,0 +1,132 @@
+{
+    "author": "oyyd",
+    "message": "dgram: implement socket.bind({ fd })\n\ndgram: Implement binding an existing `fd`. Allow pass a `fd` property\nto `socket.bind()` in dgram.\nsrc: Add `UDPWrap::Open`\n\nPR-URL: https://github.com/nodejs/node/pull/21745\nFixes: https://github.com/nodejs/node/issues/14961\nReviewed-By: Matteo Collina <matteo.collina@gmail.com>\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Colin Ihrig <cjihrig@gmail.com>",
+    "sha": "2bea9cefbc10ed1dd497bbae61c07d971da287dd",
+    "files": [
+        {
+            "sha": "b9b43fcb216c1eb57f69b754b7ebbeb3630d6ae3",
+            "filename": "doc/api/dgram.md",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/nodejs/node/blob/2bea9cefbc10ed1dd497bbae61c07d971da287dd/doc%2Fapi%2Fdgram.md",
+            "raw_url": "https://github.com/nodejs/node/raw/2bea9cefbc10ed1dd497bbae61c07d971da287dd/doc%2Fapi%2Fdgram.md",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/doc%2Fapi%2Fdgram.md?ref=2bea9cefbc10ed1dd497bbae61c07d971da287dd",
+            "patch": "@@ -166,6 +166,7 @@ added: v0.11.14\n   * `port` {integer}\n   * `address` {string}\n   * `exclusive` {boolean}\n+  * `fd` {integer}\n * `callback` {Function}\n \n For UDP sockets, causes the `dgram.Socket` to listen for datagram\n@@ -177,6 +178,11 @@ system will attempt to listen on all addresses. Once binding is\n complete, a `'listening'` event is emitted and the optional `callback`\n function is called.\n \n+The `options` object may contain a `fd` property. When a `fd` greater\n+than `0` is set, it will wrap around an existing socket with the given\n+file descriptor. In this case, the properties of `port` and `address`\n+will be ignored.\n+\n Note that specifying both a `'listening'` event listener and passing a\n `callback` to the `socket.bind()` method is not harmful but not very\n useful."
+        },
+        {
+            "sha": "c541373fe2cda658b3d3437917edee7286047031",
+            "filename": "lib/dgram.js",
+            "status": "modified",
+            "additions": 72,
+            "deletions": 19,
+            "changes": 91,
+            "blob_url": "https://github.com/nodejs/node/blob/2bea9cefbc10ed1dd497bbae61c07d971da287dd/lib%2Fdgram.js",
+            "raw_url": "https://github.com/nodejs/node/raw/2bea9cefbc10ed1dd497bbae61c07d971da287dd/lib%2Fdgram.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Fdgram.js?ref=2bea9cefbc10ed1dd497bbae61c07d971da287dd",
+            "patch": "@@ -25,7 +25,8 @@ const errors = require('internal/errors');\n const {\n   kStateSymbol,\n   _createSocketHandle,\n-  newHandle\n+  newHandle,\n+  guessHandleType,\n } = require('internal/dgram');\n const {\n   ERR_INVALID_ARG_TYPE,\n@@ -35,7 +36,8 @@ const {\n   ERR_SOCKET_BAD_PORT,\n   ERR_SOCKET_BUFFER_SIZE,\n   ERR_SOCKET_CANNOT_SEND,\n-  ERR_SOCKET_DGRAM_NOT_RUNNING\n+  ERR_SOCKET_DGRAM_NOT_RUNNING,\n+  ERR_INVALID_FD_TYPE\n } = errors.codes;\n const { Buffer } = require('buffer');\n const util = require('util');\n@@ -45,6 +47,7 @@ const {\n   defaultTriggerAsyncIdScope,\n   symbols: { async_id_symbol, owner_symbol }\n } = require('internal/async_hooks');\n+const { isInt32 } = require('internal/validators');\n const { UV_UDP_REUSEADDR } = process.binding('constants').os;\n \n const { UDP, SendWrap } = process.binding('udp_wrap');\n@@ -151,6 +154,28 @@ function bufferSize(self, size, buffer) {\n   return ret;\n }\n \n+// Query master process to get the server handle and utilize it.\n+function bindServerHandle(self, options, errCb) {\n+  if (!cluster)\n+    cluster = require('cluster');\n+\n+  const state = self[kStateSymbol];\n+  cluster._getServer(self, options, (err, handle) => {\n+    if (err) {\n+      errCb(err);\n+      return;\n+    }\n+\n+    if (!state.handle) {\n+      // Handle has been closed in the mean time.\n+      return handle.close();\n+    }\n+\n+    replaceHandle(self, handle);\n+    startListening(self);\n+  });\n+}\n+\n Socket.prototype.bind = function(port_, address_ /* , callback */) {\n   let port = port_;\n \n@@ -171,6 +196,44 @@ Socket.prototype.bind = function(port_, address_ /* , callback */) {\n     return this;\n   }\n \n+  // Open an existing fd instead of creating a new one.\n+  if (port !== null && typeof port === 'object' &&\n+      isInt32(port.fd) && port.fd > 0) {\n+    const fd = port.fd;\n+    const exclusive = !!port.exclusive;\n+    const state = this[kStateSymbol];\n+\n+    if (!cluster)\n+      cluster = require('cluster');\n+\n+    if (cluster.isWorker && !exclusive) {\n+      bindServerHandle(this, {\n+        address: null,\n+        port: null,\n+        addressType: this.type,\n+        fd,\n+        flags: null\n+      }, (err) => {\n+        // Callback to handle error.\n+        const ex = errnoException(err, 'open');\n+        this.emit('error', ex);\n+        state.bindState = BIND_STATE_UNBOUND;\n+      });\n+      return this;\n+    }\n+\n+    const type = guessHandleType(fd);\n+    if (type !== 'UDP')\n+      throw new ERR_INVALID_FD_TYPE(type);\n+    const err = state.handle.open(fd);\n+\n+    if (err)\n+      throw errnoException(err, 'open');\n+\n+    startListening(this);\n+    return this;\n+  }\n+\n   var address;\n   var exclusive;\n \n@@ -207,28 +270,18 @@ Socket.prototype.bind = function(port_, address_ /* , callback */) {\n       flags |= UV_UDP_REUSEADDR;\n \n     if (cluster.isWorker && !exclusive) {\n-      const onHandle = (err, handle) => {\n-        if (err) {\n-          var ex = exceptionWithHostPort(err, 'bind', ip, port);\n-          this.emit('error', ex);\n-          state.bindState = BIND_STATE_UNBOUND;\n-          return;\n-        }\n-\n-        if (!state.handle)\n-          // handle has been closed in the mean time.\n-          return handle.close();\n-\n-        replaceHandle(this, handle);\n-        startListening(this);\n-      };\n-      cluster._getServer(this, {\n+      bindServerHandle(this, {\n         address: ip,\n         port: port,\n         addressType: this.type,\n         fd: -1,\n         flags: flags\n-      }, onHandle);\n+      }, (err) => {\n+        // Callback to handle error.\n+        const ex = exceptionWithHostPort(err, 'bind', ip, port);\n+        this.emit('error', ex);\n+        state.bindState = BIND_STATE_UNBOUND;\n+      });\n     } else {\n       if (!state.handle)\n         return; // handle has been closed in the mean time"
+        },
+        {
+            "sha": "e9b5364c8e367449bf0e84f02b3ef16532e5daff",
+            "filename": "lib/internal/dgram.js",
+            "status": "modified",
+            "additions": 27,
+            "deletions": 12,
+            "changes": 39,
+            "blob_url": "https://github.com/nodejs/node/blob/2bea9cefbc10ed1dd497bbae61c07d971da287dd/lib%2Finternal%2Fdgram.js",
+            "raw_url": "https://github.com/nodejs/node/raw/2bea9cefbc10ed1dd497bbae61c07d971da287dd/lib%2Finternal%2Fdgram.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fdgram.js?ref=2bea9cefbc10ed1dd497bbae61c07d971da287dd",
+            "patch": "@@ -1,7 +1,9 @@\n 'use strict';\n-const assert = require('assert');\n const { codes } = require('internal/errors');\n const { UDP } = process.binding('udp_wrap');\n+const { isInt32 } = require('internal/validators');\n+const TTYWrap = process.binding('tty_wrap');\n+const { UV_EINVAL } = process.binding('uv');\n const { ERR_INVALID_ARG_TYPE, ERR_SOCKET_BAD_TYPE } = codes;\n const kStateSymbol = Symbol('state symbol');\n let dns;  // Lazy load for startup performance.\n@@ -17,6 +19,9 @@ function lookup6(lookup, address, callback) {\n }\n \n \n+const guessHandleType = TTYWrap.guessHandleType;\n+\n+\n function newHandle(type, lookup) {\n   if (lookup === undefined) {\n     if (dns === undefined) {\n@@ -49,22 +54,32 @@ function newHandle(type, lookup) {\n \n \n function _createSocketHandle(address, port, addressType, fd, flags) {\n-  // Opening an existing fd is not supported for UDP handles.\n-  assert(typeof fd !== 'number' || fd < 0);\n-\n   const handle = newHandle(addressType);\n-\n-  if (port || address) {\n-    const err = handle.bind(address, port || 0, flags);\n-\n-    if (err) {\n-      handle.close();\n-      return err;\n+  let err;\n+\n+  if (isInt32(fd) && fd > 0) {\n+    const type = guessHandleType(fd);\n+    if (type !== 'UDP') {\n+      err = UV_EINVAL;\n+    } else {\n+      err = handle.open(fd);\n     }\n+  } else if (port || address) {\n+    err = handle.bind(address, port || 0, flags);\n+  }\n+\n+  if (err) {\n+    handle.close();\n+    return err;\n   }\n \n   return handle;\n }\n \n \n-module.exports = { kStateSymbol, _createSocketHandle, newHandle };\n+module.exports = {\n+  kStateSymbol,\n+  _createSocketHandle,\n+  newHandle,\n+  guessHandleType,\n+};"
+        },
+        {
+            "sha": "9bcf6ceb7b3ed2f15578cff8255933e758416799",
+            "filename": "src/udp_wrap.cc",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 0,
+            "changes": 13,
+            "blob_url": "https://github.com/nodejs/node/blob/2bea9cefbc10ed1dd497bbae61c07d971da287dd/src%2Fudp_wrap.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/2bea9cefbc10ed1dd497bbae61c07d971da287dd/src%2Fudp_wrap.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fudp_wrap.cc?ref=2bea9cefbc10ed1dd497bbae61c07d971da287dd",
+            "patch": "@@ -117,6 +117,7 @@ void UDPWrap::Initialize(Local<Object> target,\n                                               Local<FunctionTemplate>(),\n                                               attributes);\n \n+  env->SetProtoMethod(t, \"open\", Open);\n   env->SetProtoMethod(t, \"bind\", Bind);\n   env->SetProtoMethod(t, \"send\", Send);\n   env->SetProtoMethod(t, \"bind6\", Bind6);\n@@ -206,6 +207,18 @@ void UDPWrap::DoBind(const FunctionCallbackInfo<Value>& args, int family) {\n }\n \n \n+void UDPWrap::Open(const FunctionCallbackInfo<Value>& args) {\n+  UDPWrap* wrap;\n+  ASSIGN_OR_RETURN_UNWRAP(&wrap,\n+                          args.Holder(),\n+                          args.GetReturnValue().Set(UV_EBADF));\n+  int fd = static_cast<int>(args[0]->IntegerValue());\n+  int err = uv_udp_open(&wrap->handle_, fd);\n+\n+  args.GetReturnValue().Set(err);\n+}\n+\n+\n void UDPWrap::Bind(const FunctionCallbackInfo<Value>& args) {\n   DoBind(args, AF_INET);\n }"
+        },
+        {
+            "sha": "b5d282489685edea49e7d7ba238022701db45fa6",
+            "filename": "src/udp_wrap.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/2bea9cefbc10ed1dd497bbae61c07d971da287dd/src%2Fudp_wrap.h",
+            "raw_url": "https://github.com/nodejs/node/raw/2bea9cefbc10ed1dd497bbae61c07d971da287dd/src%2Fudp_wrap.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fudp_wrap.h?ref=2bea9cefbc10ed1dd497bbae61c07d971da287dd",
+            "patch": "@@ -42,6 +42,7 @@ class UDPWrap: public HandleWrap {\n                          v8::Local<v8::Context> context);\n   static void GetFD(const v8::FunctionCallbackInfo<v8::Value>& args);\n   static void New(const v8::FunctionCallbackInfo<v8::Value>& args);\n+  static void Open(const v8::FunctionCallbackInfo<v8::Value>& args);\n   static void Bind(const v8::FunctionCallbackInfo<v8::Value>& args);\n   static void Send(const v8::FunctionCallbackInfo<v8::Value>& args);\n   static void Bind6(const v8::FunctionCallbackInfo<v8::Value>& args);"
+        },
+        {
+            "sha": "429f932608e2b2354b88827754369162c5a21600",
+            "filename": "test/parallel/test-cluster-dgram-bind-fd.js",
+            "status": "added",
+            "additions": 108,
+            "deletions": 0,
+            "changes": 108,
+            "blob_url": "https://github.com/nodejs/node/blob/2bea9cefbc10ed1dd497bbae61c07d971da287dd/test%2Fparallel%2Ftest-cluster-dgram-bind-fd.js",
+            "raw_url": "https://github.com/nodejs/node/raw/2bea9cefbc10ed1dd497bbae61c07d971da287dd/test%2Fparallel%2Ftest-cluster-dgram-bind-fd.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-cluster-dgram-bind-fd.js?ref=2bea9cefbc10ed1dd497bbae61c07d971da287dd",
+            "patch": "@@ -0,0 +1,108 @@\n+'use strict';\n+const common = require('../common');\n+if (common.isWindows)\n+  common.skip('dgram clustering is currently not supported on Windows.');\n+\n+const NUM_WORKERS = 4;\n+const PACKETS_PER_WORKER = 10;\n+\n+const assert = require('assert');\n+const cluster = require('cluster');\n+const dgram = require('dgram');\n+const { UDP } = process.binding('udp_wrap');\n+\n+if (cluster.isMaster)\n+  master();\n+else\n+  worker();\n+\n+\n+function master() {\n+  // Create a handle and use its fd.\n+  const rawHandle = new UDP();\n+  const err = rawHandle.bind(common.localhostIPv4, 0, 0);\n+  assert(err >= 0, String(err));\n+  assert.notStrictEqual(rawHandle.fd, -1);\n+\n+  const fd = rawHandle.fd;\n+\n+  let listening = 0;\n+\n+  // Fork 4 workers.\n+  for (let i = 0; i < NUM_WORKERS; i++)\n+    cluster.fork();\n+\n+  // Wait until all workers are listening.\n+  cluster.on('listening', common.mustCall((worker, address) => {\n+    if (++listening < NUM_WORKERS)\n+      return;\n+\n+    // Start sending messages.\n+    const buf = Buffer.from('hello world');\n+    const socket = dgram.createSocket('udp4');\n+    let sent = 0;\n+    doSend();\n+\n+    function doSend() {\n+      socket.send(buf, 0, buf.length, address.port, address.address, afterSend);\n+    }\n+\n+    function afterSend() {\n+      sent++;\n+      if (sent < NUM_WORKERS * PACKETS_PER_WORKER) {\n+        doSend();\n+      } else {\n+        socket.close();\n+      }\n+    }\n+  }, NUM_WORKERS));\n+\n+  // Set up event handlers for every worker. Each worker sends a message when\n+  // it has received the expected number of packets. After that it disconnects.\n+  for (const key in cluster.workers) {\n+    if (cluster.workers.hasOwnProperty(key))\n+      setupWorker(cluster.workers[key]);\n+  }\n+\n+  function setupWorker(worker) {\n+    let received = 0;\n+\n+    worker.send({\n+      fd,\n+    });\n+\n+    worker.on('message', common.mustCall((msg) => {\n+      received = msg.received;\n+      worker.disconnect();\n+    }));\n+\n+    worker.on('exit', common.mustCall(() => {\n+      assert.strictEqual(received, PACKETS_PER_WORKER);\n+    }));\n+  }\n+}\n+\n+\n+function worker() {\n+  let received = 0;\n+\n+  process.on('message', common.mustCall((data) => {\n+    const { fd } = data;\n+    // Create udp socket and start listening.\n+    const socket = dgram.createSocket('udp4');\n+\n+    socket.on('message', common.mustCall((data, info) => {\n+      received++;\n+\n+      // Every 10 messages, notify the master.\n+      if (received === PACKETS_PER_WORKER) {\n+        process.send({ received });\n+        socket.close();\n+      }\n+    }, PACKETS_PER_WORKER));\n+\n+    socket.bind({\n+      fd,\n+    });\n+  }));\n+}"
+        },
+        {
+            "sha": "efe0e43d7b5673fe3da9664a07c52dc7694ff183",
+            "filename": "test/parallel/test-dgram-bind-fd-error.js",
+            "status": "added",
+            "additions": 55,
+            "deletions": 0,
+            "changes": 55,
+            "blob_url": "https://github.com/nodejs/node/blob/2bea9cefbc10ed1dd497bbae61c07d971da287dd/test%2Fparallel%2Ftest-dgram-bind-fd-error.js",
+            "raw_url": "https://github.com/nodejs/node/raw/2bea9cefbc10ed1dd497bbae61c07d971da287dd/test%2Fparallel%2Ftest-dgram-bind-fd-error.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-dgram-bind-fd-error.js?ref=2bea9cefbc10ed1dd497bbae61c07d971da287dd",
+            "patch": "@@ -0,0 +1,55 @@\n+// Flags: --expose-internals\n+'use strict';\n+const common = require('../common');\n+if (common.isWindows)\n+  common.skip('Does not support binding fd on Windows');\n+\n+const dgram = require('dgram');\n+const assert = require('assert');\n+const { kStateSymbol } = require('internal/dgram');\n+const { TCP, constants } = process.binding('tcp_wrap');\n+const TYPE = 'udp4';\n+\n+// Throw when the fd is occupied according to https://github.com/libuv/libuv/pull/1851.\n+{\n+  const socket = dgram.createSocket(TYPE);\n+\n+  socket.bind(common.mustCall(() => {\n+    const anotherSocket = dgram.createSocket(TYPE);\n+    const { handle } = socket[kStateSymbol];\n+\n+    common.expectsError(() => {\n+      anotherSocket.bind({\n+        fd: handle.fd,\n+      });\n+    }, {\n+      code: 'EEXIST',\n+      type: Error,\n+      message: /^open EEXIST$/\n+    });\n+\n+    socket.close();\n+  }));\n+}\n+\n+// Throw when the type of fd is not \"UDP\".\n+{\n+  const handle = new TCP(constants.SOCKET);\n+  handle.listen();\n+\n+  const fd = handle.fd;\n+  assert.notStrictEqual(fd, -1);\n+\n+  const socket = new dgram.createSocket(TYPE);\n+  common.expectsError(() => {\n+    socket.bind({\n+      fd,\n+    });\n+  }, {\n+    code: 'ERR_INVALID_FD_TYPE',\n+    type: TypeError,\n+    message: /^Unsupported fd type: TCP$/\n+  });\n+\n+  handle.close();\n+}"
+        },
+        {
+            "sha": "c4a80abb92c4d2cdf2d241f70d6558c1a8585377",
+            "filename": "test/parallel/test-dgram-bind-fd.js",
+            "status": "added",
+            "additions": 118,
+            "deletions": 0,
+            "changes": 118,
+            "blob_url": "https://github.com/nodejs/node/blob/2bea9cefbc10ed1dd497bbae61c07d971da287dd/test%2Fparallel%2Ftest-dgram-bind-fd.js",
+            "raw_url": "https://github.com/nodejs/node/raw/2bea9cefbc10ed1dd497bbae61c07d971da287dd/test%2Fparallel%2Ftest-dgram-bind-fd.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-dgram-bind-fd.js?ref=2bea9cefbc10ed1dd497bbae61c07d971da287dd",
+            "patch": "@@ -0,0 +1,118 @@\n+'use strict';\n+const common = require('../common');\n+if (common.isWindows)\n+  common.skip('Does not support binding fd on Windows');\n+\n+const assert = require('assert');\n+const dgram = require('dgram');\n+const { UDP } = process.binding('udp_wrap');\n+const { UV_UDP_REUSEADDR } = process.binding('constants').os;\n+\n+const BUFFER_SIZE = 4096;\n+\n+// Test binding a fd.\n+{\n+  function createHandle(reuseAddr, udp4, bindAddress) {\n+    let flags = 0;\n+    if (reuseAddr)\n+      flags |= UV_UDP_REUSEADDR;\n+\n+    const handle = new UDP();\n+    let err = 0;\n+\n+    if (udp4) {\n+      err = handle.bind(bindAddress, 0, flags);\n+    } else {\n+      err = handle.bind6(bindAddress, 0, flags);\n+    }\n+    assert(err >= 0, String(err));\n+    assert.notStrictEqual(handle.fd, -1);\n+    return handle;\n+  }\n+\n+  function testWithOptions(reuseAddr, udp4) {\n+    const type = udp4 ? 'udp4' : 'udp6';\n+    const bindAddress = udp4 ? common.localhostIPv4 : '::1';\n+\n+    let fd;\n+\n+    const receiver = dgram.createSocket({\n+      type,\n+    });\n+\n+    receiver.bind({\n+      port: 0,\n+      address: bindAddress,\n+    }, common.mustCall(() => {\n+      const { port, address } = receiver.address();\n+      // Create a handle to reuse its fd.\n+      const handle = createHandle(reuseAddr, udp4, bindAddress);\n+\n+      fd = handle.fd;\n+      assert.notStrictEqual(handle.fd, -1);\n+\n+      const socket = dgram.createSocket({\n+        type,\n+        recvBufferSize: BUFFER_SIZE,\n+        sendBufferSize: BUFFER_SIZE,\n+      });\n+\n+      socket.bind({\n+        port: 0,\n+        address: bindAddress,\n+        fd,\n+      }, common.mustCall(() => {\n+        // Test address().\n+        const rinfo = {};\n+        const err = handle.getsockname(rinfo);\n+        assert.strictEqual(err, 0);\n+        const socketRInfo = socket.address();\n+        assert.strictEqual(rinfo.address, socketRInfo.address);\n+        assert.strictEqual(rinfo.port, socketRInfo.port);\n+\n+        // Test buffer size.\n+        const recvBufferSize = socket.getRecvBufferSize();\n+        const sendBufferSize = socket.getSendBufferSize();\n+\n+        // note: linux will double the buffer size\n+        const expectedBufferSize = common.isLinux ?\n+          BUFFER_SIZE * 2 : BUFFER_SIZE;\n+        assert.strictEqual(recvBufferSize, expectedBufferSize);\n+        assert.strictEqual(sendBufferSize, expectedBufferSize);\n+\n+        socket.send(String(fd), port, address);\n+      }));\n+\n+      socket.on('message', common.mustCall((data) => {\n+        assert.strictEqual(data.toString('utf8'), String(fd));\n+        socket.close();\n+      }));\n+\n+      socket.on('error', (err) => {\n+        console.error(err.message);\n+        assert.fail(err.message);\n+      });\n+\n+      socket.on('close', common.mustCall(() => {}));\n+    }));\n+\n+    receiver.on('message', common.mustCall((data, { address, port }) => {\n+      assert.strictEqual(data.toString('utf8'), String(fd));\n+      receiver.send(String(fd), port, address);\n+      process.nextTick(() => receiver.close());\n+    }));\n+\n+    receiver.on('error', (err) => {\n+      console.error(err.message);\n+      assert.fail(err.message);\n+    });\n+\n+    receiver.on('close', common.mustCall(() => {}));\n+  }\n+\n+  testWithOptions(true, true);\n+  testWithOptions(false, true);\n+  if (common.hasIPv6) {\n+    testWithOptions(false, false);\n+  }\n+}"
+        },
+        {
+            "sha": "ff507b6ec5091efac25ce8dfa3da4fb1203ec8d5",
+            "filename": "test/parallel/test-dgram-create-socket-handle-fd.js",
+            "status": "added",
+            "additions": 42,
+            "deletions": 0,
+            "changes": 42,
+            "blob_url": "https://github.com/nodejs/node/blob/2bea9cefbc10ed1dd497bbae61c07d971da287dd/test%2Fparallel%2Ftest-dgram-create-socket-handle-fd.js",
+            "raw_url": "https://github.com/nodejs/node/raw/2bea9cefbc10ed1dd497bbae61c07d971da287dd/test%2Fparallel%2Ftest-dgram-create-socket-handle-fd.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-dgram-create-socket-handle-fd.js?ref=2bea9cefbc10ed1dd497bbae61c07d971da287dd",
+            "patch": "@@ -0,0 +1,42 @@\n+'use strict';\n+const common = require('../common');\n+if (common.isWindows)\n+  common.skip('Does not support binding fd on Windows');\n+\n+const assert = require('assert');\n+const dgram = require('dgram');\n+const { UDP } = process.binding('udp_wrap');\n+const { TCP, constants } = process.binding('tcp_wrap');\n+const _createSocketHandle = dgram._createSocketHandle;\n+\n+// Return a negative number if the \"existing fd\" is invalid.\n+{\n+  const err = _createSocketHandle(common.localhostIPv4, 0, 'udp4', 42);\n+  assert(err < 0);\n+}\n+\n+// Return a negative number if the type of fd is not \"UDP\".\n+{\n+  // Create a handle with fd.\n+  const rawHandle = new UDP();\n+  const err = rawHandle.bind(common.localhostIPv4, 0, 0);\n+  assert(err >= 0, String(err));\n+  assert.notStrictEqual(rawHandle.fd, -1);\n+\n+  const handle = _createSocketHandle(null, 0, 'udp4', rawHandle.fd);\n+  assert(handle instanceof UDP);\n+  assert.strictEqual(typeof handle.fd, 'number');\n+  assert(handle.fd > 0);\n+}\n+\n+// Create a bound handle.\n+{\n+  const rawHandle = new TCP(constants.SOCKET);\n+  const err = rawHandle.listen();\n+  assert(err >= 0, String(err));\n+  assert.notStrictEqual(rawHandle.fd, -1);\n+\n+  const handle = _createSocketHandle(null, 0, 'udp4', rawHandle.fd);\n+  assert(handle < 0);\n+  rawHandle.close();\n+}"
+        },
+        {
+            "sha": "3df34a95c2b52671e92f4f518d96f7622570634b",
+            "filename": "test/parallel/test-dgram-create-socket-handle.js",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 8,
+            "changes": 8,
+            "blob_url": "https://github.com/nodejs/node/blob/2bea9cefbc10ed1dd497bbae61c07d971da287dd/test%2Fparallel%2Ftest-dgram-create-socket-handle.js",
+            "raw_url": "https://github.com/nodejs/node/raw/2bea9cefbc10ed1dd497bbae61c07d971da287dd/test%2Fparallel%2Ftest-dgram-create-socket-handle.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-dgram-create-socket-handle.js?ref=2bea9cefbc10ed1dd497bbae61c07d971da287dd",
+            "patch": "@@ -5,14 +5,6 @@ const assert = require('assert');\n const { _createSocketHandle } = require('internal/dgram');\n const UDP = process.binding('udp_wrap').UDP;\n \n-// Throws if an \"existing fd\" is passed in.\n-common.expectsError(() => {\n-  _createSocketHandle(common.localhostIPv4, 0, 'udp4', 42);\n-}, {\n-  code: 'ERR_ASSERTION',\n-  message: /^false == true$/\n-});\n-\n {\n   // Create a handle that is not bound.\n   const handle = _createSocketHandle(null, null, 'udp4');"
+        }
+    ],
+    "stats": {
+        "total": 481,
+        "additions": 442,
+        "deletions": 39
+    }
+}

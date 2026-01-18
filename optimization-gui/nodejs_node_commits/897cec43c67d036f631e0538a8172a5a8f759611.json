@@ -1,0 +1,36 @@
+{
+    "author": "joyeecheung",
+    "message": "fs: fix memory leak in WriteString\n\nIn the async case, if the buffer was copied instead of being moved\nthen the buf will not get deleted after the request is done.\nThis was introduced when the FSReqWrap:: Ownership was\nremoved in 4b9ba9b, and ReleaseEarly was no longer called upon\ndestruction of FSReqWrap.\n\nCreate a custom Init function so we can use the MaybeStackBuffer in\nthe FSReqBase to copy the string in the async case. The data will\nthen get destructed when the FSReqBase is destructed.\n\nFixes: https://github.com/nodejs/node/issues/19356\n\nPR-URL: https://github.com/nodejs/node/pull/19357\nReviewed-By: Anna Henningsen <anna@addaleax.net>\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "897cec43c67d036f631e0538a8172a5a8f759611",
+    "files": [
+        {
+            "sha": "510689607e87a76cd5e076915c29c834920010de",
+            "filename": "src/node_file.cc",
+            "status": "modified",
+            "additions": 30,
+            "deletions": 13,
+            "changes": 43,
+            "blob_url": "https://github.com/nodejs/node/blob/897cec43c67d036f631e0538a8172a5a8f759611/src%2Fnode_file.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/897cec43c67d036f631e0538a8172a5a8f759611/src%2Fnode_file.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_file.cc?ref=897cec43c67d036f631e0538a8172a5a8f759611",
+            "patch": "@@ -1527,7 +1527,6 @@ static void WriteString(const FunctionCallbackInfo<Value>& args) {\n \n   const auto enc = ParseEncoding(env->isolate(), args[3], UTF8);\n \n-  std::unique_ptr<char[]> delete_on_return;\n   Local<Value> value = args[1];\n   char* buf = nullptr;\n   size_t len;\n@@ -1555,24 +1554,42 @@ static void WriteString(const FunctionCallbackInfo<Value>& args) {\n     }\n   }\n \n-  if (buf == nullptr) {\n+  if (is_async) {  // write(fd, string, pos, enc, req)\n+    CHECK_NE(req_wrap, nullptr);\n     len = StringBytes::StorageSize(env->isolate(), value, enc);\n-    buf = new char[len];\n-    // SYNC_CALL returns on error.  Make sure to always free the memory.\n-    if (!is_async) delete_on_return.reset(buf);\n+    FSReqBase::FSReqBuffer& stack_buffer =\n+        req_wrap->Init(\"write\", len, enc);\n     // StorageSize may return too large a char, so correct the actual length\n     // by the write size\n-    len = StringBytes::Write(env->isolate(), buf, len, args[1], enc);\n-  }\n-\n-  uv_buf_t uvbuf = uv_buf_init(buf, len);\n-\n-  if (is_async) {  // write(fd, string, pos, enc, req)\n-    AsyncCall(env, req_wrap, args, \"write\", UTF8, AfterInteger,\n-              uv_fs_write, fd, &uvbuf, 1, pos);\n+    len = StringBytes::Write(env->isolate(), *stack_buffer, len, args[1], enc);\n+    stack_buffer.SetLengthAndZeroTerminate(len);\n+    uv_buf_t uvbuf = uv_buf_init(*stack_buffer, len);\n+    int err = uv_fs_write(env->event_loop(), req_wrap->req(),\n+                          fd, &uvbuf, 1, pos, AfterInteger);\n+    req_wrap->Dispatched();\n+    if (err < 0) {\n+      uv_fs_t* uv_req = req_wrap->req();\n+      uv_req->result = err;\n+      uv_req->path = nullptr;\n+      AfterInteger(uv_req);  // after may delete req_wrap if there is an error\n+    } else {\n+      req_wrap->SetReturnValue(args);\n+    }\n   } else {  // write(fd, string, pos, enc, undefined, ctx)\n     CHECK_EQ(argc, 6);\n     fs_req_wrap req_wrap;\n+    FSReqBase::FSReqBuffer stack_buffer;\n+    if (buf == nullptr) {\n+      len = StringBytes::StorageSize(env->isolate(), value, enc);\n+      stack_buffer.AllocateSufficientStorage(len + 1);\n+      // StorageSize may return too large a char, so correct the actual length\n+      // by the write size\n+      len = StringBytes::Write(env->isolate(), *stack_buffer,\n+                               len, args[1], enc);\n+      stack_buffer.SetLengthAndZeroTerminate(len);\n+      buf = *stack_buffer;\n+    }\n+    uv_buf_t uvbuf = uv_buf_init(buf, len);\n     int bytesWritten = SyncCall(env, args[5], &req_wrap, \"write\",\n                                 uv_fs_write, fd, &uvbuf, 1, pos);\n     args.GetReturnValue().Set(bytesWritten);"
+        },
+        {
+            "sha": "1925e400f2dffe79bd53d986cae876209aa38db6",
+            "filename": "src/node_file.h",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 4,
+            "changes": 20,
+            "blob_url": "https://github.com/nodejs/node/blob/897cec43c67d036f631e0538a8172a5a8f759611/src%2Fnode_file.h",
+            "raw_url": "https://github.com/nodejs/node/raw/897cec43c67d036f631e0538a8172a5a8f759611/src%2Fnode_file.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_file.h?ref=897cec43c67d036f631e0538a8172a5a8f759611",
+            "patch": "@@ -24,6 +24,8 @@ namespace fs {\n \n class FSReqBase : public ReqWrap<uv_fs_t> {\n  public:\n+  typedef MaybeStackBuffer<char, 64> FSReqBuffer;\n+\n   FSReqBase(Environment* env, Local<Object> req, AsyncWrap::ProviderType type)\n       : ReqWrap(env, req, type) {\n     Wrap(object(), this);\n@@ -34,9 +36,9 @@ class FSReqBase : public ReqWrap<uv_fs_t> {\n   }\n \n   void Init(const char* syscall,\n-            const char* data = nullptr,\n-            size_t len = 0,\n-            enum encoding encoding = UTF8) {\n+            const char* data,\n+            size_t len,\n+            enum encoding encoding) {\n     syscall_ = syscall;\n     encoding_ = encoding;\n \n@@ -49,6 +51,16 @@ class FSReqBase : public ReqWrap<uv_fs_t> {\n     }\n   }\n \n+  FSReqBuffer& Init(const char* syscall, size_t len,\n+                    enum encoding encoding) {\n+    syscall_ = syscall;\n+    encoding_ = encoding;\n+\n+    buffer_.AllocateSufficientStorage(len + 1);\n+    has_data_ = false;  // so that the data does not show up in error messages\n+    return buffer_;\n+  }\n+\n   virtual void FillStatsArray(const uv_stat_t* stat) = 0;\n   virtual void Reject(Local<Value> reject) = 0;\n   virtual void Resolve(Local<Value> value) = 0;\n@@ -68,7 +80,7 @@ class FSReqBase : public ReqWrap<uv_fs_t> {\n \n   // Typically, the content of buffer_ is something like a file name, so\n   // something around 64 bytes should be enough.\n-  MaybeStackBuffer<char, 64> buffer_;\n+  FSReqBuffer buffer_;\n \n   DISALLOW_COPY_AND_ASSIGN(FSReqBase);\n };"
+        }
+    ],
+    "stats": {
+        "total": 63,
+        "additions": 46,
+        "deletions": 17
+    }
+}

@@ -1,0 +1,60 @@
+{
+    "author": "addaleax",
+    "message": "worker: enable transferring WASM modules\n\nEnable in-memory transfer of WASM modules without recompilation.\n\nPreviously, the serialization step worked, but deserialization failed\nbecause we did not explicitly enable decoding inline WASM modules,\nand so the message was not successfully received.\n\nPR-URL: https://github.com/nodejs/node/pull/25314\nReviewed-By: Gus Caplan <me@gus.host>\nReviewed-By: Franziska Hinkelmann <franziska.hinkelmann@gmail.com>\nReviewed-By: Benjamin Gruenbaum <benjamingr@gmail.com>",
+    "sha": "0a549aaeaca8e3be7d19691d40f6a1c0798c82bf",
+    "files": [
+        {
+            "sha": "6036648dd4c5272ee98fe36399bcd1d648ab5750",
+            "filename": "src/node_messaging.cc",
+            "status": "modified",
+            "additions": 30,
+            "deletions": 8,
+            "changes": 38,
+            "blob_url": "https://github.com/nodejs/node/blob/0a549aaeaca8e3be7d19691d40f6a1c0798c82bf/src%2Fnode_messaging.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/0a549aaeaca8e3be7d19691d40f6a1c0798c82bf/src%2Fnode_messaging.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_messaging.cc?ref=0a549aaeaca8e3be7d19691d40f6a1c0798c82bf",
+            "patch": "@@ -30,6 +30,7 @@ using v8::String;\n using v8::Value;\n using v8::ValueDeserializer;\n using v8::ValueSerializer;\n+using v8::WasmCompiledModule;\n \n namespace node {\n namespace worker {\n@@ -43,13 +44,15 @@ namespace {\n // `MessagePort`s and `SharedArrayBuffer`s, and make new JS objects out of them.\n class DeserializerDelegate : public ValueDeserializer::Delegate {\n  public:\n-  DeserializerDelegate(Message* m,\n-                       Environment* env,\n-                       const std::vector<MessagePort*>& message_ports,\n-                       const std::vector<Local<SharedArrayBuffer>>&\n-                           shared_array_buffers)\n-    : message_ports_(message_ports),\n-      shared_array_buffers_(shared_array_buffers) {}\n+  DeserializerDelegate(\n+      Message* m,\n+      Environment* env,\n+      const std::vector<MessagePort*>& message_ports,\n+      const std::vector<Local<SharedArrayBuffer>>& shared_array_buffers,\n+      const std::vector<WasmCompiledModule::TransferrableModule>& wasm_modules)\n+      : message_ports_(message_ports),\n+        shared_array_buffers_(shared_array_buffers),\n+        wasm_modules_(wasm_modules) {}\n \n   MaybeLocal<Object> ReadHostObject(Isolate* isolate) override {\n     // Currently, only MessagePort hosts objects are supported, so identifying\n@@ -67,11 +70,19 @@ class DeserializerDelegate : public ValueDeserializer::Delegate {\n     return shared_array_buffers_[clone_id];\n   }\n \n+  MaybeLocal<WasmCompiledModule> GetWasmModuleFromId(\n+      Isolate* isolate, uint32_t transfer_id) override {\n+    CHECK_LE(transfer_id, wasm_modules_.size());\n+    return WasmCompiledModule::FromTransferrableModule(\n+        isolate, wasm_modules_[transfer_id]);\n+  }\n+\n   ValueDeserializer* deserializer = nullptr;\n \n  private:\n   const std::vector<MessagePort*>& message_ports_;\n   const std::vector<Local<SharedArrayBuffer>>& shared_array_buffers_;\n+  const std::vector<WasmCompiledModule::TransferrableModule>& wasm_modules_;\n };\n \n }  // anonymous namespace\n@@ -109,7 +120,8 @@ MaybeLocal<Value> Message::Deserialize(Environment* env,\n   }\n   shared_array_buffers_.clear();\n \n-  DeserializerDelegate delegate(this, env, ports, shared_array_buffers);\n+  DeserializerDelegate delegate(\n+      this, env, ports, shared_array_buffers, wasm_modules_);\n   ValueDeserializer deserializer(\n       env->isolate(),\n       reinterpret_cast<const uint8_t*>(main_message_buf_.data),\n@@ -143,6 +155,11 @@ void Message::AddMessagePort(std::unique_ptr<MessagePortData>&& data) {\n   message_ports_.emplace_back(std::move(data));\n }\n \n+uint32_t Message::AddWASMModule(WasmCompiledModule::TransferrableModule&& mod) {\n+  wasm_modules_.emplace_back(std::move(mod));\n+  return wasm_modules_.size() - 1;\n+}\n+\n namespace {\n \n void ThrowDataCloneException(Environment* env, Local<String> message) {\n@@ -202,6 +219,11 @@ class SerializerDelegate : public ValueSerializer::Delegate {\n     return Just(i);\n   }\n \n+  Maybe<uint32_t> GetWasmModuleTransferId(\n+      Isolate* isolate, Local<WasmCompiledModule> module) override {\n+    return Just(msg_->AddWASMModule(module->GetTransferrableModule()));\n+  }\n+\n   void Finish() {\n     // Only close the MessagePort handles and actually transfer them\n     // once we know that serialization succeeded."
+        },
+        {
+            "sha": "3c79e24f24b896c1e5c4517f8b308507a8023d30",
+            "filename": "src/node_messaging.h",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/nodejs/node/blob/0a549aaeaca8e3be7d19691d40f6a1c0798c82bf/src%2Fnode_messaging.h",
+            "raw_url": "https://github.com/nodejs/node/raw/0a549aaeaca8e3be7d19691d40f6a1c0798c82bf/src%2Fnode_messaging.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_messaging.h?ref=0a549aaeaca8e3be7d19691d40f6a1c0798c82bf",
+            "patch": "@@ -47,6 +47,9 @@ class Message : public MemoryRetainer {\n   // Internal method of Message that is called once serialization finishes\n   // and that transfers ownership of `data` to this message.\n   void AddMessagePort(std::unique_ptr<MessagePortData>&& data);\n+  // Internal method of Message that is called when a new WebAssembly.Module\n+  // object is encountered in the incoming value's structure.\n+  uint32_t AddWASMModule(v8::WasmCompiledModule::TransferrableModule&& mod);\n \n   // The MessagePorts that will be transferred, as recorded by Serialize().\n   // Used for warning user about posting the target MessagePort to itself,\n@@ -65,6 +68,7 @@ class Message : public MemoryRetainer {\n   std::vector<MallocedBuffer<char>> array_buffer_contents_;\n   std::vector<SharedArrayBufferMetadataReference> shared_array_buffers_;\n   std::vector<std::unique_ptr<MessagePortData>> message_ports_;\n+  std::vector<v8::WasmCompiledModule::TransferrableModule> wasm_modules_;\n \n   friend class MessagePort;\n };"
+        },
+        {
+            "sha": "43c12a8519981bc2d1e98ca444d68eeb99284eb0",
+            "filename": "test/parallel/test-worker-message-port-wasm-module.js",
+            "status": "added",
+            "additions": 19,
+            "deletions": 0,
+            "changes": 19,
+            "blob_url": "https://github.com/nodejs/node/blob/0a549aaeaca8e3be7d19691d40f6a1c0798c82bf/test%2Fparallel%2Ftest-worker-message-port-wasm-module.js",
+            "raw_url": "https://github.com/nodejs/node/raw/0a549aaeaca8e3be7d19691d40f6a1c0798c82bf/test%2Fparallel%2Ftest-worker-message-port-wasm-module.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-worker-message-port-wasm-module.js?ref=0a549aaeaca8e3be7d19691d40f6a1c0798c82bf",
+            "patch": "@@ -0,0 +1,19 @@\n+// Flags: --experimental-worker\n+'use strict';\n+const common = require('../common');\n+const assert = require('assert');\n+const fixtures = require('../common/fixtures');\n+\n+const { Worker } = require('worker_threads');\n+const wasmModule = new WebAssembly.Module(fixtures.readSync('test.wasm'));\n+\n+const worker = new Worker(`\n+const { parentPort } = require('worker_threads');\n+parentPort.once('message', ({ wasmModule }) => {\n+  const instance = new WebAssembly.Instance(wasmModule);\n+  parentPort.postMessage(instance.exports.addTwo(10, 20));\n+});\n+`, { eval: true });\n+\n+worker.once('message', common.mustCall((num) => assert.strictEqual(num, 30)));\n+worker.postMessage({ wasmModule });"
+        },
+        {
+            "sha": "891da80e30af364773e74d16dcb80bc7cb7654e4",
+            "filename": "test/parallel/test-worker-message-port-wasm-threads.js",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 2,
+            "changes": 12,
+            "blob_url": "https://github.com/nodejs/node/blob/0a549aaeaca8e3be7d19691d40f6a1c0798c82bf/test%2Fparallel%2Ftest-worker-message-port-wasm-threads.js",
+            "raw_url": "https://github.com/nodejs/node/raw/0a549aaeaca8e3be7d19691d40f6a1c0798c82bf/test%2Fparallel%2Ftest-worker-message-port-wasm-threads.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-worker-message-port-wasm-threads.js?ref=0a549aaeaca8e3be7d19691d40f6a1c0798c82bf",
+            "patch": "@@ -32,15 +32,23 @@ assert(buffer instanceof SharedArrayBuffer);\n   // stopped when we exit.\n   const worker = new Worker(`\n   const { parentPort } = require('worker_threads');\n+\n+  // Compile the same WASM module from its source bytes.\n   const wasmSource = new Uint8Array([${wasmSource.join(',')}]);\n   const wasmModule = new WebAssembly.Module(wasmSource);\n   const instance = new WebAssembly.Instance(wasmModule);\n   parentPort.postMessage(instance.exports.memory);\n+\n+  // Do the same thing, except we receive the WASM module via transfer.\n+  parentPort.once('message', ({ wasmModule }) => {\n+    const instance = new WebAssembly.Instance(wasmModule);\n+    parentPort.postMessage(instance.exports.memory);\n+  });\n   `, { eval: true });\n-  worker.once('message', common.mustCall(({ buffer }) => {\n+  worker.on('message', common.mustCall(({ buffer }) => {\n     assert(buffer instanceof SharedArrayBuffer);\n     worker.buf = buffer; // Basically just keep the reference to buffer alive.\n-  }));\n+  }, 2));\n   worker.once('exit', common.mustCall());\n   worker.postMessage({ wasmModule });\n }"
+        }
+    ],
+    "stats": {
+        "total": 73,
+        "additions": 63,
+        "deletions": 10
+    }
+}

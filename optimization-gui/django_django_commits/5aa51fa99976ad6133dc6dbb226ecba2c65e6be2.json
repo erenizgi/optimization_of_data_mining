@@ -1,0 +1,48 @@
+{
+    "author": "akaariai",
+    "message": "Simplified QuerySet field.null handling\n\nQuerySet had previously some complex logic for dealing with nullable\nfields in negated add_filter() calls. It seems the logic is leftover\nfrom a time where the WhereNode wasn't as intelligent in handling\nfield__in=[] conditions.\n\nThanks to aaugustin for comments on the patch.",
+    "sha": "5aa51fa99976ad6133dc6dbb226ecba2c65e6be2",
+    "files": [
+        {
+            "sha": "cf527b18b0822dd4081c72dd81e60c766a86219a",
+            "filename": "django/db/models/sql/query.py",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 8,
+            "changes": 17,
+            "blob_url": "https://github.com/django/django/blob/5aa51fa99976ad6133dc6dbb226ecba2c65e6be2/django%2Fdb%2Fmodels%2Fsql%2Fquery.py",
+            "raw_url": "https://github.com/django/django/raw/5aa51fa99976ad6133dc6dbb226ecba2c65e6be2/django%2Fdb%2Fmodels%2Fsql%2Fquery.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fmodels%2Fsql%2Fquery.py?ref=5aa51fa99976ad6133dc6dbb226ecba2c65e6be2",
+            "patch": "@@ -1193,14 +1193,15 @@ def add_filter(self, filter_expr, connector=AND, negate=False, trim=False,\n                             entry.negate()\n                             self.where.add(entry, AND)\n                             break\n-                if not (lookup_type == 'in'\n-                            and not hasattr(value, 'as_sql')\n-                            and not hasattr(value, '_as_sql')\n-                            and not value) and field.null:\n-                    # Leaky abstraction artifact: We have to specifically\n-                    # exclude the \"foo__in=[]\" case from this handling, because\n-                    # it's short-circuited in the Where class.\n-                    # We also need to handle the case where a subquery is provided\n+                if field.null:\n+                    # In SQL NULL = anyvalue returns unknown, and NOT unknown\n+                    # is still unknown. However, in Python None = anyvalue is False\n+                    # (and not False is True...), and we want to return this Python's\n+                    # view of None handling. So we need to specifically exclude the\n+                    # NULL values, and because we are inside NOT branch they will\n+                    # be included in the final resultset. We are essentially creating\n+                    # SQL like this here: NOT (col IS NOT NULL), where the first NOT\n+                    # is added in upper layers of the code.\n                     self.where.add((Constraint(alias, col, None), 'isnull', False), AND)\n \n         if can_reuse is not None:"
+        },
+        {
+            "sha": "89eefdf48e8f5038ae29ff8672b5b9ed6cc09999",
+            "filename": "tests/regressiontests/queries/models.py",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/django/django/blob/5aa51fa99976ad6133dc6dbb226ecba2c65e6be2/tests%2Fregressiontests%2Fqueries%2Fmodels.py",
+            "raw_url": "https://github.com/django/django/raw/5aa51fa99976ad6133dc6dbb226ecba2c65e6be2/tests%2Fregressiontests%2Fqueries%2Fmodels.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fqueries%2Fmodels.py?ref=5aa51fa99976ad6133dc6dbb226ecba2c65e6be2",
+            "patch": "@@ -346,3 +346,9 @@ class OneToOneCategory(models.Model):\n \n     def __unicode__(self):\n         return \"one2one \" + self.new_name\n+\n+class NullableName(models.Model):\n+    name = models.CharField(max_length=20, null=True)\n+\n+    class Meta:\n+        ordering = ['id']"
+        },
+        {
+            "sha": "fb7821997742246764968e1f2be15faddde73126",
+            "filename": "tests/regressiontests/queries/tests.py",
+            "status": "modified",
+            "additions": 37,
+            "deletions": 1,
+            "changes": 38,
+            "blob_url": "https://github.com/django/django/blob/5aa51fa99976ad6133dc6dbb226ecba2c65e6be2/tests%2Fregressiontests%2Fqueries%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/5aa51fa99976ad6133dc6dbb226ecba2c65e6be2/tests%2Fregressiontests%2Fqueries%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fqueries%2Ftests.py?ref=5aa51fa99976ad6133dc6dbb226ecba2c65e6be2",
+            "patch": "@@ -1,6 +1,7 @@\n from __future__ import absolute_import\n \n import datetime\n+from operator import attrgetter\n import pickle\n import sys\n \n@@ -18,7 +19,7 @@\n     ManagedModel, Member, NamedCategory, Note, Number, Plaything, PointerA,\n     Ranking, Related, Report, ReservedName, Tag, TvChef, Valid, X, Food, Eaten,\n     Node, ObjectA, ObjectB, ObjectC, CategoryItem, SimpleCategory,\n-    SpecialCategory, OneToOneCategory)\n+    SpecialCategory, OneToOneCategory, NullableName)\n \n \n class BaseQuerysetTest(TestCase):\n@@ -1894,3 +1895,38 @@ def test_no_extra_params(self):\n             DumbCategory.objects.create()\n         except TypeError:\n             self.fail(\"Creation of an instance of a model with only the PK field shouldn't error out after bulk insert refactoring (#17056)\")\n+\n+class NullInExcludeTest(TestCase):\n+    def setUp(self):\n+        NullableName.objects.create(name='i1')\n+        NullableName.objects.create()\n+\n+    def test_null_in_exclude_qs(self):\n+        none_val = '' if connection.features.interprets_empty_strings_as_nulls else None\n+        self.assertQuerysetEqual(\n+            NullableName.objects.exclude(name__in=[]),\n+            ['i1', none_val], attrgetter('name'))\n+        self.assertQuerysetEqual(\n+            NullableName.objects.exclude(name__in=['i1']),\n+            [none_val], attrgetter('name'))\n+        self.assertQuerysetEqual(\n+            NullableName.objects.exclude(name__in=['i3']),\n+            ['i1', none_val], attrgetter('name'))\n+        inner_qs = NullableName.objects.filter(name='i1').values_list('name')\n+        self.assertQuerysetEqual(\n+            NullableName.objects.exclude(name__in=inner_qs),\n+            [none_val], attrgetter('name'))\n+        # Check that the inner queryset wasn't executed - it should be turned\n+        # into subquery above\n+        self.assertIs(inner_qs._result_cache, None)\n+\n+    @unittest.expectedFailure\n+    def test_col_not_in_list_containing_null(self):\n+        \"\"\"\n+        The following case is not handled properly because\n+        SQL's COL NOT IN (list containing null) handling is too weird to\n+        abstract away.\n+        \"\"\"\n+        self.assertQuerysetEqual(\n+            NullableName.objects.exclude(name__in=[None]),\n+            ['i1'], attrgetter('name'))"
+        }
+    ],
+    "stats": {
+        "total": 61,
+        "additions": 52,
+        "deletions": 9
+    }
+}

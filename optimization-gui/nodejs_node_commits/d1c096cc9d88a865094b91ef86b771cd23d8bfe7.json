@@ -1,0 +1,84 @@
+{
+    "author": "addaleax",
+    "message": "worker: improve error (de)serialization\n\nRather than passing errors using some sort of string representation,\ndo a best effort for faithful serialization/deserialization of\nuncaught exception objects.\n\nPR-URL: https://github.com/nodejs/node/pull/20876\nReviewed-By: Gireesh Punathil <gpunathi@in.ibm.com>\nReviewed-By: Benjamin Gruenbaum <benjamingr@gmail.com>\nReviewed-By: Shingo Inoue <leko.noor@gmail.com>\nReviewed-By: Matteo Collina <matteo.collina@gmail.com>\nReviewed-By: Tiancheng \"Timothy\" Gu <timothygu99@gmail.com>\nReviewed-By: John-David Dalton <john.david.dalton@gmail.com>\nReviewed-By: Gus Caplan <me@gus.host>",
+    "sha": "d1c096cc9d88a865094b91ef86b771cd23d8bfe7",
+    "files": [
+        {
+            "sha": "9da1a8641716077d32f50df8b788fede360ebd5e",
+            "filename": "lib/internal/error-serdes.js",
+            "status": "added",
+            "additions": 121,
+            "deletions": 0,
+            "changes": 121,
+            "blob_url": "https://github.com/nodejs/node/blob/d1c096cc9d88a865094b91ef86b771cd23d8bfe7/lib%2Finternal%2Ferror-serdes.js",
+            "raw_url": "https://github.com/nodejs/node/raw/d1c096cc9d88a865094b91ef86b771cd23d8bfe7/lib%2Finternal%2Ferror-serdes.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Ferror-serdes.js?ref=d1c096cc9d88a865094b91ef86b771cd23d8bfe7",
+            "patch": "@@ -0,0 +1,121 @@\n+'use strict';\n+\n+const Buffer = require('buffer').Buffer;\n+const { serialize, deserialize } = require('v8');\n+const { SafeSet } = require('internal/safe_globals');\n+\n+const kSerializedError = 0;\n+const kSerializedObject = 1;\n+const kInspectedError = 2;\n+\n+const GetPrototypeOf = Object.getPrototypeOf;\n+const GetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;\n+const GetOwnPropertyNames = Object.getOwnPropertyNames;\n+const DefineProperty = Object.defineProperty;\n+const Assign = Object.assign;\n+const ObjectPrototypeToString =\n+    Function.prototype.call.bind(Object.prototype.toString);\n+const ForEach = Function.prototype.call.bind(Array.prototype.forEach);\n+const Call = Function.prototype.call.bind(Function.prototype.call);\n+\n+const errors = {\n+  Error, TypeError, RangeError, URIError, SyntaxError, ReferenceError, EvalError\n+};\n+const errorConstructorNames = new SafeSet(Object.keys(errors));\n+\n+function TryGetAllProperties(object, target = object) {\n+  const all = Object.create(null);\n+  if (object === null)\n+    return all;\n+  Assign(all, TryGetAllProperties(GetPrototypeOf(object), target));\n+  const keys = GetOwnPropertyNames(object);\n+  ForEach(keys, (key) => {\n+    const descriptor = GetOwnPropertyDescriptor(object, key);\n+    const getter = descriptor.get;\n+    if (getter && key !== '__proto__') {\n+      try {\n+        descriptor.value = Call(getter, target);\n+      } catch {}\n+    }\n+    if ('value' in descriptor && typeof descriptor.value !== 'function') {\n+      delete descriptor.get;\n+      delete descriptor.set;\n+      all[key] = descriptor;\n+    }\n+  });\n+  return all;\n+}\n+\n+function GetConstructors(object) {\n+  const constructors = [];\n+\n+  for (var current = object;\n+    current !== null;\n+    current = GetPrototypeOf(current)) {\n+    const desc = GetOwnPropertyDescriptor(current, 'constructor');\n+    if (desc && desc.value) {\n+      DefineProperty(constructors, constructors.length, {\n+        value: desc.value, enumerable: true\n+      });\n+    }\n+  }\n+\n+  return constructors;\n+}\n+\n+function GetName(object) {\n+  const desc = GetOwnPropertyDescriptor(object, 'name');\n+  return desc && desc.value;\n+}\n+\n+let util;\n+function lazyUtil() {\n+  if (!util)\n+    util = require('util');\n+  return util;\n+}\n+\n+function serializeError(error) {\n+  try {\n+    if (typeof error === 'object' &&\n+        ObjectPrototypeToString(error) === '[object Error]') {\n+      const constructors = GetConstructors(error);\n+      for (var i = constructors.length - 1; i >= 0; i--) {\n+        const name = GetName(constructors[i]);\n+        if (errorConstructorNames.has(name)) {\n+          try { error.stack; } catch {}\n+          const serialized = serialize({\n+            constructor: name,\n+            properties: TryGetAllProperties(error)\n+          });\n+          return Buffer.concat([Buffer.from([kSerializedError]), serialized]);\n+        }\n+      }\n+    }\n+  } catch {}\n+  try {\n+    const serialized = serialize(error);\n+    return Buffer.concat([Buffer.from([kSerializedObject]), serialized]);\n+  } catch {}\n+  return Buffer.concat([Buffer.from([kInspectedError]),\n+                        Buffer.from(lazyUtil().inspect(error), 'utf8')]);\n+}\n+\n+function deserializeError(error) {\n+  switch (error[0]) {\n+    case kSerializedError:\n+      const { constructor, properties } = deserialize(error.subarray(1));\n+      const ctor = errors[constructor];\n+      return Object.create(ctor.prototype, properties);\n+    case kSerializedObject:\n+      return deserialize(error.subarray(1));\n+    case kInspectedError:\n+      const buf = Buffer.from(error.buffer,\n+                              error.byteOffset + 1,\n+                              error.byteLength - 1);\n+      return buf.toString('utf8');\n+  }\n+  require('assert').fail('This should not happen');\n+}\n+\n+module.exports = { serializeError, deserializeError };"
+        },
+        {
+            "sha": "7276d7d5655db72665741f89d996a4133017b340",
+            "filename": "lib/internal/worker.js",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 12,
+            "changes": 13,
+            "blob_url": "https://github.com/nodejs/node/blob/d1c096cc9d88a865094b91ef86b771cd23d8bfe7/lib%2Finternal%2Fworker.js",
+            "raw_url": "https://github.com/nodejs/node/raw/d1c096cc9d88a865094b91ef86b771cd23d8bfe7/lib%2Finternal%2Fworker.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fworker.js?ref=d1c096cc9d88a865094b91ef86b771cd23d8bfe7",
+            "patch": "@@ -1,6 +1,5 @@\n 'use strict';\n \n-const Buffer = require('buffer').Buffer;\n const EventEmitter = require('events');\n const assert = require('assert');\n const path = require('path');\n@@ -17,6 +16,7 @@ const { internalBinding } = require('internal/bootstrap/loaders');\n const { MessagePort, MessageChannel } = internalBinding('messaging');\n const { handle_onclose } = internalBinding('symbols');\n const { clearAsyncIdStack } = require('internal/async_hooks');\n+const { serializeError, deserializeError } = require('internal/error-serdes');\n \n util.inherits(MessagePort, EventEmitter);\n \n@@ -453,17 +453,6 @@ function setupChild(evalScript) {\n   }\n }\n \n-// TODO(addaleax): These can be improved a lot.\n-function serializeError(error) {\n-  return Buffer.from(util.inspect(error), 'utf8');\n-}\n-\n-function deserializeError(error) {\n-  return Buffer.from(error.buffer,\n-                     error.byteOffset,\n-                     error.byteLength).toString('utf8');\n-}\n-\n function pipeWithoutWarning(source, dest) {\n   const sourceMaxListeners = source._maxListeners;\n   const destMaxListeners = dest._maxListeners;"
+        },
+        {
+            "sha": "617aeb379792df88a7915f68abe1ba2ec43b45cd",
+            "filename": "node.gyp",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/d1c096cc9d88a865094b91ef86b771cd23d8bfe7/node.gyp",
+            "raw_url": "https://github.com/nodejs/node/raw/d1c096cc9d88a865094b91ef86b771cd23d8bfe7/node.gyp",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/node.gyp?ref=d1c096cc9d88a865094b91ef86b771cd23d8bfe7",
+            "patch": "@@ -102,6 +102,7 @@\n       'lib/internal/constants.js',\n       'lib/internal/encoding.js',\n       'lib/internal/errors.js',\n+      'lib/internal/error-serdes.js',\n       'lib/internal/fixed_queue.js',\n       'lib/internal/freelist.js',\n       'lib/internal/fs/promises.js',"
+        },
+        {
+            "sha": "e9d91e5736bcac02e13dbd6824470b03b049a82b",
+            "filename": "test/parallel/test-error-serdes.js",
+            "status": "added",
+            "additions": 46,
+            "deletions": 0,
+            "changes": 46,
+            "blob_url": "https://github.com/nodejs/node/blob/d1c096cc9d88a865094b91ef86b771cd23d8bfe7/test%2Fparallel%2Ftest-error-serdes.js",
+            "raw_url": "https://github.com/nodejs/node/raw/d1c096cc9d88a865094b91ef86b771cd23d8bfe7/test%2Fparallel%2Ftest-error-serdes.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-error-serdes.js?ref=d1c096cc9d88a865094b91ef86b771cd23d8bfe7",
+            "patch": "@@ -0,0 +1,46 @@\n+// Flags: --expose-internals\n+'use strict';\n+require('../common');\n+const assert = require('assert');\n+const { ERR_INVALID_ARG_TYPE } = require('internal/errors').codes;\n+const { serializeError, deserializeError } = require('internal/error-serdes');\n+\n+function cycle(err) {\n+  return deserializeError(serializeError(err));\n+}\n+\n+assert.strictEqual(cycle(0), 0);\n+assert.strictEqual(cycle(-1), -1);\n+assert.strictEqual(cycle(1.4), 1.4);\n+assert.strictEqual(cycle(null), null);\n+assert.strictEqual(cycle(undefined), undefined);\n+assert.strictEqual(cycle('foo'), 'foo');\n+\n+{\n+  const err = cycle(new Error('foo'));\n+  assert(err instanceof Error);\n+  assert.strictEqual(err.name, 'Error');\n+  assert.strictEqual(err.message, 'foo');\n+  assert(/^Error: foo\\n/.test(err.stack));\n+}\n+\n+assert.strictEqual(cycle(new RangeError('foo')).name, 'RangeError');\n+assert.strictEqual(cycle(new TypeError('foo')).name, 'TypeError');\n+assert.strictEqual(cycle(new ReferenceError('foo')).name, 'ReferenceError');\n+assert.strictEqual(cycle(new URIError('foo')).name, 'URIError');\n+assert.strictEqual(cycle(new EvalError('foo')).name, 'EvalError');\n+assert.strictEqual(cycle(new SyntaxError('foo')).name, 'SyntaxError');\n+\n+class SubError extends Error {}\n+\n+assert.strictEqual(cycle(new SubError('foo')).name, 'Error');\n+\n+assert.deepStrictEqual(cycle({ message: 'foo' }), { message: 'foo' });\n+assert.strictEqual(cycle(Function), '[Function: Function]');\n+\n+{\n+  const err = new ERR_INVALID_ARG_TYPE('object', 'Object', 42);\n+  assert(/^TypeError \\[ERR_INVALID_ARG_TYPE\\]:/.test(err));\n+  assert.strictEqual(err.name, 'TypeError [ERR_INVALID_ARG_TYPE]');\n+  assert.strictEqual(err.code, 'ERR_INVALID_ARG_TYPE');\n+}"
+        },
+        {
+            "sha": "1f45c46db9ad62d1be5b32bbed72631e24697308",
+            "filename": "test/parallel/test-worker-uncaught-exception-async.js",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/nodejs/node/blob/d1c096cc9d88a865094b91ef86b771cd23d8bfe7/test%2Fparallel%2Ftest-worker-uncaught-exception-async.js",
+            "raw_url": "https://github.com/nodejs/node/raw/d1c096cc9d88a865094b91ef86b771cd23d8bfe7/test%2Fparallel%2Ftest-worker-uncaught-exception-async.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-worker-uncaught-exception-async.js?ref=d1c096cc9d88a865094b91ef86b771cd23d8bfe7",
+            "patch": "@@ -10,8 +10,7 @@ if (!process.env.HAS_STARTED_WORKER) {\n   const w = new Worker(__filename);\n   w.on('message', common.mustNotCall());\n   w.on('error', common.mustCall((err) => {\n-    // TODO(addaleax): be more specific here\n-    assert(/foo/.test(err));\n+    assert(/^Error: foo$/.test(err));\n   }));\n } else {\n   setImmediate(() => {"
+        },
+        {
+            "sha": "cb2a0d79d21238e3e9dff69b3834f9ac9ac88bd7",
+            "filename": "test/parallel/test-worker-uncaught-exception.js",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/nodejs/node/blob/d1c096cc9d88a865094b91ef86b771cd23d8bfe7/test%2Fparallel%2Ftest-worker-uncaught-exception.js",
+            "raw_url": "https://github.com/nodejs/node/raw/d1c096cc9d88a865094b91ef86b771cd23d8bfe7/test%2Fparallel%2Ftest-worker-uncaught-exception.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-worker-uncaught-exception.js?ref=d1c096cc9d88a865094b91ef86b771cd23d8bfe7",
+            "patch": "@@ -10,8 +10,7 @@ if (!process.env.HAS_STARTED_WORKER) {\n   const w = new Worker(__filename);\n   w.on('message', common.mustNotCall());\n   w.on('error', common.mustCall((err) => {\n-    // TODO(addaleax): be more specific here\n-    assert(/foo/.test(err));\n+    assert(/^Error: foo$/.test(err));\n   }));\n } else {\n   throw new Error('foo');"
+        }
+    ],
+    "stats": {
+        "total": 187,
+        "additions": 171,
+        "deletions": 16
+    }
+}

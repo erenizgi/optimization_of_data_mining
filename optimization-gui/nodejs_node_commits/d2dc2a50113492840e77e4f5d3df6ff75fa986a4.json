@@ -1,0 +1,48 @@
+{
+    "author": "joyeecheung",
+    "message": "fs: throw fs.mkdtempSync errors in JS land\n\nPR-URL: https://github.com/nodejs/node/pull/18871\nRefs: https://github.com/nodejs/node/issues/18106\nReviewed-By: Michaël Zasso <targos@protonmail.com>\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Ruben Bridgewater <ruben@bridgewater.de>",
+    "sha": "d2dc2a50113492840e77e4f5d3df6ff75fa986a4",
+    "files": [
+        {
+            "sha": "99d63476907985208287240cc2c89476b09d21ea",
+            "filename": "lib/fs.js",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 1,
+            "changes": 7,
+            "blob_url": "https://github.com/nodejs/node/blob/d2dc2a50113492840e77e4f5d3df6ff75fa986a4/lib%2Ffs.js",
+            "raw_url": "https://github.com/nodejs/node/raw/d2dc2a50113492840e77e4f5d3df6ff75fa986a4/lib%2Ffs.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Ffs.js?ref=d2dc2a50113492840e77e4f5d3df6ff75fa986a4",
+            "patch": "@@ -1839,7 +1839,12 @@ fs.mkdtempSync = function(prefix, options) {\n                                prefix);\n   }\n   nullCheck(prefix, 'prefix');\n-  return binding.mkdtemp(`${prefix}XXXXXX`, options.encoding);\n+  const path = `${prefix}XXXXXX`;\n+  const ctx = { path };\n+  const result = binding.mkdtemp(path, options.encoding,\n+                                 undefined, ctx);\n+  handleErrorFromBinding(ctx);\n+  return result;\n };\n \n "
+        },
+        {
+            "sha": "d73b5450daba32581c870d0b564e9834549e533e",
+            "filename": "src/node_file.cc",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 6,
+            "changes": 17,
+            "blob_url": "https://github.com/nodejs/node/blob/d2dc2a50113492840e77e4f5d3df6ff75fa986a4/src%2Fnode_file.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/d2dc2a50113492840e77e4f5d3df6ff75fa986a4/src%2Fnode_file.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_file.cc?ref=d2dc2a50113492840e77e4f5d3df6ff75fa986a4",
+            "patch": "@@ -1608,26 +1608,31 @@ static void FUTimes(const FunctionCallbackInfo<Value>& args) {\n static void Mkdtemp(const FunctionCallbackInfo<Value>& args) {\n   Environment* env = Environment::GetCurrent(args);\n \n-  CHECK_GE(args.Length(), 2);\n+  const int argc = args.Length();\n+  CHECK_GE(argc, 2);\n \n   BufferValue tmpl(env->isolate(), args[0]);\n   CHECK_NE(*tmpl, nullptr);\n \n   const enum encoding encoding = ParseEncoding(env->isolate(), args[1], UTF8);\n \n   FSReqBase* req_wrap = GetReqWrap(env, args[2]);\n-  if (req_wrap != nullptr) {\n+  if (req_wrap != nullptr) {  // mkdtemp(tmpl, encoding, req)\n     AsyncCall(env, req_wrap, args, \"mkdtemp\", encoding, AfterStringPath,\n               uv_fs_mkdtemp, *tmpl);\n-  } else {\n-    SYNC_CALL(mkdtemp, *tmpl, *tmpl);\n-    const char* path = static_cast<const char*>(SYNC_REQ.path);\n+  } else {  // mkdtemp(tmpl, encoding, undefined, ctx)\n+    CHECK_EQ(argc, 4);\n+    fs_req_wrap req_wrap;\n+    SyncCall(env, args[3], &req_wrap, \"mkdtemp\",\n+             uv_fs_mkdtemp, *tmpl);\n+    const char* path = static_cast<const char*>(req_wrap.req.path);\n \n     Local<Value> error;\n     MaybeLocal<Value> rc =\n         StringBytes::Encode(env->isolate(), path, encoding, &error);\n     if (rc.IsEmpty()) {\n-      env->isolate()->ThrowException(error);\n+      Local<Object> ctx = args[3].As<Object>();\n+      ctx->Set(env->context(), env->error_string(), error).FromJust();\n       return;\n     }\n     args.GetReturnValue().Set(rc.ToLocalChecked());"
+        },
+        {
+            "sha": "29056e8b669e073bb56638c27408f32c2184aec1",
+            "filename": "test/parallel/test-fs-error-messages.js",
+            "status": "modified",
+            "additions": 27,
+            "deletions": 0,
+            "changes": 27,
+            "blob_url": "https://github.com/nodejs/node/blob/d2dc2a50113492840e77e4f5d3df6ff75fa986a4/test%2Fparallel%2Ftest-fs-error-messages.js",
+            "raw_url": "https://github.com/nodejs/node/raw/d2dc2a50113492840e77e4f5d3df6ff75fa986a4/test%2Fparallel%2Ftest-fs-error-messages.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-fs-error-messages.js?ref=d2dc2a50113492840e77e4f5d3df6ff75fa986a4",
+            "patch": "@@ -25,6 +25,7 @@ const fixtures = require('../common/fixtures');\n const assert = require('assert');\n const fs = require('fs');\n const nonexistentFile = fixtures.path('non-existent');\n+const nonexistentDir = fixtures.path('non-existent', 'foo', 'bar');\n const existingFile = fixtures.path('exit.js');\n const existingFile2 = fixtures.path('create-file.js');\n const existingDir = fixtures.path('empty');\n@@ -607,3 +608,29 @@ if (!common.isAIX) {\n     validateError\n   );\n }\n+\n+// mkdtemp\n+{\n+  const validateError = (err) => {\n+    const pathPrefix = new RegExp('^' + re`${nonexistentDir}`);\n+    assert(pathPrefix.test(err.path),\n+           `Expect ${err.path} to match ${pathPrefix}`);\n+\n+    const prefix = new RegExp('^ENOENT: no such file or directory, mkdtemp ' +\n+                              re`'${nonexistentDir}`);\n+    assert(prefix.test(err.message),\n+           `Expect ${err.message} to match ${prefix}`);\n+\n+    assert.strictEqual(err.errno, uv.UV_ENOENT);\n+    assert.strictEqual(err.code, 'ENOENT');\n+    assert.strictEqual(err.syscall, 'mkdtemp');\n+    return true;\n+  };\n+\n+  fs.mkdtemp(nonexistentDir, common.mustCall(validateError));\n+\n+  assert.throws(\n+    () => fs.mkdtempSync(nonexistentDir),\n+    validateError\n+  );\n+}"
+        }
+    ],
+    "stats": {
+        "total": 51,
+        "additions": 44,
+        "deletions": 7
+    }
+}

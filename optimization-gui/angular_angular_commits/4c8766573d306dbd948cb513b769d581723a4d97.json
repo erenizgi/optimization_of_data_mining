@@ -1,0 +1,36 @@
+{
+    "author": "atscott",
+    "message": "refactor(language-service): Update hybrid visitor to use keySpan for bound attributes (#38955)\n\nThe keySpan in bound attributes provides more fine-grained location information and can be used\nto disambiguate multiple bound attributes in a single microsyntax binding. Previously,\nthis case could not distinguish between the two different attributes because\nthe sourceSpans were identical and valueSpans would not match if the cursor\nwas located in a key.\n\nPR Close #38955",
+    "sha": "4c8766573d306dbd948cb513b769d581723a4d97",
+    "files": [
+        {
+            "sha": "2f94eea3b412100934ba62f35d56e4f7b59a968f",
+            "filename": "packages/language-service/ivy/hybrid_visitor.ts",
+            "status": "modified",
+            "additions": 29,
+            "deletions": 8,
+            "changes": 37,
+            "blob_url": "https://github.com/angular/angular/blob/4c8766573d306dbd948cb513b769d581723a4d97/packages%2Flanguage-service%2Fivy%2Fhybrid_visitor.ts",
+            "raw_url": "https://github.com/angular/angular/raw/4c8766573d306dbd948cb513b769d581723a4d97/packages%2Flanguage-service%2Fivy%2Fhybrid_visitor.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Flanguage-service%2Fivy%2Fhybrid_visitor.ts?ref=4c8766573d306dbd948cb513b769d581723a4d97",
+            "patch": "@@ -6,7 +6,7 @@\n  * found in the LICENSE file at https://angular.io/license\n  */\n \n-import {ParseSourceSpan} from '@angular/compiler';\n+import {AbsoluteSourceSpan, ParseSourceSpan} from '@angular/compiler';\n import * as e from '@angular/compiler/src/expression_parser/ast';  // e for expression AST\n import * as t from '@angular/compiler/src/render3/r3_ast';         // t for template AST\n \n@@ -31,10 +31,13 @@ class R3Visitor implements t.Visitor {\n   constructor(private readonly position: number) {}\n \n   visit(node: t.Node) {\n+    if (node instanceof t.BoundAttribute) {\n+      node.visit(this);\n+      return;\n+    }\n+\n     const {start, end} = getSpanIncludingEndTag(node);\n-    // Note both start and end are inclusive because we want to match conditions\n-    // like ¦start and end¦ where ¦ is the cursor.\n-    if (start <= this.position && this.position <= end) {\n+    if (isWithin(this.position, {start, end})) {\n       const length = end - start;\n       const last: t.Node|e.AST|undefined = this.path[this.path.length - 1];\n       if (last) {\n@@ -97,8 +100,13 @@ class R3Visitor implements t.Visitor {\n   }\n \n   visitBoundAttribute(attribute: t.BoundAttribute) {\n-    const visitor = new ExpressionVisitor(this.position);\n-    visitor.visit(attribute.value, this.path);\n+    if (isWithin(this.position, attribute.keySpan)) {\n+      this.path.push(attribute);\n+    } else if (attribute.valueSpan && isWithin(this.position, attribute.valueSpan)) {\n+      this.path.push(attribute);\n+      const visitor = new ExpressionVisitor(this.position);\n+      visitor.visit(attribute.value, this.path);\n+    }\n   }\n \n   visitBoundEvent(attribute: t.BoundEvent) {\n@@ -144,10 +152,9 @@ class ExpressionVisitor extends e.RecursiveAstVisitor {\n       // `ASTWithSource` and and underlying node that it wraps.\n       node = node.ast;\n     }\n-    const {start, end} = node.sourceSpan;\n     // The third condition is to account for the implicit receiver, which should\n     // not be visited.\n-    if (start <= this.position && this.position <= end && !(node instanceof e.ImplicitReceiver)) {\n+    if (isWithin(this.position, node.sourceSpan) && !(node instanceof e.ImplicitReceiver)) {\n       path.push(node);\n       node.visit(this, path);\n     }\n@@ -178,3 +185,17 @@ function getSpanIncludingEndTag(ast: t.Node) {\n   }\n   return result;\n }\n+\n+function isWithin(position: number, span: AbsoluteSourceSpan|ParseSourceSpan): boolean {\n+  let start: number, end: number;\n+  if (span instanceof ParseSourceSpan) {\n+    start = span.start.offset;\n+    end = span.end.offset;\n+  } else {\n+    start = span.start;\n+    end = span.end;\n+  }\n+  // Note both start and end are inclusive because we want to match conditions\n+  // like ¦start and end¦ where ¦ is the cursor.\n+  return start <= position && position <= end;\n+}"
+        },
+        {
+            "sha": "2bc2a1778ec826fff12368a0f7b8ca332e368bae",
+            "filename": "packages/language-service/ivy/test/hybrid_visitor_spec.ts",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 0,
+            "changes": 10,
+            "blob_url": "https://github.com/angular/angular/blob/4c8766573d306dbd948cb513b769d581723a4d97/packages%2Flanguage-service%2Fivy%2Ftest%2Fhybrid_visitor_spec.ts",
+            "raw_url": "https://github.com/angular/angular/raw/4c8766573d306dbd948cb513b769d581723a4d97/packages%2Flanguage-service%2Fivy%2Ftest%2Fhybrid_visitor_spec.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Flanguage-service%2Fivy%2Ftest%2Fhybrid_visitor_spec.ts?ref=4c8766573d306dbd948cb513b769d581723a4d97",
+            "patch": "@@ -518,6 +518,16 @@ describe('findNodeAtPosition for microsyntax expression', () => {\n     expect((node as t.BoundAttribute).name).toBe('ngForOf');\n   });\n \n+  it('should locate bound attribute key for trackBy', () => {\n+    const {errors, nodes, position} =\n+        parse(`<div *ngFor=\"let item of items; trac¦kBy: trackByFn\"></div>`);\n+    expect(errors).toBe(null);\n+    const node = findNodeAtPosition(nodes, position);\n+    expect(isTemplateNode(node!)).toBe(true);\n+    expect(node).toBeInstanceOf(t.BoundAttribute);\n+    expect((node as t.BoundAttribute).name).toBe('ngForTrackBy');\n+  });\n+\n   it('should locate bound attribute value', () => {\n     const {errors, nodes, position} = parse(`<div *ngFor=\"let item of it¦ems\"></div>`);\n     expect(errors).toBe(null);"
+        }
+    ],
+    "stats": {
+        "total": 47,
+        "additions": 39,
+        "deletions": 8
+    }
+}

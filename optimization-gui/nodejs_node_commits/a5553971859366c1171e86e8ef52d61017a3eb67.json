@@ -1,0 +1,120 @@
+{
+    "author": "mhdawson",
+    "message": "n-api: add methods to open/close callback scope\n\nAdd support for the following methods;\n  napi_open_callback_scope\n  napi_close_callback_scope\n\nThese are needed when running asynchronous methods directly\nusing uv.\n\nPR-URL: https://github.com/nodejs/node/pull/18089\nFixes: https://github.com/nodejs/node/issues/15604\nReviewed-By: Anna Henningsen <anna@addaleax.net>\nReviewed-By: Ben Noordhuis <info@bnoordhuis.nl>",
+    "sha": "a5553971859366c1171e86e8ef52d61017a3eb67",
+    "files": [
+        {
+            "sha": "44ee567166d6bd4f90be15fd7c914156b2c860d6",
+            "filename": "doc/api/n-api.md",
+            "status": "modified",
+            "additions": 38,
+            "deletions": 0,
+            "changes": 38,
+            "blob_url": "https://github.com/nodejs/node/blob/a5553971859366c1171e86e8ef52d61017a3eb67/doc%2Fapi%2Fn-api.md",
+            "raw_url": "https://github.com/nodejs/node/raw/a5553971859366c1171e86e8ef52d61017a3eb67/doc%2Fapi%2Fn-api.md",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/doc%2Fapi%2Fn-api.md?ref=a5553971859366c1171e86e8ef52d61017a3eb67",
+            "patch": "@@ -3431,6 +3431,42 @@ is sufficient and appropriate. Use of the `napi_make_callback` function\n may be required when implementing custom async behavior that does not use\n `napi_create_async_work`.\n \n+### *napi_open_callback_scope*\n+<!-- YAML\n+added: REPLACEME\n+-->\n+```C\n+NAPI_EXTERN napi_status napi_open_callback_scope(napi_env env,\n+                                                 napi_value resource_object,\n+                                                 napi_async_context context,\n+                                                 napi_callback_scope* result)\n+```\n+- `[in] env`: The environment that the API is invoked under.\n+- `[in] resource_object`: An optional object associated with the async work\n+  that will be passed to possible async_hooks [`init` hooks][].\n+- `[in] context`: Context for the async operation that is\n+invoking the callback. This should be a value previously obtained\n+from [`napi_async_init`][].\n+- `[out] result`: The newly created scope.\n+\n+There are cases(for example resolving promises) where it is\n+necessary to have the equivalent of the scope associated with a callback\n+in place when making certain N-API calls.  If there is no other script on\n+the stack the [`napi_open_callback_scope`][] and\n+[`napi_close_callback_scope`][] functions can be used to open/close\n+the required scope.\n+\n+### *napi_close_callback_scope*\n+<!-- YAML\n+added: REPLACEME\n+-->\n+```C\n+NAPI_EXTERN napi_status napi_close_callback_scope(napi_env env,\n+                                                  napi_callback_scope scope)\n+```\n+- `[in] env`: The environment that the API is invoked under.\n+- `[in] scope`: The scope to be closed.\n+\n ## Version Management\n \n ### napi_get_node_version\n@@ -3716,6 +3752,7 @@ NAPI_EXTERN napi_status napi_get_uv_event_loop(napi_env env,\n [`napi_async_init`]: #n_api_napi_async_init\n [`napi_cancel_async_work`]: #n_api_napi_cancel_async_work\n [`napi_close_escapable_handle_scope`]: #n_api_napi_close_escapable_handle_scope\n+[`napi_close_callback_scope`]: #n_api_napi_close_callback_scope\n [`napi_close_handle_scope`]: #n_api_napi_close_handle_scope\n [`napi_create_async_work`]: #n_api_napi_create_async_work\n [`napi_create_error`]: #n_api_napi_create_error\n@@ -3741,6 +3778,7 @@ NAPI_EXTERN napi_status napi_get_uv_event_loop(napi_env env,\n [`napi_get_last_error_info`]: #n_api_napi_get_last_error_info\n [`napi_get_and_clear_last_exception`]: #n_api_napi_get_and_clear_last_exception\n [`napi_make_callback`]: #n_api_napi_make_callback\n+[`napi_open_callback_scope`]: #n_api_napi_open_callback_scope\n [`napi_open_escapable_handle_scope`]: #n_api_napi_open_escapable_handle_scope\n [`napi_open_handle_scope`]: #n_api_napi_open_handle_scope\n [`napi_property_descriptor`]: #n_api_napi_property_descriptor"
+        },
+        {
+            "sha": "2c5f3066f728b170822310d7fea512760ae5fcc2",
+            "filename": "src/node_api.cc",
+            "status": "modified",
+            "additions": 59,
+            "deletions": 3,
+            "changes": 62,
+            "blob_url": "https://github.com/nodejs/node/blob/a5553971859366c1171e86e8ef52d61017a3eb67/src%2Fnode_api.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/a5553971859366c1171e86e8ef52d61017a3eb67/src%2Fnode_api.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_api.cc?ref=a5553971859366c1171e86e8ef52d61017a3eb67",
+            "patch": "@@ -44,6 +44,7 @@ struct napi_env__ {\n   v8::Persistent<v8::ObjectTemplate> accessor_data_template;\n   napi_extended_error_info last_error;\n   int open_handle_scopes = 0;\n+  int open_callback_scopes = 0;\n   uv_loop_t* loop = nullptr;\n };\n \n@@ -253,6 +254,18 @@ V8EscapableHandleScopeFromJsEscapableHandleScope(\n   return reinterpret_cast<EscapableHandleScopeWrapper*>(s);\n }\n \n+static\n+napi_callback_scope JsCallbackScopeFromV8CallbackScope(\n+    node::CallbackScope* s) {\n+  return reinterpret_cast<napi_callback_scope>(s);\n+}\n+\n+static\n+node::CallbackScope* V8CallbackScopeFromJsCallbackScope(\n+    napi_callback_scope s) {\n+  return reinterpret_cast<node::CallbackScope*>(s);\n+}\n+\n //=== Conversion between V8 Handles and napi_value ========================\n \n // This asserts v8::Local<> will always be implemented with a single\n@@ -544,6 +557,7 @@ class CallbackWrapperBase : public CallbackWrapper {\n     napi_clear_last_error(env);\n \n     int open_handle_scopes = env->open_handle_scopes;\n+    int open_callback_scopes = env->open_callback_scopes;\n \n     napi_value result = cb(env, cbinfo_wrapper);\n \n@@ -552,6 +566,7 @@ class CallbackWrapperBase : public CallbackWrapper {\n     }\n \n     CHECK_EQ(env->open_handle_scopes, open_handle_scopes);\n+    CHECK_EQ(env->open_callback_scopes, open_callback_scopes);\n \n     if (!env->last_exception.IsEmpty()) {\n       isolate->ThrowException(\n@@ -911,7 +926,8 @@ const char* error_messages[] = {nullptr,\n                                 \"An exception is pending\",\n                                 \"The async work item was cancelled\",\n                                 \"napi_escape_handle already called on scope\",\n-                                \"Invalid handle scope usage\"};\n+                                \"Invalid handle scope usage\",\n+                                \"Invalid callback scope usage\"};\n \n static inline napi_status napi_clear_last_error(napi_env env) {\n   env->last_error.error_code = napi_ok;\n@@ -942,9 +958,9 @@ napi_status napi_get_last_error_info(napi_env env,\n   // We don't have a napi_status_last as this would result in an ABI\n   // change each time a message was added.\n   static_assert(\n-      node::arraysize(error_messages) == napi_handle_scope_mismatch + 1,\n+      node::arraysize(error_messages) == napi_callback_scope_mismatch + 1,\n       \"Count of error messages must match count of error values\");\n-  CHECK_LE(env->last_error.error_code, napi_handle_scope_mismatch);\n+  CHECK_LE(env->last_error.error_code, napi_callback_scope_mismatch);\n \n   // Wait until someone requests the last error information to fetch the error\n   // message string\n@@ -2633,6 +2649,46 @@ napi_status napi_escape_handle(napi_env env,\n   return napi_set_last_error(env, napi_escape_called_twice);\n }\n \n+napi_status napi_open_callback_scope(napi_env env,\n+                                     napi_value resource_object,\n+                                     napi_async_context async_context_handle,\n+                                     napi_callback_scope* result) {\n+  // Omit NAPI_PREAMBLE and GET_RETURN_STATUS because V8 calls here cannot throw\n+  // JS exceptions.\n+  CHECK_ENV(env);\n+  CHECK_ARG(env, result);\n+\n+  v8::Local<v8::Context> context = env->isolate->GetCurrentContext();\n+\n+  node::async_context* node_async_context =\n+      reinterpret_cast<node::async_context*>(async_context_handle);\n+\n+  v8::Local<v8::Object> resource;\n+  CHECK_TO_OBJECT(env, context, resource, resource_object);\n+\n+  *result = v8impl::JsCallbackScopeFromV8CallbackScope(\n+      new node::CallbackScope(env->isolate,\n+                              resource,\n+                              *node_async_context));\n+\n+  env->open_callback_scopes++;\n+  return napi_clear_last_error(env);\n+}\n+\n+napi_status napi_close_callback_scope(napi_env env, napi_callback_scope scope) {\n+  // Omit NAPI_PREAMBLE and GET_RETURN_STATUS because V8 calls here cannot throw\n+  // JS exceptions.\n+  CHECK_ENV(env);\n+  CHECK_ARG(env, scope);\n+  if (env->open_callback_scopes == 0) {\n+    return napi_callback_scope_mismatch;\n+  }\n+\n+  env->open_callback_scopes--;\n+  delete v8impl::V8CallbackScopeFromJsCallbackScope(scope);\n+  return napi_clear_last_error(env);\n+}\n+\n napi_status napi_new_instance(napi_env env,\n                               napi_value constructor,\n                               size_t argc,"
+        },
+        {
+            "sha": "e9b3645e404530949e314de77cf7f4b8711a243c",
+            "filename": "src/node_api.h",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 0,
+            "changes": 8,
+            "blob_url": "https://github.com/nodejs/node/blob/a5553971859366c1171e86e8ef52d61017a3eb67/src%2Fnode_api.h",
+            "raw_url": "https://github.com/nodejs/node/raw/a5553971859366c1171e86e8ef52d61017a3eb67/src%2Fnode_api.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_api.h?ref=a5553971859366c1171e86e8ef52d61017a3eb67",
+            "patch": "@@ -424,6 +424,14 @@ NAPI_EXTERN napi_status napi_escape_handle(napi_env env,\n                                            napi_value escapee,\n                                            napi_value* result);\n \n+NAPI_EXTERN napi_status napi_open_callback_scope(napi_env env,\n+                                                 napi_value resource_object,\n+                                                 napi_async_context context,\n+                                                 napi_callback_scope* result);\n+\n+NAPI_EXTERN napi_status napi_close_callback_scope(napi_env env,\n+                                                  napi_callback_scope scope);\n+\n // Methods to support error handling\n NAPI_EXTERN napi_status napi_throw(napi_env env, napi_value error);\n NAPI_EXTERN napi_status napi_throw_error(napi_env env,"
+        },
+        {
+            "sha": "76f38802e83e2e15acaf26ff1c551c6255e7b0c4",
+            "filename": "src/node_api_types.h",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 1,
+            "changes": 4,
+            "blob_url": "https://github.com/nodejs/node/blob/a5553971859366c1171e86e8ef52d61017a3eb67/src%2Fnode_api_types.h",
+            "raw_url": "https://github.com/nodejs/node/raw/a5553971859366c1171e86e8ef52d61017a3eb67/src%2Fnode_api_types.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_api_types.h?ref=a5553971859366c1171e86e8ef52d61017a3eb67",
+            "patch": "@@ -15,6 +15,7 @@ typedef struct napi_value__ *napi_value;\n typedef struct napi_ref__ *napi_ref;\n typedef struct napi_handle_scope__ *napi_handle_scope;\n typedef struct napi_escapable_handle_scope__ *napi_escapable_handle_scope;\n+typedef struct napi_callback_scope__ *napi_callback_scope;\n typedef struct napi_callback_info__ *napi_callback_info;\n typedef struct napi_async_context__ *napi_async_context;\n typedef struct napi_async_work__ *napi_async_work;\n@@ -70,7 +71,8 @@ typedef enum {\n   napi_pending_exception,\n   napi_cancelled,\n   napi_escape_called_twice,\n-  napi_handle_scope_mismatch\n+  napi_handle_scope_mismatch,\n+  napi_callback_scope_mismatch\n } napi_status;\n \n typedef napi_value (*napi_callback)(napi_env env,"
+        },
+        {
+            "sha": "e6631b6ac7bb52a7944254d4cd6badddab38194d",
+            "filename": "test/addons-napi/test_callback_scope/binding.cc",
+            "status": "added",
+            "additions": 138,
+            "deletions": 0,
+            "changes": 138,
+            "blob_url": "https://github.com/nodejs/node/blob/a5553971859366c1171e86e8ef52d61017a3eb67/test%2Faddons-napi%2Ftest_callback_scope%2Fbinding.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/a5553971859366c1171e86e8ef52d61017a3eb67/test%2Faddons-napi%2Ftest_callback_scope%2Fbinding.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Faddons-napi%2Ftest_callback_scope%2Fbinding.cc?ref=a5553971859366c1171e86e8ef52d61017a3eb67",
+            "patch": "@@ -0,0 +1,138 @@\n+#include \"node_api.h\"\n+#include \"uv.h\"\n+#include \"../common.h\"\n+\n+namespace {\n+\n+// the test needs to fake out the async structure, so we need to use\n+// the raw structure here and then cast as done behind the scenes\n+// in napi calls.\n+struct async_context {\n+  double async_id;\n+  double trigger_async_id;\n+};\n+\n+\n+napi_value RunInCallbackScope(napi_env env, napi_callback_info info) {\n+  size_t argc;\n+  napi_value args[4];\n+\n+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, nullptr, nullptr, nullptr));\n+  NAPI_ASSERT(env, argc == 4 , \"Wrong number of arguments\");\n+\n+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, args, nullptr, nullptr));\n+\n+  napi_valuetype valuetype;\n+  NAPI_CALL(env, napi_typeof(env, args[0], &valuetype));\n+  NAPI_ASSERT(env, valuetype == napi_object,\n+      \"Wrong type of arguments. Expects an object as first argument.\");\n+\n+  NAPI_CALL(env, napi_typeof(env, args[1], &valuetype));\n+  NAPI_ASSERT(env, valuetype == napi_number,\n+      \"Wrong type of arguments. Expects a number as second argument.\");\n+\n+  NAPI_CALL(env, napi_typeof(env, args[2], &valuetype));\n+  NAPI_ASSERT(env, valuetype == napi_number,\n+      \"Wrong type of arguments. Expects a number as third argument.\");\n+\n+  NAPI_CALL(env, napi_typeof(env, args[3], &valuetype));\n+  NAPI_ASSERT(env, valuetype == napi_function,\n+      \"Wrong type of arguments. Expects a function as third argument.\");\n+\n+  struct async_context context;\n+  NAPI_CALL(env, napi_get_value_double(env, args[1], &context.async_id));\n+  NAPI_CALL(env,\n+      napi_get_value_double(env, args[2], &context.trigger_async_id));\n+\n+  napi_callback_scope scope = nullptr;\n+  NAPI_CALL(\n+      env,\n+      napi_open_callback_scope(env,\n+                               args[0],\n+                               reinterpret_cast<napi_async_context>(&context),\n+                               &scope));\n+\n+  // if the function has an exception pending after the call that is ok\n+  // so we don't use NAPI_CALL as we must close the callback scope regardless\n+  napi_value result = nullptr;\n+  napi_status function_call_result =\n+      napi_call_function(env, args[0], args[3], 0, nullptr, &result);\n+  if (function_call_result != napi_ok) {\n+    GET_AND_THROW_LAST_ERROR((env));\n+  }\n+\n+  NAPI_CALL(env, napi_close_callback_scope(env, scope));\n+\n+  return result;\n+}\n+\n+static napi_env shared_env = nullptr;\n+static napi_deferred deferred = nullptr;\n+\n+static void Callback(uv_work_t* req, int ignored) {\n+  napi_env env = shared_env;\n+\n+  napi_handle_scope handle_scope = nullptr;\n+  NAPI_CALL_RETURN_VOID(env, napi_open_handle_scope(env, &handle_scope));\n+\n+  napi_value resource_name;\n+  NAPI_CALL_RETURN_VOID(env, napi_create_string_utf8(\n+      env, \"test\", NAPI_AUTO_LENGTH, &resource_name));\n+  napi_async_context context;\n+  NAPI_CALL_RETURN_VOID(env,\n+                        napi_async_init(env, nullptr, resource_name, &context));\n+\n+  napi_value resource_object;\n+  NAPI_CALL_RETURN_VOID(env, napi_create_object(env, &resource_object));\n+\n+  napi_value undefined_value;\n+  NAPI_CALL_RETURN_VOID(env, napi_get_undefined(env, &undefined_value));\n+\n+  napi_callback_scope scope = nullptr;\n+  NAPI_CALL_RETURN_VOID(env, napi_open_callback_scope(env,\n+                                                      resource_object,\n+                                                      context,\n+                                                      &scope));\n+\n+  NAPI_CALL_RETURN_VOID(env,\n+                        napi_resolve_deferred(env, deferred, undefined_value));\n+\n+  NAPI_CALL_RETURN_VOID(env, napi_close_callback_scope(env, scope));\n+\n+  NAPI_CALL_RETURN_VOID(env, napi_close_handle_scope(env, handle_scope));\n+  delete req;\n+}\n+\n+napi_value TestResolveAsync(napi_env env, napi_callback_info info) {\n+  napi_value promise = nullptr;\n+  if (deferred == nullptr) {\n+    shared_env = env;\n+    NAPI_CALL(env, napi_create_promise(env, &deferred, &promise));\n+\n+    uv_loop_t* loop = nullptr;\n+    NAPI_CALL(env, napi_get_uv_event_loop(env, &loop));\n+\n+    uv_work_t* req = new uv_work_t();\n+    uv_queue_work(loop,\n+                  req,\n+                  [](uv_work_t*) {},\n+                  Callback);\n+  }\n+  return promise;\n+}\n+\n+napi_value Init(napi_env env, napi_value exports) {\n+  napi_property_descriptor descriptors[] = {\n+    DECLARE_NAPI_PROPERTY(\"runInCallbackScope\", RunInCallbackScope),\n+    DECLARE_NAPI_PROPERTY(\"testResolveAsync\", TestResolveAsync)\n+  };\n+\n+  NAPI_CALL(env, napi_define_properties(\n+      env, exports, sizeof(descriptors) / sizeof(*descriptors), descriptors));\n+\n+  return exports;\n+}\n+\n+}  // anonymous namespace\n+\n+NAPI_MODULE(NODE_GYP_MODULE_NAME, Init)"
+        },
+        {
+            "sha": "7ede63d94a0d77635ff78b8ad2d0079216eefa1a",
+            "filename": "test/addons-napi/test_callback_scope/binding.gyp",
+            "status": "added",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/nodejs/node/blob/a5553971859366c1171e86e8ef52d61017a3eb67/test%2Faddons-napi%2Ftest_callback_scope%2Fbinding.gyp",
+            "raw_url": "https://github.com/nodejs/node/raw/a5553971859366c1171e86e8ef52d61017a3eb67/test%2Faddons-napi%2Ftest_callback_scope%2Fbinding.gyp",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Faddons-napi%2Ftest_callback_scope%2Fbinding.gyp?ref=a5553971859366c1171e86e8ef52d61017a3eb67",
+            "patch": "@@ -0,0 +1,9 @@\n+{\n+  'targets': [\n+    {\n+      'target_name': 'binding',\n+      'defines': [ 'V8_DEPRECATION_WARNINGS=1' ],\n+      'sources': [ 'binding.cc' ]\n+    }\n+  ]\n+}"
+        },
+        {
+            "sha": "1a11bf60398f9beedf3b576de91992ec62444f90",
+            "filename": "test/addons-napi/test_callback_scope/test-async-hooks.js",
+            "status": "added",
+            "additions": 29,
+            "deletions": 0,
+            "changes": 29,
+            "blob_url": "https://github.com/nodejs/node/blob/a5553971859366c1171e86e8ef52d61017a3eb67/test%2Faddons-napi%2Ftest_callback_scope%2Ftest-async-hooks.js",
+            "raw_url": "https://github.com/nodejs/node/raw/a5553971859366c1171e86e8ef52d61017a3eb67/test%2Faddons-napi%2Ftest_callback_scope%2Ftest-async-hooks.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Faddons-napi%2Ftest_callback_scope%2Ftest-async-hooks.js?ref=a5553971859366c1171e86e8ef52d61017a3eb67",
+            "patch": "@@ -0,0 +1,29 @@\n+'use strict';\n+\n+const common = require('../../common');\n+const assert = require('assert');\n+const async_hooks = require('async_hooks');\n+\n+// The async_hook that we enable would register the process.emitWarning()\n+// call from loading the N-API addon as asynchronous activity because\n+// it contains a process.nextTick() call. Monkey patch it to be a no-op\n+// before we load the addon in order to avoid this.\n+process.emitWarning = () => {};\n+\n+const { runInCallbackScope } = require(`./build/${common.buildType}/binding`);\n+\n+let insideHook = false;\n+async_hooks.createHook({\n+  before: common.mustCall((id) => {\n+    assert.strictEqual(id, 1000);\n+    insideHook = true;\n+  }),\n+  after: common.mustCall((id) => {\n+    assert.strictEqual(id, 1000);\n+    insideHook = false;\n+  })\n+}).enable();\n+\n+runInCallbackScope({}, 1000, 1000, () => {\n+  assert(insideHook);\n+});"
+        },
+        {
+            "sha": "e9f4b9044c015437a4aa3cfd9229b557a4deaa43",
+            "filename": "test/addons-napi/test_callback_scope/test-resolve-async.js",
+            "status": "added",
+            "additions": 13,
+            "deletions": 0,
+            "changes": 13,
+            "blob_url": "https://github.com/nodejs/node/blob/a5553971859366c1171e86e8ef52d61017a3eb67/test%2Faddons-napi%2Ftest_callback_scope%2Ftest-resolve-async.js",
+            "raw_url": "https://github.com/nodejs/node/raw/a5553971859366c1171e86e8ef52d61017a3eb67/test%2Faddons-napi%2Ftest_callback_scope%2Ftest-resolve-async.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Faddons-napi%2Ftest_callback_scope%2Ftest-resolve-async.js?ref=a5553971859366c1171e86e8ef52d61017a3eb67",
+            "patch": "@@ -0,0 +1,13 @@\n+'use strict';\n+\n+const common = require('../../common');\n+const assert = require('assert');\n+const { testResolveAsync } = require(`./build/${common.buildType}/binding`);\n+\n+let called = false;\n+testResolveAsync().then(common.mustCall(() => {\n+  called = true;\n+}));\n+\n+setTimeout(common.mustCall(() => { assert(called); }),\n+           common.platformTimeout(20));"
+        },
+        {
+            "sha": "2f2efe5f47b98adb5477c4c6c9fb11b3f8651d9d",
+            "filename": "test/addons-napi/test_callback_scope/test.js",
+            "status": "added",
+            "additions": 17,
+            "deletions": 0,
+            "changes": 17,
+            "blob_url": "https://github.com/nodejs/node/blob/a5553971859366c1171e86e8ef52d61017a3eb67/test%2Faddons-napi%2Ftest_callback_scope%2Ftest.js",
+            "raw_url": "https://github.com/nodejs/node/raw/a5553971859366c1171e86e8ef52d61017a3eb67/test%2Faddons-napi%2Ftest_callback_scope%2Ftest.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Faddons-napi%2Ftest_callback_scope%2Ftest.js?ref=a5553971859366c1171e86e8ef52d61017a3eb67",
+            "patch": "@@ -0,0 +1,17 @@\n+'use strict';\n+\n+const common = require('../../common');\n+const assert = require('assert');\n+const { runInCallbackScope } = require(`./build/${common.buildType}/binding`);\n+\n+assert.strictEqual(runInCallbackScope({}, 0, 0, () => 42), 42);\n+\n+{\n+  process.once('uncaughtException', common.mustCall((err) => {\n+    assert.strictEqual(err.message, 'foo');\n+  }));\n+\n+  runInCallbackScope({}, 0, 0, () => {\n+    throw new Error('foo');\n+  });\n+}"
+        }
+    ],
+    "stats": {
+        "total": 318,
+        "additions": 314,
+        "deletions": 4
+    }
+}

@@ -1,0 +1,48 @@
+{
+    "author": "unknown",
+    "message": "n-api: back up env before async work finalize\n\nWe must back up the value of `_env` before calling the async work\ncomplete callback, because the complete callback may delete the\ninstance in which `_env` is stored by calling `napi_delete_async_work`,\nand because we need to use it after the complete callback has\ncompleted.\n\nFixes: https://github.com/nodejs/node/issues/20966\nPR-URL: https://github.com/nodejs/node/pull/21129\nReviewed-By: Anatoli Papirovski <apapirovski@mac.com>\nReviewed-By: Refael Ackermann <refack@gmail.com>\nReviewed-By: Michael Dawson <michael_dawson@ca.ibm.com>",
+    "sha": "991f4060adf1800ef50eaaf8bd84ef42e7587f08",
+    "files": [
+        {
+            "sha": "fdd12afc220421e4a4fb3c522a048d2f117d8442",
+            "filename": "src/node_api.cc",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 3,
+            "changes": 12,
+            "blob_url": "https://github.com/nodejs/node/blob/991f4060adf1800ef50eaaf8bd84ef42e7587f08/src%2Fnode_api.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/991f4060adf1800ef50eaaf8bd84ef42e7587f08/src%2Fnode_api.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_api.cc?ref=991f4060adf1800ef50eaaf8bd84ef42e7587f08",
+            "patch": "@@ -3393,13 +3393,19 @@ class Work : public node::AsyncResource, public node::ThreadPoolWork {\n \n     CallbackScope callback_scope(this);\n \n-    NAPI_CALL_INTO_MODULE(_env,\n+    // We have to back up the env here because the `NAPI_CALL_INTO_MODULE` macro\n+    // makes use of it after the call into the module completes, but the module\n+    // may have deallocated **this**, and along with it the place where _env is\n+    // stored.\n+    napi_env env = _env;\n+\n+    NAPI_CALL_INTO_MODULE(env,\n         _complete(_env, ConvertUVErrorCode(status), _data),\n-        [this] (v8::Local<v8::Value> local_err) {\n+        [env] (v8::Local<v8::Value> local_err) {\n           // If there was an unhandled exception in the complete callback,\n           // report it as a fatal exception. (There is no JavaScript on the\n           // callstack that can possibly handle it.)\n-          v8impl::trigger_fatal_exception(_env, local_err);\n+          v8impl::trigger_fatal_exception(env, local_err);\n         });\n \n     // Note: Don't access `work` after this point because it was"
+        },
+        {
+            "sha": "efd15bcb2d0efd4a8563efc2f87bab161972224b",
+            "filename": "test/addons-napi/test_async/test-loop.js",
+            "status": "added",
+            "additions": 14,
+            "deletions": 0,
+            "changes": 14,
+            "blob_url": "https://github.com/nodejs/node/blob/991f4060adf1800ef50eaaf8bd84ef42e7587f08/test%2Faddons-napi%2Ftest_async%2Ftest-loop.js",
+            "raw_url": "https://github.com/nodejs/node/raw/991f4060adf1800ef50eaaf8bd84ef42e7587f08/test%2Faddons-napi%2Ftest_async%2Ftest-loop.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Faddons-napi%2Ftest_async%2Ftest-loop.js?ref=991f4060adf1800ef50eaaf8bd84ef42e7587f08",
+            "patch": "@@ -0,0 +1,14 @@\n+'use strict';\n+const common = require('../../common');\n+const assert = require('assert');\n+const test_async = require(`./build/${common.buildType}/test_async`);\n+const iterations = 500;\n+\n+let x = 0;\n+const workDone = common.mustCall((status) => {\n+  assert.strictEqual(status, 0, 'Work completed successfully');\n+  if (++x < iterations) {\n+    setImmediate(() => test_async.DoRepeatedWork(workDone));\n+  }\n+}, iterations);\n+test_async.DoRepeatedWork(workDone);"
+        },
+        {
+            "sha": "a7ea0eb64c053794f0fc92748ee37a100e883de5",
+            "filename": "test/addons-napi/test_async/test_async.cc",
+            "status": "modified",
+            "additions": 43,
+            "deletions": 0,
+            "changes": 43,
+            "blob_url": "https://github.com/nodejs/node/blob/991f4060adf1800ef50eaaf8bd84ef42e7587f08/test%2Faddons-napi%2Ftest_async%2Ftest_async.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/991f4060adf1800ef50eaaf8bd84ef42e7587f08/test%2Faddons-napi%2Ftest_async%2Ftest_async.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Faddons-napi%2Ftest_async%2Ftest_async.cc?ref=991f4060adf1800ef50eaaf8bd84ef42e7587f08",
+            "patch": "@@ -1,3 +1,4 @@\n+#include <stdio.h>\n #include <node_api.h>\n #include \"../common.h\"\n \n@@ -173,10 +174,52 @@ napi_value TestCancel(napi_env env, napi_callback_info info) {\n   return nullptr;\n }\n \n+struct {\n+  napi_ref ref;\n+  napi_async_work work;\n+} repeated_work_info = { nullptr, nullptr };\n+\n+static void RepeatedWorkerThread(napi_env env, void* data) {}\n+\n+static void RepeatedWorkComplete(napi_env env, napi_status status, void* data) {\n+  napi_value cb, js_status;\n+  NAPI_CALL_RETURN_VOID(env,\n+      napi_get_reference_value(env, repeated_work_info.ref, &cb));\n+  NAPI_CALL_RETURN_VOID(env,\n+      napi_delete_async_work(env, repeated_work_info.work));\n+  NAPI_CALL_RETURN_VOID(env,\n+      napi_delete_reference(env, repeated_work_info.ref));\n+  repeated_work_info.work = nullptr;\n+  repeated_work_info.ref = nullptr;\n+  NAPI_CALL_RETURN_VOID(env,\n+      napi_create_uint32(env, (uint32_t)status, &js_status));\n+  NAPI_CALL_RETURN_VOID(env,\n+      napi_call_function(env, cb, cb, 1, &js_status, nullptr));\n+}\n+\n+static napi_value DoRepeatedWork(napi_env env, napi_callback_info info) {\n+  size_t argc = 1;\n+  napi_value cb, name;\n+  NAPI_ASSERT(env, repeated_work_info.ref == nullptr,\n+      \"Reference left over from previous work\");\n+  NAPI_ASSERT(env, repeated_work_info.work == nullptr,\n+      \"Work pointer left over from previous work\");\n+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, &cb, nullptr, nullptr));\n+  NAPI_CALL(env, napi_create_reference(env, cb, 1, &repeated_work_info.ref));\n+  NAPI_CALL(env,\n+      napi_create_string_utf8(env, \"Repeated Work\", NAPI_AUTO_LENGTH, &name));\n+  NAPI_CALL(env,\n+      napi_create_async_work(env, nullptr, name, RepeatedWorkerThread,\n+          RepeatedWorkComplete, &repeated_work_info, &repeated_work_info.work));\n+  NAPI_CALL(env, napi_queue_async_work(env, repeated_work_info.work));\n+  return nullptr;\n+}\n+\n napi_value Init(napi_env env, napi_value exports) {\n   napi_property_descriptor properties[] = {\n     DECLARE_NAPI_PROPERTY(\"Test\", Test),\n     DECLARE_NAPI_PROPERTY(\"TestCancel\", TestCancel),\n+    DECLARE_NAPI_PROPERTY(\"DoRepeatedWork\", DoRepeatedWork),\n   };\n \n   NAPI_CALL(env, napi_define_properties("
+        }
+    ],
+    "stats": {
+        "total": 69,
+        "additions": 66,
+        "deletions": 3
+    }
+}

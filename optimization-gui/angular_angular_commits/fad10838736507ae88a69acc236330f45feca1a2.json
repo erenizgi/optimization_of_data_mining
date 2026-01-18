@@ -1,0 +1,48 @@
+{
+    "author": "JoostK",
+    "message": "perf(core): simplify bloom bucket computation (#40489)\n\nThe injector system uses a bloom filter to determine if a token is\npossibly defined in the node injector tree, which is stored across\nmultiple bloom buckets that each represent 32 bits of the full 256-bit\nwide bloom hash. This means that a computation is required to determine\nthe exact bloom bucket which is responsible for storing any given 32-bit\ninterval, which was previously computed using three bitmask operations\nand three branches to derive the bloom bucket offset.\n\nThis commit exploits the observation that all bits beyond the low 5 bits\nof the bloom hash are an accurate representation for the bucket offset,\nif shifted right such that those bits become the least significant bits.\nThis reduces the three bitmask operations and three branches with a\nsingle shift operation, while additionally offering a code size\nimprovement.\n\nPR Close #40489",
+    "sha": "fad10838736507ae88a69acc236330f45feca1a2",
+    "files": [
+        {
+            "sha": "0520b53e03275f3ab8ade8a176965d17ae70352a",
+            "filename": "goldens/size-tracking/aio-payloads.json",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/angular/angular/blob/fad10838736507ae88a69acc236330f45feca1a2/goldens%2Fsize-tracking%2Faio-payloads.json",
+            "raw_url": "https://github.com/angular/angular/raw/fad10838736507ae88a69acc236330f45feca1a2/goldens%2Fsize-tracking%2Faio-payloads.json",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/goldens%2Fsize-tracking%2Faio-payloads.json?ref=fad10838736507ae88a69acc236330f45feca1a2",
+            "patch": "@@ -12,7 +12,7 @@\n     \"master\": {\n       \"uncompressed\": {\n         \"runtime-es2015\": 3033,\n-        \"main-es2015\": 448090,\n+        \"main-es2015\": 447514,\n         \"polyfills-es2015\": 52493\n       }\n     }"
+        },
+        {
+            "sha": "38791a2991da7694a9224367ec50bcfe73db1583",
+            "filename": "goldens/size-tracking/integration-payloads.json",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/angular/angular/blob/fad10838736507ae88a69acc236330f45feca1a2/goldens%2Fsize-tracking%2Fintegration-payloads.json",
+            "raw_url": "https://github.com/angular/angular/raw/fad10838736507ae88a69acc236330f45feca1a2/goldens%2Fsize-tracking%2Fintegration-payloads.json",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/goldens%2Fsize-tracking%2Fintegration-payloads.json?ref=fad10838736507ae88a69acc236330f45feca1a2",
+            "patch": "@@ -39,7 +39,7 @@\n     \"master\": {\n       \"uncompressed\": {\n         \"runtime-es2015\": 2285,\n-        \"main-es2015\": 241738,\n+        \"main-es2015\": 241202,\n         \"polyfills-es2015\": 36709,\n         \"5-es2015\": 745\n       }"
+        },
+        {
+            "sha": "fa1f98e62e0c73ae39ee2d4976d698d065931b25",
+            "filename": "packages/core/src/render3/di.ts",
+            "status": "modified",
+            "additions": 19,
+            "deletions": 33,
+            "changes": 52,
+            "blob_url": "https://github.com/angular/angular/blob/fad10838736507ae88a69acc236330f45feca1a2/packages%2Fcore%2Fsrc%2Frender3%2Fdi.ts",
+            "raw_url": "https://github.com/angular/angular/raw/fad10838736507ae88a69acc236330f45feca1a2/packages%2Fcore%2Fsrc%2Frender3%2Fdi.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcore%2Fsrc%2Frender3%2Fdi.ts?ref=fad10838736507ae88a69acc236330f45feca1a2",
+            "patch": "@@ -87,6 +87,13 @@ export function setIncludeViewProviders(v: boolean): boolean {\n const BLOOM_SIZE = 256;\n const BLOOM_MASK = BLOOM_SIZE - 1;\n \n+/**\n+ * The number of bits that is represented by a single bloom bucket. JS bit operations are 32 bits,\n+ * so each bucket represents 32 distinct tokens which accounts for log2(32) = 5 bits of a bloom hash\n+ * number.\n+ */\n+const BLOOM_BUCKET_BITS = 5;\n+\n /** Counter used to generate unique IDs for directives. */\n let nextNgElementId = 0;\n \n@@ -116,27 +123,17 @@ export function bloomAdd(\n \n   // We only have BLOOM_SIZE (256) slots in our bloom filter (8 buckets * 32 bits each),\n   // so all unique IDs must be modulo-ed into a number from 0 - 255 to fit into the filter.\n-  const bloomBit = id & BLOOM_MASK;\n+  const bloomHash = id & BLOOM_MASK;\n \n   // Create a mask that targets the specific bit associated with the directive.\n   // JS bit operations are 32 bits, so this will be a number between 2^0 and 2^31, corresponding\n   // to bit positions 0 - 31 in a 32 bit integer.\n-  const mask = 1 << bloomBit;\n-\n-  // Use the raw bloomBit number to determine which bloom filter bucket we should check\n-  // e.g: bf0 = [0 - 31], bf1 = [32 - 63], bf2 = [64 - 95], bf3 = [96 - 127], etc\n-  const b7 = bloomBit & 0x80;\n-  const b6 = bloomBit & 0x40;\n-  const b5 = bloomBit & 0x20;\n-  const tData = tView.data as number[];\n-\n-  if (b7) {\n-    b6 ? (b5 ? (tData[injectorIndex + 7] |= mask) : (tData[injectorIndex + 6] |= mask)) :\n-         (b5 ? (tData[injectorIndex + 5] |= mask) : (tData[injectorIndex + 4] |= mask));\n-  } else {\n-    b6 ? (b5 ? (tData[injectorIndex + 3] |= mask) : (tData[injectorIndex + 2] |= mask)) :\n-         (b5 ? (tData[injectorIndex + 1] |= mask) : (tData[injectorIndex] |= mask));\n-  }\n+  const mask = 1 << bloomHash;\n+\n+  // Each bloom bucket in `tData` represents `BLOOM_BUCKET_BITS` number of bits of `bloomHash`.\n+  // Any bits in `bloomHash` beyond `BLOOM_BUCKET_BITS` indicate the bucket offset that the mask\n+  // should be written to.\n+  (tView.data as number[])[injectorIndex + (bloomHash >> BLOOM_BUCKET_BITS)] |= mask;\n }\n \n /**\n@@ -675,22 +672,11 @@ export function bloomHasToken(bloomHash: number, injectorIndex: number, injector\n   // JS bit operations are 32 bits, so this will be a number between 2^0 and 2^31, corresponding\n   // to bit positions 0 - 31 in a 32 bit integer.\n   const mask = 1 << bloomHash;\n-  const b7 = bloomHash & 0x80;\n-  const b6 = bloomHash & 0x40;\n-  const b5 = bloomHash & 0x20;\n-\n-  // Our bloom filter size is 256 bits, which is eight 32-bit bloom filter buckets:\n-  // bf0 = [0 - 31], bf1 = [32 - 63], bf2 = [64 - 95], bf3 = [96 - 127], etc.\n-  // Get the bloom filter value from the appropriate bucket based on the directive's bloomBit.\n-  let value: number;\n-\n-  if (b7) {\n-    value = b6 ? (b5 ? injectorView[injectorIndex + 7] : injectorView[injectorIndex + 6]) :\n-                 (b5 ? injectorView[injectorIndex + 5] : injectorView[injectorIndex + 4]);\n-  } else {\n-    value = b6 ? (b5 ? injectorView[injectorIndex + 3] : injectorView[injectorIndex + 2]) :\n-                 (b5 ? injectorView[injectorIndex + 1] : injectorView[injectorIndex]);\n-  }\n+\n+  // Each bloom bucket in `injectorView` represents `BLOOM_BUCKET_BITS` number of bits of\n+  // `bloomHash`. Any bits in `bloomHash` beyond `BLOOM_BUCKET_BITS` indicate the bucket offset\n+  // that should be used.\n+  const value = injectorView[injectorIndex + (bloomHash >> BLOOM_BUCKET_BITS)];\n \n   // If the bloom filter value has the bit corresponding to the directive's bloomBit flipped on,\n   // this injector is a potential match."
+        }
+    ],
+    "stats": {
+        "total": 56,
+        "additions": 21,
+        "deletions": 35
+    }
+}

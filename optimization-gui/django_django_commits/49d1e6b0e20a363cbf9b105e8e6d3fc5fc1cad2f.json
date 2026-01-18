@@ -1,0 +1,84 @@
+{
+    "author": "andrewgodwin",
+    "message": "Remove AppCache state handling, replace with swappable caches",
+    "sha": "49d1e6b0e20a363cbf9b105e8e6d3fc5fc1cad2f",
+    "files": [
+        {
+            "sha": "a1fd95fe8bccbadebae540de6231dabdef8c0229",
+            "filename": "django/db/backends/sqlite3/schema.py",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 5,
+            "changes": 12,
+            "blob_url": "https://github.com/django/django/blob/49d1e6b0e20a363cbf9b105e8e6d3fc5fc1cad2f/django%2Fdb%2Fbackends%2Fsqlite3%2Fschema.py",
+            "raw_url": "https://github.com/django/django/raw/49d1e6b0e20a363cbf9b105e8e6d3fc5fc1cad2f/django%2Fdb%2Fbackends%2Fsqlite3%2Fschema.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fbackends%2Fsqlite3%2Fschema.py?ref=49d1e6b0e20a363cbf9b105e8e6d3fc5fc1cad2f",
+            "patch": "@@ -1,5 +1,5 @@\n from django.db.backends.schema import BaseDatabaseSchemaEditor\n-from django.db.models.loading import cache\n+from django.db.models.loading import cache, default_cache, AppCache\n from django.db.models.fields.related import ManyToManyField\n \n \n@@ -46,10 +46,12 @@ def _remake_table(self, model, create_fields=[], delete_fields=[], alter_fields=\n         }\n         meta = type(\"Meta\", tuple(), meta_contents)\n         body['Meta'] = meta\n-        body['__module__'] = \"__fake__\"\n-        with cache.temporary_state():\n-            del cache.app_models[model._meta.app_label][model._meta.object_name.lower()]\n-            temp_model = type(model._meta.object_name, model.__bases__, body)\n+        body['__module__'] = model.__module__\n+        self.app_cache = AppCache()\n+        cache.set_cache(self.app_cache)\n+        cache.copy_from(default_cache)\n+        temp_model = type(model._meta.object_name, model.__bases__, body)\n+        cache.set_cache(default_cache)\n         # Create a new table with that format\n         self.create_model(temp_model)\n         # Copy data from the old table"
+        },
+        {
+            "sha": "de94911601e08ed325bd42da02ce2602018404d8",
+            "filename": "django/db/models/base.py",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 8,
+            "changes": 19,
+            "blob_url": "https://github.com/django/django/blob/49d1e6b0e20a363cbf9b105e8e6d3fc5fc1cad2f/django%2Fdb%2Fmodels%2Fbase.py",
+            "raw_url": "https://github.com/django/django/raw/49d1e6b0e20a363cbf9b105e8e6d3fc5fc1cad2f/django%2Fdb%2Fmodels%2Fbase.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fmodels%2Fbase.py?ref=49d1e6b0e20a363cbf9b105e8e6d3fc5fc1cad2f",
+            "patch": "@@ -228,14 +228,17 @@ def __new__(cls, name, bases, attrs):\n             return new_class\n \n         new_class._prepare()\n-        register_models(new_class._meta.app_label, new_class)\n-\n-        # Because of the way imports happen (recursively), we may or may not be\n-        # the first time this model tries to register with the framework. There\n-        # should only be one class for each model, so we always return the\n-        # registered version.\n-        return get_model(new_class._meta.app_label, name,\n-                         seed_cache=False, only_installed=False)\n+        \n+        if new_class._meta.auto_register:\n+            register_models(new_class._meta.app_label, new_class)\n+            # Because of the way imports happen (recursively), we may or may not be\n+            # the first time this model tries to register with the framework. There\n+            # should only be one class for each model, so we always return the\n+            # registered version.\n+            return get_model(new_class._meta.app_label, name,\n+                             seed_cache=False, only_installed=False)\n+        else:\n+            return new_class\n \n     def copy_managers(cls, base_managers):\n         # This is in-place sorting of an Options attribute, but that's fine."
+        },
+        {
+            "sha": "6ae37505a57d9e630c400faa09757d1c4be3bd02",
+            "filename": "django/db/models/loading.py",
+            "status": "modified",
+            "additions": 34,
+            "deletions": 54,
+            "changes": 88,
+            "blob_url": "https://github.com/django/django/blob/49d1e6b0e20a363cbf9b105e8e6d3fc5fc1cad2f/django%2Fdb%2Fmodels%2Floading.py",
+            "raw_url": "https://github.com/django/django/raw/49d1e6b0e20a363cbf9b105e8e6d3fc5fc1cad2f/django%2Fdb%2Fmodels%2Floading.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fmodels%2Floading.py?ref=49d1e6b0e20a363cbf9b105e8e6d3fc5fc1cad2f",
+            "patch": "@@ -236,69 +236,49 @@ def register_models(self, app_label, *models):\n             model_dict[model_name] = model\n         self._get_models_cache.clear()\n \n-    def save_state(self):\n-        \"\"\"\n-        Returns an object that contains the current AppCache state.\n-        Can be provided to restore_state to undo actions.\n-        \"\"\"\n-        return {\n-            \"app_store\": SortedDict(self.app_store.items()),\n-            \"app_labels\": dict(self.app_labels.items()),\n-            \"app_models\": SortedDict((k, SortedDict(v.items())) for k, v in self.app_models.items()),\n-            \"app_errors\": dict(self.app_errors.items()),\n-        }\n-\n-    def restore_state(self, state):\n-        \"\"\"\n-        Restores the AppCache to a previous state from save_state.\n-        Note that the state is used by reference, not copied in.\n-        \"\"\"\n-        self.app_store = state['app_store']\n-        self.app_labels = state['app_labels']\n-        self.app_models = state['app_models']\n-        self.app_errors = state['app_errors']\n-        self._get_models_cache.clear()\n-\n-    def temporary_state(self):\n-        \"Returns a context manager that restores the state on exit\"\n-        return StateContextManager(self)\n-\n-    def unregister_all(self):\n-        \"\"\"\n-        Wipes the AppCache clean of all registered models.\n-        Used for things like migration libraries' fake ORMs.\n-        \"\"\"\n-        self.app_store = SortedDict()\n-        self.app_labels = {}\n-        self.app_models = SortedDict()\n-        self.app_errors = {}\n+    def copy_from(self, other):\n+        \"Registers all models from the other cache into this one\"\n+        cache._populate()\n+        for app_label, models in other.app_models.items():\n+            self.register_models(app_label, *models.values())\n \n \n-class StateContextManager(object):\n+class AppCacheWrapper(object):\n     \"\"\"\n-    Context manager for locking cache state.\n-    Useful for making temporary models you don't want to stay in the cache.\n+    As AppCache can be changed at runtime, this class wraps it so any\n+    imported references to 'cache' are changed along with it.\n     \"\"\"\n \n     def __init__(self, cache):\n-        self.cache = cache\n+        self._cache = cache\n+\n+    def set_cache(self, cache):\n+        self._cache = cache\n \n-    def __enter__(self):\n-        self.state = self.cache.save_state()\n+    def __getattr__(self, attr):\n+        if attr in (\"_cache\", \"set_cache\"):\n+            return self.__dict__[attr]\n+        return getattr(self._cache, attr)\n+\n+    def __setattr__(self, attr, value):\n+        if attr in (\"_cache\", \"set_cache\"):\n+            self.__dict__[attr] = value\n+            return\n+        return setattr(self._cache, attr, value)\n \n-    def __exit__(self, type, value, traceback):\n-        self.cache.restore_state(self.state)\n \n+default_cache = AppCache()\n+cache = AppCacheWrapper(default_cache)\n \n-cache = AppCache()\n \n # These methods were always module level, so are kept that way for backwards\n-# compatibility.\n-get_apps = cache.get_apps\n-get_app = cache.get_app\n-get_app_errors = cache.get_app_errors\n-get_models = cache.get_models\n-get_model = cache.get_model\n-register_models = cache.register_models\n-load_app = cache.load_app\n-app_cache_ready = cache.app_cache_ready\n+# compatibility. These are wrapped with lambdas to stop the attribute\n+# access resolving directly to a method on a single cache instance.\n+get_apps = lambda *x, **y: cache.get_apps(*x, **y)\n+get_app = lambda *x, **y: cache.get_app(*x, **y)\n+get_app_errors = lambda *x, **y: cache.get_app_errors(*x, **y)\n+get_models = lambda *x, **y: cache.get_models(*x, **y)\n+get_model = lambda *x, **y: cache.get_model(*x, **y)\n+register_models = lambda *x, **y: cache.register_models(*x, **y)\n+load_app = lambda *x, **y: cache.load_app(*x, **y)\n+app_cache_ready = lambda *x, **y: cache.app_cache_ready(*x, **y)"
+        },
+        {
+            "sha": "820540559f1903f139f709858d4efdfca7b36316",
+            "filename": "django/db/models/options.py",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 1,
+            "changes": 5,
+            "blob_url": "https://github.com/django/django/blob/49d1e6b0e20a363cbf9b105e8e6d3fc5fc1cad2f/django%2Fdb%2Fmodels%2Foptions.py",
+            "raw_url": "https://github.com/django/django/raw/49d1e6b0e20a363cbf9b105e8e6d3fc5fc1cad2f/django%2Fdb%2Fmodels%2Foptions.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fmodels%2Foptions.py?ref=49d1e6b0e20a363cbf9b105e8e6d3fc5fc1cad2f",
+            "patch": "@@ -21,7 +21,7 @@\n DEFAULT_NAMES = ('verbose_name', 'verbose_name_plural', 'db_table', 'ordering',\n                  'unique_together', 'permissions', 'get_latest_by',\n                  'order_with_respect_to', 'app_label', 'db_tablespace',\n-                 'abstract', 'managed', 'proxy', 'auto_created')\n+                 'abstract', 'managed', 'proxy', 'auto_created', 'auto_register')\n \n @python_2_unicode_compatible\n class Options(object):\n@@ -68,6 +68,9 @@ def __init__(self, meta, app_label=None):\n         # from *other* models. Needed for some admin checks. Internal use only.\n         self.related_fkey_lookups = []\n \n+        # If we should auto-register with the AppCache\n+        self.auto_register = True\n+\n     def contribute_to_class(self, cls, name):\n         from django.db import connection\n         from django.db.backends.util import truncate_name"
+        },
+        {
+            "sha": "fdf950860cb80ecb7708dfdc243c42171c497a8e",
+            "filename": "tests/modeltests/schema/models.py",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 8,
+            "changes": 16,
+            "blob_url": "https://github.com/django/django/blob/49d1e6b0e20a363cbf9b105e8e6d3fc5fc1cad2f/tests%2Fmodeltests%2Fschema%2Fmodels.py",
+            "raw_url": "https://github.com/django/django/raw/49d1e6b0e20a363cbf9b105e8e6d3fc5fc1cad2f/tests%2Fmodeltests%2Fschema%2Fmodels.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fmodeltests%2Fschema%2Fmodels.py?ref=49d1e6b0e20a363cbf9b105e8e6d3fc5fc1cad2f",
+            "patch": "@@ -10,14 +10,14 @@ class Author(models.Model):\n     height = models.PositiveIntegerField(null=True, blank=True)\n \n     class Meta:\n-        managed = False\n+        auto_register = False\n \n \n class AuthorWithM2M(models.Model):\n     name = models.CharField(max_length=255)\n \n     class Meta:\n-        managed = False\n+        auto_register = False\n \n \n class Book(models.Model):\n@@ -27,7 +27,7 @@ class Book(models.Model):\n     #tags = models.ManyToManyField(\"Tag\", related_name=\"books\")\n \n     class Meta:\n-        managed = False\n+        auto_register = False\n \n \n class BookWithM2M(models.Model):\n@@ -37,7 +37,7 @@ class BookWithM2M(models.Model):\n     tags = models.ManyToManyField(\"Tag\", related_name=\"books\")\n \n     class Meta:\n-        managed = False\n+        auto_register = False\n \n \n class BookWithSlug(models.Model):\n@@ -47,7 +47,7 @@ class BookWithSlug(models.Model):\n     slug = models.CharField(max_length=20, unique=True)\n \n     class Meta:\n-        managed = False\n+        auto_register = False\n         db_table = \"schema_book\"\n \n \n@@ -56,15 +56,15 @@ class Tag(models.Model):\n     slug = models.SlugField(unique=True)\n \n     class Meta:\n-        managed = False\n+        auto_register = False\n \n \n class TagUniqueRename(models.Model):\n     title = models.CharField(max_length=255)\n     slug2 = models.SlugField(unique=True)\n \n     class Meta:\n-        managed = False\n+        auto_register = False\n         db_table = \"schema_tag\"\n \n \n@@ -73,5 +73,5 @@ class UniqueTest(models.Model):\n     slug = models.SlugField(unique=False)\n \n     class Meta:\n-        managed = False\n+        auto_register = False\n         unique_together = [\"year\", \"slug\"]"
+        },
+        {
+            "sha": "5fabe6e91db919c855c4ef1704299e246e26de57",
+            "filename": "tests/modeltests/schema/tests.py",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 7,
+            "changes": 15,
+            "blob_url": "https://github.com/django/django/blob/49d1e6b0e20a363cbf9b105e8e6d3fc5fc1cad2f/tests%2Fmodeltests%2Fschema%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/49d1e6b0e20a363cbf9b105e8e6d3fc5fc1cad2f/tests%2Fmodeltests%2Fschema%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fmodeltests%2Fschema%2Ftests.py?ref=49d1e6b0e20a363cbf9b105e8e6d3fc5fc1cad2f",
+            "patch": "@@ -6,7 +6,7 @@\n from django.db import connection, DatabaseError, IntegrityError\n from django.db.models.fields import IntegerField, TextField, CharField, SlugField\n from django.db.models.fields.related import ManyToManyField, ForeignKey\n-from django.db.models.loading import cache\n+from django.db.models.loading import cache, default_cache, AppCache\n from .models import Author, AuthorWithM2M, Book, BookWithSlug, BookWithM2M, Tag, TagUniqueRename, UniqueTest\n \n \n@@ -30,20 +30,21 @@ def setUp(self):\n         connection.managed(True)\n         # The unmanaged models need to be removed after the test in order to\n         # prevent bad interactions with the flush operation in other tests.\n-        self.cache_state = cache.save_state()\n+        self.app_cache = AppCache()\n+        cache.set_cache(self.app_cache)\n+        cache.copy_from(default_cache)\n         for model in self.models:\n-            model._meta.managed = True\n+            cache.register_models(\"schema\", model)\n+            model._prepare()\n \n     def tearDown(self):\n         # Delete any tables made for our models\n         self.delete_tables()\n         # Rollback anything that may have happened\n         connection.rollback()\n         connection.leave_transaction_management()\n-        # Unhook our models\n-        for model in self.models:\n-            model._meta.managed = False\n-        cache.restore_state(self.cache_state)\n+        cache.set_cache(default_cache)\n+        cache.app_models['schema'] = {}  # One M2M gets left in the old cache\n \n     def delete_tables(self):\n         \"Deletes all model tables for our models for a clean test environment\""
+        }
+    ],
+    "stats": {
+        "total": 155,
+        "additions": 72,
+        "deletions": 83
+    }
+}

@@ -1,0 +1,108 @@
+{
+    "author": "devsnek",
+    "message": "esm: provide named exports for builtin libs\n\nProvide named exports for all builtin libraries so that the libraries\nmay be imported in a nicer way for esm users. The default export is left\nas the entire namespace (module.exports) and wrapped in a proxy such\nthat APMs and other behavior are still left intact.\n\nPR-URL: https://github.com/nodejs/node/pull/20403\nReviewed-By: Bradley Farias <bradley.meck@gmail.com>\nReviewed-By: Guy Bedford <guybedford@gmail.com>\nReviewed-By: Jan Krems <jan.krems@gmail.com>",
+    "sha": "f074612b744fecfd1f79fd05d7f10fe9a1487e5a",
+    "files": [
+        {
+            "sha": "459f87771815cc22eba92eb266153c9adb443a1a",
+            "filename": "doc/api/esm.md",
+            "status": "modified",
+            "additions": 30,
+            "deletions": 3,
+            "changes": 33,
+            "blob_url": "https://github.com/nodejs/node/blob/f074612b744fecfd1f79fd05d7f10fe9a1487e5a/doc%2Fapi%2Fesm.md",
+            "raw_url": "https://github.com/nodejs/node/raw/f074612b744fecfd1f79fd05d7f10fe9a1487e5a/doc%2Fapi%2Fesm.md",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/doc%2Fapi%2Fesm.md?ref=f074612b744fecfd1f79fd05d7f10fe9a1487e5a",
+            "patch": "@@ -95,16 +95,43 @@ When loaded via `import` these modules will provide a single `default` export\n representing the value of `module.exports` at the time they finished evaluating.\n \n ```js\n-import fs from 'fs';\n-fs.readFile('./foo.txt', (err, body) => {\n+// foo.js\n+module.exports = { one: 1 };\n+\n+// bar.js\n+import foo from './foo.js';\n+foo.one === 1; // true\n+```\n+\n+Builtin modules will provide named exports of their public API, as well as a\n+default export which can be used for, among other things, modifying the named\n+exports. Named exports of builtin modules are updated when the corresponding\n+exports property is accessed, redefined, or deleted.\n+\n+```js\n+import EventEmitter from 'events';\n+const e = new EventEmitter();\n+```\n+\n+```js\n+import { readFile } from 'fs';\n+readFile('./foo.txt', (err, source) => {\n   if (err) {\n     console.error(err);\n   } else {\n-    console.log(body);\n+    console.log(source);\n   }\n });\n ```\n \n+```js\n+import fs, { readFileSync } from 'fs';\n+\n+fs.readFileSync = () => Buffer.from('Hello, ESM');\n+\n+fs.readFileSync === readFileSync;\n+```\n+\n ## Loader hooks\n \n <!-- type=misc -->"
+        },
+        {
+            "sha": "7dc44d5bbe28fb19f1ef17dd9f1833ac8614fa9a",
+            "filename": "lib/internal/bootstrap/loaders.js",
+            "status": "modified",
+            "additions": 81,
+            "deletions": 3,
+            "changes": 84,
+            "blob_url": "https://github.com/nodejs/node/blob/f074612b744fecfd1f79fd05d7f10fe9a1487e5a/lib%2Finternal%2Fbootstrap%2Floaders.js",
+            "raw_url": "https://github.com/nodejs/node/raw/f074612b744fecfd1f79fd05d7f10fe9a1487e5a/lib%2Finternal%2Fbootstrap%2Floaders.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fbootstrap%2Floaders.js?ref=f074612b744fecfd1f79fd05d7f10fe9a1487e5a",
+            "patch": "@@ -41,10 +41,26 @@\n \n (function bootstrapInternalLoaders(process, getBinding, getLinkedBinding,\n                                    getInternalBinding) {\n+  const {\n+    apply: ReflectApply,\n+    deleteProperty: ReflectDeleteProperty,\n+    get: ReflectGet,\n+    getOwnPropertyDescriptor: ReflectGetOwnPropertyDescriptor,\n+    has: ReflectHas,\n+    set: ReflectSet,\n+  } = Reflect;\n+  const {\n+    prototype: {\n+      hasOwnProperty: ObjectHasOwnProperty,\n+    },\n+    create: ObjectCreate,\n+    defineProperty: ObjectDefineProperty,\n+    keys: ObjectKeys,\n+  } = Object;\n \n   // Set up process.moduleLoadList\n   const moduleLoadList = [];\n-  Object.defineProperty(process, 'moduleLoadList', {\n+  ObjectDefineProperty(process, 'moduleLoadList', {\n     value: moduleLoadList,\n     configurable: true,\n     enumerable: true,\n@@ -53,7 +69,7 @@\n \n   // Set up process.binding() and process._linkedBinding()\n   {\n-    const bindingObj = Object.create(null);\n+    const bindingObj = ObjectCreate(null);\n \n     process.binding = function binding(module) {\n       module = String(module);\n@@ -77,7 +93,7 @@\n   // Set up internalBinding() in the closure\n   let internalBinding;\n   {\n-    const bindingObj = Object.create(null);\n+    const bindingObj = ObjectCreate(null);\n     internalBinding = function internalBinding(module) {\n       let mod = bindingObj[module];\n       if (typeof mod !== 'object') {\n@@ -95,6 +111,8 @@\n     this.filename = `${id}.js`;\n     this.id = id;\n     this.exports = {};\n+    this.reflect = undefined;\n+    this.exportKeys = undefined;\n     this.loaded = false;\n     this.loading = false;\n   }\n@@ -193,6 +211,12 @@\n     '\\n});'\n   ];\n \n+  const getOwn = (target, property, receiver) => {\n+    return ReflectApply(ObjectHasOwnProperty, target, [property]) ?\n+      ReflectGet(target, property, receiver) :\n+      undefined;\n+  };\n+\n   NativeModule.prototype.compile = function() {\n     let source = NativeModule.getSource(this.id);\n     source = NativeModule.wrap(source);\n@@ -208,6 +232,60 @@\n         NativeModule.require;\n       fn(this.exports, requireFn, this, process);\n \n+      if (config.experimentalModules && !NativeModule.isInternal(this.id)) {\n+        this.exportKeys = ObjectKeys(this.exports);\n+\n+        const update = (property, value) => {\n+          if (this.reflect !== undefined &&\n+              ReflectApply(ObjectHasOwnProperty,\n+                           this.reflect.exports, [property]))\n+            this.reflect.exports[property].set(value);\n+        };\n+\n+        const handler = {\n+          __proto__: null,\n+          defineProperty: (target, prop, descriptor) => {\n+            // Use `Object.defineProperty` instead of `Reflect.defineProperty`\n+            // to throw the appropriate error if something goes wrong.\n+            ObjectDefineProperty(target, prop, descriptor);\n+            if (typeof descriptor.get === 'function' &&\n+                !ReflectHas(handler, 'get')) {\n+              handler.get = (target, prop, receiver) => {\n+                const value = ReflectGet(target, prop, receiver);\n+                if (ReflectApply(ObjectHasOwnProperty, target, [prop]))\n+                  update(prop, value);\n+                return value;\n+              };\n+            }\n+            update(prop, getOwn(target, prop));\n+            return true;\n+          },\n+          deleteProperty: (target, prop) => {\n+            if (ReflectDeleteProperty(target, prop)) {\n+              update(prop, undefined);\n+              return true;\n+            }\n+            return false;\n+          },\n+          set: (target, prop, value, receiver) => {\n+            const descriptor = ReflectGetOwnPropertyDescriptor(target, prop);\n+            if (ReflectSet(target, prop, value, receiver)) {\n+              if (descriptor && typeof descriptor.set === 'function') {\n+                for (const key of this.exportKeys) {\n+                  update(key, getOwn(target, key, receiver));\n+                }\n+              } else {\n+                update(prop, getOwn(target, prop, receiver));\n+              }\n+              return true;\n+            }\n+            return false;\n+          }\n+        };\n+\n+        this.exports = new Proxy(this.exports, handler);\n+      }\n+\n       this.loaded = true;\n     } finally {\n       this.loading = false;"
+        },
+        {
+            "sha": "c01844feb8b6547bd72ae23465cebaac3520720e",
+            "filename": "lib/internal/modules/esm/create_dynamic_module.js",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/nodejs/node/blob/f074612b744fecfd1f79fd05d7f10fe9a1487e5a/lib%2Finternal%2Fmodules%2Fesm%2Fcreate_dynamic_module.js",
+            "raw_url": "https://github.com/nodejs/node/raw/f074612b744fecfd1f79fd05d7f10fe9a1487e5a/lib%2Finternal%2Fmodules%2Fesm%2Fcreate_dynamic_module.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fmodules%2Fesm%2Fcreate_dynamic_module.js?ref=f074612b744fecfd1f79fd05d7f10fe9a1487e5a",
+            "patch": "@@ -52,9 +52,10 @@ const createDynamicModule = (exports, url = '', evaluate) => {\n   const module = new ModuleWrap(reexports, `${url}`);\n   module.link(async () => reflectiveModule);\n   module.instantiate();\n+  reflect.namespace = module.namespace();\n   return {\n     module,\n-    reflect\n+    reflect,\n   };\n };\n "
+        },
+        {
+            "sha": "4ed6b2c3b023a90de13db571959614da33682489",
+            "filename": "lib/internal/modules/esm/translators.js",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 5,
+            "changes": 17,
+            "blob_url": "https://github.com/nodejs/node/blob/f074612b744fecfd1f79fd05d7f10fe9a1487e5a/lib%2Finternal%2Fmodules%2Fesm%2Ftranslators.js",
+            "raw_url": "https://github.com/nodejs/node/raw/f074612b744fecfd1f79fd05d7f10fe9a1487e5a/lib%2Finternal%2Fmodules%2Fesm%2Ftranslators.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fmodules%2Fesm%2Ftranslators.js?ref=f074612b744fecfd1f79fd05d7f10fe9a1487e5a",
+            "patch": "@@ -59,11 +59,18 @@ translators.set('cjs', async (url) => {\n // through normal resolution\n translators.set('builtin', async (url) => {\n   debug(`Translating BuiltinModule ${url}`);\n-  return createDynamicModule(['default'], url, (reflect) => {\n-    debug(`Loading BuiltinModule ${url}`);\n-    const exports = NativeModule.require(url.slice(5));\n-    reflect.exports.default.set(exports);\n-  });\n+  // slice 'node:' scheme\n+  const id = url.slice(5);\n+  NativeModule.require(id);\n+  const module = NativeModule.getCached(id);\n+  return createDynamicModule(\n+    [...module.exportKeys, 'default'], url, (reflect) => {\n+      debug(`Loading BuiltinModule ${url}`);\n+      module.reflect = reflect;\n+      for (const key of module.exportKeys)\n+        reflect.exports[key].set(module.exports[key]);\n+      reflect.exports.default.set(module.exports);\n+    });\n });\n \n // Strategy for loading a node native module"
+        },
+        {
+            "sha": "91757172880f674721c873a6f22fec809644917a",
+            "filename": "test/es-module/test-esm-dynamic-import.js",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/f074612b744fecfd1f79fd05d7f10fe9a1487e5a/test%2Fes-module%2Ftest-esm-dynamic-import.js",
+            "raw_url": "https://github.com/nodejs/node/raw/f074612b744fecfd1f79fd05d7f10fe9a1487e5a/test%2Fes-module%2Ftest-esm-dynamic-import.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fes-module%2Ftest-esm-dynamic-import.js?ref=f074612b744fecfd1f79fd05d7f10fe9a1487e5a",
+            "patch": "@@ -52,6 +52,7 @@ function expectFsNamespace(result) {\n   Promise.resolve(result)\n     .then(common.mustCall(ns => {\n       assert.strictEqual(typeof ns.default.writeFile, 'function');\n+      assert.strictEqual(typeof ns.writeFile, 'function');\n     }));\n }\n "
+        },
+        {
+            "sha": "d151e004dff4b25d52d1384d0749e52e58ec5f19",
+            "filename": "test/es-module/test-esm-live-binding.mjs",
+            "status": "added",
+            "additions": 143,
+            "deletions": 0,
+            "changes": 143,
+            "blob_url": "https://github.com/nodejs/node/blob/f074612b744fecfd1f79fd05d7f10fe9a1487e5a/test%2Fes-module%2Ftest-esm-live-binding.mjs",
+            "raw_url": "https://github.com/nodejs/node/raw/f074612b744fecfd1f79fd05d7f10fe9a1487e5a/test%2Fes-module%2Ftest-esm-live-binding.mjs",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fes-module%2Ftest-esm-live-binding.mjs?ref=f074612b744fecfd1f79fd05d7f10fe9a1487e5a",
+            "patch": "@@ -0,0 +1,143 @@\n+// Flags: --experimental-modules\n+\n+import '../common';\n+import assert from 'assert';\n+\n+import fs, { readFile, readFileSync } from 'fs';\n+import events, { defaultMaxListeners } from 'events';\n+import util from 'util';\n+\n+const readFileDescriptor = Reflect.getOwnPropertyDescriptor(fs, 'readFile');\n+const readFileSyncDescriptor =\n+  Reflect.getOwnPropertyDescriptor(fs, 'readFileSync');\n+\n+const s = Symbol();\n+const fn = () => s;\n+\n+Reflect.deleteProperty(fs, 'readFile');\n+\n+assert.deepStrictEqual([fs.readFile, readFile], [undefined, undefined]);\n+\n+fs.readFile = fn;\n+\n+assert.deepStrictEqual([fs.readFile(), readFile()], [s, s]);\n+\n+Reflect.defineProperty(fs, 'readFile', {\n+  value: fn,\n+  configurable: true,\n+  writable: true,\n+});\n+\n+assert.deepStrictEqual([fs.readFile(), readFile()], [s, s]);\n+\n+Reflect.deleteProperty(fs, 'readFile');\n+\n+assert.deepStrictEqual([fs.readFile, readFile], [undefined, undefined]);\n+\n+let count = 0;\n+\n+Reflect.defineProperty(fs, 'readFile', {\n+  get() { return count; },\n+  configurable: true,\n+});\n+\n+count++;\n+\n+assert.deepStrictEqual([readFile, fs.readFile, readFile], [0, 1, 1]);\n+\n+let otherValue;\n+\n+Reflect.defineProperty(fs, 'readFile', { // eslint-disable-line accessor-pairs\n+  set(value) {\n+    Reflect.deleteProperty(fs, 'readFile');\n+    otherValue = value;\n+  },\n+  configurable: true,\n+});\n+\n+Reflect.defineProperty(fs, 'readFileSync', {\n+  get() {\n+    return otherValue;\n+  },\n+  configurable: true,\n+});\n+\n+fs.readFile = 2;\n+\n+assert.deepStrictEqual([readFile, readFileSync], [undefined, 2]);\n+\n+Reflect.defineProperty(fs, 'readFile', readFileDescriptor);\n+Reflect.defineProperty(fs, 'readFileSync', readFileSyncDescriptor);\n+\n+const originDefaultMaxListeners = events.defaultMaxListeners;\n+const utilProto = util.__proto__; // eslint-disable-line no-proto\n+\n+count = 0;\n+\n+Reflect.defineProperty(Function.prototype, 'defaultMaxListeners', {\n+  configurable: true,\n+  enumerable: true,\n+  get: function() { return ++count; },\n+  set: function(v) {\n+    Reflect.defineProperty(this, 'defaultMaxListeners', {\n+      configurable: true,\n+      enumerable: true,\n+      writable: true,\n+      value: v,\n+    });\n+  },\n+});\n+\n+assert.strictEqual(defaultMaxListeners, originDefaultMaxListeners);\n+assert.strictEqual(events.defaultMaxListeners, originDefaultMaxListeners);\n+\n+assert.strictEqual(++events.defaultMaxListeners,\n+                   originDefaultMaxListeners + 1);\n+\n+assert.strictEqual(defaultMaxListeners, originDefaultMaxListeners + 1);\n+assert.strictEqual(Function.prototype.defaultMaxListeners, 1);\n+\n+Function.prototype.defaultMaxListeners = 'foo';\n+\n+assert.strictEqual(Function.prototype.defaultMaxListeners, 'foo');\n+assert.strictEqual(events.defaultMaxListeners, originDefaultMaxListeners + 1);\n+assert.strictEqual(defaultMaxListeners, originDefaultMaxListeners + 1);\n+\n+count = 0;\n+\n+const p = {\n+  get foo() { return ++count; },\n+  set foo(v) {\n+    Reflect.defineProperty(this, 'foo', {\n+      configurable: true,\n+      enumerable: true,\n+      writable: true,\n+      value: v,\n+    });\n+  },\n+};\n+\n+util.__proto__ = p; // eslint-disable-line no-proto\n+\n+assert.strictEqual(util.foo, 1);\n+\n+util.foo = 'bar';\n+\n+assert.strictEqual(count, 1);\n+assert.strictEqual(util.foo, 'bar');\n+assert.strictEqual(p.foo, 2);\n+\n+p.foo = 'foo';\n+\n+assert.strictEqual(p.foo, 'foo');\n+\n+events.defaultMaxListeners = originDefaultMaxListeners;\n+util.__proto__ = utilProto; // eslint-disable-line no-proto\n+\n+Reflect.deleteProperty(util, 'foo');\n+Reflect.deleteProperty(Function.prototype, 'defaultMaxListeners');\n+\n+assert.throws(\n+  () => Object.defineProperty(events, 'defaultMaxListeners', { value: 3 }),\n+  /TypeError: Cannot redefine/\n+);"
+        },
+        {
+            "sha": "dcd159f6c8729a234c24f444ec6d9b971fb93482",
+            "filename": "test/es-module/test-esm-namespace.mjs",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 1,
+            "changes": 10,
+            "blob_url": "https://github.com/nodejs/node/blob/f074612b744fecfd1f79fd05d7f10fe9a1487e5a/test%2Fes-module%2Ftest-esm-namespace.mjs",
+            "raw_url": "https://github.com/nodejs/node/raw/f074612b744fecfd1f79fd05d7f10fe9a1487e5a/test%2Fes-module%2Ftest-esm-namespace.mjs",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fes-module%2Ftest-esm-namespace.mjs?ref=f074612b744fecfd1f79fd05d7f10fe9a1487e5a",
+            "patch": "@@ -2,5 +2,13 @@\n import '../common';\n import * as fs from 'fs';\n import assert from 'assert';\n+import Module from 'module';\n \n-assert.deepStrictEqual(Object.keys(fs), ['default']);\n+const keys = Object.entries(\n+  Object.getOwnPropertyDescriptors(new Module().require('fs')))\n+  .filter(([name, d]) => d.enumerable)\n+  .map(([name]) => name)\n+  .concat('default')\n+  .sort();\n+\n+assert.deepStrictEqual(Object.keys(fs).sort(), keys);"
+        },
+        {
+            "sha": "9fa6b9eed4d02915b3d228921ce4cf5eaa17a9bc",
+            "filename": "test/fixtures/es-module-loaders/js-loader.mjs",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 3,
+            "changes": 7,
+            "blob_url": "https://github.com/nodejs/node/blob/f074612b744fecfd1f79fd05d7f10fe9a1487e5a/test%2Ffixtures%2Fes-module-loaders%2Fjs-loader.mjs",
+            "raw_url": "https://github.com/nodejs/node/raw/f074612b744fecfd1f79fd05d7f10fe9a1487e5a/test%2Ffixtures%2Fes-module-loaders%2Fjs-loader.mjs",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Ffixtures%2Fes-module-loaders%2Fjs-loader.mjs?ref=f074612b744fecfd1f79fd05d7f10fe9a1487e5a",
+            "patch": "@@ -1,10 +1,11 @@\n-import _url from 'url';\n+import { URL } from 'url';\n+\n const builtins = new Set(\n   Object.keys(process.binding('natives')).filter(str =>\n     /^(?!(?:internal|node|v8)\\/)/.test(str))\n )\n \n-const baseURL = new _url.URL('file://');\n+const baseURL = new URL('file://');\n baseURL.pathname = process.cwd() + '/';\n \n export function resolve (specifier, base = baseURL) {\n@@ -15,7 +16,7 @@ export function resolve (specifier, base = baseURL) {\n     };\n   }\n   // load all dependencies as esm, regardless of file extension\n-  const url = new _url.URL(specifier, base).href;\n+  const url = new URL(specifier, base).href;\n   return {\n     url,\n     format: 'esm'"
+        }
+    ],
+    "stats": {
+        "total": 298,
+        "additions": 282,
+        "deletions": 16
+    }
+}

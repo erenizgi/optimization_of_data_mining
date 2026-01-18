@@ -1,0 +1,48 @@
+{
+    "author": "alexkozy",
+    "message": "src: implement v8::Platform::CallDelayedOnWorkerThread\n\nThis method is crucial for Runtime.evaluate protocol command with\ntimeout flag. At least Chrome DevTools frontend uses this method for\nevery execution in console.\n\nPR-URL: https://github.com/nodejs/node/pull/22383\nFixes: https://github.com/nodejs/node/issues/22157\nReviewed-By: Gus Caplan <me@gus.host>\nReviewed-By: Anna Henningsen <anna@addaleax.net>\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "b1e26128f317a6f5a5808a0a727e98f80f088b84",
+    "files": [
+        {
+            "sha": "92e9b371c5be6ff74daac1764ccfca76d59cc3d7",
+            "filename": "src/node_platform.cc",
+            "status": "modified",
+            "additions": 123,
+            "deletions": 1,
+            "changes": 124,
+            "blob_url": "https://github.com/nodejs/node/blob/b1e26128f317a6f5a5808a0a727e98f80f088b84/src%2Fnode_platform.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/b1e26128f317a6f5a5808a0a727e98f80f088b84/src%2Fnode_platform.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_platform.cc?ref=b1e26128f317a6f5a5808a0a727e98f80f088b84",
+            "patch": "@@ -2,6 +2,7 @@\n #include \"node_internals.h\"\n \n #include \"env-inl.h\"\n+#include \"debug_utils.h\"\n #include \"util.h\"\n #include <algorithm>\n \n@@ -29,7 +30,127 @@ static void PlatformWorkerThread(void* data) {\n \n }  // namespace\n \n+class WorkerThreadsTaskRunner::DelayedTaskScheduler {\n+ public:\n+  explicit DelayedTaskScheduler(TaskQueue<Task>* tasks)\n+    : pending_worker_tasks_(tasks) {}\n+\n+  std::unique_ptr<uv_thread_t> Start() {\n+    auto start_thread = [](void* data) {\n+      static_cast<DelayedTaskScheduler*>(data)->Run();\n+    };\n+    std::unique_ptr<uv_thread_t> t { new uv_thread_t() };\n+    uv_sem_init(&ready_, 0);\n+    CHECK_EQ(0, uv_thread_create(t.get(), start_thread, this));\n+    uv_sem_wait(&ready_);\n+    uv_sem_destroy(&ready_);\n+    return t;\n+  }\n+\n+  void PostDelayedTask(std::unique_ptr<Task> task, double delay_in_seconds) {\n+    tasks_.Push(std::unique_ptr<Task>(new ScheduleTask(this, std::move(task),\n+                                                       delay_in_seconds)));\n+    uv_async_send(&flush_tasks_);\n+  }\n+\n+  void Stop() {\n+    tasks_.Push(std::unique_ptr<Task>(new StopTask(this)));\n+    uv_async_send(&flush_tasks_);\n+  }\n+\n+ private:\n+  void Run() {\n+    TRACE_EVENT_METADATA1(\"__metadata\", \"thread_name\", \"name\",\n+                          \"WorkerThreadsTaskRunner::DelayedTaskScheduler\");\n+    loop_.data = this;\n+    CHECK_EQ(0, uv_loop_init(&loop_));\n+    flush_tasks_.data = this;\n+    CHECK_EQ(0, uv_async_init(&loop_, &flush_tasks_, FlushTasks));\n+    uv_sem_post(&ready_);\n+\n+    uv_run(&loop_, UV_RUN_DEFAULT);\n+    CheckedUvLoopClose(&loop_);\n+  }\n+\n+  static void FlushTasks(uv_async_t* flush_tasks) {\n+    DelayedTaskScheduler* scheduler =\n+        ContainerOf(&DelayedTaskScheduler::loop_, flush_tasks->loop);\n+    while (std::unique_ptr<Task> task = scheduler->tasks_.Pop())\n+      task->Run();\n+  }\n+\n+  class StopTask : public Task {\n+   public:\n+    explicit StopTask(DelayedTaskScheduler* scheduler): scheduler_(scheduler) {}\n+\n+    void Run() override {\n+      std::vector<uv_timer_t*> timers;\n+      for (uv_timer_t* timer : scheduler_->timers_)\n+        timers.push_back(timer);\n+      for (uv_timer_t* timer : timers)\n+        scheduler_->TakeTimerTask(timer);\n+      uv_close(reinterpret_cast<uv_handle_t*>(&scheduler_->flush_tasks_),\n+               [](uv_handle_t* handle) {});\n+    }\n+\n+   private:\n+     DelayedTaskScheduler* scheduler_;\n+  };\n+\n+  class ScheduleTask : public Task {\n+   public:\n+    ScheduleTask(DelayedTaskScheduler* scheduler,\n+                 std::unique_ptr<Task> task,\n+                 double delay_in_seconds)\n+      : scheduler_(scheduler),\n+        task_(std::move(task)),\n+        delay_in_seconds_(delay_in_seconds) {}\n+\n+    void Run() override {\n+      uint64_t delay_millis =\n+          static_cast<uint64_t>(delay_in_seconds_ + 0.5) * 1000;\n+      std::unique_ptr<uv_timer_t> timer(new uv_timer_t());\n+      CHECK_EQ(0, uv_timer_init(&scheduler_->loop_, timer.get()));\n+      timer->data = task_.release();\n+      CHECK_EQ(0, uv_timer_start(timer.get(), RunTask, delay_millis, 0));\n+      scheduler_->timers_.insert(timer.release());\n+    }\n+\n+   private:\n+    DelayedTaskScheduler* scheduler_;\n+    std::unique_ptr<Task> task_;\n+    double delay_in_seconds_;\n+  };\n+\n+  static void RunTask(uv_timer_t* timer) {\n+    DelayedTaskScheduler* scheduler =\n+        ContainerOf(&DelayedTaskScheduler::loop_, timer->loop);\n+    scheduler->pending_worker_tasks_->Push(scheduler->TakeTimerTask(timer));\n+  }\n+\n+  std::unique_ptr<Task> TakeTimerTask(uv_timer_t* timer) {\n+    std::unique_ptr<Task> task(static_cast<Task*>(timer->data));\n+    uv_timer_stop(timer);\n+    uv_close(reinterpret_cast<uv_handle_t*>(timer), [](uv_handle_t* handle) {\n+      delete reinterpret_cast<uv_timer_t*>(handle);\n+    });\n+    timers_.erase(timer);\n+    return task;\n+  }\n+\n+  uv_sem_t ready_;\n+  TaskQueue<v8::Task>* pending_worker_tasks_;\n+\n+  TaskQueue<v8::Task> tasks_;\n+  uv_loop_t loop_;\n+  uv_async_t flush_tasks_;\n+  std::unordered_set<uv_timer_t*> timers_;\n+};\n+\n WorkerThreadsTaskRunner::WorkerThreadsTaskRunner(int thread_pool_size) {\n+  delayed_task_scheduler_.reset(\n+      new DelayedTaskScheduler(&pending_worker_tasks_));\n+  threads_.push_back(delayed_task_scheduler_->Start());\n   for (int i = 0; i < thread_pool_size; i++) {\n     std::unique_ptr<uv_thread_t> t { new uv_thread_t() };\n     if (uv_thread_create(t.get(), PlatformWorkerThread,\n@@ -46,7 +167,7 @@ void WorkerThreadsTaskRunner::PostTask(std::unique_ptr<Task> task) {\n \n void WorkerThreadsTaskRunner::PostDelayedTask(std::unique_ptr<v8::Task> task,\n                                               double delay_in_seconds) {\n-  UNREACHABLE();\n+  delayed_task_scheduler_->PostDelayedTask(std::move(task), delay_in_seconds);\n }\n \n void WorkerThreadsTaskRunner::BlockingDrain() {\n@@ -55,6 +176,7 @@ void WorkerThreadsTaskRunner::BlockingDrain() {\n \n void WorkerThreadsTaskRunner::Shutdown() {\n   pending_worker_tasks_.Stop();\n+  delayed_task_scheduler_->Stop();\n   for (size_t i = 0; i < threads_.size(); i++) {\n     CHECK_EQ(0, uv_thread_join(threads_[i].get()));\n   }"
+        },
+        {
+            "sha": "69968c49f80bb366e9709737c926623c8d7dada9",
+            "filename": "src/node_platform.h",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/nodejs/node/blob/b1e26128f317a6f5a5808a0a727e98f80f088b84/src%2Fnode_platform.h",
+            "raw_url": "https://github.com/nodejs/node/raw/b1e26128f317a6f5a5808a0a727e98f80f088b84/src%2Fnode_platform.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_platform.h?ref=b1e26128f317a6f5a5808a0a727e98f80f088b84",
+            "patch": "@@ -109,6 +109,10 @@ class WorkerThreadsTaskRunner {\n \n  private:\n   TaskQueue<v8::Task> pending_worker_tasks_;\n+\n+  class DelayedTaskScheduler;\n+  std::unique_ptr<DelayedTaskScheduler> delayed_task_scheduler_;\n+\n   std::vector<std::unique_ptr<uv_thread_t>> threads_;\n };\n "
+        },
+        {
+            "sha": "1def39a82fead477fe6479a1d1fdd96d216119f2",
+            "filename": "test/sequential/test-inspector-runtime-evaluate-with-timeout.js",
+            "status": "added",
+            "additions": 21,
+            "deletions": 0,
+            "changes": 21,
+            "blob_url": "https://github.com/nodejs/node/blob/b1e26128f317a6f5a5808a0a727e98f80f088b84/test%2Fsequential%2Ftest-inspector-runtime-evaluate-with-timeout.js",
+            "raw_url": "https://github.com/nodejs/node/raw/b1e26128f317a6f5a5808a0a727e98f80f088b84/test%2Fsequential%2Ftest-inspector-runtime-evaluate-with-timeout.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fsequential%2Ftest-inspector-runtime-evaluate-with-timeout.js?ref=b1e26128f317a6f5a5808a0a727e98f80f088b84",
+            "patch": "@@ -0,0 +1,21 @@\n+// Flags: --expose-internals\n+'use strict';\n+\n+const common = require('../common');\n+common.skipIfInspectorDisabled();\n+\n+(async function test() {\n+  const { strictEqual } = require('assert');\n+  const { Session } = require('inspector');\n+  const { promisify } = require('util');\n+\n+  const session = new Session();\n+  session.connect();\n+  session.post = promisify(session.post);\n+  const result = await session.post('Runtime.evaluate', {\n+    expression: 'for(;;);',\n+    timeout: 0\n+  }).catch((e) => e);\n+  strictEqual(result.message, 'Execution was terminated');\n+  session.disconnect();\n+})();"
+        }
+    ],
+    "stats": {
+        "total": 149,
+        "additions": 148,
+        "deletions": 1
+    }
+}

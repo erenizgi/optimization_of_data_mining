@@ -1,0 +1,72 @@
+{
+    "author": "aaugustin",
+    "message": "Fixed #19547 -- Caching of related instances.\n\nWhen &'ing or |'ing querysets, wrong values could be cached, and crashes\ncould happen.\n\nThanks Marc Tamlyn for figuring out the problem and writing the patch.",
+    "sha": "07fbc6ae0e3b7742915b785c737b7e6e8a0e3503",
+    "files": [
+        {
+            "sha": "9a657d9d26f334ca580966e409490002764ee3b9",
+            "filename": "django/db/models/fields/related.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/django/django/blob/07fbc6ae0e3b7742915b785c737b7e6e8a0e3503/django%2Fdb%2Fmodels%2Ffields%2Frelated.py",
+            "raw_url": "https://github.com/django/django/raw/07fbc6ae0e3b7742915b785c737b7e6e8a0e3503/django%2Fdb%2Fmodels%2Ffields%2Frelated.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fmodels%2Ffields%2Frelated.py?ref=07fbc6ae0e3b7742915b785c737b7e6e8a0e3503",
+            "patch": "@@ -496,7 +496,7 @@ def get_query_set(self):\n                 except (AttributeError, KeyError):\n                     db = self._db or router.db_for_read(self.model, instance=self.instance)\n                     qs = super(RelatedManager, self).get_query_set().using(db).filter(**self.core_filters)\n-                    qs._known_related_object = (rel_field.name, self.instance)\n+                    qs._known_related_objects = {rel_field: {self.instance.pk: self.instance}}\n                     return qs\n \n             def get_prefetch_query_set(self, instances):"
+        },
+        {
+            "sha": "26b93b20bfcd63ac0c5dd51cae5ce098d5f23e15",
+            "filename": "django/db/models/query.py",
+            "status": "modified",
+            "additions": 22,
+            "deletions": 7,
+            "changes": 29,
+            "blob_url": "https://github.com/django/django/blob/07fbc6ae0e3b7742915b785c737b7e6e8a0e3503/django%2Fdb%2Fmodels%2Fquery.py",
+            "raw_url": "https://github.com/django/django/raw/07fbc6ae0e3b7742915b785c737b7e6e8a0e3503/django%2Fdb%2Fmodels%2Fquery.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fmodels%2Fquery.py?ref=07fbc6ae0e3b7742915b785c737b7e6e8a0e3503",
+            "patch": "@@ -44,7 +44,7 @@ def __init__(self, model=None, query=None, using=None):\n         self._for_write = False\n         self._prefetch_related_lookups = []\n         self._prefetch_done = False\n-        self._known_related_object = None       # (attname, rel_obj)\n+        self._known_related_objects = {}        # {rel_field, {pk: rel_obj}}\n \n     ########################\n     # PYTHON MAGIC METHODS #\n@@ -221,6 +221,7 @@ def __and__(self, other):\n         if isinstance(other, EmptyQuerySet):\n             return other._clone()\n         combined = self._clone()\n+        combined._merge_known_related_objects(other)\n         combined.query.combine(other.query, sql.AND)\n         return combined\n \n@@ -229,6 +230,7 @@ def __or__(self, other):\n         combined = self._clone()\n         if isinstance(other, EmptyQuerySet):\n             return combined\n+        combined._merge_known_related_objects(other)\n         combined.query.combine(other.query, sql.OR)\n         return combined\n \n@@ -289,10 +291,9 @@ def iterator(self):\n                     init_list.append(field.attname)\n             model_cls = deferred_class_factory(self.model, skip)\n \n-        # Cache db, model and known_related_object outside the loop\n+        # Cache db and model outside the loop\n         db = self.db\n         model = self.model\n-        kro_attname, kro_instance = self._known_related_object or (None, None)\n         compiler = self.query.get_compiler(using=db)\n         if fill_cache:\n             klass_info = get_klass_info(model, max_depth=max_depth,\n@@ -323,9 +324,16 @@ def iterator(self):\n                 for i, aggregate in enumerate(aggregate_select):\n                     setattr(obj, aggregate, row[i + aggregate_start])\n \n-            # Add the known related object to the model, if there is one\n-            if kro_instance:\n-                setattr(obj, kro_attname, kro_instance)\n+            # Add the known related objects to the model, if there are any\n+            if self._known_related_objects:\n+                for field, rel_objs in self._known_related_objects.items():\n+                    pk = getattr(obj, field.get_attname())\n+                    try:\n+                        rel_obj = rel_objs[pk]\n+                    except KeyError:\n+                        pass               # may happen in qs1 | qs2 scenarios\n+                    else:\n+                        setattr(obj, field.name, rel_obj)\n \n             yield obj\n \n@@ -902,7 +910,7 @@ def _clone(self, klass=None, setup=False, **kwargs):\n         c = klass(model=self.model, query=query, using=self._db)\n         c._for_write = self._for_write\n         c._prefetch_related_lookups = self._prefetch_related_lookups[:]\n-        c._known_related_object = self._known_related_object\n+        c._known_related_objects = self._known_related_objects\n         c.__dict__.update(kwargs)\n         if setup and hasattr(c, '_setup_query'):\n             c._setup_query()\n@@ -942,6 +950,13 @@ def _merge_sanity_check(self, other):\n         \"\"\"\n         pass\n \n+    def _merge_known_related_objects(self, other):\n+        \"\"\"\n+        Keep track of all known related objects from either QuerySet instance.\n+        \"\"\"\n+        for field, objects in other._known_related_objects.items():\n+            self._known_related_objects.setdefault(field, {}).update(objects)\n+\n     def _setup_aggregate_query(self, aggregates):\n         \"\"\"\n         Prepare the query for computing a result that contains aggregate annotations."
+        },
+        {
+            "sha": "b8f053e15236dfc9232338064df9273863d9f3a3",
+            "filename": "tests/modeltests/known_related_objects/fixtures/tournament.json",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 0,
+            "changes": 11,
+            "blob_url": "https://github.com/django/django/blob/07fbc6ae0e3b7742915b785c737b7e6e8a0e3503/tests%2Fmodeltests%2Fknown_related_objects%2Ffixtures%2Ftournament.json",
+            "raw_url": "https://github.com/django/django/raw/07fbc6ae0e3b7742915b785c737b7e6e8a0e3503/tests%2Fmodeltests%2Fknown_related_objects%2Ffixtures%2Ftournament.json",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fmodeltests%2Fknown_related_objects%2Ffixtures%2Ftournament.json?ref=07fbc6ae0e3b7742915b785c737b7e6e8a0e3503",
+            "patch": "@@ -13,11 +13,19 @@\n             \"name\": \"Tourney 2\"\n             }\n         },\n+    {\n+        \"pk\": 1,\n+        \"model\": \"known_related_objects.organiser\",\n+        \"fields\": {\n+            \"name\": \"Organiser 1\"\n+            }\n+        },\n     {\n         \"pk\": 1,\n         \"model\": \"known_related_objects.pool\",\n         \"fields\": {\n             \"tournament\": 1,\n+            \"organiser\": 1,\n             \"name\": \"T1 Pool 1\"\n             }\n         },\n@@ -26,6 +34,7 @@\n         \"model\": \"known_related_objects.pool\",\n         \"fields\": {\n             \"tournament\": 1,\n+            \"organiser\": 1,\n             \"name\": \"T1 Pool 2\"\n             }\n         },\n@@ -34,6 +43,7 @@\n         \"model\": \"known_related_objects.pool\",\n         \"fields\": {\n             \"tournament\": 2,\n+            \"organiser\": 1,\n             \"name\": \"T2 Pool 1\"\n             }\n         },\n@@ -42,6 +52,7 @@\n         \"model\": \"known_related_objects.pool\",\n         \"fields\": {\n             \"tournament\": 2,\n+            \"organiser\": 1,\n             \"name\": \"T2 Pool 2\"\n             }\n         },"
+        },
+        {
+            "sha": "e256cc38f2fea1a0f553d125dd0f6cfe9c3adec4",
+            "filename": "tests/modeltests/known_related_objects/models.py",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/django/django/blob/07fbc6ae0e3b7742915b785c737b7e6e8a0e3503/tests%2Fmodeltests%2Fknown_related_objects%2Fmodels.py",
+            "raw_url": "https://github.com/django/django/raw/07fbc6ae0e3b7742915b785c737b7e6e8a0e3503/tests%2Fmodeltests%2Fknown_related_objects%2Fmodels.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fmodeltests%2Fknown_related_objects%2Fmodels.py?ref=07fbc6ae0e3b7742915b785c737b7e6e8a0e3503",
+            "patch": "@@ -9,9 +9,13 @@\n class Tournament(models.Model):\n     name = models.CharField(max_length=30)\n \n+class Organiser(models.Model):\n+    name = models.CharField(max_length=30)\n+\n class Pool(models.Model):\n     name = models.CharField(max_length=30)\n     tournament = models.ForeignKey(Tournament)\n+    organiser = models.ForeignKey(Organiser)\n \n class PoolStyle(models.Model):\n     name = models.CharField(max_length=30)"
+        },
+        {
+            "sha": "2371ac2e20f346d0d273d66b1445aa97987039f7",
+            "filename": "tests/modeltests/known_related_objects/tests.py",
+            "status": "modified",
+            "additions": 41,
+            "deletions": 1,
+            "changes": 42,
+            "blob_url": "https://github.com/django/django/blob/07fbc6ae0e3b7742915b785c737b7e6e8a0e3503/tests%2Fmodeltests%2Fknown_related_objects%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/07fbc6ae0e3b7742915b785c737b7e6e8a0e3503/tests%2Fmodeltests%2Fknown_related_objects%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fmodeltests%2Fknown_related_objects%2Ftests.py?ref=07fbc6ae0e3b7742915b785c737b7e6e8a0e3503",
+            "patch": "@@ -2,7 +2,7 @@\n \n from django.test import TestCase\n \n-from .models import Tournament, Pool, PoolStyle\n+from .models import Tournament, Organiser, Pool, PoolStyle\n \n class ExistingRelatedInstancesTests(TestCase):\n     fixtures = ['tournament.json']\n@@ -27,6 +27,46 @@ def test_foreign_key_multiple_prefetch(self):\n             pool2 = tournaments[1].pool_set.all()[0]\n             self.assertIs(tournaments[1], pool2.tournament)\n \n+    def test_queryset_or(self):\n+        tournament_1 = Tournament.objects.get(pk=1)\n+        tournament_2 = Tournament.objects.get(pk=2)\n+        with self.assertNumQueries(1):\n+            pools = tournament_1.pool_set.all() | tournament_2.pool_set.all()\n+            related_objects = set(pool.tournament for pool in pools)\n+            self.assertEqual(related_objects, set((tournament_1, tournament_2)))\n+\n+    def test_queryset_or_different_cached_items(self):\n+        tournament = Tournament.objects.get(pk=1)\n+        organiser = Organiser.objects.get(pk=1)\n+        with self.assertNumQueries(1):\n+            pools = tournament.pool_set.all() | organiser.pool_set.all()\n+            first = pools.filter(pk=1)[0]\n+            self.assertIs(first.tournament, tournament)\n+            self.assertIs(first.organiser, organiser)\n+\n+    def test_queryset_or_only_one_with_precache(self):\n+        tournament_1 = Tournament.objects.get(pk=1)\n+        tournament_2 = Tournament.objects.get(pk=2)\n+        # 2 queries here as pool id 3 has tournament 2, which is not cached\n+        with self.assertNumQueries(2):\n+            pools = tournament_1.pool_set.all() | Pool.objects.filter(pk=3)\n+            related_objects = set(pool.tournament for pool in pools)\n+            self.assertEqual(related_objects, set((tournament_1, tournament_2)))\n+        # and the other direction\n+        with self.assertNumQueries(2):\n+            pools = Pool.objects.filter(pk=3) | tournament_1.pool_set.all()\n+            related_objects = set(pool.tournament for pool in pools)\n+            self.assertEqual(related_objects, set((tournament_1, tournament_2)))\n+\n+    def test_queryset_and(self):\n+        tournament = Tournament.objects.get(pk=1)\n+        organiser = Organiser.objects.get(pk=1)\n+        with self.assertNumQueries(1):\n+            pools = tournament.pool_set.all() & organiser.pool_set.all()\n+            first = pools.filter(pk=1)[0]\n+            self.assertIs(first.tournament, tournament)\n+            self.assertIs(first.organiser, organiser)\n+\n     def test_one_to_one(self):\n         with self.assertNumQueries(2):\n             style = PoolStyle.objects.get(pk=1)"
+        }
+    ],
+    "stats": {
+        "total": 88,
+        "additions": 79,
+        "deletions": 9
+    }
+}

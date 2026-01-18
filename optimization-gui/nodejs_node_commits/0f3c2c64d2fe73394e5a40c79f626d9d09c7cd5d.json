@@ -1,0 +1,72 @@
+{
+    "author": "unknown",
+    "message": "src: use modern v8::Platform worker threads APIs\n\nPrecursor to removing deprecated APIs on the v8 side @\nhttps://chromium-review.googlesource.com/c/v8/v8/+/1045310\n\nPR-URL: https://github.com/nodejs/node/pull/21079\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Matteo Collina <matteo.collina@gmail.com>\nReviewed-By: Colin Ihrig <cjihrig@gmail.com>\nReviewed-By: Yang Guo <yangguo@chromium.org>",
+    "sha": "0f3c2c64d2fe73394e5a40c79f626d9d09c7cd5d",
+    "files": [
+        {
+            "sha": "1f4d39a56b044cbb3f3ac3c27badda575ffc95c9",
+            "filename": "src/node.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/0f3c2c64d2fe73394e5a40c79f626d9d09c7cd5d/src%2Fnode.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/0f3c2c64d2fe73394e5a40c79f626d9d09c7cd5d/src%2Fnode.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode.cc?ref=0f3c2c64d2fe73394e5a40c79f626d9d09c7cd5d",
+            "patch": "@@ -404,7 +404,7 @@ static struct {\n   }\n \n   void DrainVMTasks(Isolate* isolate) {\n-    platform_->DrainBackgroundTasks(isolate);\n+    platform_->DrainTasks(isolate);\n   }\n \n   void CancelVMTasks(Isolate* isolate) {"
+        },
+        {
+            "sha": "a3f9c92fe0d3ebcc3ad52cbe1f80542fb9ced72c",
+            "filename": "src/node.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/0f3c2c64d2fe73394e5a40c79f626d9d09c7cd5d/src%2Fnode.h",
+            "raw_url": "https://github.com/nodejs/node/raw/0f3c2c64d2fe73394e5a40c79f626d9d09c7cd5d/src%2Fnode.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode.h?ref=0f3c2c64d2fe73394e5a40c79f626d9d09c7cd5d",
+            "patch": "@@ -229,7 +229,7 @@ class MultiIsolatePlatform : public v8::Platform {\n   // posted during flushing of the queue are postponed until the next\n   // flushing.\n   virtual bool FlushForegroundTasks(v8::Isolate* isolate) = 0;\n-  virtual void DrainBackgroundTasks(v8::Isolate* isolate) = 0;\n+  virtual void DrainTasks(v8::Isolate* isolate) = 0;\n   virtual void CancelPendingDelayedTasks(v8::Isolate* isolate) = 0;\n \n   // These will be called by the `IsolateData` creation/destruction functions."
+        },
+        {
+            "sha": "ce9117ae38e7ee814ae8253250902295ea6e000f",
+            "filename": "src/node_platform.cc",
+            "status": "modified",
+            "additions": 38,
+            "deletions": 38,
+            "changes": 76,
+            "blob_url": "https://github.com/nodejs/node/blob/0f3c2c64d2fe73394e5a40c79f626d9d09c7cd5d/src%2Fnode_platform.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/0f3c2c64d2fe73394e5a40c79f626d9d09c7cd5d/src%2Fnode_platform.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_platform.cc?ref=0f3c2c64d2fe73394e5a40c79f626d9d09c7cd5d",
+            "patch": "@@ -15,50 +15,52 @@ using v8::Platform;\n using v8::Task;\n using v8::TracingController;\n \n-static void BackgroundRunner(void* data) {\n+namespace {\n+\n+static void WorkerThreadMain(void* data) {\n   TRACE_EVENT_METADATA1(\"__metadata\", \"thread_name\", \"name\",\n                         \"BackgroundTaskRunner\");\n-  TaskQueue<Task> *background_tasks = static_cast<TaskQueue<Task> *>(data);\n-  while (std::unique_ptr<Task> task = background_tasks->BlockingPop()) {\n+  TaskQueue<Task>* pending_worker_tasks = static_cast<TaskQueue<Task>*>(data);\n+  while (std::unique_ptr<Task> task = pending_worker_tasks->BlockingPop()) {\n     task->Run();\n-    background_tasks->NotifyOfCompletion();\n+    pending_worker_tasks->NotifyOfCompletion();\n   }\n }\n \n-BackgroundTaskRunner::BackgroundTaskRunner(int thread_pool_size) {\n+}  // namespace\n+\n+WorkerThreadsTaskRunner::WorkerThreadsTaskRunner(int thread_pool_size) {\n   for (int i = 0; i < thread_pool_size; i++) {\n     std::unique_ptr<uv_thread_t> t { new uv_thread_t() };\n-    if (uv_thread_create(t.get(), BackgroundRunner, &background_tasks_) != 0)\n+    if (uv_thread_create(t.get(), WorkerThreadMain,\n+                         &pending_worker_tasks_) != 0) {\n       break;\n+    }\n     threads_.push_back(std::move(t));\n   }\n }\n \n-void BackgroundTaskRunner::PostTask(std::unique_ptr<Task> task) {\n-  background_tasks_.Push(std::move(task));\n-}\n-\n-void BackgroundTaskRunner::PostIdleTask(std::unique_ptr<v8::IdleTask> task) {\n-  UNREACHABLE();\n+void WorkerThreadsTaskRunner::PostTask(std::unique_ptr<Task> task) {\n+  pending_worker_tasks_.Push(std::move(task));\n }\n \n-void BackgroundTaskRunner::PostDelayedTask(std::unique_ptr<v8::Task> task,\n-                                           double delay_in_seconds) {\n+void WorkerThreadsTaskRunner::PostDelayedTask(std::unique_ptr<v8::Task> task,\n+                                              double delay_in_seconds) {\n   UNREACHABLE();\n }\n \n-void BackgroundTaskRunner::BlockingDrain() {\n-  background_tasks_.BlockingDrain();\n+void WorkerThreadsTaskRunner::BlockingDrain() {\n+  pending_worker_tasks_.BlockingDrain();\n }\n \n-void BackgroundTaskRunner::Shutdown() {\n-  background_tasks_.Stop();\n+void WorkerThreadsTaskRunner::Shutdown() {\n+  pending_worker_tasks_.Stop();\n   for (size_t i = 0; i < threads_.size(); i++) {\n     CHECK_EQ(0, uv_thread_join(threads_[i].get()));\n   }\n }\n \n-size_t BackgroundTaskRunner::NumberOfAvailableBackgroundThreads() const {\n+int WorkerThreadsTaskRunner::NumberOfWorkerThreads() const {\n   return threads_.size();\n }\n \n@@ -131,8 +133,8 @@ NodePlatform::NodePlatform(int thread_pool_size,\n     TracingController* controller = new TracingController();\n     tracing_controller_.reset(controller);\n   }\n-  background_task_runner_ =\n-      std::make_shared<BackgroundTaskRunner>(thread_pool_size);\n+  worker_thread_task_runner_ =\n+      std::make_shared<WorkerThreadsTaskRunner>(thread_pool_size);\n }\n \n void NodePlatform::RegisterIsolate(IsolateData* isolate_data, uv_loop_t* loop) {\n@@ -160,16 +162,16 @@ void NodePlatform::UnregisterIsolate(IsolateData* isolate_data) {\n }\n \n void NodePlatform::Shutdown() {\n-  background_task_runner_->Shutdown();\n+  worker_thread_task_runner_->Shutdown();\n \n   {\n     Mutex::ScopedLock lock(per_isolate_mutex_);\n     per_isolate_.clear();\n   }\n }\n \n-size_t NodePlatform::NumberOfAvailableBackgroundThreads() {\n-  return background_task_runner_->NumberOfAvailableBackgroundThreads();\n+int NodePlatform::NumberOfWorkerThreads() {\n+  return worker_thread_task_runner_->NumberOfWorkerThreads();\n }\n \n void PerIsolatePlatformData::RunForegroundTask(std::unique_ptr<Task> task) {\n@@ -201,15 +203,12 @@ void PerIsolatePlatformData::CancelPendingDelayedTasks() {\n   scheduled_delayed_tasks_.clear();\n }\n \n-void NodePlatform::DrainBackgroundTasks(Isolate* isolate) {\n+void NodePlatform::DrainTasks(Isolate* isolate) {\n   std::shared_ptr<PerIsolatePlatformData> per_isolate = ForIsolate(isolate);\n \n   do {\n-    // Right now, there is no way to drain only background tasks associated\n-    // with a specific isolate, so this sometimes does more work than\n-    // necessary. In the long run, that functionality is probably going to\n-    // be available anyway, though.\n-    background_task_runner_->BlockingDrain();\n+    // Worker tasks aren't associated with an Isolate.\n+    worker_thread_task_runner_->BlockingDrain();\n   } while (per_isolate->FlushForegroundTasksInternal());\n }\n \n@@ -249,11 +248,17 @@ bool PerIsolatePlatformData::FlushForegroundTasksInternal() {\n   return did_work;\n }\n \n-void NodePlatform::CallOnBackgroundThread(Task* task,\n-                                          ExpectedRuntime expected_runtime) {\n-  background_task_runner_->PostTask(std::unique_ptr<Task>(task));\n+void NodePlatform::CallOnWorkerThread(std::unique_ptr<v8::Task> task) {\n+  worker_thread_task_runner_->PostTask(std::move(task));\n }\n \n+void NodePlatform::CallDelayedOnWorkerThread(std::unique_ptr<v8::Task> task,\n+                                             double delay_in_seconds) {\n+  worker_thread_task_runner_->PostDelayedTask(std::move(task),\n+                                              delay_in_seconds);\n+}\n+\n+\n std::shared_ptr<PerIsolatePlatformData>\n NodePlatform::ForIsolate(Isolate* isolate) {\n   Mutex::ScopedLock lock(per_isolate_mutex_);\n@@ -283,11 +288,6 @@ void NodePlatform::CancelPendingDelayedTasks(v8::Isolate* isolate) {\n \n bool NodePlatform::IdleTasksEnabled(Isolate* isolate) { return false; }\n \n-std::shared_ptr<v8::TaskRunner>\n-NodePlatform::GetBackgroundTaskRunner(Isolate* isolate) {\n-  return background_task_runner_;\n-}\n-\n std::shared_ptr<v8::TaskRunner>\n NodePlatform::GetForegroundTaskRunner(Isolate* isolate) {\n   return ForIsolate(isolate);"
+        },
+        {
+            "sha": "62301a302b22e034016f47aa7f8d758522086360",
+            "filename": "src/node_platform.h",
+            "status": "modified",
+            "additions": 14,
+            "deletions": 16,
+            "changes": 30,
+            "blob_url": "https://github.com/nodejs/node/blob/0f3c2c64d2fe73394e5a40c79f626d9d09c7cd5d/src%2Fnode_platform.h",
+            "raw_url": "https://github.com/nodejs/node/raw/0f3c2c64d2fe73394e5a40c79f626d9d09c7cd5d/src%2Fnode_platform.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_platform.h?ref=0f3c2c64d2fe73394e5a40c79f626d9d09c7cd5d",
+            "patch": "@@ -93,23 +93,22 @@ class PerIsolatePlatformData :\n   std::vector<DelayedTaskPointer> scheduled_delayed_tasks_;\n };\n \n-// This acts as the single background task runner for all Isolates.\n-class BackgroundTaskRunner : public v8::TaskRunner {\n+// This acts as the single worker thread task runner for all Isolates.\n+class WorkerThreadsTaskRunner {\n  public:\n-  explicit BackgroundTaskRunner(int thread_pool_size);\n+  explicit WorkerThreadsTaskRunner(int thread_pool_size);\n \n-  void PostTask(std::unique_ptr<v8::Task> task) override;\n-  void PostIdleTask(std::unique_ptr<v8::IdleTask> task) override;\n+  void PostTask(std::unique_ptr<v8::Task> task);\n   void PostDelayedTask(std::unique_ptr<v8::Task> task,\n-                       double delay_in_seconds) override;\n-  bool IdleTasksEnabled() override { return false; };\n+                       double delay_in_seconds);\n \n   void BlockingDrain();\n   void Shutdown();\n \n-  size_t NumberOfAvailableBackgroundThreads() const;\n+  int NumberOfWorkerThreads() const;\n+\n  private:\n-  TaskQueue<v8::Task> background_tasks_;\n+  TaskQueue<v8::Task> pending_worker_tasks_;\n   std::vector<std::unique_ptr<uv_thread_t>> threads_;\n };\n \n@@ -118,14 +117,15 @@ class NodePlatform : public MultiIsolatePlatform {\n   NodePlatform(int thread_pool_size, v8::TracingController* tracing_controller);\n   virtual ~NodePlatform() {}\n \n-  void DrainBackgroundTasks(v8::Isolate* isolate) override;\n+  void DrainTasks(v8::Isolate* isolate) override;\n   void CancelPendingDelayedTasks(v8::Isolate* isolate) override;\n   void Shutdown();\n \n   // v8::Platform implementation.\n-  size_t NumberOfAvailableBackgroundThreads() override;\n-  void CallOnBackgroundThread(v8::Task* task,\n-                              ExpectedRuntime expected_runtime) override;\n+  int NumberOfWorkerThreads() override;\n+  void CallOnWorkerThread(std::unique_ptr<v8::Task> task) override;\n+  void CallDelayedOnWorkerThread(std::unique_ptr<v8::Task> task,\n+                                 double delay_in_seconds) override;\n   void CallOnForegroundThread(v8::Isolate* isolate, v8::Task* task) override;\n   void CallDelayedOnForegroundThread(v8::Isolate* isolate, v8::Task* task,\n                                      double delay_in_seconds) override;\n@@ -138,8 +138,6 @@ class NodePlatform : public MultiIsolatePlatform {\n   void RegisterIsolate(IsolateData* isolate_data, uv_loop_t* loop) override;\n   void UnregisterIsolate(IsolateData* isolate_data) override;\n \n-  std::shared_ptr<v8::TaskRunner> GetBackgroundTaskRunner(\n-      v8::Isolate* isolate) override;\n   std::shared_ptr<v8::TaskRunner> GetForegroundTaskRunner(\n       v8::Isolate* isolate) override;\n \n@@ -151,7 +149,7 @@ class NodePlatform : public MultiIsolatePlatform {\n                      std::shared_ptr<PerIsolatePlatformData>> per_isolate_;\n \n   std::unique_ptr<v8::TracingController> tracing_controller_;\n-  std::shared_ptr<BackgroundTaskRunner> background_task_runner_;\n+  std::shared_ptr<WorkerThreadsTaskRunner> worker_thread_task_runner_;\n };\n \n }  // namespace node"
+        },
+        {
+            "sha": "d3bffba51f39541849583b59c4dc31fad3a40ab5",
+            "filename": "src/node_worker.cc",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/nodejs/node/blob/0f3c2c64d2fe73394e5a40c79f626d9d09c7cd5d/src%2Fnode_worker.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/0f3c2c64d2fe73394e5a40c79f626d9d09c7cd5d/src%2Fnode_worker.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_worker.cc?ref=0f3c2c64d2fe73394e5a40c79f626d9d09c7cd5d",
+            "patch": "@@ -173,7 +173,7 @@ void Worker::Run() {\n           uv_run(&loop_, UV_RUN_DEFAULT);\n           if (is_stopped()) break;\n \n-          platform->DrainBackgroundTasks(isolate_);\n+          platform->DrainTasks(isolate_);\n \n           more = uv_loop_alive(&loop_);\n           if (more && !is_stopped())\n@@ -232,7 +232,7 @@ void Worker::Run() {\n       // This call needs to be made while the `Environment` is still alive\n       // because we assume that it is available for async tracking in the\n       // NodePlatform implementation.\n-      platform->DrainBackgroundTasks(isolate_);\n+      platform->DrainTasks(isolate_);\n     }\n \n     env_.reset();"
+        }
+    ],
+    "stats": {
+        "total": 114,
+        "additions": 56,
+        "deletions": 58
+    }
+}

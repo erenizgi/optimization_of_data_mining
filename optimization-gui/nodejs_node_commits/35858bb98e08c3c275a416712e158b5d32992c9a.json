@@ -1,0 +1,60 @@
+{
+    "author": "apapirovski",
+    "message": "http2: force through RST_STREAM in destroy\n\nIf still needed, force through RST_STREAM in Http2Stream#destroy\ncalls, so that nghttp2 can wrap up properly and doesn't continue\ntrying to read & write data to the stream.\n\nPR-URL: https://github.com/nodejs/node/pull/21016\nFixes: https://github.com/nodejs/node/issues/21008\nReviewed-By: Benjamin Gruenbaum <benjamingr@gmail.com>\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Anna Henningsen <anna@addaleax.net>",
+    "sha": "35858bb98e08c3c275a416712e158b5d32992c9a",
+    "files": [
+        {
+            "sha": "97a6a5b4f1f89cc9b98f0614d73f1447a3cf81e5",
+            "filename": "lib/internal/http2/core.js",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 5,
+            "changes": 15,
+            "blob_url": "https://github.com/nodejs/node/blob/35858bb98e08c3c275a416712e158b5d32992c9a/lib%2Finternal%2Fhttp2%2Fcore.js",
+            "raw_url": "https://github.com/nodejs/node/raw/35858bb98e08c3c275a416712e158b5d32992c9a/lib%2Finternal%2Fhttp2%2Fcore.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fhttp2%2Fcore.js?ref=35858bb98e08c3c275a416712e158b5d32992c9a",
+            "patch": "@@ -337,7 +337,7 @@ function onStreamClose(code) {\n         `${sessionName(stream[kSession][kType])}]: closed with code ${code}`);\n \n   if (!stream.closed)\n-    closeStream(stream, code, false);\n+    closeStream(stream, code, kNoRstStream);\n \n   stream[kState].fd = -1;\n   // Defer destroy we actually emit end.\n@@ -1476,7 +1476,11 @@ function finishSendTrailers(stream, headersList) {\n     stream[kMaybeDestroy]();\n }\n \n-function closeStream(stream, code, shouldSubmitRstStream = true) {\n+const kNoRstStream = 0;\n+const kSubmitRstStream = 1;\n+const kForceRstStream = 2;\n+\n+function closeStream(stream, code, rstStreamStatus = kSubmitRstStream) {\n   const state = stream[kState];\n   state.flags |= STREAM_FLAGS_CLOSED;\n   state.rstCode = code;\n@@ -1499,9 +1503,10 @@ function closeStream(stream, code, shouldSubmitRstStream = true) {\n     stream.end();\n   }\n \n-  if (shouldSubmitRstStream) {\n+  if (rstStreamStatus !== kNoRstStream) {\n     const finishFn = finishCloseStream.bind(stream, code);\n-    if (!ending || finished || code !== NGHTTP2_NO_ERROR)\n+    if (!ending || finished || code !== NGHTTP2_NO_ERROR ||\n+        rstStreamStatus === kForceRstStream)\n       finishFn();\n     else\n       stream.once('finish', finishFn);\n@@ -1852,7 +1857,7 @@ class Http2Stream extends Duplex {\n     const hasHandle = handle !== undefined;\n \n     if (!this.closed)\n-      closeStream(this, code, hasHandle);\n+      closeStream(this, code, hasHandle ? kForceRstStream : kNoRstStream);\n     this.push(null);\n \n     if (hasHandle) {"
+        },
+        {
+            "sha": "be43cc1e69067be8683d9643fbd4d04f4d4b3375",
+            "filename": "src/node_http2.cc",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/35858bb98e08c3c275a416712e158b5d32992c9a/src%2Fnode_http2.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/35858bb98e08c3c275a416712e158b5d32992c9a/src%2Fnode_http2.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_http2.cc?ref=35858bb98e08c3c275a416712e158b5d32992c9a",
+            "patch": "@@ -1762,6 +1762,8 @@ void Http2Stream::Destroy() {\n   // Do nothing if this stream instance is already destroyed\n   if (IsDestroyed())\n     return;\n+  if (session_->HasPendingRstStream(id_))\n+    FlushRstStream();\n   flags_ |= NGHTTP2_STREAM_FLAG_DESTROYED;\n \n   Debug(this, \"destroying stream\");"
+        },
+        {
+            "sha": "e0a93c8f0fdc465cb282efb4ecc96943e1e4dff8",
+            "filename": "src/node_http2.h",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/nodejs/node/blob/35858bb98e08c3c275a416712e158b5d32992c9a/src%2Fnode_http2.h",
+            "raw_url": "https://github.com/nodejs/node/raw/35858bb98e08c3c275a416712e158b5d32992c9a/src%2Fnode_http2.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_http2.h?ref=35858bb98e08c3c275a416712e158b5d32992c9a",
+            "patch": "@@ -9,6 +9,7 @@\n #include \"stream_base-inl.h\"\n #include \"string_bytes.h\"\n \n+#include <algorithm>\n #include <queue>\n \n namespace node {\n@@ -803,6 +804,12 @@ class Http2Session : public AsyncWrap, public StreamListener {\n     pending_rst_streams_.emplace_back(stream_id);\n   }\n \n+  inline bool HasPendingRstStream(int32_t stream_id) {\n+    return pending_rst_streams_.end() != std::find(pending_rst_streams_.begin(),\n+                                                   pending_rst_streams_.end(),\n+                                                   stream_id);\n+  }\n+\n   // Handle reads/writes from the underlying network transport.\n   void OnStreamRead(ssize_t nread, const uv_buf_t& buf) override;\n   void OnStreamAfterWrite(WriteWrap* w, int status) override;"
+        },
+        {
+            "sha": "24c0a055cc943fd10146f0270c51fde58a58d793",
+            "filename": "test/parallel/test-http2-large-write-destroy.js",
+            "status": "added",
+            "additions": 40,
+            "deletions": 0,
+            "changes": 40,
+            "blob_url": "https://github.com/nodejs/node/blob/35858bb98e08c3c275a416712e158b5d32992c9a/test%2Fparallel%2Ftest-http2-large-write-destroy.js",
+            "raw_url": "https://github.com/nodejs/node/raw/35858bb98e08c3c275a416712e158b5d32992c9a/test%2Fparallel%2Ftest-http2-large-write-destroy.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-http2-large-write-destroy.js?ref=35858bb98e08c3c275a416712e158b5d32992c9a",
+            "patch": "@@ -0,0 +1,40 @@\n+'use strict';\n+const common = require('../common');\n+if (!common.hasCrypto)\n+  common.skip('missing crypto');\n+const fixtures = require('../common/fixtures');\n+const http2 = require('http2');\n+\n+// This test will result in a crash due to a missed CHECK in C++ or\n+// a straight-up segfault if the C++ doesn't send RST_STREAM through\n+// properly when calling destroy.\n+\n+const content = Buffer.alloc(60000, 0x44);\n+\n+const server = http2.createSecureServer({\n+  key: fixtures.readKey('agent1-key.pem'),\n+  cert: fixtures.readKey('agent1-cert.pem')\n+});\n+server.on('stream', common.mustCall((stream) => {\n+  stream.respond({\n+    'Content-Type': 'application/octet-stream',\n+    'Content-Length': (content.length.toString() * 2),\n+    'Vary': 'Accept-Encoding'\n+  }, { waitForTrailers: true });\n+\n+  stream.write(content);\n+  stream.destroy();\n+}));\n+\n+server.listen(0, common.mustCall(() => {\n+  const client = http2.connect(`https://localhost:${server.address().port}`,\n+                               { rejectUnauthorized: false });\n+\n+  const req = client.request({ ':path': '/' });\n+  req.end();\n+\n+  req.on('close', common.mustCall(() => {\n+    client.close();\n+    server.close();\n+  }));\n+}));"
+        }
+    ],
+    "stats": {
+        "total": 64,
+        "additions": 59,
+        "deletions": 5
+    }
+}

@@ -1,0 +1,96 @@
+{
+    "author": "alxhub",
+    "message": "fix(compiler-cli): setComponentScope should only list used components/pipes (#39662)\n\nngtsc will avoid emitting generated imports that would create an import\ncycle in the user's program. The main way such imports can arise is when\na component would ordinarily reference its dependencies in its component\ndefinition `directiveDefs` and `pipeDefs`. This requires adding imports,\nwhich run the risk of creating a cycle.\n\nWhen ngtsc detects that adding such an import would cause this to occur, it\ninstead falls back on a strategy called \"remote scoping\", where a side-\neffectful call to `setComponentScope` in the component's NgModule file is\nused to patch `directiveDefs` and `pipeDefs` onto the component. Since the\nNgModule file already imports all of the component's dependencies (to\ndeclare them in the NgModule), this approach does not risk adding a cycle.\nIt has several large downsides, however:\n\n1. it breaks under `sideEffects: false` logic in bundlers including the CLI\n2. it breaks tree-shaking for the given component and its dependencies\n\nSee this doc for further details: https://hackmd.io/Odw80D0pR6yfsOjg_7XCJg?view\n\nIn particular, the impact on tree-shaking was exacerbated by the naive logic\nngtsc used to employ here. When this feature was implemented, at the time of\ngenerating the side-effectful `setComponentScope` call, the compiler did not\nknow which of the component's declared dependencies were actually used in\nits template. This meant that unlike the generation of `directiveDefs` in\nthe component definition itself, `setComponentScope` calls had to list the\n_entire_ compilation scope of the component's NgModule, including directives\nand pipes which were not actually used in the template. This made the tree-\nshaking impact much worse, since if the component's NgModule made use of any\nshared NgModules (e.g. `CommonModule`), every declaration therein would\nbecome un-treeshakable.\n\nToday, ngtsc does have the information on which directives/pipes are\nactually used in the template, but this was not being used during the remote\nscoping operation. This commit modifies remote scoping to take advantage of\nthe extra context and only list used dependencies in `setComponentScope`\ncalls, which should ameliorate the tree-shaking impact somewhat.\n\nPR Close #39662",
+    "sha": "c59f401f9a7e1bb7d752456eb4a9254581aa6a2a",
+    "files": [
+        {
+            "sha": "24679125e31059e51c1c6ecbdbb7e2b912b0cfdb",
+            "filename": "packages/compiler-cli/src/ngtsc/annotations/src/component.ts",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 2,
+            "changes": 7,
+            "blob_url": "https://github.com/angular/angular/blob/c59f401f9a7e1bb7d752456eb4a9254581aa6a2a/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fannotations%2Fsrc%2Fcomponent.ts",
+            "raw_url": "https://github.com/angular/angular/raw/c59f401f9a7e1bb7d752456eb4a9254581aa6a2a/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fannotations%2Fsrc%2Fcomponent.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fannotations%2Fsrc%2Fcomponent.ts?ref=c59f401f9a7e1bb7d752456eb4a9254581aa6a2a",
+            "patch": "@@ -510,16 +510,18 @@ export class ComponentDecoratorHandler implements\n         return {\n           selector: directive.selector,\n           expression: this.refEmitter.emit(directive.ref, context),\n+          ref: directive.ref,\n         };\n       });\n \n-      const usedPipes: {pipeName: string, expression: Expression}[] = [];\n+      const usedPipes: {ref: Reference, pipeName: string, expression: Expression}[] = [];\n       for (const pipeName of bound.getUsedPipes()) {\n         if (!pipes.has(pipeName)) {\n           continue;\n         }\n         const pipe = pipes.get(pipeName)!;\n         usedPipes.push({\n+          ref: pipe,\n           pipeName,\n           expression: this.refEmitter.emit(pipe, context),\n         });\n@@ -557,7 +559,8 @@ export class ComponentDecoratorHandler implements\n         // Declaring the directiveDefs/pipeDefs arrays directly would require imports that would\n         // create a cycle. Instead, mark this component as requiring remote scoping, so that the\n         // NgModule file will take care of setting the directives for the component.\n-        this.scopeRegistry.setComponentAsRequiringRemoteScoping(node);\n+        this.scopeRegistry.setComponentRemoteScope(\n+            node, usedDirectives.map(dir => dir.ref), usedPipes.map(pipe => pipe.ref));\n       }\n     }\n "
+        },
+        {
+            "sha": "67ad6373dddf40a5bb7338a6c9a554477233a606",
+            "filename": "packages/compiler-cli/src/ngtsc/annotations/src/ng_module.ts",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 9,
+            "changes": 14,
+            "blob_url": "https://github.com/angular/angular/blob/c59f401f9a7e1bb7d752456eb4a9254581aa6a2a/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fannotations%2Fsrc%2Fng_module.ts",
+            "raw_url": "https://github.com/angular/angular/raw/c59f401f9a7e1bb7d752456eb4a9254581aa6a2a/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fannotations%2Fsrc%2Fng_module.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fannotations%2Fsrc%2Fng_module.ts?ref=c59f401f9a7e1bb7d752456eb4a9254581aa6a2a",
+            "patch": "@@ -387,15 +387,11 @@ export class NgModuleDecoratorHandler implements\n     }\n     const context = getSourceFile(node);\n     for (const decl of analysis.declarations) {\n-      if (this.scopeRegistry.getRequiresRemoteScope(decl.node)) {\n-        const scope = this.scopeRegistry.getScopeOfModule(ts.getOriginalNode(node) as typeof node);\n-        if (scope === null || scope === 'error') {\n-          continue;\n-        }\n-\n-        const directives = scope.compilation.directives.map(\n-            directive => this.refEmitter.emit(directive.ref, context));\n-        const pipes = scope.compilation.pipes.map(pipe => this.refEmitter.emit(pipe.ref, context));\n+      const remoteScope = this.scopeRegistry.getRemoteScope(decl.node);\n+      if (remoteScope !== null) {\n+        const directives =\n+            remoteScope.directives.map(directive => this.refEmitter.emit(directive, context));\n+        const pipes = remoteScope.pipes.map(pipe => this.refEmitter.emit(pipe, context));\n         const directiveArray = new LiteralArrayExpr(directives);\n         const pipesArray = new LiteralArrayExpr(pipes);\n         const declExpr = this.refEmitter.emit(decl, context)!;"
+        },
+        {
+            "sha": "e293acda1cca56ef888991b8bc32a11113b39dc9",
+            "filename": "packages/compiler-cli/src/ngtsc/scope/src/api.ts",
+            "status": "modified",
+            "additions": 17,
+            "deletions": 0,
+            "changes": 17,
+            "blob_url": "https://github.com/angular/angular/blob/c59f401f9a7e1bb7d752456eb4a9254581aa6a2a/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fscope%2Fsrc%2Fapi.ts",
+            "raw_url": "https://github.com/angular/angular/raw/c59f401f9a7e1bb7d752456eb4a9254581aa6a2a/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fscope%2Fsrc%2Fapi.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fscope%2Fsrc%2Fapi.ts?ref=c59f401f9a7e1bb7d752456eb4a9254581aa6a2a",
+            "patch": "@@ -6,6 +6,7 @@\n  * found in the LICENSE file at https://angular.io/license\n  */\n \n+import {Reference} from '../../imports';\n import {DirectiveMeta, PipeMeta} from '../../metadata';\n import {ClassDeclaration} from '../../reflection';\n \n@@ -40,3 +41,19 @@ export interface ExportScope {\n    */\n   exported: ScopeData;\n }\n+\n+/**\n+ * A resolved scope for a given component that cannot be set locally in the component definition,\n+ * and must be set via remote scoping call in the component's NgModule file.\n+ */\n+export interface RemoteScope {\n+  /**\n+   * Those directives used by the component that requires this scope to be set remotely.\n+   */\n+  directives: Reference[];\n+\n+  /**\n+   * Those pipes used by the component that requires this scope to be set remotely.\n+   */\n+  pipes: Reference[];\n+}\n\\ No newline at end of file"
+        },
+        {
+            "sha": "0f4d63913f62bda00bd18258f769e096393ce28d",
+            "filename": "packages/compiler-cli/src/ngtsc/scope/src/component_scope.ts",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 5,
+            "changes": 18,
+            "blob_url": "https://github.com/angular/angular/blob/c59f401f9a7e1bb7d752456eb4a9254581aa6a2a/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fscope%2Fsrc%2Fcomponent_scope.ts",
+            "raw_url": "https://github.com/angular/angular/raw/c59f401f9a7e1bb7d752456eb4a9254581aa6a2a/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fscope%2Fsrc%2Fcomponent_scope.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fscope%2Fsrc%2Fcomponent_scope.ts?ref=c59f401f9a7e1bb7d752456eb4a9254581aa6a2a",
+            "patch": "@@ -6,14 +6,22 @@\n  * found in the LICENSE file at https://angular.io/license\n  */\n import {ClassDeclaration} from '../../reflection';\n+import {RemoteScope} from './api';\n import {LocalModuleScope} from './local';\n \n /**\n  * Read information about the compilation scope of components.\n  */\n export interface ComponentScopeReader {\n   getScopeForComponent(clazz: ClassDeclaration): LocalModuleScope|null|'error';\n-  getRequiresRemoteScope(clazz: ClassDeclaration): boolean|null;\n+\n+  /**\n+   * Get the `RemoteScope` required for this component, if any.\n+   *\n+   * If the component requires remote scoping, then retrieve the directives/pipes registered for\n+   * that component. If remote scoping is not required (the common case), returns `null`.\n+   */\n+  getRemoteScope(clazz: ClassDeclaration): RemoteScope|null;\n }\n \n /**\n@@ -36,11 +44,11 @@ export class CompoundComponentScopeReader implements ComponentScopeReader {\n     return null;\n   }\n \n-  getRequiresRemoteScope(clazz: ClassDeclaration): boolean|null {\n+  getRemoteScope(clazz: ClassDeclaration): RemoteScope|null {\n     for (const reader of this.readers) {\n-      const requiredScoping = reader.getRequiresRemoteScope(clazz);\n-      if (requiredScoping !== null) {\n-        return requiredScoping;\n+      const remoteScope = reader.getRemoteScope(clazz);\n+      if (remoteScope !== null) {\n+        return remoteScope;\n       }\n     }\n     return null;"
+        },
+        {
+            "sha": "30c3a1ce26669a9a8a8f14cc042bc874b72f1ac8",
+            "filename": "packages/compiler-cli/src/ngtsc/scope/src/local.ts",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 8,
+            "changes": 18,
+            "blob_url": "https://github.com/angular/angular/blob/c59f401f9a7e1bb7d752456eb4a9254581aa6a2a/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fscope%2Fsrc%2Flocal.ts",
+            "raw_url": "https://github.com/angular/angular/raw/c59f401f9a7e1bb7d752456eb4a9254581aa6a2a/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fscope%2Fsrc%2Flocal.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fscope%2Fsrc%2Flocal.ts?ref=c59f401f9a7e1bb7d752456eb4a9254581aa6a2a",
+            "patch": "@@ -15,7 +15,7 @@ import {DirectiveMeta, MetadataReader, MetadataRegistry, NgModuleMeta, PipeMeta}\n import {ClassDeclaration, DeclarationNode} from '../../reflection';\n import {identifierOfNode, nodeNameForError} from '../../util/src/typescript';\n \n-import {ExportScope, ScopeData} from './api';\n+import {ExportScope, RemoteScope, ScopeData} from './api';\n import {ComponentScopeReader} from './component_scope';\n import {DtsModuleScopeResolver} from './dependency';\n \n@@ -96,14 +96,14 @@ export class LocalModuleScopeRegistry implements MetadataRegistry, ComponentScop\n   private cache = new Map<ClassDeclaration, LocalModuleScope|undefined|null>();\n \n   /**\n-   * Tracks whether a given component requires \"remote scoping\".\n+   * Tracks the `RemoteScope` for components requiring \"remote scoping\".\n    *\n    * Remote scoping is when the set of directives which apply to a given component is set in the\n    * NgModule's file instead of directly on the component def (which is sometimes needed to get\n    * around cyclic import issues). This is not used in calculation of `LocalModuleScope`s, but is\n    * tracked here for convenience.\n    */\n-  private remoteScoping = new Set<ClassDeclaration>();\n+  private remoteScoping = new Map<ClassDeclaration, RemoteScope>();\n \n   /**\n    * Tracks errors accumulated in the processing of scopes for each module declaration.\n@@ -452,15 +452,17 @@ export class LocalModuleScopeRegistry implements MetadataRegistry, ComponentScop\n   /**\n    * Check whether a component requires remote scoping.\n    */\n-  getRequiresRemoteScope(node: ClassDeclaration): boolean {\n-    return this.remoteScoping.has(node);\n+  getRemoteScope(node: ClassDeclaration): RemoteScope|null {\n+    return this.remoteScoping.has(node) ? this.remoteScoping.get(node)! : null;\n   }\n \n   /**\n-   * Set a component as requiring remote scoping.\n+   * Set a component as requiring remote scoping, with the given directives and pipes to be\n+   * registered remotely.\n    */\n-  setComponentAsRequiringRemoteScoping(node: ClassDeclaration): void {\n-    this.remoteScoping.add(node);\n+  setComponentRemoteScope(node: ClassDeclaration, directives: Reference[], pipes: Reference[]):\n+      void {\n+    this.remoteScoping.set(node, {directives, pipes});\n   }\n \n   /**"
+        },
+        {
+            "sha": "07bd93cb9677a5eaae92869cef1268792678383a",
+            "filename": "packages/compiler-cli/src/ngtsc/typecheck/test/test_utils.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/angular/angular/blob/c59f401f9a7e1bb7d752456eb4a9254581aa6a2a/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Ftest%2Ftest_utils.ts",
+            "raw_url": "https://github.com/angular/angular/raw/c59f401f9a7e1bb7d752456eb4a9254581aa6a2a/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Ftest%2Ftest_utils.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Ftest%2Ftest_utils.ts?ref=c59f401f9a7e1bb7d752456eb4a9254581aa6a2a",
+            "patch": "@@ -418,7 +418,7 @@ export function setup(targets: TypeCheckingTarget[], overrides: {\n   }\n \n   const fakeScopeReader: ComponentScopeReader = {\n-    getRequiresRemoteScope() {\n+    getRemoteScope(): null {\n       return null;\n     },\n     // If there is a module with [className] + 'Module' in the same source file, that will be"
+        },
+        {
+            "sha": "cbf673384fc76f92bdfcbce821ba43b97085796f",
+            "filename": "packages/compiler-cli/test/ngtsc/ngtsc_spec.ts",
+            "status": "modified",
+            "additions": 44,
+            "deletions": 1,
+            "changes": 45,
+            "blob_url": "https://github.com/angular/angular/blob/c59f401f9a7e1bb7d752456eb4a9254581aa6a2a/packages%2Fcompiler-cli%2Ftest%2Fngtsc%2Fngtsc_spec.ts",
+            "raw_url": "https://github.com/angular/angular/raw/c59f401f9a7e1bb7d752456eb4a9254581aa6a2a/packages%2Fcompiler-cli%2Ftest%2Fngtsc%2Fngtsc_spec.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Ftest%2Fngtsc%2Fngtsc_spec.ts?ref=c59f401f9a7e1bb7d752456eb4a9254581aa6a2a",
+            "patch": "@@ -4597,7 +4597,7 @@ runInEachFileSystem(os => {\n         const jsContents = env.getContents('test.js');\n         expect(jsContents)\n             .toMatch(\n-                /i\\d\\.ɵɵsetComponentScope\\(NormalComponent,\\s+\\[NormalComponent,\\s+CyclicComponent\\],\\s+\\[\\]\\)/);\n+                /i\\d\\.ɵɵsetComponentScope\\(NormalComponent,\\s+\\[CyclicComponent\\],\\s+\\[\\]\\)/);\n         expect(jsContents).not.toContain('/*__PURE__*/ i0.ɵɵsetComponentScope');\n       });\n \n@@ -4666,6 +4666,49 @@ runInEachFileSystem(os => {\n         const jsContents = env.getContents('test.js');\n         expect(jsContents).not.toContain('setComponentScope');\n       });\n+\n+      it('should only pass components actually used to setComponentScope', () => {\n+        env.write('test.ts', `\n+          import {Component, NgModule} from '@angular/core';\n+          import {NormalComponent} from './cyclic';\n+          import {OtherComponent} from './other';\n+\n+          @Component({\n+            selector: 'cyclic-component',\n+            template: 'Importing this causes a cycle',\n+          })\n+          export class CyclicComponent {}\n+\n+          @NgModule({\n+            declarations: [NormalComponent, CyclicComponent, OtherComponent],\n+          })\n+          export class Module {}\n+        `);\n+\n+        env.write('cyclic.ts', `\n+          import {Component} from '@angular/core';\n+\n+          @Component({\n+            selector: 'normal-component',\n+            template: '<cyclic-component></cyclic-component>',\n+          })\n+          export class NormalComponent {}\n+        `);\n+\n+        env.write('other.ts', `\n+          import {Component} from '@angular/core';\n+\n+          @Component({\n+            selector: 'other-component',\n+            template: 'An unused other component',\n+          })\n+          export class OtherComponent {}\n+        `);\n+\n+        env.driveMain();\n+        const jsContents = env.getContents('test.js');\n+        expect(jsContents).not.toMatch(/i\\d\\.ɵɵsetComponentScope\\([^)]*OtherComponent[^)]*\\)/);\n+      });\n     });\n \n     describe('local refs', () => {"
+        }
+    ],
+    "stats": {
+        "total": 121,
+        "additions": 95,
+        "deletions": 26
+    }
+}

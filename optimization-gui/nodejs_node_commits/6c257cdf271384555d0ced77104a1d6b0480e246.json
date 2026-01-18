@@ -1,0 +1,48 @@
+{
+    "author": "addaleax",
+    "message": "src: add allocation utils to env\n\nAdd a RAII utility for managing blocks of memory that have\nbeen allocated with the `ArrayBuffer::Allocator` for a given\n`Isolate`.\n\nPR-URL: https://github.com/nodejs/node/pull/26207\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Joyee Cheung <joyeec9h3@gmail.com>",
+    "sha": "6c257cdf271384555d0ced77104a1d6b0480e246",
+    "files": [
+        {
+            "sha": "63b71daf15a245e98dd8a63e12a65add45d7434b",
+            "filename": "src/env-inl.h",
+            "status": "modified",
+            "additions": 98,
+            "deletions": 0,
+            "changes": 98,
+            "blob_url": "https://github.com/nodejs/node/blob/6c257cdf271384555d0ced77104a1d6b0480e246/src%2Fenv-inl.h",
+            "raw_url": "https://github.com/nodejs/node/raw/6c257cdf271384555d0ced77104a1d6b0480e246/src%2Fenv-inl.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv-inl.h?ref=6c257cdf271384555d0ced77104a1d6b0480e246",
+            "patch": "@@ -715,6 +715,104 @@ inline IsolateData* Environment::isolate_data() const {\n   return isolate_data_;\n }\n \n+inline char* Environment::AllocateUnchecked(size_t size) {\n+  return static_cast<char*>(\n+      isolate_data()->allocator()->AllocateUninitialized(size));\n+}\n+\n+inline char* Environment::Allocate(size_t size) {\n+  char* ret = AllocateUnchecked(size);\n+  CHECK_NE(ret, nullptr);\n+  return ret;\n+}\n+\n+inline void Environment::Free(char* data, size_t size) {\n+  if (data != nullptr)\n+    isolate_data()->allocator()->Free(data, size);\n+}\n+\n+inline AllocatedBuffer Environment::AllocateManaged(size_t size, bool checked) {\n+  char* data = checked ? Allocate(size) : AllocateUnchecked(size);\n+  if (data == nullptr) size = 0;\n+  return AllocatedBuffer(this, uv_buf_init(data, size));\n+}\n+\n+inline AllocatedBuffer::AllocatedBuffer(Environment* env, uv_buf_t buf)\n+    : env_(env), buffer_(buf) {}\n+\n+inline void AllocatedBuffer::Resize(size_t len) {\n+  char* new_data = env_->Reallocate(buffer_.base, buffer_.len, len);\n+  CHECK_IMPLIES(len > 0, new_data != nullptr);\n+  buffer_ = uv_buf_init(new_data, len);\n+}\n+\n+inline uv_buf_t AllocatedBuffer::release() {\n+  uv_buf_t ret = buffer_;\n+  buffer_ = uv_buf_init(nullptr, 0);\n+  return ret;\n+}\n+\n+inline char* AllocatedBuffer::data() {\n+  return buffer_.base;\n+}\n+\n+inline const char* AllocatedBuffer::data() const {\n+  return buffer_.base;\n+}\n+\n+inline size_t AllocatedBuffer::size() const {\n+  return buffer_.len;\n+}\n+\n+inline AllocatedBuffer::AllocatedBuffer(Environment* env)\n+    : env_(env), buffer_(uv_buf_init(nullptr, 0)) {}\n+\n+inline AllocatedBuffer::AllocatedBuffer(AllocatedBuffer&& other)\n+    : AllocatedBuffer() {\n+  *this = std::move(other);\n+}\n+\n+inline AllocatedBuffer& AllocatedBuffer::operator=(AllocatedBuffer&& other) {\n+  clear();\n+  env_ = other.env_;\n+  buffer_ = other.release();\n+  return *this;\n+}\n+\n+inline AllocatedBuffer::~AllocatedBuffer() {\n+  clear();\n+}\n+\n+inline void AllocatedBuffer::clear() {\n+  uv_buf_t buf = release();\n+  env_->Free(buf.base, buf.len);\n+}\n+\n+// It's a bit awkward to define this Buffer::New() overload here, but it\n+// avoids a circular dependency with node_internals.h.\n+namespace Buffer {\n+v8::MaybeLocal<v8::Object> New(Environment* env,\n+                               char* data,\n+                               size_t length,\n+                               bool uses_malloc);\n+}\n+\n+inline v8::MaybeLocal<v8::Object> AllocatedBuffer::ToBuffer() {\n+  CHECK_NOT_NULL(env_);\n+  v8::MaybeLocal<v8::Object> obj = Buffer::New(env_, data(), size(), false);\n+  if (!obj.IsEmpty()) release();\n+  return obj;\n+}\n+\n+inline v8::Local<v8::ArrayBuffer> AllocatedBuffer::ToArrayBuffer() {\n+  CHECK_NOT_NULL(env_);\n+  uv_buf_t buf = release();\n+  return v8::ArrayBuffer::New(env_->isolate(),\n+                              buf.base,\n+                              buf.len,\n+                              v8::ArrayBufferCreationMode::kInternalized);\n+}\n+\n inline void Environment::ThrowError(const char* errmsg) {\n   ThrowError(v8::Exception::Error, errmsg);\n }"
+        },
+        {
+            "sha": "fce949f63a84819190a591645d04437a8a204ad7",
+            "filename": "src/env.cc",
+            "status": "modified",
+            "additions": 18,
+            "deletions": 0,
+            "changes": 18,
+            "blob_url": "https://github.com/nodejs/node/blob/6c257cdf271384555d0ced77104a1d6b0480e246/src%2Fenv.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/6c257cdf271384555d0ced77104a1d6b0480e246/src%2Fenv.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv.cc?ref=6c257cdf271384555d0ced77104a1d6b0480e246",
+            "patch": "@@ -21,6 +21,7 @@\n namespace node {\n \n using errors::TryCatchScope;\n+using v8::ArrayBuffer;\n using v8::Boolean;\n using v8::Context;\n using v8::EmbedderGraph;\n@@ -905,6 +906,23 @@ void Environment::BuildEmbedderGraph(Isolate* isolate,\n   });\n }\n \n+char* Environment::Reallocate(char* data, size_t old_size, size_t size) {\n+  // If we know that the allocator is our ArrayBufferAllocator, we can let\n+  // if reallocate directly.\n+  if (isolate_data()->uses_node_allocator()) {\n+    return static_cast<char*>(\n+        isolate_data()->node_allocator()->Reallocate(data, old_size, size));\n+  }\n+  // Generic allocators do not provide a reallocation method; we need to\n+  // allocate a new chunk of memory and copy the data over.\n+  char* new_data = AllocateUnchecked(size);\n+  if (new_data == nullptr) return nullptr;\n+  memcpy(new_data, data, std::min(size, old_size));\n+  if (size > old_size)\n+    memset(new_data + old_size, 0, size - old_size);\n+  Free(data, old_size);\n+  return new_data;\n+}\n \n // Not really any better place than env.cc at this moment.\n void BaseObject::DeleteMe(void* data) {"
+        },
+        {
+            "sha": "3856f5241d63b60bafd8660dc63c2847f8d6fc33",
+            "filename": "src/env.h",
+            "status": "modified",
+            "additions": 41,
+            "deletions": 0,
+            "changes": 41,
+            "blob_url": "https://github.com/nodejs/node/blob/6c257cdf271384555d0ced77104a1d6b0480e246/src%2Fenv.h",
+            "raw_url": "https://github.com/nodejs/node/raw/6c257cdf271384555d0ced77104a1d6b0480e246/src%2Fenv.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv.h?ref=6c257cdf271384555d0ced77104a1d6b0480e246",
+            "patch": "@@ -476,6 +476,38 @@ enum class DebugCategory {\n   CATEGORY_COUNT\n };\n \n+// A unique-pointer-ish object that is compatible with the JS engine's\n+// ArrayBuffer::Allocator.\n+struct AllocatedBuffer {\n+ public:\n+  explicit inline AllocatedBuffer(Environment* env = nullptr);\n+  inline AllocatedBuffer(Environment* env, uv_buf_t buf);\n+  inline ~AllocatedBuffer();\n+  inline void Resize(size_t len);\n+\n+  inline uv_buf_t release();\n+  inline char* data();\n+  inline const char* data() const;\n+  inline size_t size() const;\n+  inline void clear();\n+\n+  inline v8::MaybeLocal<v8::Object> ToBuffer();\n+  inline v8::Local<v8::ArrayBuffer> ToArrayBuffer();\n+\n+  inline AllocatedBuffer(AllocatedBuffer&& other);\n+  inline AllocatedBuffer& operator=(AllocatedBuffer&& other);\n+  AllocatedBuffer(const AllocatedBuffer& other) = delete;\n+  AllocatedBuffer& operator=(const AllocatedBuffer& other) = delete;\n+\n+ private:\n+  Environment* env_;\n+  // We do not pass this to libuv directly, but uv_buf_t is a convenient way\n+  // to represent a chunk of memory, and plays nicely with other parts of core.\n+  uv_buf_t buffer_;\n+\n+  friend class Environment;\n+};\n+\n class Environment {\n  public:\n   class AsyncHooks {\n@@ -697,6 +729,15 @@ class Environment {\n \n   inline IsolateData* isolate_data() const;\n \n+  // Utilites that allocate memory using the Isolate's ArrayBuffer::Allocator.\n+  // In particular, using AllocateManaged() will provide a RAII-style object\n+  // with easy conversion to `Buffer` and `ArrayBuffer` objects.\n+  inline AllocatedBuffer AllocateManaged(size_t size, bool checked = true);\n+  inline char* Allocate(size_t size);\n+  inline char* AllocateUnchecked(size_t size);\n+  char* Reallocate(char* data, size_t old_size, size_t size);\n+  inline void Free(char* data, size_t size);\n+\n   inline bool printed_error() const;\n   inline void set_printed_error(bool value);\n "
+        }
+    ],
+    "stats": {
+        "total": 157,
+        "additions": 157,
+        "deletions": 0
+    }
+}

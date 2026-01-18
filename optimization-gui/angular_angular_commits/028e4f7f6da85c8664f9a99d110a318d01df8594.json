@@ -1,0 +1,36 @@
+{
+    "author": "alxhub",
+    "message": "fix(language-service): force compileNonExportedClasses: false in LS (#40092)\n\nProjects opened in the LS are often larger in scope than the compilation\nunits seen by the compiler when actually building. For example, in the LS\nit's not uncommon for the project to include both application as well as\ntest files. This can create issues when the combination of files results\nin errors that are not otherwise present - for example, if test files\nhave inline NgModules that re-declare components (a common Angular pattern).\nSuch code is valid when compiling the app only (test files are excluded, so\nonly one declaration is seen by the compiler) or when compiling tests only\n(since tests run in JIT mode and are not seen by the AOT compiler), but when\nboth sets of files are mixed into a single compilation unit, the compiler\nsees the double declaration as an error.\n\nThis commit attempts to mitigate the problem by forcing the compiler flag\n`compileNonExportedClasses` to `false` in a LS context. When tests contain\nduplicate declarations, often such declarations are inline in specs and not\nexported from the top level, so this flag can be used to greatly improve the\nIDE experience.\n\nPR Close #40092",
+    "sha": "028e4f7f6da85c8664f9a99d110a318d01df8594",
+    "files": [
+        {
+            "sha": "04deedfda15efdc2bf022a6ed259919f2e74b979",
+            "filename": "packages/language-service/ivy/language_service.ts",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 0,
+            "changes": 12,
+            "blob_url": "https://github.com/angular/angular/blob/028e4f7f6da85c8664f9a99d110a318d01df8594/packages%2Flanguage-service%2Fivy%2Flanguage_service.ts",
+            "raw_url": "https://github.com/angular/angular/raw/028e4f7f6da85c8664f9a99d110a318d01df8594/packages%2Flanguage-service%2Fivy%2Flanguage_service.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Flanguage-service%2Fivy%2Flanguage_service.ts?ref=028e4f7f6da85c8664f9a99d110a318d01df8594",
+            "patch": "@@ -32,6 +32,18 @@ export class LanguageService {\n   constructor(project: ts.server.Project, private readonly tsLS: ts.LanguageService) {\n     this.parseConfigHost = new LSParseConfigHost(project.projectService.host);\n     this.options = parseNgCompilerOptions(project, this.parseConfigHost);\n+\n+    // Projects loaded into the Language Service often include test files which are not part of the\n+    // app's main compilation unit, and these test files often include inline NgModules that declare\n+    // components from the app. These declarations conflict with the main declarations of such\n+    // components in the app's NgModules. This conflict is not normally present during regular\n+    // compilation because the app and the tests are part of separate compilation units.\n+    //\n+    // As a temporary mitigation of this problem, we instruct the compiler to ignore classes which\n+    // are not exported. In many cases, this ensures the test NgModules are ignored by the compiler\n+    // and only the real component declaration is used.\n+    this.options.compileNonExportedClasses = false;\n+\n     this.strategy = createTypeCheckingProgramStrategy(project);\n     this.adapter = new LanguageServiceAdapter(project);\n     this.compilerFactory = new CompilerFactory(this.adapter, this.strategy, this.options);"
+        },
+        {
+            "sha": "98307bbce5a81d59b2c15c573b970f1a7808a3a8",
+            "filename": "packages/language-service/ivy/test/compiler_spec.ts",
+            "status": "modified",
+            "additions": 58,
+            "deletions": 1,
+            "changes": 59,
+            "blob_url": "https://github.com/angular/angular/blob/028e4f7f6da85c8664f9a99d110a318d01df8594/packages%2Flanguage-service%2Fivy%2Ftest%2Fcompiler_spec.ts",
+            "raw_url": "https://github.com/angular/angular/raw/028e4f7f6da85c8664f9a99d110a318d01df8594/packages%2Flanguage-service%2Fivy%2Ftest%2Fcompiler_spec.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Flanguage-service%2Fivy%2Ftest%2Fcompiler_spec.ts?ref=028e4f7f6da85c8664f9a99d110a318d01df8594",
+            "patch": "@@ -6,7 +6,7 @@\n  * found in the LICENSE file at https://angular.io/license\n  */\n \n-import {absoluteFrom} from '@angular/compiler-cli/src/ngtsc/file_system';\n+import {absoluteFrom, getSourceFileOrError} from '@angular/compiler-cli/src/ngtsc/file_system';\n import {initMockFileSystem} from '@angular/compiler-cli/src/ngtsc/file_system/testing';\n \n import {LanguageServiceTestEnvironment} from './env';\n@@ -16,6 +16,63 @@ describe('language-service/compiler integration', () => {\n     initMockFileSystem('Native');\n   });\n \n+  it('should not produce errors from inline test declarations mixing with those of the app', () => {\n+    const appCmpFile = absoluteFrom('/test.cmp.ts');\n+    const appModuleFile = absoluteFrom('/test.mod.ts');\n+    const testFile = absoluteFrom('/test_spec.ts');\n+\n+    const env = LanguageServiceTestEnvironment.setup([\n+      {\n+        name: appCmpFile,\n+        contents: `\n+          import {Component} from '@angular/core';\n+\n+          @Component({\n+            selector: 'app-cmp',\n+            template: 'Some template',\n+          })\n+          export class AppCmp {}\n+        `,\n+        isRoot: true,\n+      },\n+      {\n+        name: appModuleFile,\n+        contents: `\n+          import {NgModule} from '@angular/core';\n+          import {AppCmp} from './test.cmp';\n+\n+          @NgModule({\n+            declarations: [AppCmp],\n+          })\n+          export class AppModule {}\n+        `,\n+        isRoot: true,\n+      },\n+      {\n+        name: testFile,\n+        contents: `\n+          import {NgModule} from '@angular/core';\n+          import {AppCmp} from './test.cmp';\n+\n+          export function test(): void {\n+            @NgModule({\n+              declarations: [AppCmp],\n+            })\n+            class TestModule {}\n+          }\n+        `,\n+        isRoot: true,\n+      }\n+    ]);\n+\n+    // Expect that this program is clean diagnostically.\n+    const ngCompiler = env.ngLS.compilerFactory.getOrCreate();\n+    const program = ngCompiler.getNextProgram();\n+    expect(ngCompiler.getDiagnostics(getSourceFileOrError(program, appCmpFile))).toEqual([]);\n+    expect(ngCompiler.getDiagnostics(getSourceFileOrError(program, appModuleFile))).toEqual([]);\n+    expect(ngCompiler.getDiagnostics(getSourceFileOrError(program, testFile))).toEqual([]);\n+  });\n+\n   it('should show type-checking errors from components with poisoned scopes', () => {\n     // Normally, the Angular compiler suppresses errors from components that belong to NgModules\n     // which themselves have errors (such scopes are considered \"poisoned\"), to avoid overwhelming"
+        }
+    ],
+    "stats": {
+        "total": 71,
+        "additions": 70,
+        "deletions": 1
+    }
+}

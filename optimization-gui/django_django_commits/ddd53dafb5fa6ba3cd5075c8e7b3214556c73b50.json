@@ -1,0 +1,48 @@
+{
+    "author": "carljm",
+    "message": "Fixed #17918 - Handle proxy models correctly when sorting deletions for databases without deferred constraints. Thanks Nate Bragg for the report.\n\ngit-svn-id: http://code.djangoproject.com/svn/django/trunk@17756 bcc190cf-cafb-0310-a4f2-bffc1f526a37",
+    "sha": "ddd53dafb5fa6ba3cd5075c8e7b3214556c73b50",
+    "files": [
+        {
+            "sha": "730847ef215d874b09bd2cab4fc6fed43d7a41e8",
+            "filename": "django/db/models/deletion.py",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 3,
+            "changes": 15,
+            "blob_url": "https://github.com/django/django/blob/ddd53dafb5fa6ba3cd5075c8e7b3214556c73b50/django%2Fdb%2Fmodels%2Fdeletion.py",
+            "raw_url": "https://github.com/django/django/raw/ddd53dafb5fa6ba3cd5075c8e7b3214556c73b50/django%2Fdb%2Fmodels%2Fdeletion.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fmodels%2Fdeletion.py?ref=ddd53dafb5fa6ba3cd5075c8e7b3214556c73b50",
+            "patch": "@@ -76,6 +76,12 @@ def __init__(self, using):\n         self.data = {}\n         self.batches = {} # {model: {field: set([instances])}}\n         self.field_updates = {} # {model: {(field, value): set([instances])}}\n+\n+        # Tracks deletion-order dependency for databases without transactions\n+        # or ability to defer constraint checks. Only concrete model classes\n+        # should be included, as the dependencies exist only between actual\n+        # database tables; proxy models are represented here by their concrete\n+        # parent.\n         self.dependencies = {} # {model: set([models])}\n \n     def add(self, objs, source=None, nullable=False, reverse_dependency=False):\n@@ -101,7 +107,8 @@ def add(self, objs, source=None, nullable=False, reverse_dependency=False):\n         if source is not None and not nullable:\n             if reverse_dependency:\n                 source, model = model, source\n-            self.dependencies.setdefault(source, set()).add(model)\n+            self.dependencies.setdefault(\n+                source._meta.concrete_model, set()).add(model._meta.concrete_model)\n         return new_objs\n \n     def add_batch(self, model, field, objs):\n@@ -197,15 +204,17 @@ def instances_with_model(self):\n \n     def sort(self):\n         sorted_models = []\n+        concrete_models = set()\n         models = self.data.keys()\n         while len(sorted_models) < len(models):\n             found = False\n             for model in models:\n                 if model in sorted_models:\n                     continue\n-                dependencies = self.dependencies.get(model)\n-                if not (dependencies and dependencies.difference(sorted_models)):\n+                dependencies = self.dependencies.get(model._meta.concrete_model)\n+                if not (dependencies and dependencies.difference(concrete_models)):\n                     sorted_models.append(model)\n+                    concrete_models.add(model._meta.concrete_model)\n                     found = True\n             if not found:\n                 return"
+        },
+        {
+            "sha": "5db253f713e8233cb09d42ac4c12bc8555e1de8d",
+            "filename": "tests/regressiontests/delete_regress/models.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 1,
+            "changes": 4,
+            "blob_url": "https://github.com/django/django/blob/ddd53dafb5fa6ba3cd5075c8e7b3214556c73b50/tests%2Fregressiontests%2Fdelete_regress%2Fmodels.py",
+            "raw_url": "https://github.com/django/django/raw/ddd53dafb5fa6ba3cd5075c8e7b3214556c73b50/tests%2Fregressiontests%2Fdelete_regress%2Fmodels.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fdelete_regress%2Fmodels.py?ref=ddd53dafb5fa6ba3cd5075c8e7b3214556c73b50",
+            "patch": "@@ -90,4 +90,6 @@ class FooFile(models.Model):\n class FooPhoto(models.Model):\n     my_photo = models.ForeignKey(Photo)\n \n-\n+class FooFileProxy(FooFile):\n+    class Meta:\n+        proxy = True"
+        },
+        {
+            "sha": "32feae2dedfe7c5f92f06ac1275a84fed41c6160",
+            "filename": "tests/regressiontests/delete_regress/tests.py",
+            "status": "modified",
+            "additions": 22,
+            "deletions": 1,
+            "changes": 23,
+            "blob_url": "https://github.com/django/django/blob/ddd53dafb5fa6ba3cd5075c8e7b3214556c73b50/tests%2Fregressiontests%2Fdelete_regress%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/ddd53dafb5fa6ba3cd5075c8e7b3214556c73b50/tests%2Fregressiontests%2Fdelete_regress%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fdelete_regress%2Ftests.py?ref=ddd53dafb5fa6ba3cd5075c8e7b3214556c73b50",
+            "patch": "@@ -8,7 +8,7 @@\n \n from .models import (Book, Award, AwardNote, Person, Child, Toy, PlayedWith,\n     PlayedWithNote, Email, Researcher, Food, Eaten, Policy, Version, Location,\n-    Item, Image, File, Photo, FooFile, FooImage, FooPhoto)\n+    Item, Image, File, Photo, FooFile, FooImage, FooPhoto, FooFileProxy)\n \n \n # Can't run this test under SQLite, because you can't\n@@ -237,3 +237,24 @@ def test_delete_concrete_parent(self):\n         # to it.\n         self.assertEqual(len(FooFile.objects.all()), 0)\n         self.assertEqual(len(FooImage.objects.all()), 0)\n+\n+\n+    def test_delete_proxy_pair(self):\n+        \"\"\"\n+        If a pair of proxy models are linked by an FK from one concrete parent\n+        to the other, deleting one proxy model cascade-deletes the other, and\n+        the deletion happens in the right order (not triggering an\n+        IntegrityError on databases unable to defer integrity checks).\n+\n+        Refs #17918.\n+\n+        \"\"\"\n+        # Create an Image (proxy of File) and FooFileProxy (proxy of FooFile,\n+        # which has an FK to File)\n+        image = Image.objects.create()\n+        as_file = File.objects.get(pk=image.pk)\n+        FooFileProxy.objects.create(my_file=as_file)\n+\n+        Image.objects.all().delete()\n+\n+        self.assertEqual(len(FooFileProxy.objects.all()), 0)"
+        }
+    ],
+    "stats": {
+        "total": 42,
+        "additions": 37,
+        "deletions": 5
+    }
+}

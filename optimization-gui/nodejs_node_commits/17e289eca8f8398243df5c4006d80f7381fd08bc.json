@@ -1,0 +1,168 @@
+{
+    "author": "addaleax",
+    "message": "src: make CleanupHandles() tear down handles/reqs\n\nPreviously, handles would not be closed when the current `Environment`\nstopped, which is acceptable in a single-`Environment`-per-process\nsituation, but would otherwise create memory and file descriptor\nleaks.\n\nAlso, introduce a generic way to close handles via the\n`Environment::CloseHandle()` function, which automatically keeps\ntrack of whether a close callback has been called yet or not.\n\nMany thanks for Stephen Belanger for reviewing the original version of\nthis commit in the Ayo.js project.\n\nRefs: https://github.com/ayojs/ayo/pull/85\nPR-URL: https://github.com/nodejs/node/pull/19377\nReviewed-By: Ben Noordhuis <info@bnoordhuis.nl>\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "17e289eca8f8398243df5c4006d80f7381fd08bc",
+    "files": [
+        {
+            "sha": "ae253d40ca94b261b233cba5f7448284db66839c",
+            "filename": "src/cares_wrap.cc",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 12,
+            "changes": 18,
+            "blob_url": "https://github.com/nodejs/node/blob/17e289eca8f8398243df5c4006d80f7381fd08bc/src%2Fcares_wrap.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/17e289eca8f8398243df5c4006d80f7381fd08bc/src%2Fcares_wrap.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fcares_wrap.cc?ref=17e289eca8f8398243df5c4006d80f7381fd08bc",
+            "patch": "@@ -267,9 +267,8 @@ void ares_poll_cb(uv_poll_t* watcher, int status, int events) {\n }\n \n \n-void ares_poll_close_cb(uv_handle_t* watcher) {\n-  node_ares_task* task = ContainerOf(&node_ares_task::poll_watcher,\n-                                  reinterpret_cast<uv_poll_t*>(watcher));\n+void ares_poll_close_cb(uv_poll_t* watcher) {\n+  node_ares_task* task = ContainerOf(&node_ares_task::poll_watcher, watcher);\n   free(task);\n }\n \n@@ -347,8 +346,7 @@ void ares_sockstate_cb(void* data,\n           \"When an ares socket is closed we should have a handle for it\");\n \n     channel->task_list()->erase(it);\n-    uv_close(reinterpret_cast<uv_handle_t*>(&task->poll_watcher),\n-             ares_poll_close_cb);\n+    channel->env()->CloseHandle(&task->poll_watcher, ares_poll_close_cb);\n \n     if (channel->task_list()->empty()) {\n       uv_timer_stop(channel->timer_handle());\n@@ -517,10 +515,7 @@ ChannelWrap::~ChannelWrap() {\n void ChannelWrap::CleanupTimer() {\n   if (timer_handle_ == nullptr) return;\n \n-  uv_close(reinterpret_cast<uv_handle_t*>(timer_handle_),\n-           [](uv_handle_t* handle) {\n-    delete reinterpret_cast<uv_timer_t*>(handle);\n-  });\n+  env()->CloseHandle(timer_handle_, [](uv_timer_t* handle){ delete handle; });\n   timer_handle_ = nullptr;\n }\n \n@@ -610,8 +605,7 @@ class QueryWrap : public AsyncWrap {\n                static_cast<void*>(this));\n   }\n \n-  static void CaresAsyncClose(uv_handle_t* handle) {\n-    uv_async_t* async = reinterpret_cast<uv_async_t*>(handle);\n+  static void CaresAsyncClose(uv_async_t* async) {\n     auto data = static_cast<struct CaresAsyncData*>(async->data);\n     delete data->wrap;\n     delete data;\n@@ -636,7 +630,7 @@ class QueryWrap : public AsyncWrap {\n       free(host);\n     }\n \n-    uv_close(reinterpret_cast<uv_handle_t*>(handle), CaresAsyncClose);\n+    wrap->env()->CloseHandle(handle, CaresAsyncClose);\n   }\n \n   static void Callback(void *arg, int status, int timeouts,"
+        },
+        {
+            "sha": "72030a00901daf35d540128947cae9bd4148d69d",
+            "filename": "src/connection_wrap.h",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 2,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/17e289eca8f8398243df5c4006d80f7381fd08bc/src%2Fconnection_wrap.h",
+            "raw_url": "https://github.com/nodejs/node/raw/17e289eca8f8398243df5c4006d80f7381fd08bc/src%2Fconnection_wrap.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fconnection_wrap.h?ref=17e289eca8f8398243df5c4006d80f7381fd08bc",
+            "patch": "@@ -23,8 +23,6 @@ class ConnectionWrap : public LibuvStreamWrap {\n   ConnectionWrap(Environment* env,\n                  v8::Local<v8::Object> object,\n                  ProviderType provider);\n-  ~ConnectionWrap() {\n-  }\n \n   UVType handle_;\n };"
+        },
+        {
+            "sha": "917ddd1b6bcb75eb4118f5b799035daf4dca6475",
+            "filename": "src/env-inl.h",
+            "status": "modified",
+            "additions": 20,
+            "deletions": 2,
+            "changes": 22,
+            "blob_url": "https://github.com/nodejs/node/blob/17e289eca8f8398243df5c4006d80f7381fd08bc/src%2Fenv-inl.h",
+            "raw_url": "https://github.com/nodejs/node/raw/17e289eca8f8398243df5c4006d80f7381fd08bc/src%2Fenv-inl.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv-inl.h?ref=17e289eca8f8398243df5c4006d80f7381fd08bc",
+            "patch": "@@ -349,8 +349,26 @@ inline void Environment::RegisterHandleCleanup(uv_handle_t* handle,\n   handle_cleanup_queue_.push_back(HandleCleanup{handle, cb, arg});\n }\n \n-inline void Environment::FinishHandleCleanup(uv_handle_t* handle) {\n-  handle_cleanup_waiting_--;\n+template <typename T, typename OnCloseCallback>\n+inline void Environment::CloseHandle(T* handle, OnCloseCallback callback) {\n+  handle_cleanup_waiting_++;\n+  static_assert(sizeof(T) >= sizeof(uv_handle_t), \"T is a libuv handle\");\n+  static_assert(offsetof(T, data) == offsetof(uv_handle_t, data),\n+                \"T is a libuv handle\");\n+  static_assert(offsetof(T, close_cb) == offsetof(uv_handle_t, close_cb),\n+                \"T is a libuv handle\");\n+  struct CloseData {\n+    Environment* env;\n+    OnCloseCallback callback;\n+    void* original_data;\n+  };\n+  handle->data = new CloseData { this, callback, handle->data };\n+  uv_close(reinterpret_cast<uv_handle_t*>(handle), [](uv_handle_t* handle) {\n+    std::unique_ptr<CloseData> data { static_cast<CloseData*>(handle->data) };\n+    data->env->handle_cleanup_waiting_--;\n+    handle->data = data->original_data;\n+    data->callback(reinterpret_cast<T*>(handle));\n+  });\n }\n \n inline uv_loop_t* Environment::event_loop() const {"
+        },
+        {
+            "sha": "6526c680ac179245ddd3964603acd53c01d5c651",
+            "filename": "src/env.cc",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 8,
+            "changes": 20,
+            "blob_url": "https://github.com/nodejs/node/blob/17e289eca8f8398243df5c4006d80f7381fd08bc/src%2Fenv.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/17e289eca8f8398243df5c4006d80f7381fd08bc/src%2Fenv.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv.cc?ref=17e289eca8f8398243df5c4006d80f7381fd08bc",
+            "patch": "@@ -209,9 +209,7 @@ void Environment::RegisterHandleCleanups() {\n                                         void* arg) {\n     handle->data = env;\n \n-    uv_close(handle, [](uv_handle_t* handle) {\n-      static_cast<Environment*>(handle->data)->FinishHandleCleanup(handle);\n-    });\n+    env->CloseHandle(handle, [](uv_handle_t* handle) {});\n   };\n \n   RegisterHandleCleanup(\n@@ -233,13 +231,17 @@ void Environment::RegisterHandleCleanups() {\n }\n \n void Environment::CleanupHandles() {\n-  for (HandleCleanup& hc : handle_cleanup_queue_) {\n-    handle_cleanup_waiting_++;\n+  for (ReqWrap<uv_req_t>* request : req_wrap_queue_)\n+    request->Cancel();\n+\n+  for (HandleWrap* handle : handle_wrap_queue_)\n+    handle->Close();\n+\n+  for (HandleCleanup& hc : handle_cleanup_queue_)\n     hc.cb_(this, hc.handle_, hc.arg_);\n-  }\n   handle_cleanup_queue_.clear();\n \n-  while (handle_cleanup_waiting_ != 0)\n+  while (handle_cleanup_waiting_ != 0 || !handle_wrap_queue_.IsEmpty())\n     uv_run(event_loop(), UV_RUN_ONCE);\n }\n \n@@ -306,6 +308,8 @@ void Environment::PrintSyncTrace() const {\n }\n \n void Environment::RunCleanup() {\n+  CleanupHandles();\n+\n   while (!cleanup_hooks_.empty()) {\n     // Copy into a vector, since we can't sort an unordered_set in-place.\n     std::vector<CleanupHookCallback> callbacks(\n@@ -329,8 +333,8 @@ void Environment::RunCleanup() {\n \n       cb.fn_(cb.arg_);\n       cleanup_hooks_.erase(cb);\n-      CleanupHandles();\n     }\n+    CleanupHandles();\n   }\n }\n "
+        },
+        {
+            "sha": "79351666c1182e1950176d8d6a88c9df9fdb8d3c",
+            "filename": "src/env.h",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 1,
+            "changes": 6,
+            "blob_url": "https://github.com/nodejs/node/blob/17e289eca8f8398243df5c4006d80f7381fd08bc/src%2Fenv.h",
+            "raw_url": "https://github.com/nodejs/node/raw/17e289eca8f8398243df5c4006d80f7381fd08bc/src%2Fenv.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv.h?ref=17e289eca8f8398243df5c4006d80f7381fd08bc",
+            "patch": "@@ -577,10 +577,14 @@ class Environment {\n \n   void RegisterHandleCleanups();\n   void CleanupHandles();\n+\n+  // Register clean-up cb to be called on environment destruction.\n   inline void RegisterHandleCleanup(uv_handle_t* handle,\n                                     HandleCleanupCb cb,\n                                     void *arg);\n-  inline void FinishHandleCleanup(uv_handle_t* handle);\n+\n+  template <typename T, typename OnCloseCallback>\n+  inline void CloseHandle(T* handle, OnCloseCallback callback);\n \n   inline void AssignToContext(v8::Local<v8::Context> context,\n                               const ContextInfo& info);"
+        },
+        {
+            "sha": "579e446fc5c485f989e941ac452e2af93d9ad4cf",
+            "filename": "src/fs_event_wrap.cc",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 2,
+            "changes": 6,
+            "blob_url": "https://github.com/nodejs/node/blob/17e289eca8f8398243df5c4006d80f7381fd08bc/src%2Ffs_event_wrap.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/17e289eca8f8398243df5c4006d80f7381fd08bc/src%2Ffs_event_wrap.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Ffs_event_wrap.cc?ref=17e289eca8f8398243df5c4006d80f7381fd08bc",
+            "patch": "@@ -78,11 +78,12 @@ FSEventWrap::FSEventWrap(Environment* env, Local<Object> object)\n     : HandleWrap(env,\n                  object,\n                  reinterpret_cast<uv_handle_t*>(&handle_),\n-                 AsyncWrap::PROVIDER_FSEVENTWRAP) {}\n+                 AsyncWrap::PROVIDER_FSEVENTWRAP) {\n+  MarkAsUninitialized();\n+}\n \n \n FSEventWrap::~FSEventWrap() {\n-  CHECK_EQ(initialized_, false);\n }\n \n void FSEventWrap::GetInitialized(const FunctionCallbackInfo<Value>& args) {\n@@ -153,6 +154,7 @@ void FSEventWrap::Start(const FunctionCallbackInfo<Value>& args) {\n   }\n \n   err = uv_fs_event_start(&wrap->handle_, OnEvent, *path, flags);\n+  wrap->MarkAsInitialized();\n   wrap->initialized_ = true;\n \n   if (err != 0) {"
+        },
+        {
+            "sha": "20356b94a5775abc6542fc18751c1479516ab55c",
+            "filename": "src/handle_wrap.cc",
+            "status": "modified",
+            "additions": 25,
+            "deletions": 12,
+            "changes": 37,
+            "blob_url": "https://github.com/nodejs/node/blob/17e289eca8f8398243df5c4006d80f7381fd08bc/src%2Fhandle_wrap.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/17e289eca8f8398243df5c4006d80f7381fd08bc/src%2Fhandle_wrap.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fhandle_wrap.cc?ref=17e289eca8f8398243df5c4006d80f7381fd08bc",
+            "patch": "@@ -61,29 +61,40 @@ void HandleWrap::HasRef(const FunctionCallbackInfo<Value>& args) {\n \n \n void HandleWrap::Close(const FunctionCallbackInfo<Value>& args) {\n-  Environment* env = Environment::GetCurrent(args);\n-\n   HandleWrap* wrap;\n   ASSIGN_OR_RETURN_UNWRAP(&wrap, args.Holder());\n \n-  // Guard against uninitialized handle or double close.\n-  if (!IsAlive(wrap))\n-    return;\n+  wrap->Close(args[0]);\n+}\n \n-  if (wrap->state_ != kInitialized)\n+void HandleWrap::Close(v8::Local<v8::Value> close_callback) {\n+  if (state_ != kInitialized)\n     return;\n \n-  CHECK_EQ(false, wrap->persistent().IsEmpty());\n-  uv_close(wrap->handle_, OnClose);\n-  wrap->state_ = kClosing;\n+  CHECK_EQ(false, persistent().IsEmpty());\n+  uv_close(handle_, OnClose);\n+  state_ = kClosing;\n \n-  if (args[0]->IsFunction()) {\n-    wrap->object()->Set(env->onclose_string(), args[0]);\n-    wrap->state_ = kClosingWithCallback;\n+  if (!close_callback.IsEmpty() && close_callback->IsFunction()) {\n+    object()->Set(env()->context(), env()->onclose_string(), close_callback)\n+        .FromJust();\n+    state_ = kClosingWithCallback;\n   }\n }\n \n \n+void HandleWrap::MarkAsInitialized() {\n+  env()->handle_wrap_queue()->PushBack(this);\n+  state_ = kInitialized;\n+}\n+\n+\n+void HandleWrap::MarkAsUninitialized() {\n+  handle_wrap_queue_.Remove();\n+  state_ = kClosed;\n+}\n+\n+\n HandleWrap::HandleWrap(Environment* env,\n                        Local<Object> object,\n                        uv_handle_t* handle,\n@@ -110,6 +121,8 @@ void HandleWrap::OnClose(uv_handle_t* handle) {\n   const bool have_close_callback = (wrap->state_ == kClosingWithCallback);\n   wrap->state_ = kClosed;\n \n+  wrap->OnClose();\n+\n   if (have_close_callback)\n     wrap->MakeCallback(env->onclose_string(), 0, nullptr);\n "
+        },
+        {
+            "sha": "fd2d002dce0338d0c6f7b0fe2bf0a7cf8b97c985",
+            "filename": "src/handle_wrap.h",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/nodejs/node/blob/17e289eca8f8398243df5c4006d80f7381fd08bc/src%2Fhandle_wrap.h",
+            "raw_url": "https://github.com/nodejs/node/raw/17e289eca8f8398243df5c4006d80f7381fd08bc/src%2Fhandle_wrap.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fhandle_wrap.h?ref=17e289eca8f8398243df5c4006d80f7381fd08bc",
+            "patch": "@@ -70,11 +70,17 @@ class HandleWrap : public AsyncWrap {\n \n   inline uv_handle_t* GetHandle() const { return handle_; }\n \n+  void Close(v8::Local<v8::Value> close_callback = v8::Local<v8::Value>());\n+\n  protected:\n   HandleWrap(Environment* env,\n              v8::Local<v8::Object> object,\n              uv_handle_t* handle,\n              AsyncWrap::ProviderType provider);\n+  virtual void OnClose() {}\n+\n+  void MarkAsInitialized();\n+  void MarkAsUninitialized();\n \n  private:\n   friend class Environment;"
+        },
+        {
+            "sha": "d8f8a6a362237d542d8d8cc7a206658fb007bbb2",
+            "filename": "src/node_stat_watcher.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 6,
+            "changes": 7,
+            "blob_url": "https://github.com/nodejs/node/blob/17e289eca8f8398243df5c4006d80f7381fd08bc/src%2Fnode_stat_watcher.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/17e289eca8f8398243df5c4006d80f7381fd08bc/src%2Fnode_stat_watcher.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_stat_watcher.cc?ref=17e289eca8f8398243df5c4006d80f7381fd08bc",
+            "patch": "@@ -75,11 +75,6 @@ void StatWatcher::Initialize(Environment* env, Local<Object> target) {\n }\n \n \n-static void Delete(uv_handle_t* handle) {\n-  delete reinterpret_cast<uv_fs_poll_t*>(handle);\n-}\n-\n-\n StatWatcher::StatWatcher(Environment* env, Local<Object> wrap)\n     : AsyncWrap(env, wrap, AsyncWrap::PROVIDER_STATWATCHER),\n       watcher_(new uv_fs_poll_t) {\n@@ -93,7 +88,7 @@ StatWatcher::~StatWatcher() {\n   if (IsActive()) {\n     Stop();\n   }\n-  uv_close(reinterpret_cast<uv_handle_t*>(watcher_), Delete);\n+  env()->CloseHandle(watcher_, [](uv_fs_poll_t* handle) { delete handle; });\n }\n \n "
+        },
+        {
+            "sha": "6d421fe7c4d4deca86d4b390d7c0cd21e0bccf48",
+            "filename": "src/process_wrap.cc",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/17e289eca8f8398243df5c4006d80f7381fd08bc/src%2Fprocess_wrap.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/17e289eca8f8398243df5c4006d80f7381fd08bc/src%2Fprocess_wrap.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fprocess_wrap.cc?ref=17e289eca8f8398243df5c4006d80f7381fd08bc",
+            "patch": "@@ -88,6 +88,7 @@ class ProcessWrap : public HandleWrap {\n                    object,\n                    reinterpret_cast<uv_handle_t*>(&process_),\n                    AsyncWrap::PROVIDER_PROCESSWRAP) {\n+    MarkAsUninitialized();\n   }\n \n   static void ParseStdioOptions(Environment* env,\n@@ -256,6 +257,7 @@ class ProcessWrap : public HandleWrap {\n     }\n \n     int err = uv_spawn(env->event_loop(), &wrap->process_, &options);\n+    wrap->MarkAsInitialized();\n \n     if (err == 0) {\n       CHECK_EQ(wrap->process_.data, wrap);"
+        },
+        {
+            "sha": "ab5051e41d8e8904c98323f57a18a74e05ed2256",
+            "filename": "src/req_wrap-inl.h",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/nodejs/node/blob/17e289eca8f8398243df5c4006d80f7381fd08bc/src%2Freq_wrap-inl.h",
+            "raw_url": "https://github.com/nodejs/node/raw/17e289eca8f8398243df5c4006d80f7381fd08bc/src%2Freq_wrap-inl.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Freq_wrap-inl.h?ref=17e289eca8f8398243df5c4006d80f7381fd08bc",
+            "patch": "@@ -7,6 +7,7 @@\n #include \"async_wrap-inl.h\"\n #include \"env-inl.h\"\n #include \"util-inl.h\"\n+#include \"uv.h\"\n \n namespace node {\n \n@@ -37,6 +38,11 @@ ReqWrap<T>* ReqWrap<T>::from_req(T* req) {\n   return ContainerOf(&ReqWrap<T>::req_, req);\n }\n \n+template <typename T>\n+void ReqWrap<T>::Cancel() {\n+  uv_cancel(reinterpret_cast<uv_req_t*>(&req_));\n+}\n+\n }  // namespace node\n \n #endif  // defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS"
+        },
+        {
+            "sha": "4d6a89d743c591fb5d75184450c225a7524761a0",
+            "filename": "src/req_wrap.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/17e289eca8f8398243df5c4006d80f7381fd08bc/src%2Freq_wrap.h",
+            "raw_url": "https://github.com/nodejs/node/raw/17e289eca8f8398243df5c4006d80f7381fd08bc/src%2Freq_wrap.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Freq_wrap.h?ref=17e289eca8f8398243df5c4006d80f7381fd08bc",
+            "patch": "@@ -19,6 +19,7 @@ class ReqWrap : public AsyncWrap {\n   inline ~ReqWrap() override;\n   inline void Dispatched();  // Call this after the req has been dispatched.\n   T* req() { return &req_; }\n+  inline void Cancel();\n \n   static ReqWrap* from_req(T* req);\n "
+        },
+        {
+            "sha": "d01caba4a558f262422ff2e61aad41a6456cfb99",
+            "filename": "src/tty_wrap.cc",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/17e289eca8f8398243df5c4006d80f7381fd08bc/src%2Ftty_wrap.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/17e289eca8f8398243df5c4006d80f7381fd08bc/src%2Ftty_wrap.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Ftty_wrap.cc?ref=17e289eca8f8398243df5c4006d80f7381fd08bc",
+            "patch": "@@ -172,6 +172,8 @@ TTYWrap::TTYWrap(Environment* env,\n                       reinterpret_cast<uv_stream_t*>(&handle_),\n                       AsyncWrap::PROVIDER_TTYWRAP) {\n   *init_err = uv_tty_init(env->event_loop(), &handle_, fd, readable);\n+  if (*init_err != 0)\n+    MarkAsUninitialized();\n }\n \n }  // namespace node"
+        }
+    ],
+    "stats": {
+        "total": 135,
+        "additions": 90,
+        "deletions": 45
+    }
+}

@@ -1,0 +1,36 @@
+{
+    "author": "kfarnung",
+    "message": "tls: use after free in tls_wrap\n\nThe root cause is that `req_wrap` is created in `StreamBase::Write`\nand passed to `TLSWrap::DoWrite`. In the TLS case the object gets\ndisposed and replaced with a new instance, but the caller's pointer is\nnever updated. When the `StreamBase::Write` method returns, it returns\na pointer to the freed object to the caller. In some cases when the\nobject memory has already been reused an assert is hit in\n`WriteWrap::SetAllocatedStorage` because the pointer is non-null.\n\nPR-URL: https://github.com/nodejs/node/pull/18860\nRefs: https://github.com/nodejs/node/pull/18676\nReviewed-By: Anna Henningsen <anna@addaleax.net>",
+    "sha": "743f8904cca16d87c8ac856488bf021849a43383",
+    "files": [
+        {
+            "sha": "9f8888b0c54434f4ee5d4990a23e1796c53810e2",
+            "filename": "src/tls_wrap.cc",
+            "status": "modified",
+            "additions": 17,
+            "deletions": 16,
+            "changes": 33,
+            "blob_url": "https://github.com/nodejs/node/blob/743f8904cca16d87c8ac856488bf021849a43383/src%2Ftls_wrap.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/743f8904cca16d87c8ac856488bf021849a43383/src%2Ftls_wrap.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Ftls_wrap.cc?ref=743f8904cca16d87c8ac856488bf021849a43383",
+            "patch": "@@ -298,10 +298,12 @@ void TLSWrap::EncOut() {\n \n \n void TLSWrap::OnStreamAfterWrite(WriteWrap* req_wrap, int status) {\n-  // Report back to the previous listener as well. This is only needed for the\n-  // \"empty\" writes that are passed through directly to the underlying stream.\n-  if (req_wrap != nullptr)\n-    previous_listener_->OnStreamAfterWrite(req_wrap, status);\n+  if (current_empty_write_ != nullptr) {\n+    WriteWrap* finishing = current_empty_write_;\n+    current_empty_write_ = nullptr;\n+    finishing->Done(status);\n+    return;\n+  }\n \n   if (ssl_ == nullptr)\n     status = UV_ECANCELED;\n@@ -567,18 +569,17 @@ int TLSWrap::DoWrite(WriteWrap* w,\n     // However, if there is any data that should be written to the socket,\n     // the callback should not be invoked immediately\n     if (BIO_pending(enc_out_) == 0) {\n-      // We destroy the current WriteWrap* object and create a new one that\n-      // matches the underlying stream, rather than the TLSWrap itself.\n-\n-      // Note: We cannot simply use w->object() because of the \"optimized\"\n-      // way in which we read persistent handles; the JS object itself might be\n-      // destroyed by w->Dispose(), and the Local<Object> we have is not a\n-      // \"real\" handle in the sense the V8 is aware of its existence.\n-      Local<Object> req_wrap_obj =\n-          w->GetAsyncWrap()->persistent().Get(env()->isolate());\n-      w->Dispose();\n-      w = underlying_stream()->CreateWriteWrap(req_wrap_obj);\n-      return stream_->DoWrite(w, bufs, count, send_handle);\n+      CHECK_EQ(current_empty_write_, nullptr);\n+      current_empty_write_ = w;\n+      StreamWriteResult res =\n+          underlying_stream()->Write(bufs, count, send_handle);\n+      if (!res.async) {\n+        env()->SetImmediate([](Environment* env, void* data) {\n+          TLSWrap* self = static_cast<TLSWrap*>(data);\n+          self->OnStreamAfterWrite(self->current_empty_write_, 0);\n+        }, this, object());\n+      }\n+      return 0;\n     }\n   }\n "
+        },
+        {
+            "sha": "245a6d518ac59bbf2ef93d5e8fe0e5b34d7d2e66",
+            "filename": "src/tls_wrap.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/743f8904cca16d87c8ac856488bf021849a43383/src%2Ftls_wrap.h",
+            "raw_url": "https://github.com/nodejs/node/raw/743f8904cca16d87c8ac856488bf021849a43383/src%2Ftls_wrap.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Ftls_wrap.h?ref=743f8904cca16d87c8ac856488bf021849a43383",
+            "patch": "@@ -152,6 +152,7 @@ class TLSWrap : public AsyncWrap,\n   std::vector<uv_buf_t> pending_cleartext_input_;\n   size_t write_size_;\n   WriteWrap* current_write_ = nullptr;\n+  WriteWrap* current_empty_write_ = nullptr;\n   bool write_callback_scheduled_ = false;\n   bool started_;\n   bool established_;"
+        }
+    ],
+    "stats": {
+        "total": 34,
+        "additions": 18,
+        "deletions": 16
+    }
+}

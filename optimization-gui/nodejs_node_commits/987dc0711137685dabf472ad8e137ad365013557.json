@@ -1,0 +1,60 @@
+{
+    "author": "addaleax",
+    "message": "src: use smart pointers for NodeBIO\n\nPR-URL: https://github.com/nodejs/node/pull/21984\nReviewed-By: Anatoli Papirovski <apapirovski@mac.com>\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "987dc0711137685dabf472ad8e137ad365013557",
+    "files": [
+        {
+            "sha": "adbfaaf98e8d17bb5683d82bc8fe7dd93dcb22fc",
+            "filename": "src/node_crypto.cc",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 4,
+            "changes": 11,
+            "blob_url": "https://github.com/nodejs/node/blob/987dc0711137685dabf472ad8e137ad365013557/src%2Fnode_crypto.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/987dc0711137685dabf472ad8e137ad365013557/src%2Fnode_crypto.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_crypto.cc?ref=987dc0711137685dabf472ad8e137ad365013557",
+            "patch": "@@ -483,7 +483,7 @@ void SecureContext::Init(const FunctionCallbackInfo<Value>& args) {\n \n // Takes a string or buffer and loads it into a BIO.\n // Caller responsible for BIO_free_all-ing the returned object.\n-static BIO* LoadBIO(Environment* env, Local<Value> v) {\n+static BIOPointer LoadBIO(Environment* env, Local<Value> v) {\n   HandleScope scope(env->isolate());\n \n   if (v->IsString()) {\n@@ -738,9 +738,12 @@ static X509_STORE* NewRootCertStore() {\n \n   if (root_certs_vector.empty()) {\n     for (size_t i = 0; i < arraysize(root_certs); i++) {\n-      BIO* bp = NodeBIO::NewFixed(root_certs[i], strlen(root_certs[i]));\n-      X509* x509 = PEM_read_bio_X509(bp, nullptr, NoPasswordCallback, nullptr);\n-      BIO_free(bp);\n+      X509* x509 =\n+          PEM_read_bio_X509(NodeBIO::NewFixed(root_certs[i],\n+                                              strlen(root_certs[i])).get(),\n+                            nullptr,   // no re-use of X509 structure\n+                            NoPasswordCallback,\n+                            nullptr);  // no callback data\n \n       // Parse errors from the built-in roots are fatal.\n       CHECK_NOT_NULL(x509);"
+        },
+        {
+            "sha": "ab68c0a08111f2b532fe0648b66d6e11b424400a",
+            "filename": "src/node_crypto_bio.cc",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 15,
+            "changes": 26,
+            "blob_url": "https://github.com/nodejs/node/blob/987dc0711137685dabf472ad8e137ad365013557/src%2Fnode_crypto_bio.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/987dc0711137685dabf472ad8e137ad365013557/src%2Fnode_crypto_bio.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_crypto_bio.cc?ref=987dc0711137685dabf472ad8e137ad365013557",
+            "patch": "@@ -38,36 +38,32 @@ namespace crypto {\n #endif\n \n \n-BIO* NodeBIO::New() {\n+BIOPointer NodeBIO::New(Environment* env) {\n   // The const_cast doesn't violate const correctness.  OpenSSL's usage of\n   // BIO_METHOD is effectively const but BIO_new() takes a non-const argument.\n-  return BIO_new(const_cast<BIO_METHOD*>(GetMethod()));\n+  BIOPointer bio(BIO_new(const_cast<BIO_METHOD*>(GetMethod())));\n+  if (bio && env != nullptr)\n+    NodeBIO::FromBIO(bio.get())->env_ = env;\n+  return bio;\n }\n \n \n-BIO* NodeBIO::NewFixed(const char* data, size_t len) {\n-  BIO* bio = New();\n+BIOPointer NodeBIO::NewFixed(const char* data, size_t len, Environment* env) {\n+  BIOPointer bio = New(env);\n \n-  if (bio == nullptr ||\n+  if (!bio ||\n       len > INT_MAX ||\n-      BIO_write(bio, data, len) != static_cast<int>(len) ||\n-      BIO_set_mem_eof_return(bio, 0) != 1) {\n-    BIO_free(bio);\n-    return nullptr;\n+      BIO_write(bio.get(), data, len) != static_cast<int>(len) ||\n+      BIO_set_mem_eof_return(bio.get(), 0) != 1) {\n+    return BIOPointer();\n   }\n \n   return bio;\n }\n \n \n-void NodeBIO::AssignEnvironment(Environment* env) {\n-  env_ = env;\n-}\n-\n-\n int NodeBIO::New(BIO* bio) {\n   BIO_set_data(bio, new NodeBIO());\n-\n   BIO_set_init(bio, 1);\n \n   return 1;"
+        },
+        {
+            "sha": "fefd097b32a7ba0bdb9812ffff78ade6ebfb6ffd",
+            "filename": "src/node_crypto_bio.h",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 18,
+            "changes": 33,
+            "blob_url": "https://github.com/nodejs/node/blob/987dc0711137685dabf472ad8e137ad365013557/src%2Fnode_crypto_bio.h",
+            "raw_url": "https://github.com/nodejs/node/raw/987dc0711137685dabf472ad8e137ad365013557/src%2Fnode_crypto_bio.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_crypto_bio.h?ref=987dc0711137685dabf472ad8e137ad365013557",
+            "patch": "@@ -24,6 +24,7 @@\n \n #if defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS\n \n+#include \"node_crypto.h\"\n #include \"openssl/bio.h\"\n #include \"env-inl.h\"\n #include \"util-inl.h\"\n@@ -32,25 +33,21 @@\n namespace node {\n namespace crypto {\n \n+// This class represents buffers for OpenSSL I/O, implemented as a singly-linked\n+// list of chunks. It can be used both for writing data from Node to OpenSSL\n+// and back, but only one direction per instance.\n+// The structure is only accessed, and owned by, the OpenSSL BIOPointer\n+// (a.k.a. std::unique_ptr<BIO>).\n class NodeBIO : public MemoryRetainer {\n  public:\n-  NodeBIO() : env_(nullptr),\n-              initial_(kInitialBufferLength),\n-              length_(0),\n-              eof_return_(-1),\n-              read_head_(nullptr),\n-              write_head_(nullptr) {\n-  }\n-\n   ~NodeBIO();\n \n-  static BIO* New();\n+  static BIOPointer New(Environment* env = nullptr);\n \n   // NewFixed takes a copy of `len` bytes from `data` and returns a BIO that,\n   // when read from, returns those bytes followed by EOF.\n-  static BIO* NewFixed(const char* data, size_t len);\n-\n-  void AssignEnvironment(Environment* env);\n+  static BIOPointer NewFixed(const char* data, size_t len,\n+                             Environment* env = nullptr);\n \n   // Move read head to next buffer if needed\n   void TryMoveReadHead();\n@@ -161,12 +158,12 @@ class NodeBIO : public MemoryRetainer {\n     char* data_;\n   };\n \n-  Environment* env_;\n-  size_t initial_;\n-  size_t length_;\n-  int eof_return_;\n-  Buffer* read_head_;\n-  Buffer* write_head_;\n+  Environment* env_ = nullptr;\n+  size_t initial_ = kInitialBufferLength;\n+  size_t length_ = 0;\n+  int eof_return_ = -1;\n+  Buffer* read_head_ = nullptr;\n+  Buffer* write_head_ = nullptr;\n };\n \n }  // namespace crypto"
+        },
+        {
+            "sha": "3e6c66d5e36d07c900955042265b44bf8ad7115c",
+            "filename": "src/tls_wrap.cc",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 5,
+            "changes": 8,
+            "blob_url": "https://github.com/nodejs/node/blob/987dc0711137685dabf472ad8e137ad365013557/src%2Ftls_wrap.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/987dc0711137685dabf472ad8e137ad365013557/src%2Ftls_wrap.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Ftls_wrap.cc?ref=987dc0711137685dabf472ad8e137ad365013557",
+            "patch": "@@ -112,11 +112,9 @@ void TLSWrap::NewSessionDoneCb() {\n \n \n void TLSWrap::InitSSL() {\n-  // Initialize SSL\n-  enc_in_ = crypto::NodeBIO::New();\n-  enc_out_ = crypto::NodeBIO::New();\n-  crypto::NodeBIO::FromBIO(enc_in_)->AssignEnvironment(env());\n-  crypto::NodeBIO::FromBIO(enc_out_)->AssignEnvironment(env());\n+  // Initialize SSL – OpenSSL takes ownership of these.\n+  enc_in_ = crypto::NodeBIO::New(env()).release();\n+  enc_out_ = crypto::NodeBIO::New(env()).release();\n \n   SSL_set_bio(ssl_.get(), enc_in_, enc_out_);\n "
+        }
+    ],
+    "stats": {
+        "total": 78,
+        "additions": 36,
+        "deletions": 42
+    }
+}

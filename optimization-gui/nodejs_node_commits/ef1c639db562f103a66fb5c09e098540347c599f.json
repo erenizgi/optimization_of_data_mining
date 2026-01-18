@@ -1,0 +1,48 @@
+{
+    "author": "addaleax",
+    "message": "src: restrict unloading addons to Worker threads\n\nUnloading native addons from the main thread was an (presumably\nunintended) significant breaking change, because addons may\nrely on their memory being available after an `Environment` exits.\n\nThis patch only restricts this to Worker threads, at least for the\ntime being, and thus matches the behaviour from\nhttps://github.com/nodejs/node/pull/23319.\n\nPR-URL: https://github.com/nodejs/node/pull/25577\nRefs: https://github.com/nodejs/node/pull/24861\nRefs: https://github.com/nodejs/node/pull/23319\nReviewed-By: Colin Ihrig <cjihrig@gmail.com>\nReviewed-By: Daniel Bevenius <daniel.bevenius@gmail.com>\nReviewed-By: Ben Noordhuis <info@bnoordhuis.nl>",
+    "sha": "ef1c639db562f103a66fb5c09e098540347c599f",
+    "files": [
+        {
+            "sha": "f45386dce4a058dafd1ec9ce6844fd397752e4cd",
+            "filename": "src/env.cc",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 3,
+            "changes": 13,
+            "blob_url": "https://github.com/nodejs/node/blob/ef1c639db562f103a66fb5c09e098540347c599f/src%2Fenv.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/ef1c639db562f103a66fb5c09e098540347c599f/src%2Fenv.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv.cc?ref=ef1c639db562f103a66fb5c09e098540347c599f",
+            "patch": "@@ -276,9 +276,16 @@ Environment::~Environment() {\n   TRACE_EVENT_NESTABLE_ASYNC_END0(\n     TRACING_CATEGORY_NODE1(environment), \"Environment\", this);\n \n-  // Dereference all addons that were loaded into this environment.\n-  for (binding::DLib& addon : loaded_addons_) {\n-    addon.Close();\n+  // Do not unload addons on the main thread. Some addons need to retain memory\n+  // beyond the Environment's lifetime, and unloading them early would break\n+  // them; with Worker threads, we have the opportunity to be stricter.\n+  // Also, since the main thread usually stops just before the process exits,\n+  // this is far less relevant here.\n+  if (!is_main_thread()) {\n+    // Dereference all addons that were loaded into this environment.\n+    for (binding::DLib& addon : loaded_addons_) {\n+      addon.Close();\n+    }\n   }\n }\n "
+        },
+        {
+            "sha": "faf3ba8647e5bc62ec2f5f03d116cd1ed9cf5247",
+            "filename": "test/addons/worker-addon/binding.cc",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 0,
+            "changes": 12,
+            "blob_url": "https://github.com/nodejs/node/blob/ef1c639db562f103a66fb5c09e098540347c599f/test%2Faddons%2Fworker-addon%2Fbinding.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/ef1c639db562f103a66fb5c09e098540347c599f/test%2Faddons%2Fworker-addon%2Fbinding.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Faddons%2Fworker-addon%2Fbinding.cc?ref=ef1c639db562f103a66fb5c09e098540347c599f",
+            "patch": "@@ -3,6 +3,7 @@\n #include <stdio.h>\n #include <stdlib.h>\n #include <v8.h>\n+#include <uv.h>\n \n using v8::Context;\n using v8::HandleScope;\n@@ -41,6 +42,17 @@ void Initialize(Local<Object> exports,\n       const_cast<void*>(static_cast<const void*>(\"cleanup\")));\n   node::AddEnvironmentCleanupHook(context->GetIsolate(), Dummy, nullptr);\n   node::RemoveEnvironmentCleanupHook(context->GetIsolate(), Dummy, nullptr);\n+\n+  if (getenv(\"addExtraItemToEventLoop\") != nullptr) {\n+    // Add an item to the event loop that we do not clean up in order to make\n+    // sure that for the main thread, this addon's memory persists even after\n+    // the Environment instance has been destroyed.\n+    static uv_async_t extra_async;\n+    uv_loop_t* loop = node::GetCurrentEventLoop(context->GetIsolate());\n+    int err = uv_async_init(loop, &extra_async, [](uv_async_t*) {});\n+    assert(err == 0);\n+    uv_unref(reinterpret_cast<uv_handle_t*>(&extra_async));\n+  }\n }\n \n NODE_MODULE_CONTEXT_AWARE(NODE_GYP_MODULE_NAME, Initialize)"
+        },
+        {
+            "sha": "7fb7c1a87aa903326696a6b385218f6b1b630434",
+            "filename": "test/addons/worker-addon/test.js",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 3,
+            "changes": 13,
+            "blob_url": "https://github.com/nodejs/node/blob/ef1c639db562f103a66fb5c09e098540347c599f/test%2Faddons%2Fworker-addon%2Ftest.js",
+            "raw_url": "https://github.com/nodejs/node/raw/ef1c639db562f103a66fb5c09e098540347c599f/test%2Faddons%2Fworker-addon%2Ftest.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Faddons%2Fworker-addon%2Ftest.js?ref=ef1c639db562f103a66fb5c09e098540347c599f",
+            "patch": "@@ -6,12 +6,19 @@ const path = require('path');\n const { Worker } = require('worker_threads');\n const binding = path.resolve(__dirname, `./build/${common.buildType}/binding`);\n \n-if (process.argv[2] === 'child') {\n+if (process.argv[2] === 'worker') {\n   new Worker(`require(${JSON.stringify(binding)});`, { eval: true });\n-} else {\n+  return;\n+} else if (process.argv[2] === 'main-thread') {\n+  process.env.addExtraItemToEventLoop = 'yes';\n+  require(binding);\n+  return;\n+}\n+\n+for (const test of ['worker', 'main-thread']) {\n   const proc = child_process.spawnSync(process.execPath, [\n     __filename,\n-    'child'\n+    test\n   ]);\n   assert.strictEqual(proc.stderr.toString(), '');\n   assert.strictEqual(proc.stdout.toString(), 'ctor cleanup dtor');"
+        }
+    ],
+    "stats": {
+        "total": 38,
+        "additions": 32,
+        "deletions": 6
+    }
+}

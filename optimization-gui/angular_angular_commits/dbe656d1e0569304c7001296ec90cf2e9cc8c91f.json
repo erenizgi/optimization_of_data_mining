@@ -1,0 +1,36 @@
+{
+    "author": "devversion",
+    "message": "fix(bazel): ngc-wrapped should not rely on linker for external workspaces (#43690)\n\nCurrently when `ngc-wrapped` runs in external/consumer workspaces, like\nin the Angular Components project, the `ngc-wrapped` binary relies on\nthe linker due to the patched module resolution in `rules_nodejs` no\nlonger being default. The reliance on the linker of `rules_nodejs` is\nproblematic for workers as the required `node_modules` are not\nre-linked for every build. This was previously not an issue before the\nAPF v13 changes because the `compiler-cli` module was loaded only once\nthrough an import statement.\n\nAs of APF v13, the compiler-cli module is loaded dynamically for every\nbuild. This dynamic import can then break as the worker does not\ninitially load the compiler-cli module when becoming online. Instead,\nthe module is loaded on the first build where the node modules might not\nbe linked properly anymore (due to e.g. other targets running at the same time).\n\nWe fix thi issue by doing the following things:\n\n1. Enabling the patched module resolution for consumer/external\n   workspaces. This would match how we use ngc-wrapped inside FW as\n   well.\n\n2. Caching the compiler CLI module. Instead of re-fetching the module\n   through dynamic imports for every build (in a worker), we should use\n   the cached version. This is semantically the same as with APF v12\n   where a single import statement at file top-level was used.\n   Technically, NodeJS should cache the module, but it doesn't hurt\n   directly caching it as the module resolution will be patched by\n   `rules_nodejs` and could perform unnecessary tasks.\n\nPR Close #43690",
+    "sha": "dbe656d1e0569304c7001296ec90cf2e9cc8c91f",
+    "files": [
+        {
+            "sha": "d9654ecb12a5cea45d52fdebe061566f005f4c9d",
+            "filename": "packages/bazel/package.json",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/angular/angular/blob/dbe656d1e0569304c7001296ec90cf2e9cc8c91f/packages%2Fbazel%2Fpackage.json",
+            "raw_url": "https://github.com/angular/angular/raw/dbe656d1e0569304c7001296ec90cf2e9cc8c91f/packages%2Fbazel%2Fpackage.json",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fbazel%2Fpackage.json?ref=dbe656d1e0569304c7001296ec90cf2e9cc8c91f",
+            "patch": "@@ -17,7 +17,8 @@\n   \"bazelBin\": {\n     \"ngc-wrapped\": {\n       \"additionalAttributes\": {\n-        \"configuration_env_vars\": \"[\\\"angular_ivy_enabled\\\"]\"\n+        \"configuration_env_vars\": \"[\\\"angular_ivy_enabled\\\"]\",\n+        \"templated_args\": \"[\\\"--bazel_patch_module_resolver\\\"]\"\n       }\n     }\n   },"
+        },
+        {
+            "sha": "43b4b2989c20ab62edb9ebd34f98ab04d59869c4",
+            "filename": "packages/bazel/src/ngc-wrapped/index.ts",
+            "status": "modified",
+            "additions": 27,
+            "deletions": 6,
+            "changes": 33,
+            "blob_url": "https://github.com/angular/angular/blob/dbe656d1e0569304c7001296ec90cf2e9cc8c91f/packages%2Fbazel%2Fsrc%2Fngc-wrapped%2Findex.ts",
+            "raw_url": "https://github.com/angular/angular/raw/dbe656d1e0569304c7001296ec90cf2e9cc8c91f/packages%2Fbazel%2Fsrc%2Fngc-wrapped%2Findex.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fbazel%2Fsrc%2Fngc-wrapped%2Findex.ts?ref=dbe656d1e0569304c7001296ec90cf2e9cc8c91f",
+            "patch": "@@ -17,6 +17,13 @@ import {pathToFileURL} from 'url';\n type CompilerCliModule =\n     typeof import('@angular/compiler-cli')&typeof import('@angular/compiler-cli/private/bazel');\n \n+/**\n+ * Reference to the previously loaded `compiler-cli` module exports. We cache the exports\n+ * as `ngc-wrapped` can run as part of a worker where the Angular compiler should not be\n+ * resolved through a dynamic import for every build.\n+ */\n+let _cachedCompilerCliModule: CompilerCliModule|null = null;\n+\n const EXT = /(\\.ts|\\.d\\.ts|\\.js|\\.jsx|\\.tsx)$/;\n const NGC_GEN_FILES = /^(.*?)\\.(ngfactory|ngsummary|ngstyle|shim\\.ngstyle)(.*)$/;\n // FIXME: we should be able to add the assets to the tsconfig so FileLoader\n@@ -58,11 +65,14 @@ async function loadModuleInterop<T>(moduleName: string): Promise<T> {\n   return exports.default ?? exports as T;\n }\n \n-export async function runOneBuild(\n-    args: string[], inputs?: {[path: string]: string}): Promise<boolean> {\n-  if (args[0] === '-p') args.shift();\n-  // Strip leading at-signs, used to indicate a params file\n-  const project = args[0].replace(/^@+/, '');\n+/**\n+ * Fetches the Angular compiler CLI module dynamically, allowing for an ESM\n+ * variant of the compiler.\n+ */\n+async function fetchCompilerCliModule(): Promise<CompilerCliModule> {\n+  if (_cachedCompilerCliModule !== null) {\n+    return _cachedCompilerCliModule;\n+  }\n \n   // Note: We load the compiler-cli package dynamically using `loadModuleInterop` as\n   // this script runs as CommonJS module but the compiler-cli could be built as strict ESM\n@@ -75,7 +85,18 @@ export async function runOneBuild(\n   const compilerPrivateExports =\n       await loadModuleInterop<typeof import('@angular/compiler-cli/private/bazel')>(\n           '@angular/compiler-cli/private/bazel');\n-  const ng = {...compilerExports, ...compilerPrivateExports};\n+  return _cachedCompilerCliModule = {...compilerExports, ...compilerPrivateExports};\n+}\n+\n+export async function runOneBuild(\n+    args: string[], inputs?: {[path: string]: string}): Promise<boolean> {\n+  if (args[0] === '-p') {\n+    args.shift();\n+  }\n+\n+  // Strip leading at-signs, used to indicate a params file\n+  const project = args[0].replace(/^@+/, '');\n+  const ng = await fetchCompilerCliModule();\n \n   const [parsedOptions, errors] = parseTsconfig(project);\n   if (errors?.length) {"
+        }
+    ],
+    "stats": {
+        "total": 36,
+        "additions": 29,
+        "deletions": 7
+    }
+}

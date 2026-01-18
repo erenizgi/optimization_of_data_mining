@@ -1,0 +1,36 @@
+{
+    "author": "addaleax",
+    "message": "src: use only one tracing write fs req at a time\n\nConcurrent writes to the same fd are generally not ideal,\nsince it’s not generally guaranteed that data from those\nwrites will end up on disk in the right order.\n\nPR-URL: https://github.com/nodejs/node/pull/21867\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Eugene Ostroukhov <eostroukhov@google.com>\nReviewed-By: Ali Ijaz Sheikh <ofrobots@google.com>",
+    "sha": "5e83a2abd0eccfb9b7200605e8371eb301dec452",
+    "files": [
+        {
+            "sha": "a0382e587b3ad79cf6ccb704feb59c7852e05c95",
+            "filename": "src/tracing/node_trace_writer.cc",
+            "status": "modified",
+            "additions": 45,
+            "deletions": 26,
+            "changes": 71,
+            "blob_url": "https://github.com/nodejs/node/blob/5e83a2abd0eccfb9b7200605e8371eb301dec452/src%2Ftracing%2Fnode_trace_writer.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/5e83a2abd0eccfb9b7200605e8371eb301dec452/src%2Ftracing%2Fnode_trace_writer.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Ftracing%2Fnode_trace_writer.cc?ref=5e83a2abd0eccfb9b7200605e8371eb301dec452",
+            "patch": "@@ -158,38 +158,57 @@ void NodeTraceWriter::Flush(bool blocking) {\n \n void NodeTraceWriter::WriteToFile(std::string&& str, int highest_request_id) {\n   if (fd_ == -1) return;\n-  WriteRequest* write_req = new WriteRequest();\n-  write_req->str = std::move(str);\n-  write_req->writer = this;\n-  write_req->highest_request_id = highest_request_id;\n-  uv_buf_t uv_buf = uv_buf_init(const_cast<char*>(write_req->str.c_str()),\n-      write_req->str.length());\n-  request_mutex_.Lock();\n-  // Manage a queue of WriteRequest objects because the behavior of uv_write is\n-  // undefined if the same WriteRequest object is used more than once\n-  // between WriteCb calls. In addition, this allows us to keep track of the id\n-  // of the latest write request that actually been completed.\n-  write_req_queue_.push(write_req);\n-  request_mutex_.Unlock();\n-  int err = uv_fs_write(tracing_loop_, reinterpret_cast<uv_fs_t*>(write_req),\n-      fd_, &uv_buf, 1, -1, WriteCb);\n+\n+  uv_buf_t buf = uv_buf_init(nullptr, 0);\n+  {\n+    Mutex::ScopedLock lock(request_mutex_);\n+    write_req_queue_.emplace(WriteRequest {\n+      std::move(str), highest_request_id\n+    });\n+    if (write_req_queue_.size() == 1) {\n+      buf = uv_buf_init(\n+          const_cast<char*>(write_req_queue_.front().str.c_str()),\n+          write_req_queue_.front().str.length());\n+    }\n+  }\n+  // Only one write request for the same file descriptor should be active at\n+  // a time.\n+  if (buf.base != nullptr && fd_ != -1) {\n+    StartWrite(buf);\n+  }\n+}\n+\n+void NodeTraceWriter::StartWrite(uv_buf_t buf) {\n+  int err = uv_fs_write(\n+      tracing_loop_, &write_req_, fd_, &buf, 1, -1,\n+      [](uv_fs_t* req) {\n+        NodeTraceWriter* writer =\n+            ContainerOf(&NodeTraceWriter::write_req_, req);\n+        writer->AfterWrite();\n+      });\n   CHECK_EQ(err, 0);\n }\n \n-void NodeTraceWriter::WriteCb(uv_fs_t* req) {\n-  WriteRequest* write_req = ContainerOf(&WriteRequest::req, req);\n-  CHECK_GE(write_req->req.result, 0);\n+void NodeTraceWriter::AfterWrite() {\n+  CHECK_GE(write_req_.result, 0);\n+  uv_fs_req_cleanup(&write_req_);\n \n-  NodeTraceWriter* writer = write_req->writer;\n-  int highest_request_id = write_req->highest_request_id;\n+  uv_buf_t buf = uv_buf_init(nullptr, 0);\n   {\n-    Mutex::ScopedLock scoped_lock(writer->request_mutex_);\n-    CHECK_EQ(write_req, writer->write_req_queue_.front());\n-    writer->write_req_queue_.pop();\n-    writer->highest_request_id_completed_ = highest_request_id;\n-    writer->request_cond_.Broadcast(scoped_lock);\n+    Mutex::ScopedLock scoped_lock(request_mutex_);\n+    int highest_request_id = write_req_queue_.front().highest_request_id;\n+    write_req_queue_.pop();\n+    highest_request_id_completed_ = highest_request_id;\n+    request_cond_.Broadcast(scoped_lock);\n+    if (!write_req_queue_.empty()) {\n+      buf = uv_buf_init(\n+          const_cast<char*>(write_req_queue_.front().str.c_str()),\n+          write_req_queue_.front().str.length());\n+    }\n+  }\n+  if (buf.base != nullptr && fd_ != -1) {\n+    StartWrite(buf);\n   }\n-  delete write_req;\n }\n \n // static"
+        },
+        {
+            "sha": "5e5781479c689f098b462619f7c13980d3a315b9",
+            "filename": "src/tracing/node_trace_writer.h",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 4,
+            "changes": 8,
+            "blob_url": "https://github.com/nodejs/node/blob/5e83a2abd0eccfb9b7200605e8371eb301dec452/src%2Ftracing%2Fnode_trace_writer.h",
+            "raw_url": "https://github.com/nodejs/node/raw/5e83a2abd0eccfb9b7200605e8371eb301dec452/src%2Ftracing%2Fnode_trace_writer.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Ftracing%2Fnode_trace_writer.h?ref=5e83a2abd0eccfb9b7200605e8371eb301dec452",
+            "patch": "@@ -27,13 +27,12 @@ class NodeTraceWriter : public AsyncTraceWriter {\n \n  private:\n   struct WriteRequest {\n-    uv_fs_t req;\n-    NodeTraceWriter* writer;\n     std::string str;\n     int highest_request_id;\n   };\n \n-  static void WriteCb(uv_fs_t* req);\n+  void AfterWrite();\n+  void StartWrite(uv_buf_t buf);\n   void OpenNewFileForStreaming();\n   void WriteToFile(std::string&& str, int highest_request_id);\n   void WriteSuffix();\n@@ -56,7 +55,8 @@ class NodeTraceWriter : public AsyncTraceWriter {\n   // Used to wait until async handles have been closed.\n   ConditionVariable exit_cond_;\n   int fd_ = -1;\n-  std::queue<WriteRequest*> write_req_queue_;\n+  uv_fs_t write_req_;\n+  std::queue<WriteRequest> write_req_queue_;\n   int num_write_requests_ = 0;\n   int highest_request_id_completed_ = 0;\n   int total_traces_ = 0;"
+        }
+    ],
+    "stats": {
+        "total": 79,
+        "additions": 49,
+        "deletions": 30
+    }
+}

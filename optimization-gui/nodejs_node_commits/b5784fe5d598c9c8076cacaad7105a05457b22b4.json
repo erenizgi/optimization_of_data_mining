@@ -1,0 +1,72 @@
+{
+    "author": "BridgeAR",
+    "message": "deps: V8: backport bf84766\n\nOriginal commit message:\n\n    [CloneObjectIC] clone MutableHeapNumbers instead of referencing them\n\n    Adds a helper macro \"CloneIfMutablePrimitive\", which tests if the\n    operand is a MutableHeapNumber, and if so, clones it, otherwise\n    returning the original value.\n\n    Also modifies the signature of \"CopyPropertyArrayValues\" to take a\n    \"DestroySource\" enum, indicating whether or not the resulting object is\n    supplanting the source object or not, and removes all default\n    parameters from that macro (which were not used anyways).\n\n    This corrects the issue reported in chromium:901301, where\n    StaNamedOwnProperty was replacing the value of a MutableHeapNumber\n    referenced by both the cloned object and the source object.\n\n    BUG=chromium:901301, v8:7611\n    R=cbruni@chromium.org, jkummerow@chromium.org\n\n    Change-Id: I43df1ddc84dfa4840e680b6affeba452ce0b6629\n    Reviewed-on: https://chromium-review.googlesource.com/c/1318096\n    Commit-Queue: Caitlin Potter <caitp@igalia.com>\n    Reviewed-by: Jakob Kummerow <jkummerow@chromium.org>\n    Reviewed-by: Camillo Bruni <cbruni@chromium.org>\n    Cr-Commit-Position: refs/heads/master@{#57304}\n\nPR-URL: https://github.com/nodejs/node/pull/25101\nRefs: https://github.com/v8/v8/commit/bf84766a2cd3e09070adcd6228a3a487c8dc4bbd\nFixes: https://github.com/nodejs/node/issues/25089\nReviewed-By: Richard Lau <riclau@uk.ibm.com>\nReviewed-By: Gus Caplan <me@gus.host>\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Ali Ijaz Sheikh <ofrobots@google.com>\nReviewed-By: Yang Guo <yangguo@chromium.org>",
+    "sha": "b5784fe5d598c9c8076cacaad7105a05457b22b4",
+    "files": [
+        {
+            "sha": "6c4e3d5375be0a44fe13a0fe2a531fef84ca7721",
+            "filename": "common.gypi",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/b5784fe5d598c9c8076cacaad7105a05457b22b4/common.gypi",
+            "raw_url": "https://github.com/nodejs/node/raw/b5784fe5d598c9c8076cacaad7105a05457b22b4/common.gypi",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/common.gypi?ref=b5784fe5d598c9c8076cacaad7105a05457b22b4",
+            "patch": "@@ -38,7 +38,7 @@\n \n     # Reset this number to 0 on major V8 upgrades.\n     # Increment by one for each non-official patch applied to deps/v8.\n-    'v8_embedder_string': '-node.5',\n+    'v8_embedder_string': '-node.6',\n \n     ##### V8 defaults for Node.js #####\n "
+        },
+        {
+            "sha": "e11beb6541d68788449b9d1ef845d4c5cb107012",
+            "filename": "deps/v8/src/code-stub-assembler.cc",
+            "status": "modified",
+            "additions": 38,
+            "deletions": 2,
+            "changes": 40,
+            "blob_url": "https://github.com/nodejs/node/blob/b5784fe5d598c9c8076cacaad7105a05457b22b4/deps%2Fv8%2Fsrc%2Fcode-stub-assembler.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/b5784fe5d598c9c8076cacaad7105a05457b22b4/deps%2Fv8%2Fsrc%2Fcode-stub-assembler.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/deps%2Fv8%2Fsrc%2Fcode-stub-assembler.cc?ref=b5784fe5d598c9c8076cacaad7105a05457b22b4",
+            "patch": "@@ -3067,6 +3067,24 @@ TNode<MutableHeapNumber> CodeStubAssembler::AllocateMutableHeapNumber() {\n   return UncheckedCast<MutableHeapNumber>(result);\n }\n \n+TNode<Object> CodeStubAssembler::CloneIfMutablePrimitive(TNode<Object> object) {\n+  TVARIABLE(Object, result, object);\n+  Label done(this);\n+\n+  GotoIf(TaggedIsSmi(object), &done);\n+  GotoIfNot(IsMutableHeapNumber(UncheckedCast<HeapObject>(object)), &done);\n+  {\n+    // Mutable heap number found --- allocate a clone.\n+    TNode<Float64T> value =\n+        LoadHeapNumberValue(UncheckedCast<HeapNumber>(object));\n+    result = AllocateMutableHeapNumberWithValue(value);\n+    Goto(&done);\n+  }\n+\n+  BIND(&done);\n+  return result.value();\n+}\n+\n TNode<MutableHeapNumber> CodeStubAssembler::AllocateMutableHeapNumberWithValue(\n     SloppyTNode<Float64T> value) {\n   TNode<MutableHeapNumber> result = AllocateMutableHeapNumber();\n@@ -4904,7 +4922,8 @@ void CodeStubAssembler::CopyPropertyArrayValues(Node* from_array,\n                                                 Node* to_array,\n                                                 Node* property_count,\n                                                 WriteBarrierMode barrier_mode,\n-                                                ParameterMode mode) {\n+                                                ParameterMode mode,\n+                                                DestroySource destroy_source) {\n   CSA_SLOW_ASSERT(this, MatchesParameterMode(property_count, mode));\n   CSA_SLOW_ASSERT(this, Word32Or(IsPropertyArray(from_array),\n                                  IsEmptyFixedArray(from_array)));\n@@ -4916,9 +4935,14 @@ void CodeStubAssembler::CopyPropertyArrayValues(Node* from_array,\n   ElementsKind kind = PACKED_ELEMENTS;\n   BuildFastFixedArrayForEach(\n       from_array, kind, start, property_count,\n-      [this, to_array, needs_write_barrier](Node* array, Node* offset) {\n+      [this, to_array, needs_write_barrier, destroy_source](Node* array,\n+                                                            Node* offset) {\n         Node* value = Load(MachineType::AnyTagged(), array, offset);\n \n+        if (destroy_source == DestroySource::kNo) {\n+          value = CloneIfMutablePrimitive(CAST(value));\n+        }\n+\n         if (needs_write_barrier) {\n           Store(to_array, offset, value);\n         } else {\n@@ -4927,6 +4951,18 @@ void CodeStubAssembler::CopyPropertyArrayValues(Node* from_array,\n         }\n       },\n       mode);\n+\n+#ifdef DEBUG\n+  // Zap {from_array} if the copying above has made it invalid.\n+  if (destroy_source == DestroySource::kYes) {\n+    Label did_zap(this);\n+    GotoIf(IsEmptyFixedArray(from_array), &did_zap);\n+    FillPropertyArrayWithUndefined(from_array, start, property_count, mode);\n+\n+    Goto(&did_zap);\n+    BIND(&did_zap);\n+  }\n+#endif\n   Comment(\"] CopyPropertyArrayValues\");\n }\n "
+        },
+        {
+            "sha": "2be168af8513d751b09a0aa9819a89deb85e385b",
+            "filename": "deps/v8/src/code-stub-assembler.h",
+            "status": "modified",
+            "additions": 17,
+            "deletions": 4,
+            "changes": 21,
+            "blob_url": "https://github.com/nodejs/node/blob/b5784fe5d598c9c8076cacaad7105a05457b22b4/deps%2Fv8%2Fsrc%2Fcode-stub-assembler.h",
+            "raw_url": "https://github.com/nodejs/node/raw/b5784fe5d598c9c8076cacaad7105a05457b22b4/deps%2Fv8%2Fsrc%2Fcode-stub-assembler.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/deps%2Fv8%2Fsrc%2Fcode-stub-assembler.h?ref=b5784fe5d598c9c8076cacaad7105a05457b22b4",
+            "patch": "@@ -1512,10 +1512,19 @@ class V8_EXPORT_PRIVATE CodeStubAssembler : public compiler::CodeAssembler {\n                                       Node* to_index,\n                                       ParameterMode mode = INTPTR_PARAMETERS);\n \n-  void CopyPropertyArrayValues(\n-      Node* from_array, Node* to_array, Node* length,\n-      WriteBarrierMode barrier_mode = UPDATE_WRITE_BARRIER,\n-      ParameterMode mode = INTPTR_PARAMETERS);\n+  enum class DestroySource { kNo, kYes };\n+\n+  // Specify DestroySource::kYes if {from_array} is being supplanted by\n+  // {to_array}. This offers a slight performance benefit by simply copying the\n+  // array word by word. The source may be destroyed at the end of this macro.\n+  //\n+  // Otherwise, specify DestroySource::kNo for operations where an Object is\n+  // being cloned, to ensure that MutableHeapNumbers are unique between the\n+  // source and cloned object.\n+  void CopyPropertyArrayValues(Node* from_array, Node* to_array, Node* length,\n+                               WriteBarrierMode barrier_mode,\n+                               ParameterMode mode,\n+                               DestroySource destroy_source);\n \n   // Copies all elements from |from_array| of |length| size to\n   // |to_array| of the same size respecting the elements kind.\n@@ -3073,6 +3082,10 @@ class V8_EXPORT_PRIVATE CodeStubAssembler : public compiler::CodeAssembler {\n   void InitializeFunctionContext(Node* native_context, Node* context,\n                                  int slots);\n \n+  // Allocate a clone of a mutable primitive, if {object} is a\n+  // MutableHeapNumber.\n+  TNode<Object> CloneIfMutablePrimitive(TNode<Object> object);\n+\n  private:\n   friend class CodeStubArguments;\n "
+        },
+        {
+            "sha": "9ba5cde75472a86534fd2943dceac1c269f170ac",
+            "filename": "deps/v8/src/ic/accessor-assembler.cc",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 3,
+            "changes": 8,
+            "blob_url": "https://github.com/nodejs/node/blob/b5784fe5d598c9c8076cacaad7105a05457b22b4/deps%2Fv8%2Fsrc%2Fic%2Faccessor-assembler.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/b5784fe5d598c9c8076cacaad7105a05457b22b4/deps%2Fv8%2Fsrc%2Fic%2Faccessor-assembler.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/deps%2Fv8%2Fsrc%2Fic%2Faccessor-assembler.cc?ref=b5784fe5d598c9c8076cacaad7105a05457b22b4",
+            "patch": "@@ -1683,7 +1683,8 @@ Node* AccessorAssembler::ExtendPropertiesBackingStore(Node* object,\n     // |new_properties| is guaranteed to be in new space, so we can skip\n     // the write barrier.\n     CopyPropertyArrayValues(var_properties.value(), new_properties,\n-                            var_length.value(), SKIP_WRITE_BARRIER, mode);\n+                            var_length.value(), SKIP_WRITE_BARRIER, mode,\n+                            DestroySource::kYes);\n \n     // TODO(gsathya): Clean up the type conversions by creating smarter\n     // helpers that do the correct op based on the mode.\n@@ -3620,7 +3621,7 @@ void AccessorAssembler::GenerateCloneObjectIC() {\n       auto mode = INTPTR_PARAMETERS;\n       var_properties = CAST(AllocatePropertyArray(length, mode));\n       CopyPropertyArrayValues(source_properties, var_properties.value(), length,\n-                              SKIP_WRITE_BARRIER, mode);\n+                              SKIP_WRITE_BARRIER, mode, DestroySource::kNo);\n     }\n \n     Goto(&allocate_object);\n@@ -3640,7 +3641,8 @@ void AccessorAssembler::GenerateCloneObjectIC() {\n     BuildFastLoop(source_start, source_size,\n                   [=](Node* field_index) {\n                     Node* field_offset = TimesPointerSize(field_index);\n-                    Node* field = LoadObjectField(source, field_offset);\n+                    TNode<Object> field = LoadObjectField(source, field_offset);\n+                    field = CloneIfMutablePrimitive(field);\n                     Node* result_offset =\n                         IntPtrAdd(field_offset, field_offset_difference);\n                     StoreObjectFieldNoWriteBarrier(object, result_offset,"
+        },
+        {
+            "sha": "55d60f2cf8ae29fa9f77611e19908dd6d7e61d49",
+            "filename": "deps/v8/test/mjsunit/es9/object-spread-ic.js",
+            "status": "modified",
+            "additions": 22,
+            "deletions": 0,
+            "changes": 22,
+            "blob_url": "https://github.com/nodejs/node/blob/b5784fe5d598c9c8076cacaad7105a05457b22b4/deps%2Fv8%2Ftest%2Fmjsunit%2Fes9%2Fobject-spread-ic.js",
+            "raw_url": "https://github.com/nodejs/node/raw/b5784fe5d598c9c8076cacaad7105a05457b22b4/deps%2Fv8%2Ftest%2Fmjsunit%2Fes9%2Fobject-spread-ic.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/deps%2Fv8%2Ftest%2Fmjsunit%2Fes9%2Fobject-spread-ic.js?ref=b5784fe5d598c9c8076cacaad7105a05457b22b4",
+            "patch": "@@ -99,3 +99,25 @@\n   // Megamorphic\n   assertEquals({ boop: 1 }, f({ boop: 1 }));\n })();\n+\n+// There are 2 paths in CloneObjectIC's handler which need to handle double\n+// fields specially --- in object properties, and copying the property array.\n+function testMutableInlineProperties() {\n+  function inobject() { \"use strict\"; this.x = 1.1; }\n+  const src = new inobject();\n+  const x0 = src.x;\n+  const clone = { ...src, x: x0 + 1 };\n+  assertEquals(x0, src.x);\n+  assertEquals({ x: 2.1 }, clone);\n+}\n+testMutableInlineProperties()\n+\n+function testMutableOutOfLineProperties() {\n+  const src = { a: 1, b: 2, c: 3 };\n+  src.x = 2.3;\n+  const x0 = src.x;\n+  const clone = { ...src, x: x0 + 1 };\n+  assertEquals(x0, src.x);\n+  assertEquals({ a: 1, b: 2, c: 3, x: 3.3 }, clone);\n+}\n+testMutableOutOfLineProperties();"
+        }
+    ],
+    "stats": {
+        "total": 93,
+        "additions": 83,
+        "deletions": 10
+    }
+}

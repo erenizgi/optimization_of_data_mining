@@ -1,0 +1,60 @@
+{
+    "author": "joyeecheung",
+    "message": "os: do not call into JS to push values to an array in GetCPUInfo\n\nInstead of calling into JS from C++ to push values into an array,\nuse the new Array::New API that takes a pointer and a length\ndirectly.\n\nPR-URL: https://github.com/nodejs/node/pull/24264\nReviewed-By: Anna Henningsen <anna@addaleax.net>\nReviewed-By: Daniel Bevenius <daniel.bevenius@gmail.com>\nReviewed-By: Refael Ackermann <refack@gmail.com>",
+    "sha": "51cea618e21ba88bc20feb537a72c1b831a94b46",
+    "files": [
+        {
+            "sha": "2c806908eeac983629ebaaa7970a40a301dff689",
+            "filename": "lib/os.js",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 17,
+            "changes": 32,
+            "blob_url": "https://github.com/nodejs/node/blob/51cea618e21ba88bc20feb537a72c1b831a94b46/lib%2Fos.js",
+            "raw_url": "https://github.com/nodejs/node/raw/51cea618e21ba88bc20feb537a72c1b831a94b46/lib%2Fos.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Fos.js?ref=51cea618e21ba88bc20feb537a72c1b831a94b46",
+            "patch": "@@ -21,7 +21,7 @@\n \n 'use strict';\n \n-const { pushValToArrayMax, safeGetenv } = internalBinding('util');\n+const { safeGetenv } = internalBinding('util');\n const constants = internalBinding('constants').os;\n const { deprecate } = require('internal/util');\n const isWindows = process.platform === 'win32';\n@@ -82,31 +82,29 @@ const getNetworkInterfacesDepMsg =\n   'os.getNetworkInterfaces is deprecated. Use os.networkInterfaces instead.';\n \n const avgValues = new Float64Array(3);\n-const cpuValues = new Float64Array(6 * pushValToArrayMax);\n \n function loadavg() {\n   getLoadAvg(avgValues);\n   return [avgValues[0], avgValues[1], avgValues[2]];\n }\n \n-function addCPUInfo() {\n-  for (var i = 0, c = 0; i < arguments.length; ++i, c += 6) {\n-    this[this.length] = {\n-      model: arguments[i],\n-      speed: cpuValues[c],\n+function cpus() {\n+  const data = getCPUs();\n+  const result = [];\n+  for (var i = 0; i < data.length; i += 7) {\n+    result.push({\n+      model: data[i],\n+      speed: data[i + 1],\n       times: {\n-        user: cpuValues[c + 1],\n-        nice: cpuValues[c + 2],\n-        sys: cpuValues[c + 3],\n-        idle: cpuValues[c + 4],\n-        irq: cpuValues[c + 5]\n+        user: data[i + 2],\n+        nice: data[i + 3],\n+        sys: data[i + 4],\n+        idle: data[i + 5],\n+        irq: data[i + 6]\n       }\n-    };\n+    });\n   }\n-}\n-\n-function cpus() {\n-  return getCPUs(addCPUInfo, cpuValues, []);\n+  return result;\n }\n \n function arch() {"
+        },
+        {
+            "sha": "0b46af95f4ba78127170d34d2863c1d9eeccea4c",
+            "filename": "src/node_os.cc",
+            "status": "modified",
+            "additions": 18,
+            "deletions": 36,
+            "changes": 54,
+            "blob_url": "https://github.com/nodejs/node/blob/51cea618e21ba88bc20feb537a72c1b831a94b46/src%2Fnode_os.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/51cea618e21ba88bc20feb537a72c1b831a94b46/src%2Fnode_os.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_os.cc?ref=51cea618e21ba88bc20feb537a72c1b831a94b46",
+            "patch": "@@ -54,6 +54,7 @@ using v8::Function;\n using v8::FunctionCallbackInfo;\n using v8::Int32;\n using v8::Integer;\n+using v8::Isolate;\n using v8::Local;\n using v8::MaybeLocal;\n using v8::Null;\n@@ -148,52 +149,33 @@ static void GetOSRelease(const FunctionCallbackInfo<Value>& args) {\n \n static void GetCPUInfo(const FunctionCallbackInfo<Value>& args) {\n   Environment* env = Environment::GetCurrent(args);\n+  Isolate* isolate = env->isolate();\n+\n   uv_cpu_info_t* cpu_infos;\n-  int count, i, field_idx;\n+  int count;\n \n   int err = uv_cpu_info(&cpu_infos, &count);\n   if (err)\n     return;\n \n-  CHECK(args[0]->IsFunction());\n-  Local<Function> addfn = args[0].As<Function>();\n-\n-  CHECK(args[1]->IsFloat64Array());\n-  Local<Float64Array> array = args[1].As<Float64Array>();\n-  CHECK_EQ(array->Length(), 6 * NODE_PUSH_VAL_TO_ARRAY_MAX);\n-  Local<ArrayBuffer> ab = array->Buffer();\n-  double* fields = static_cast<double*>(ab->GetContents().Data());\n-\n-  CHECK(args[2]->IsArray());\n-  Local<Array> cpus = args[2].As<Array>();\n-\n-  Local<Value> model_argv[NODE_PUSH_VAL_TO_ARRAY_MAX];\n-  unsigned int model_idx = 0;\n-\n-  for (i = 0, field_idx = 0; i < count; i++) {\n+  // It's faster to create an array packed with all the data and\n+  // assemble them into objects in JS than to call Object::Set() repeatedly\n+  // The array is in the format\n+  // [model, speed, (5 entries of cpu_times), model2, speed2, ...]\n+  std::vector<Local<Value>> result(count * 7);\n+  for (size_t i = 0; i < count; i++) {\n     uv_cpu_info_t* ci = cpu_infos + i;\n-\n-    fields[field_idx++] = ci->speed;\n-    fields[field_idx++] = ci->cpu_times.user;\n-    fields[field_idx++] = ci->cpu_times.nice;\n-    fields[field_idx++] = ci->cpu_times.sys;\n-    fields[field_idx++] = ci->cpu_times.idle;\n-    fields[field_idx++] = ci->cpu_times.irq;\n-    model_argv[model_idx++] = OneByteString(env->isolate(), ci->model);\n-\n-    if (model_idx >= NODE_PUSH_VAL_TO_ARRAY_MAX) {\n-      addfn->Call(env->context(), cpus, model_idx, model_argv).ToLocalChecked();\n-      model_idx = 0;\n-      field_idx = 0;\n-    }\n-  }\n-\n-  if (model_idx > 0) {\n-    addfn->Call(env->context(), cpus, model_idx, model_argv).ToLocalChecked();\n+    result[i * 7] = OneByteString(isolate, ci->model);\n+    result[i * 7 + 1] = Number::New(isolate, ci->speed);\n+    result[i * 7 + 2] = Number::New(isolate, ci->cpu_times.user);\n+    result[i * 7 + 3] = Number::New(isolate, ci->cpu_times.nice);\n+    result[i * 7 + 4] = Number::New(isolate, ci->cpu_times.sys);\n+    result[i * 7 + 5] = Number::New(isolate, ci->cpu_times.idle);\n+    result[i * 7 + 6] = Number::New(isolate, ci->cpu_times.irq);\n   }\n \n   uv_free_cpu_info(cpu_infos, count);\n-  args.GetReturnValue().Set(cpus);\n+  args.GetReturnValue().Set(Array::New(isolate, result.data(), result.size()));\n }\n \n "
+        },
+        {
+            "sha": "1a08c0e255f8d315bd74da2fe0acf8da238a8b19",
+            "filename": "src/node_util.cc",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 7,
+            "changes": 7,
+            "blob_url": "https://github.com/nodejs/node/blob/51cea618e21ba88bc20feb537a72c1b831a94b46/src%2Fnode_util.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/51cea618e21ba88bc20feb537a72c1b831a94b46/src%2Fnode_util.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_util.cc?ref=51cea618e21ba88bc20feb537a72c1b831a94b46",
+            "patch": "@@ -24,7 +24,6 @@ using v8::Private;\n using v8::Promise;\n using v8::PropertyFilter;\n using v8::Proxy;\n-using v8::ReadOnly;\n using v8::SKIP_STRINGS;\n using v8::SKIP_SYMBOLS;\n using v8::String;\n@@ -206,12 +205,6 @@ void Initialize(Local<Object> target,\n   }\n #undef V\n \n-  target->DefineOwnProperty(\n-    env->context(),\n-    OneByteString(env->isolate(), \"pushValToArrayMax\"),\n-    Integer::NewFromUnsigned(env->isolate(), NODE_PUSH_VAL_TO_ARRAY_MAX),\n-    ReadOnly).FromJust();\n-\n #define V(name)                                                               \\\n   target->Set(context,                                                        \\\n               FIXED_ONE_BYTE_STRING(env->isolate(), #name),                   \\"
+        },
+        {
+            "sha": "9b86d3af8b263ea643400cee2af4a42ab27ef455",
+            "filename": "test/parallel/test-os.js",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/nodejs/node/blob/51cea618e21ba88bc20feb537a72c1b831a94b46/test%2Fparallel%2Ftest-os.js",
+            "raw_url": "https://github.com/nodejs/node/raw/51cea618e21ba88bc20feb537a72c1b831a94b46/test%2Fparallel%2Ftest-os.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-os.js?ref=51cea618e21ba88bc20feb537a72c1b831a94b46",
+            "patch": "@@ -92,6 +92,15 @@ assert.ok(uptime > 0);\n const cpus = os.cpus();\n is.array(cpus);\n assert.ok(cpus.length > 0);\n+for (const cpu of cpus) {\n+  assert.strictEqual(typeof cpu.model, 'string');\n+  assert.strictEqual(typeof cpu.speed, 'number');\n+  assert.strictEqual(typeof cpu.times.user, 'number');\n+  assert.strictEqual(typeof cpu.times.nice, 'number');\n+  assert.strictEqual(typeof cpu.times.sys, 'number');\n+  assert.strictEqual(typeof cpu.times.idle, 'number');\n+  assert.strictEqual(typeof cpu.times.irq, 'number');\n+}\n \n const type = os.type();\n is.string(type);"
+        }
+    ],
+    "stats": {
+        "total": 102,
+        "additions": 42,
+        "deletions": 60
+    }
+}

@@ -1,0 +1,36 @@
+{
+    "author": "addaleax",
+    "message": "domain: avoid circular memory references\n\nAvoid circular references that the JS engine cannot see through\nbecause it involves an `async id` ⇒ `domain` link.\n\nUsing weak references is not a great solution, because it increases\nthe domain module’s dependency on internals and the added calls into\nC++ may affect performance, but it seems like the least bad one.\n\nPR-URL: https://github.com/nodejs/node/pull/25993\nFixes: https://github.com/nodejs/node/issues/23862\nReviewed-By: Matteo Collina <matteo.collina@gmail.com>\nReviewed-By: Ruben Bridgewater <ruben@bridgewater.de>\nReviewed-By: Сковорода Никита Андреевич <chalkerx@gmail.com>\nReviewed-By: Vladimir de Turckheim <vlad2t@hotmail.com>\nReviewed-By: Colin Ihrig <cjihrig@gmail.com>\nReviewed-By: Ben Noordhuis <info@bnoordhuis.nl>\nReviewed-By: Refael Ackermann <refack@gmail.com>",
+    "sha": "93417ac99521f0164dfacbbc0f7d30806d1ec0e3",
+    "files": [
+        {
+            "sha": "031350746cc5b8db0695626e601f4841db8f25b1",
+            "filename": "lib/domain.js",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 3,
+            "changes": 13,
+            "blob_url": "https://github.com/nodejs/node/blob/93417ac99521f0164dfacbbc0f7d30806d1ec0e3/lib%2Fdomain.js",
+            "raw_url": "https://github.com/nodejs/node/raw/93417ac99521f0164dfacbbc0f7d30806d1ec0e3/lib%2Fdomain.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Fdomain.js?ref=93417ac99521f0164dfacbbc0f7d30806d1ec0e3",
+            "patch": "@@ -35,6 +35,10 @@ const {\n } = require('internal/errors').codes;\n const { createHook } = require('async_hooks');\n \n+// TODO(addaleax): Use a non-internal solution for this.\n+const kWeak = Symbol('kWeak');\n+const { WeakReference } = internalBinding('util');\n+\n // Overwrite process.domain with a getter/setter that will allow for more\n // effective optimizations\n var _domain = [null];\n@@ -53,20 +57,22 @@ const asyncHook = createHook({\n   init(asyncId, type, triggerAsyncId, resource) {\n     if (process.domain !== null && process.domain !== undefined) {\n       // If this operation is created while in a domain, let's mark it\n-      pairing.set(asyncId, process.domain);\n+      pairing.set(asyncId, process.domain[kWeak]);\n       resource.domain = process.domain;\n     }\n   },\n   before(asyncId) {\n     const current = pairing.get(asyncId);\n     if (current !== undefined) { // enter domain for this cb\n-      current.enter();\n+      // We will get the domain through current.get(), because the resource\n+      // object's .domain property makes sure it is not garbage collected.\n+      current.get().enter();\n     }\n   },\n   after(asyncId) {\n     const current = pairing.get(asyncId);\n     if (current !== undefined) { // exit domain for this cb\n-      current.exit();\n+      current.get().exit();\n     }\n   },\n   destroy(asyncId) {\n@@ -167,6 +173,7 @@ class Domain extends EventEmitter {\n     super();\n \n     this.members = [];\n+    this[kWeak] = new WeakReference(this);\n     asyncHook.enable();\n \n     this.on('removeListener', updateExceptionCapture);"
+        },
+        {
+            "sha": "e720241841d130bf91d97d7c984f9e7958e1935e",
+            "filename": "test/parallel/test-domain-async-id-map-leak.js",
+            "status": "added",
+            "additions": 36,
+            "deletions": 0,
+            "changes": 36,
+            "blob_url": "https://github.com/nodejs/node/blob/93417ac99521f0164dfacbbc0f7d30806d1ec0e3/test%2Fparallel%2Ftest-domain-async-id-map-leak.js",
+            "raw_url": "https://github.com/nodejs/node/raw/93417ac99521f0164dfacbbc0f7d30806d1ec0e3/test%2Fparallel%2Ftest-domain-async-id-map-leak.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-domain-async-id-map-leak.js?ref=93417ac99521f0164dfacbbc0f7d30806d1ec0e3",
+            "patch": "@@ -0,0 +1,36 @@\n+// Flags: --expose-gc\n+'use strict';\n+const common = require('../common');\n+const onGC = require('../common/ongc');\n+const assert = require('assert');\n+const async_hooks = require('async_hooks');\n+const domain = require('domain');\n+const EventEmitter = require('events');\n+\n+// This test makes sure that the (async id → domain) map which is part of the\n+// domain module does not get in the way of garbage collection.\n+// See: https://github.com/nodejs/node/issues/23862\n+\n+let d = domain.create();\n+d.run(() => {\n+  const resource = new async_hooks.AsyncResource('TestResource');\n+  const emitter = new EventEmitter();\n+\n+  d.remove(emitter);\n+  d.add(emitter);\n+\n+  emitter.linkToResource = resource;\n+  assert.strictEqual(emitter.domain, d);\n+  assert.strictEqual(resource.domain, d);\n+\n+  // This would otherwise be a circular chain now:\n+  // emitter → resource → async id ⇒ domain → emitter.\n+  // Make sure that all of these objects are released:\n+\n+  onGC(resource, { ongc: common.mustCall() });\n+  onGC(d, { ongc: common.mustCall() });\n+  onGC(emitter, { ongc: common.mustCall() });\n+});\n+\n+d = null;\n+global.gc();"
+        }
+    ],
+    "stats": {
+        "total": 49,
+        "additions": 46,
+        "deletions": 3
+    }
+}

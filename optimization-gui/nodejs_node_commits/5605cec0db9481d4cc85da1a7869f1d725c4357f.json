@@ -1,0 +1,84 @@
+{
+    "author": "BridgeAR",
+    "message": "process: add `multipleResolves` event\n\nThis adds the `multipleResolves` event to track promises that resolve\nmore than once or that reject after resolving.\n\nIt is important to expose this to the user to make sure the\napplication runs as expected. Without such warnings it would be very\nhard to debug these situations.\n\nPR-URL: https://github.com/nodejs/node/pull/22218\nFixes: https://github.com/nodejs/promises-debugging/issues/8\nReviewed-By: Matteo Collina <matteo.collina@gmail.com>\nReviewed-By: Benjamin Gruenbaum <benjamingr@gmail.com>\nReviewed-By: Franziska Hinkelmann <franziska.hinkelmann@gmail.com>\nReviewed-By: Anatoli Papirovski <apapirovski@mac.com>",
+    "sha": "5605cec0db9481d4cc85da1a7869f1d725c4357f",
+    "files": [
+        {
+            "sha": "07d9b43b55b8c571e5c9c534451ffe7f689e994d",
+            "filename": "doc/api/process.md",
+            "status": "modified",
+            "additions": 53,
+            "deletions": 0,
+            "changes": 53,
+            "blob_url": "https://github.com/nodejs/node/blob/5605cec0db9481d4cc85da1a7869f1d725c4357f/doc%2Fapi%2Fprocess.md",
+            "raw_url": "https://github.com/nodejs/node/raw/5605cec0db9481d4cc85da1a7869f1d725c4357f/doc%2Fapi%2Fprocess.md",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/doc%2Fapi%2Fprocess.md?ref=5605cec0db9481d4cc85da1a7869f1d725c4357f",
+            "patch": "@@ -97,6 +97,59 @@ the child process.\n The message goes through serialization and parsing. The resulting message might\n not be the same as what is originally sent.\n \n+### Event: 'multipleResolves'\n+<!-- YAML\n+added: REPLACEME\n+-->\n+\n+* `type` {string} The error type. One of `'resolve'` or `'reject'`.\n+* `promise` {Promise} The promise that resolved or rejected more than once.\n+* `value` {any} The value with which the promise was either resolved or\n+  rejected after the original resolve.\n+\n+The `'multipleResolves'` event is emitted whenever a `Promise` has been either:\n+\n+* Resolved more than once.\n+* Rejected more than once.\n+* Rejected after resolve.\n+* Resolved after reject.\n+\n+This is useful for tracking errors in your application while using the promise\n+constructor. Otherwise such mistakes are silently swallowed due to being in a\n+dead zone.\n+\n+It is recommended to end the process on such errors, since the process could be\n+in an undefined state. While using the promise constructor make sure that it is\n+guaranteed to trigger the `resolve()` or `reject()` functions exactly once per\n+call and never call both functions in the same call.\n+\n+```js\n+process.on('multipleResolves', (type, promise, reason) => {\n+  console.error(type, promise, reason);\n+  setImmediate(() => process.exit(1));\n+});\n+\n+async function main() {\n+  try {\n+    return await new Promise((resolve, reject) => {\n+      resolve('First call');\n+      resolve('Swallowed resolve');\n+      reject(new Error('Swallowed reject'));\n+    });\n+  } catch {\n+    throw new Error('Failed');\n+  }\n+}\n+\n+main().then(console.log);\n+// resolve: Promise { 'First call' } 'Swallowed resolve'\n+// reject: Promise { 'First call' } Error: Swallowed reject\n+//     at Promise (*)\n+//     at new Promise (<anonymous>)\n+//     at main (*)\n+// First call\n+```\n+\n ### Event: 'rejectionHandled'\n <!-- YAML\n added: v1.4.1"
+        },
+        {
+            "sha": "695baefefae3e56ac7f2fe5de92881cb8173f85c",
+            "filename": "lib/internal/process/promises.js",
+            "status": "modified",
+            "additions": 28,
+            "deletions": 14,
+            "changes": 42,
+            "blob_url": "https://github.com/nodejs/node/blob/5605cec0db9481d4cc85da1a7869f1d725c4357f/lib%2Finternal%2Fprocess%2Fpromises.js",
+            "raw_url": "https://github.com/nodejs/node/raw/5605cec0db9481d4cc85da1a7869f1d725c4357f/lib%2Finternal%2Fprocess%2Fpromises.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fprocess%2Fpromises.js?ref=5605cec0db9481d4cc85da1a7869f1d725c4357f",
+            "patch": "@@ -6,15 +6,37 @@ const { safeToString } = internalBinding('util');\n const maybeUnhandledPromises = new WeakMap();\n const pendingUnhandledRejections = [];\n const asyncHandledRejections = [];\n+const promiseRejectEvents = {};\n let lastPromiseId = 0;\n \n exports.setup = setupPromises;\n \n function setupPromises(_setupPromises) {\n-  _setupPromises(unhandledRejection, handledRejection);\n+  _setupPromises(handler, promiseRejectEvents);\n   return emitPromiseRejectionWarnings;\n }\n \n+function handler(type, promise, reason) {\n+  switch (type) {\n+    case promiseRejectEvents.kPromiseRejectWithNoHandler:\n+      return unhandledRejection(promise, reason);\n+    case promiseRejectEvents.kPromiseHandlerAddedAfterReject:\n+      return handledRejection(promise);\n+    case promiseRejectEvents.kPromiseResolveAfterResolved:\n+      return resolveError('resolve', promise, reason);\n+    case promiseRejectEvents.kPromiseRejectAfterResolved:\n+      return resolveError('reject', promise, reason);\n+  }\n+}\n+\n+function resolveError(type, promise, reason) {\n+  // We have to wrap this in a next tick. Otherwise the error could be caught by\n+  // the executed promise.\n+  process.nextTick(() => {\n+    process.emit('multipleResolves', type, promise, reason);\n+  });\n+}\n+\n function unhandledRejection(promise, reason) {\n   maybeUnhandledPromises.set(promise, {\n     reason,\n@@ -46,16 +68,6 @@ function handledRejection(promise) {\n \n const unhandledRejectionErrName = 'UnhandledPromiseRejectionWarning';\n function emitWarning(uid, reason) {\n-  try {\n-    if (reason instanceof Error) {\n-      process.emitWarning(reason.stack, unhandledRejectionErrName);\n-    } else {\n-      process.emitWarning(safeToString(reason), unhandledRejectionErrName);\n-    }\n-  } catch (e) {\n-    // ignored\n-  }\n-\n   // eslint-disable-next-line no-restricted-syntax\n   const warning = new Error(\n     'Unhandled promise rejection. This error originated either by ' +\n@@ -67,10 +79,12 @@ function emitWarning(uid, reason) {\n   try {\n     if (reason instanceof Error) {\n       warning.stack = reason.stack;\n+      process.emitWarning(reason.stack, unhandledRejectionErrName);\n+    } else {\n+      process.emitWarning(safeToString(reason), unhandledRejectionErrName);\n     }\n-  } catch (err) {\n-    // ignored\n-  }\n+  } catch {}\n+\n   process.emitWarning(warning);\n   emitDeprecationWarning();\n }"
+        },
+        {
+            "sha": "d6a8d3854ad6ff7d03c651196aa602b8f401364e",
+            "filename": "src/bootstrapper.cc",
+            "status": "modified",
+            "additions": 36,
+            "deletions": 19,
+            "changes": 55,
+            "blob_url": "https://github.com/nodejs/node/blob/5605cec0db9481d4cc85da1a7869f1d725c4357f/src%2Fbootstrapper.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/5605cec0db9481d4cc85da1a7869f1d725c4357f/src%2Fbootstrapper.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fbootstrapper.cc?ref=5605cec0db9481d4cc85da1a7869f1d725c4357f",
+            "patch": "@@ -12,8 +12,13 @@ using v8::Context;\n using v8::Function;\n using v8::FunctionCallbackInfo;\n using v8::Isolate;\n+using v8::kPromiseHandlerAddedAfterReject;\n+using v8::kPromiseRejectAfterResolved;\n+using v8::kPromiseRejectWithNoHandler;\n+using v8::kPromiseResolveAfterResolved;\n using v8::Local;\n using v8::MaybeLocal;\n+using v8::Number;\n using v8::Object;\n using v8::Promise;\n using v8::PromiseRejectEvent;\n@@ -67,34 +72,40 @@ void PromiseRejectCallback(PromiseRejectMessage message) {\n   PromiseRejectEvent event = message.GetEvent();\n \n   Environment* env = Environment::GetCurrent(isolate);\n+\n   if (env == nullptr) return;\n-  Local<Function> callback;\n+\n+  Local<Function> callback = env->promise_handler_function();\n   Local<Value> value;\n+  Local<Value> type = Number::New(env->isolate(), event);\n \n-  if (event == v8::kPromiseRejectWithNoHandler) {\n-    callback = env->promise_reject_unhandled_function();\n+  if (event == kPromiseRejectWithNoHandler) {\n     value = message.GetValue();\n-\n-    if (value.IsEmpty())\n-      value = Undefined(isolate);\n-\n     unhandledRejections++;\n-  } else if (event == v8::kPromiseHandlerAddedAfterReject) {\n-    callback = env->promise_reject_handled_function();\n+    TRACE_COUNTER2(TRACING_CATEGORY_NODE2(promises, rejections),\n+                  \"rejections\",\n+                  \"unhandled\", unhandledRejections,\n+                  \"handledAfter\", rejectionsHandledAfter);\n+  } else if (event == kPromiseHandlerAddedAfterReject) {\n     value = Undefined(isolate);\n-\n     rejectionsHandledAfter++;\n+    TRACE_COUNTER2(TRACING_CATEGORY_NODE2(promises, rejections),\n+                  \"rejections\",\n+                  \"unhandled\", unhandledRejections,\n+                  \"handledAfter\", rejectionsHandledAfter);\n+  } else if (event == kPromiseResolveAfterResolved) {\n+    value = message.GetValue();\n+  } else if (event == kPromiseRejectAfterResolved) {\n+    value = message.GetValue();\n   } else {\n     return;\n   }\n \n-  TRACE_COUNTER2(TRACING_CATEGORY_NODE2(promises, rejections),\n-                 \"rejections\",\n-                 \"unhandled\", unhandledRejections,\n-                 \"handledAfter\", rejectionsHandledAfter);\n-\n+  if (value.IsEmpty()) {\n+    value = Undefined(isolate);\n+  }\n \n-  Local<Value> args[] = { promise, value };\n+  Local<Value> args[] = { type, promise, value };\n   MaybeLocal<Value> ret = callback->Call(env->context(),\n                                          Undefined(isolate),\n                                          arraysize(args),\n@@ -109,11 +120,17 @@ void SetupPromises(const FunctionCallbackInfo<Value>& args) {\n   Isolate* isolate = env->isolate();\n \n   CHECK(args[0]->IsFunction());\n-  CHECK(args[1]->IsFunction());\n+  CHECK(args[1]->IsObject());\n+\n+  Local<Object> constants = args[1].As<Object>();\n+\n+  NODE_DEFINE_CONSTANT(constants, kPromiseRejectWithNoHandler);\n+  NODE_DEFINE_CONSTANT(constants, kPromiseHandlerAddedAfterReject);\n+  NODE_DEFINE_CONSTANT(constants, kPromiseResolveAfterResolved);\n+  NODE_DEFINE_CONSTANT(constants, kPromiseRejectAfterResolved);\n \n   isolate->SetPromiseRejectCallback(PromiseRejectCallback);\n-  env->set_promise_reject_unhandled_function(args[0].As<Function>());\n-  env->set_promise_reject_handled_function(args[1].As<Function>());\n+  env->set_promise_handler_function(args[0].As<Function>());\n }\n \n #define BOOTSTRAP_METHOD(name, fn) env->SetMethod(bootstrapper, #name, fn)"
+        },
+        {
+            "sha": "4db8ae2baa5bfc03b56a6814b9c31e7113dfe5bc",
+            "filename": "src/env.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/nodejs/node/blob/5605cec0db9481d4cc85da1a7869f1d725c4357f/src%2Fenv.h",
+            "raw_url": "https://github.com/nodejs/node/raw/5605cec0db9481d4cc85da1a7869f1d725c4357f/src%2Fenv.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv.h?ref=5605cec0db9481d4cc85da1a7869f1d725c4357f",
+            "patch": "@@ -342,8 +342,7 @@ struct PackageConfig {\n   V(performance_entry_callback, v8::Function)                                 \\\n   V(performance_entry_template, v8::Function)                                 \\\n   V(process_object, v8::Object)                                               \\\n-  V(promise_reject_handled_function, v8::Function)                            \\\n-  V(promise_reject_unhandled_function, v8::Function)                          \\\n+  V(promise_handler_function, v8::Function)                                   \\\n   V(promise_wrap_template, v8::ObjectTemplate)                                \\\n   V(push_values_to_array_function, v8::Function)                              \\\n   V(sab_lifetimepartner_constructor_template, v8::FunctionTemplate)           \\"
+        },
+        {
+            "sha": "d610bb05eb07bce7216db8efc75c02eff1443c4d",
+            "filename": "test/message/unhandled_promise_trace_warnings.out",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/5605cec0db9481d4cc85da1a7869f1d725c4357f/test%2Fmessage%2Funhandled_promise_trace_warnings.out",
+            "raw_url": "https://github.com/nodejs/node/raw/5605cec0db9481d4cc85da1a7869f1d725c4357f/test%2Fmessage%2Funhandled_promise_trace_warnings.out",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fmessage%2Funhandled_promise_trace_warnings.out?ref=5605cec0db9481d4cc85da1a7869f1d725c4357f",
+            "patch": "@@ -34,6 +34,7 @@\n     at *\n (node:*) PromiseRejectionHandledWarning: Promise rejection was handled asynchronously (rejection id: 1)\n     at handledRejection (internal/process/promises.js:*)\n+    at handler (internal/process/promises.js:*)\n     at Promise.then *\n     at Promise.catch *\n     at Immediate.setImmediate (*test*message*unhandled_promise_trace_warnings.js:*)"
+        },
+        {
+            "sha": "144d732c20668b1994e15f3f65e685e5a27c08d2",
+            "filename": "test/parallel/test-promise-swallowed-event.js",
+            "status": "added",
+            "additions": 58,
+            "deletions": 0,
+            "changes": 58,
+            "blob_url": "https://github.com/nodejs/node/blob/5605cec0db9481d4cc85da1a7869f1d725c4357f/test%2Fparallel%2Ftest-promise-swallowed-event.js",
+            "raw_url": "https://github.com/nodejs/node/raw/5605cec0db9481d4cc85da1a7869f1d725c4357f/test%2Fparallel%2Ftest-promise-swallowed-event.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-promise-swallowed-event.js?ref=5605cec0db9481d4cc85da1a7869f1d725c4357f",
+            "patch": "@@ -0,0 +1,58 @@\n+'use strict';\n+\n+const common = require('../common');\n+const assert = require('assert');\n+\n+const rejection = new Error('Swallowed reject');\n+const rejection2 = new TypeError('Weird');\n+const resolveMessage = 'First call';\n+const rejectPromise = new Promise((r) => setTimeout(r, 10, rejection2));\n+const swallowedResolve = 'Swallowed resolve';\n+const swallowedResolve2 = 'Foobar';\n+\n+process.on('multipleResolves', common.mustCall(handler, 4));\n+\n+const p1 = new Promise((resolve, reject) => {\n+  resolve(resolveMessage);\n+  resolve(swallowedResolve);\n+  reject(rejection);\n+});\n+\n+const p2 = new Promise((resolve, reject) => {\n+  reject(rejectPromise);\n+  resolve(swallowedResolve2);\n+  reject(rejection2);\n+}).catch(common.mustCall((exception) => {\n+  assert.strictEqual(exception, rejectPromise);\n+}));\n+\n+const expected = [\n+  'resolve',\n+  p1,\n+  swallowedResolve,\n+  'reject',\n+  p1,\n+  rejection,\n+  'resolve',\n+  p2,\n+  swallowedResolve2,\n+  'reject',\n+  p2,\n+  rejection2\n+];\n+\n+let count = 0;\n+\n+function handler(type, promise, reason) {\n+  assert.strictEqual(type, expected.shift());\n+  // In the first two cases the promise is identical because it's not delayed.\n+  // The other two cases are not identical, because the `promise` is caught in a\n+  // state when it has no knowledge about the `.catch()` handler that is\n+  // attached to it right afterwards.\n+  if (count++ < 2) {\n+    assert.strictEqual(promise, expected.shift());\n+  } else {\n+    assert.notStrictEqual(promise, expected.shift());\n+  }\n+  assert.strictEqual(reason, expected.shift());\n+}"
+        }
+    ],
+    "stats": {
+        "total": 212,
+        "additions": 177,
+        "deletions": 35
+    }
+}

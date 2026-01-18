@@ -1,0 +1,192 @@
+{
+    "author": "apapirovski",
+    "message": "http2: fix several serious bugs\n\nCurrently http2 does not properly submit GOAWAY frames when a session\nis being destroyed. It also doesn't properly handle when the other\nparty severs the connection after sending a GOAWAY frame, even though\nit should.\n\nEdge, IE & Safari are currently unable to handle empty TRAILERS\nframes despite them being correctly to spec. Instead send an empty\nDATA frame with END_STREAM flag in those situations.\n\nFix and adjust several flaky and/or incorrect tests.\n\nPR-URL: https://github.com/nodejs/node/pull/20772\nFixes: https://github.com/nodejs/node/issues/20705\nFixes: https://github.com/nodejs/node/issues/20750\nFixes: https://github.com/nodejs/node/issues/20850\nReviewed-By: Matteo Collina <matteo.collina@gmail.com>\nReviewed-By: Rich Trott <rtrott@gmail.com>\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "b11e19e8eed059ddf473657c28c357987ca0015e",
+    "files": [
+        {
+            "sha": "72233407d6c9e21619a3bce79835a1833f0d69ff",
+            "filename": "doc/api/http2.md",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/nodejs/node/blob/b11e19e8eed059ddf473657c28c357987ca0015e/doc%2Fapi%2Fhttp2.md",
+            "raw_url": "https://github.com/nodejs/node/raw/b11e19e8eed059ddf473657c28c357987ca0015e/doc%2Fapi%2Fhttp2.md",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/doc%2Fapi%2Fhttp2.md?ref=b11e19e8eed059ddf473657c28c357987ca0015e",
+            "patch": "@@ -880,6 +880,10 @@ The `'trailers'` event is emitted when a block of headers associated with\n trailing header fields is received. The listener callback is passed the\n [HTTP/2 Headers Object][] and flags associated with the headers.\n \n+Note that this event might not be emitted if `http2stream.end()` is called\n+before trailers are received and the incoming data is not being read or\n+listened for.\n+\n ```js\n stream.on('trailers', (headers, flags) => {\n   console.log(headers);"
+        },
+        {
+            "sha": "39d456fb75905fb91e90f552bdf13a5ffc38f100",
+            "filename": "lib/internal/http2/core.js",
+            "status": "modified",
+            "additions": 66,
+            "deletions": 44,
+            "changes": 110,
+            "blob_url": "https://github.com/nodejs/node/blob/b11e19e8eed059ddf473657c28c357987ca0015e/lib%2Finternal%2Fhttp2%2Fcore.js",
+            "raw_url": "https://github.com/nodejs/node/raw/b11e19e8eed059ddf473657c28c357987ca0015e/lib%2Finternal%2Fhttp2%2Fcore.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fhttp2%2Fcore.js?ref=b11e19e8eed059ddf473657c28c357987ca0015e",
+            "patch": "@@ -341,20 +341,25 @@ function onStreamClose(code) {\n \n   stream[kState].fd = -1;\n   // Defer destroy we actually emit end.\n-  if (stream._readableState.endEmitted || code !== NGHTTP2_NO_ERROR) {\n+  if (!stream.readable || code !== NGHTTP2_NO_ERROR) {\n     // If errored or ended, we can destroy immediately.\n-    stream[kMaybeDestroy](null, code);\n+    stream[kMaybeDestroy](code);\n   } else {\n     // Wait for end to destroy.\n     stream.on('end', stream[kMaybeDestroy]);\n     // Push a null so the stream can end whenever the client consumes\n     // it completely.\n     stream.push(null);\n-    // If the client hasn't tried to consume the stream and there is no\n-    // resume scheduled (which would indicate they would consume in the future),\n-    // then just dump the incoming data so that the stream can be destroyed.\n-    if (!stream[kState].didRead && !stream._readableState.resumeScheduled)\n+\n+    // If the user hasn't tried to consume the stream (and this is a server\n+    // session) then just dump the incoming data so that the stream can\n+    // be destroyed.\n+    if (stream[kSession][kType] === NGHTTP2_SESSION_SERVER &&\n+        !stream[kState].didRead &&\n+        stream.readableFlowing === null)\n       stream.resume();\n+    else\n+      stream.read(0);\n   }\n }\n \n@@ -379,7 +384,7 @@ function onStreamRead(nread, buf) {\n         `${sessionName(stream[kSession][kType])}]: ending readable.`);\n \n   // defer this until we actually emit end\n-  if (stream._readableState.endEmitted) {\n+  if (!stream.readable) {\n     stream[kMaybeDestroy]();\n   } else {\n     stream.on('end', stream[kMaybeDestroy]);\n@@ -469,8 +474,7 @@ function onGoawayData(code, lastStreamID, buf) {\n     // goaway using NGHTTP2_NO_ERROR because there was no error\n     // condition on this side of the session that caused the\n     // shutdown.\n-    session.destroy(new ERR_HTTP2_SESSION_ERROR(code),\n-                    { errorCode: NGHTTP2_NO_ERROR });\n+    session.destroy(new ERR_HTTP2_SESSION_ERROR(code), NGHTTP2_NO_ERROR);\n   }\n }\n \n@@ -813,6 +817,21 @@ function emitClose(self, error) {\n   self.emit('close');\n }\n \n+function finishSessionDestroy(session, error) {\n+  const socket = session[kSocket];\n+  if (!socket.destroyed)\n+    socket.destroy(error);\n+\n+  session[kProxySocket] = undefined;\n+  session[kSocket] = undefined;\n+  session[kHandle] = undefined;\n+  socket[kSession] = undefined;\n+  socket[kServer] = undefined;\n+\n+  // Finally, emit the close and error events (if necessary) on next tick.\n+  process.nextTick(emitClose, session, error);\n+}\n+\n // Upon creation, the Http2Session takes ownership of the socket. The session\n // may not be ready to use immediately if the socket is not yet fully connected.\n // In that case, the Http2Session will wait for the socket to connect. Once\n@@ -869,6 +888,8 @@ class Http2Session extends EventEmitter {\n \n     this[kState] = {\n       flags: SESSION_FLAGS_PENDING,\n+      goawayCode: null,\n+      goawayLastStreamID: null,\n       streams: new Map(),\n       pendingStreams: new Set(),\n       pendingAck: 0,\n@@ -1171,25 +1192,13 @@ class Http2Session extends EventEmitter {\n     if (handle !== undefined)\n       handle.destroy(code, socket.destroyed);\n \n-    // If there is no error, use setImmediate to destroy the socket on the\n+    // If the socket is alive, use setImmediate to destroy the session on the\n     // next iteration of the event loop in order to give data time to transmit.\n     // Otherwise, destroy immediately.\n-    if (!socket.destroyed) {\n-      if (!error) {\n-        setImmediate(socket.destroy.bind(socket));\n-      } else {\n-        socket.destroy(error);\n-      }\n-    }\n-\n-    this[kProxySocket] = undefined;\n-    this[kSocket] = undefined;\n-    this[kHandle] = undefined;\n-    socket[kSession] = undefined;\n-    socket[kServer] = undefined;\n-\n-    // Finally, emit the close and error events (if necessary) on next tick.\n-    process.nextTick(emitClose, this, error);\n+    if (!socket.destroyed)\n+      setImmediate(finishSessionDestroy, this, error);\n+    else\n+      finishSessionDestroy(this, error);\n   }\n \n   // Closing the session will:\n@@ -1441,11 +1450,8 @@ function afterDoStreamWrite(status, handle) {\n }\n \n function streamOnResume() {\n-  if (!this.destroyed && !this.pending) {\n-    if (!this[kState].didRead)\n-      this[kState].didRead = true;\n+  if (!this.destroyed)\n     this[kHandle].readStart();\n-  }\n }\n \n function streamOnPause() {\n@@ -1460,6 +1466,16 @@ function afterShutdown() {\n     stream[kMaybeDestroy]();\n }\n \n+function finishSendTrailers(stream, headersList) {\n+  stream[kState].flags &= ~STREAM_FLAGS_HAS_TRAILERS;\n+\n+  const ret = stream[kHandle].trailers(headersList);\n+  if (ret < 0)\n+    stream.destroy(new NghttpError(ret));\n+  else\n+    stream[kMaybeDestroy]();\n+}\n+\n function closeStream(stream, code, shouldSubmitRstStream = true) {\n   const state = stream[kState];\n   state.flags |= STREAM_FLAGS_CLOSED;\n@@ -1521,6 +1537,10 @@ class Http2Stream extends Duplex {\n     this[kSession] = session;\n     session[kState].pendingStreams.add(this);\n \n+    // Allow our logic for determining whether any reads have happened to\n+    // work in all situations. This is similar to what we do in _http_incoming.\n+    this._readableState.readingMore = true;\n+\n     this[kTimeout] = null;\n \n     this[kState] = {\n@@ -1531,7 +1551,6 @@ class Http2Stream extends Duplex {\n       trailersReady: false\n     };\n \n-    this.on('resume', streamOnResume);\n     this.on('pause', streamOnPause);\n   }\n \n@@ -1725,6 +1744,10 @@ class Http2Stream extends Duplex {\n       this.push(null);\n       return;\n     }\n+    if (!this[kState].didRead) {\n+      this._readableState.readingMore = false;\n+      this[kState].didRead = true;\n+    }\n     if (!this.pending) {\n       streamOnResume.call(this);\n     } else {\n@@ -1773,13 +1796,8 @@ class Http2Stream extends Duplex {\n       throw headersList;\n     this[kSentTrailers] = headers;\n \n-    this[kState].flags &= ~STREAM_FLAGS_HAS_TRAILERS;\n-\n-    const ret = this[kHandle].trailers(headersList);\n-    if (ret < 0)\n-      this.destroy(new NghttpError(ret));\n-    else\n-      this[kMaybeDestroy]();\n+    // Send the trailers in setImmediate so we don't do it on nghttp2 stack.\n+    setImmediate(finishSendTrailers, this, headersList);\n   }\n \n   get closed() {\n@@ -1866,15 +1884,15 @@ class Http2Stream extends Duplex {\n   }\n   // The Http2Stream can be destroyed if it has closed and if the readable\n   // side has received the final chunk.\n-  [kMaybeDestroy](error, code = NGHTTP2_NO_ERROR) {\n-    if (error || code !== NGHTTP2_NO_ERROR) {\n-      this.destroy(error);\n+  [kMaybeDestroy](code = NGHTTP2_NO_ERROR) {\n+    if (code !== NGHTTP2_NO_ERROR) {\n+      this.destroy();\n       return;\n     }\n \n     // TODO(mcollina): remove usage of _*State properties\n-    if (this._writableState.ended && this._writableState.pendingcb === 0) {\n-      if (this._readableState.ended && this.closed) {\n+    if (!this.writable) {\n+      if (!this.readable && this.closed) {\n         this.destroy();\n         return;\n       }\n@@ -1887,7 +1905,7 @@ class Http2Stream extends Duplex {\n           this[kSession][kType] === NGHTTP2_SESSION_SERVER &&\n           !(state.flags & STREAM_FLAGS_HAS_TRAILERS) &&\n           !state.didRead &&\n-          !this._readableState.resumeScheduled) {\n+          this.readableFlowing === null) {\n         this.close();\n       }\n     }\n@@ -2477,6 +2495,10 @@ Object.defineProperty(Http2Session.prototype, 'setTimeout', setTimeout);\n function socketOnError(error) {\n   const session = this[kSession];\n   if (session !== undefined) {\n+    // We can ignore ECONNRESET after GOAWAY was received as there's nothing\n+    // we can do and the other side is fully within its rights to do so.\n+    if (error.code === 'ECONNRESET' && session[kState].goawayCode !== null)\n+      return session.destroy();\n     debug(`Http2Session ${sessionName(session[kType])}: socket error [` +\n           `${error.message}]`);\n     session.destroy(error);"
+        },
+        {
+            "sha": "4745707f9ac345d0b17a384b317d3402d7060af1",
+            "filename": "src/node_http2.cc",
+            "status": "modified",
+            "additions": 33,
+            "deletions": 17,
+            "changes": 50,
+            "blob_url": "https://github.com/nodejs/node/blob/b11e19e8eed059ddf473657c28c357987ca0015e/src%2Fnode_http2.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/b11e19e8eed059ddf473657c28c357987ca0015e/src%2Fnode_http2.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_http2.cc?ref=b11e19e8eed059ddf473657c28c357987ca0015e",
+            "patch": "@@ -577,26 +577,28 @@ void Http2Session::EmitStatistics() {\n void Http2Session::Close(uint32_t code, bool socket_closed) {\n   DEBUG_HTTP2SESSION(this, \"closing session\");\n \n-  if (flags_ & SESSION_STATE_CLOSED)\n+  if (flags_ & SESSION_STATE_CLOSING)\n     return;\n-  flags_ |= SESSION_STATE_CLOSED;\n+  flags_ |= SESSION_STATE_CLOSING;\n \n   // Stop reading on the i/o stream\n   if (stream_ != nullptr)\n     stream_->ReadStop();\n \n   // If the socket is not closed, then attempt to send a closing GOAWAY\n   // frame. There is no guarantee that this GOAWAY will be received by\n-  // the peer but the HTTP/2 spec recommends sendinng it anyway. We'll\n+  // the peer but the HTTP/2 spec recommends sending it anyway. We'll\n   // make a best effort.\n   if (!socket_closed) {\n-    Http2Scope h2scope(this);\n     DEBUG_HTTP2SESSION2(this, \"terminating session with code %d\", code);\n     CHECK_EQ(nghttp2_session_terminate_session(session_, code), 0);\n+    SendPendingData();\n   } else if (stream_ != nullptr) {\n     stream_->RemoveStreamListener(this);\n   }\n \n+  flags_ |= SESSION_STATE_CLOSED;\n+\n   // If there are outstanding pings, those will need to be canceled, do\n   // so on the next iteration of the event loop to avoid calling out into\n   // javascript since this may be called during garbage collection.\n@@ -1355,25 +1357,32 @@ void Http2Session::MaybeScheduleWrite() {\n   }\n }\n \n+void Http2Session::MaybeStopReading() {\n+  int want_read = nghttp2_session_want_read(session_);\n+  DEBUG_HTTP2SESSION2(this, \"wants read? %d\", want_read);\n+  if (want_read == 0)\n+    stream_->ReadStop();\n+}\n+\n // Unset the sending state, finish up all current writes, and reset\n // storage for data and metadata that was associated with these writes.\n void Http2Session::ClearOutgoing(int status) {\n   CHECK_NE(flags_ & SESSION_STATE_SENDING, 0);\n \n+  flags_ &= ~SESSION_STATE_SENDING;\n+\n   if (outgoing_buffers_.size() > 0) {\n     outgoing_storage_.clear();\n \n-    for (const nghttp2_stream_write& wr : outgoing_buffers_) {\n+    std::vector<nghttp2_stream_write> current_outgoing_buffers_;\n+    current_outgoing_buffers_.swap(outgoing_buffers_);\n+    for (const nghttp2_stream_write& wr : current_outgoing_buffers_) {\n       WriteWrap* wrap = wr.req_wrap;\n       if (wrap != nullptr)\n         wrap->Done(status);\n     }\n-\n-    outgoing_buffers_.clear();\n   }\n \n-  flags_ &= ~SESSION_STATE_SENDING;\n-\n   // Now that we've finished sending queued data, if there are any pending\n   // RstStreams we should try sending again and then flush them one by one.\n   if (pending_rst_streams_.size() > 0) {\n@@ -1484,8 +1493,7 @@ uint8_t Http2Session::SendPendingData() {\n     ClearOutgoing(res.err);\n   }\n \n-  DEBUG_HTTP2SESSION2(this, \"wants data in return? %d\",\n-                      nghttp2_session_want_read(session_));\n+  MaybeStopReading();\n \n   return 0;\n }\n@@ -1618,8 +1626,7 @@ void Http2Session::OnStreamRead(ssize_t nread, const uv_buf_t& buf) {\n       };\n       MakeCallback(env()->error_string(), arraysize(argv), argv);\n     } else {\n-      DEBUG_HTTP2SESSION2(this, \"processed %d bytes. wants more? %d\", ret,\n-                          nghttp2_session_want_read(session_));\n+      MaybeStopReading();\n     }\n   }\n \n@@ -1814,6 +1821,7 @@ void Http2Stream::OnTrailers() {\n   HandleScope scope(isolate);\n   Local<Context> context = env()->context();\n   Context::Scope context_scope(context);\n+  flags_ &= ~NGHTTP2_STREAM_FLAG_TRAILERS;\n   MakeCallback(env()->ontrailers_string(), 0, nullptr);\n }\n \n@@ -1822,7 +1830,16 @@ int Http2Stream::SubmitTrailers(nghttp2_nv* nva, size_t len) {\n   CHECK(!this->IsDestroyed());\n   Http2Scope h2scope(this);\n   DEBUG_HTTP2STREAM2(this, \"sending %d trailers\", len);\n-  int ret = nghttp2_submit_trailer(**session_, id_, nva, len);\n+  int ret;\n+  // Sending an empty trailers frame poses problems in Safari, Edge & IE.\n+  // Instead we can just send an empty data frame with NGHTTP2_FLAG_END_STREAM\n+  // to indicate that the stream is ready to be closed.\n+  if (len == 0) {\n+    Http2Stream::Provider::Stream prov(this, 0);\n+    ret = nghttp2_submit_data(**session_, NGHTTP2_FLAG_END_STREAM, id_, *prov);\n+  } else {\n+    ret = nghttp2_submit_trailer(**session_, id_, nva, len);\n+  }\n   CHECK_NE(ret, NGHTTP2_ERR_NOMEM);\n   return ret;\n }\n@@ -2351,8 +2368,7 @@ void Http2Stream::Info(const FunctionCallbackInfo<Value>& args) {\n \n   Headers list(isolate, context, headers);\n   args.GetReturnValue().Set(stream->SubmitInfo(*list, list.length()));\n-  DEBUG_HTTP2STREAM2(stream, \"%d informational headers sent\",\n-                     headers->Length());\n+  DEBUG_HTTP2STREAM2(stream, \"%d informational headers sent\", list.length());\n }\n \n // Submits trailing headers on the Http2Stream\n@@ -2367,7 +2383,7 @@ void Http2Stream::Trailers(const FunctionCallbackInfo<Value>& args) {\n \n   Headers list(isolate, context, headers);\n   args.GetReturnValue().Set(stream->SubmitTrailers(*list, list.length()));\n-  DEBUG_HTTP2STREAM2(stream, \"%d trailing headers sent\", headers->Length());\n+  DEBUG_HTTP2STREAM2(stream, \"%d trailing headers sent\", list.length());\n }\n \n // Grab the numeric id of the Http2Stream"
+        },
+        {
+            "sha": "043449624fb120070d8342a466f50a88de03d892",
+            "filename": "src/node_http2.h",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 2,
+            "changes": 8,
+            "blob_url": "https://github.com/nodejs/node/blob/b11e19e8eed059ddf473657c28c357987ca0015e/src%2Fnode_http2.h",
+            "raw_url": "https://github.com/nodejs/node/raw/b11e19e8eed059ddf473657c28c357987ca0015e/src%2Fnode_http2.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_http2.h?ref=b11e19e8eed059ddf473657c28c357987ca0015e",
+            "patch": "@@ -433,7 +433,8 @@ enum session_state_flags {\n   SESSION_STATE_HAS_SCOPE = 0x1,\n   SESSION_STATE_WRITE_SCHEDULED = 0x2,\n   SESSION_STATE_CLOSED = 0x4,\n-  SESSION_STATE_SENDING = 0x8,\n+  SESSION_STATE_CLOSING = 0x8,\n+  SESSION_STATE_SENDING = 0x10,\n };\n \n // This allows for 4 default-sized frames with their frame headers\n@@ -619,7 +620,7 @@ class Http2Stream : public AsyncWrap,\n \n   inline bool IsClosed() const {\n     return flags_ & NGHTTP2_STREAM_FLAG_CLOSED;\n-    }\n+  }\n \n   inline bool HasTrailers() const {\n     return flags_ & NGHTTP2_STREAM_FLAG_TRAILERS;\n@@ -827,6 +828,9 @@ class Http2Session : public AsyncWrap, public StreamListener {\n   // Schedule a write if nghttp2 indicates it wants to write to the socket.\n   void MaybeScheduleWrite();\n \n+  // Stop reading if nghttp2 doesn't want to anymore.\n+  void MaybeStopReading();\n+\n   // Returns pointer to the stream, or nullptr if stream does not exist\n   inline Http2Stream* FindStream(int32_t id);\n "
+        },
+        {
+            "sha": "899e6adfac060da35ba659d7c0f89d7e014648f1",
+            "filename": "test/parallel/parallel.status",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 6,
+            "changes": 6,
+            "blob_url": "https://github.com/nodejs/node/blob/b11e19e8eed059ddf473657c28c357987ca0015e/test%2Fparallel%2Fparallel.status",
+            "raw_url": "https://github.com/nodejs/node/raw/b11e19e8eed059ddf473657c28c357987ca0015e/test%2Fparallel%2Fparallel.status",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Fparallel.status?ref=b11e19e8eed059ddf473657c28c357987ca0015e",
+            "patch": "@@ -8,12 +8,6 @@ prefix parallel\n # Postmortem debugging data is prone to accidental removal during V8 updates.\n test-postmortem-metadata: PASS,FLAKY\n \n-# http2 has a few bugs that make these tests flaky and that are currently worked\n-# on.\n-test-http2-client-upload-reject: PASS,FLAKY\n-test-http2-pipe: PASS,FLAKY\n-test-http2-client-upload: PASS,FLAKY\n-\n [$system==win32]\n \n [$system==linux]"
+        },
+        {
+            "sha": "43fc6819e21f7a211e7b764550c208f92d3500a5",
+            "filename": "test/parallel/test-http2-client-destroy.js",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 7,
+            "changes": 8,
+            "blob_url": "https://github.com/nodejs/node/blob/b11e19e8eed059ddf473657c28c357987ca0015e/test%2Fparallel%2Ftest-http2-client-destroy.js",
+            "raw_url": "https://github.com/nodejs/node/raw/b11e19e8eed059ddf473657c28c357987ca0015e/test%2Fparallel%2Ftest-http2-client-destroy.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-http2-client-destroy.js?ref=b11e19e8eed059ddf473657c28c357987ca0015e",
+            "patch": "@@ -109,20 +109,14 @@ const Countdown = require('../common/countdown');\n \n   server.listen(0, common.mustCall(() => {\n     const client = h2.connect(`http://localhost:${server.address().port}`);\n-    // On some platforms (e.g. windows), an ECONNRESET may occur at this\n-    // point -- or it may not. Do not make this a mustCall\n-    client.on('error', () => {});\n \n     client.on('close', () => {\n       server.close();\n       // calling destroy in here should not matter\n       client.destroy();\n     });\n \n-    const req = client.request();\n-    // On some platforms (e.g. windows), an ECONNRESET may occur at this\n-    // point -- or it may not. Do not make this a mustCall\n-    req.on('error', () => {});\n+    client.request();\n   }));\n }\n "
+        },
+        {
+            "sha": "87bc21df48aa2c0388c5fba82069b3cb27e5c677",
+            "filename": "test/parallel/test-http2-no-wanttrailers-listener.js",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 4,
+            "changes": 5,
+            "blob_url": "https://github.com/nodejs/node/blob/b11e19e8eed059ddf473657c28c357987ca0015e/test%2Fparallel%2Ftest-http2-no-wanttrailers-listener.js",
+            "raw_url": "https://github.com/nodejs/node/raw/b11e19e8eed059ddf473657c28c357987ca0015e/test%2Fparallel%2Ftest-http2-no-wanttrailers-listener.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-http2-no-wanttrailers-listener.js?ref=b11e19e8eed059ddf473657c28c357987ca0015e",
+            "patch": "@@ -3,7 +3,6 @@\n const common = require('../common');\n if (!common.hasCrypto)\n   common.skip('missing crypto');\n-const assert = require('assert');\n const h2 = require('http2');\n \n const server = h2.createServer();\n@@ -25,9 +24,7 @@ server.on('listening', common.mustCall(function() {\n   const client = h2.connect(`http://localhost:${this.address().port}`);\n   const req = client.request();\n   req.resume();\n-  req.on('trailers', common.mustCall((headers) => {\n-    assert.strictEqual(Object.keys(headers).length, 0);\n-  }));\n+  req.on('trailers', common.mustNotCall());\n   req.on('close', common.mustCall(() => {\n     server.close();\n     client.close();"
+        },
+        {
+            "sha": "f822d8a4a92d7816b409c24ef0936e64729769e3",
+            "filename": "test/parallel/test-http2-server-close-callback.js",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 8,
+            "changes": 19,
+            "blob_url": "https://github.com/nodejs/node/blob/b11e19e8eed059ddf473657c28c357987ca0015e/test%2Fparallel%2Ftest-http2-server-close-callback.js",
+            "raw_url": "https://github.com/nodejs/node/raw/b11e19e8eed059ddf473657c28c357987ca0015e/test%2Fparallel%2Ftest-http2-server-close-callback.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-http2-server-close-callback.js?ref=b11e19e8eed059ddf473657c28c357987ca0015e",
+            "patch": "@@ -4,21 +4,24 @@ const common = require('../common');\n if (!common.hasCrypto)\n   common.skip('missing crypto');\n \n+const Countdown = require('../common/countdown');\n const http2 = require('http2');\n \n const server = http2.createServer();\n \n+let session;\n+\n+const countdown = new Countdown(2, () => {\n+  server.close(common.mustCall());\n+  session.destroy();\n+});\n+\n server.listen(0, common.mustCall(() => {\n   const client = http2.connect(`http://localhost:${server.address().port}`);\n-  client.on('error', (err) => {\n-    if (err.code !== 'ECONNRESET')\n-      throw err;\n-  });\n+  client.on('connect', common.mustCall(() => countdown.dec()));\n }));\n \n server.on('session', common.mustCall((s) => {\n-  setImmediate(() => {\n-    server.close(common.mustCall());\n-    s.destroy();\n-  });\n+  session = s;\n+  countdown.dec();\n }));"
+        },
+        {
+            "sha": "c50352fcc35c28aa032ccd193906917664bf13be",
+            "filename": "test/parallel/test-http2-server-sessionerror.js",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 5,
+            "changes": 13,
+            "blob_url": "https://github.com/nodejs/node/blob/b11e19e8eed059ddf473657c28c357987ca0015e/test%2Fparallel%2Ftest-http2-server-sessionerror.js",
+            "raw_url": "https://github.com/nodejs/node/raw/b11e19e8eed059ddf473657c28c357987ca0015e/test%2Fparallel%2Ftest-http2-server-sessionerror.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-http2-server-sessionerror.js?ref=b11e19e8eed059ddf473657c28c357987ca0015e",
+            "patch": "@@ -35,14 +35,17 @@ server.on('session', common.mustCall((session) => {\n server.listen(0, common.mustCall(() => {\n   const url = `http://localhost:${server.address().port}`;\n   http2.connect(url)\n-    // An ECONNRESET error may occur depending on the platform (due largely\n-    // to differences in the timing of socket closing). Do not wrap this in\n-    // a common must call.\n-    .on('error', () => {})\n+    .on('error', common.expectsError({\n+      code: 'ERR_HTTP2_SESSION_ERROR',\n+      message: 'Session closed with error code 2',\n+    }))\n     .on('close', () => {\n       server.removeAllListeners('error');\n       http2.connect(url)\n-        .on('error', () => {})\n+        .on('error', common.expectsError({\n+          code: 'ERR_HTTP2_SESSION_ERROR',\n+          message: 'Session closed with error code 2',\n+        }))\n         .on('close', () => server.close());\n     });\n }));"
+        },
+        {
+            "sha": "9dde6660ea25cec17a8d12fb5926d283b89a332b",
+            "filename": "test/parallel/test-http2-server-shutdown-options-errors.js",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 6,
+            "changes": 6,
+            "blob_url": "https://github.com/nodejs/node/blob/b11e19e8eed059ddf473657c28c357987ca0015e/test%2Fparallel%2Ftest-http2-server-shutdown-options-errors.js",
+            "raw_url": "https://github.com/nodejs/node/raw/b11e19e8eed059ddf473657c28c357987ca0015e/test%2Fparallel%2Ftest-http2-server-shutdown-options-errors.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-http2-server-shutdown-options-errors.js?ref=b11e19e8eed059ddf473657c28c357987ca0015e",
+            "patch": "@@ -55,13 +55,7 @@ server.listen(\n   0,\n   common.mustCall(() => {\n     const client = http2.connect(`http://localhost:${server.address().port}`);\n-    // On certain operating systems, an ECONNRESET may occur. We do not need\n-    // to test for it here. Do not make this a mustCall\n-    client.on('error', () => {});\n     const req = client.request();\n-    // On certain operating systems, an ECONNRESET may occur. We do not need\n-    // to test for it here. Do not make this a mustCall\n-    req.on('error', () => {});\n     req.resume();\n     req.on('close', common.mustCall(() => {\n       client.close();"
+        },
+        {
+            "sha": "99595aeb63004d5c157781162d6d55bdc667ff9b",
+            "filename": "test/parallel/test-http2-server-socket-destroy.js",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 2,
+            "changes": 10,
+            "blob_url": "https://github.com/nodejs/node/blob/b11e19e8eed059ddf473657c28c357987ca0015e/test%2Fparallel%2Ftest-http2-server-socket-destroy.js",
+            "raw_url": "https://github.com/nodejs/node/raw/b11e19e8eed059ddf473657c28c357987ca0015e/test%2Fparallel%2Ftest-http2-server-socket-destroy.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-http2-server-socket-destroy.js?ref=b11e19e8eed059ddf473657c28c357987ca0015e",
+            "patch": "@@ -41,14 +41,20 @@ server.on('listening', common.mustCall(() => {\n   // The client may have an ECONNRESET error here depending on the operating\n   // system, due mainly to differences in the timing of socket closing. Do\n   // not wrap this in a common mustCall.\n-  client.on('error', () => {});\n+  client.on('error', (err) => {\n+    if (err.code !== 'ECONNRESET')\n+      throw err;\n+  });\n   client.on('close', common.mustCall());\n \n   const req = client.request({ ':method': 'POST' });\n   // The client may have an ECONNRESET error here depending on the operating\n   // system, due mainly to differences in the timing of socket closing. Do\n   // not wrap this in a common mustCall.\n-  req.on('error', () => {});\n+  req.on('error', (err) => {\n+    if (err.code !== 'ECONNRESET')\n+      throw err;\n+  });\n \n   req.on('aborted', common.mustCall());\n   req.resume();"
+        },
+        {
+            "sha": "6a262e2736e4bcb16cc16387f6d91263726bb9e9",
+            "filename": "test/parallel/test-http2-server-stream-session-destroy.js",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 8,
+            "changes": 8,
+            "blob_url": "https://github.com/nodejs/node/blob/b11e19e8eed059ddf473657c28c357987ca0015e/test%2Fparallel%2Ftest-http2-server-stream-session-destroy.js",
+            "raw_url": "https://github.com/nodejs/node/raw/b11e19e8eed059ddf473657c28c357987ca0015e/test%2Fparallel%2Ftest-http2-server-stream-session-destroy.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-http2-server-stream-session-destroy.js?ref=b11e19e8eed059ddf473657c28c357987ca0015e",
+            "patch": "@@ -44,16 +44,8 @@ server.on('stream', common.mustCall((stream) => {\n \n server.listen(0, common.mustCall(() => {\n   const client = h2.connect(`http://localhost:${server.address().port}`);\n-  client.on('error', (err) => {\n-    if (err.code !== 'ECONNRESET')\n-      throw err;\n-  });\n   const req = client.request();\n   req.resume();\n   req.on('end', common.mustCall());\n   req.on('close', common.mustCall(() => server.close(common.mustCall())));\n-  req.on('error', (err) => {\n-    if (err.code !== 'ECONNRESET')\n-      throw err;\n-  });\n }));"
+        },
+        {
+            "sha": "88fc4eab2e08c07ed10d1c17e10a7a5f00ec3e7f",
+            "filename": "test/parallel/test-http2-server-timeout.js",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 8,
+            "changes": 10,
+            "blob_url": "https://github.com/nodejs/node/blob/b11e19e8eed059ddf473657c28c357987ca0015e/test%2Fparallel%2Ftest-http2-server-timeout.js",
+            "raw_url": "https://github.com/nodejs/node/raw/b11e19e8eed059ddf473657c28c357987ca0015e/test%2Fparallel%2Ftest-http2-server-timeout.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-http2-server-timeout.js?ref=b11e19e8eed059ddf473657c28c357987ca0015e",
+            "patch": "@@ -6,10 +6,10 @@ if (!common.hasCrypto)\n const http2 = require('http2');\n \n const server = http2.createServer();\n-server.setTimeout(common.platformTimeout(1));\n+server.setTimeout(common.platformTimeout(50));\n \n const onServerTimeout = common.mustCall((session) => {\n-  session.close(() => session.destroy());\n+  session.close();\n });\n \n server.on('stream', common.mustNotCall());\n@@ -18,14 +18,8 @@ server.once('timeout', onServerTimeout);\n server.listen(0, common.mustCall(() => {\n   const url = `http://localhost:${server.address().port}`;\n   const client = http2.connect(url);\n-  // Because of the timeout, an ECONNRESET error may or may not happen here.\n-  // Keep this as a non-op and do not use common.mustCall()\n-  client.on('error', () => {});\n   client.on('close', common.mustCall(() => {\n     const client2 = http2.connect(url);\n-    // Because of the timeout, an ECONNRESET error may or may not happen here.\n-    // Keep this as a non-op and do not use common.mustCall()\n-    client2.on('error', () => {});\n     client2.on('close', common.mustCall(() => server.close()));\n   }));\n }));"
+        },
+        {
+            "sha": "acfd73ada6841639e4b4ce5bd082cb1fccc3fb72",
+            "filename": "test/parallel/test-http2-too-many-settings.js",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 3,
+            "changes": 7,
+            "blob_url": "https://github.com/nodejs/node/blob/b11e19e8eed059ddf473657c28c357987ca0015e/test%2Fparallel%2Ftest-http2-too-many-settings.js",
+            "raw_url": "https://github.com/nodejs/node/raw/b11e19e8eed059ddf473657c28c357987ca0015e/test%2Fparallel%2Ftest-http2-too-many-settings.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-http2-too-many-settings.js?ref=b11e19e8eed059ddf473657c28c357987ca0015e",
+            "patch": "@@ -29,9 +29,10 @@ function doTest(session) {\n \n   server.listen(0, common.mustCall(() => {\n     const client = h2.connect(`http://localhost:${server.address().port}`);\n-    // On some operating systems, an ECONNRESET error may be emitted.\n-    // On others it won't be. Do not make this a mustCall\n-    client.on('error', () => {});\n+    client.on('error', common.expectsError({\n+      code: 'ERR_HTTP2_SESSION_ERROR',\n+      message: 'Session closed with error code 2',\n+    }));\n     client.on('close', common.mustCall(() => server.close()));\n   }));\n }"
+        },
+        {
+            "sha": "bdc0931157ad582e3c409c453ce6b29a4e1f6206",
+            "filename": "test/parallel/test-http2-trailers.js",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/nodejs/node/blob/b11e19e8eed059ddf473657c28c357987ca0015e/test%2Fparallel%2Ftest-http2-trailers.js",
+            "raw_url": "https://github.com/nodejs/node/raw/b11e19e8eed059ddf473657c28c357987ca0015e/test%2Fparallel%2Ftest-http2-trailers.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-http2-trailers.js?ref=b11e19e8eed059ddf473657c28c357987ca0015e",
+            "patch": "@@ -18,6 +18,7 @@ server.on('stream', common.mustCall(onStream));\n function onStream(stream, headers, flags) {\n   stream.on('trailers', common.mustCall((headers) => {\n     assert.strictEqual(headers[trailerKey], trailerValue);\n+    stream.end(body);\n   }));\n   stream.respond({\n     'content-type': 'text/html',\n@@ -41,8 +42,6 @@ function onStream(stream, headers, flags) {\n       type: Error\n     }\n   );\n-\n-  stream.end(body);\n }\n \n server.listen(0);"
+        }
+    ],
+    "stats": {
+        "total": 267,
+        "additions": 145,
+        "deletions": 122
+    }
+}

@@ -1,0 +1,120 @@
+{
+    "author": "AndrewKushnir",
+    "message": "perf(core): make DI decorators tree-shakable when used for `useFactory` deps config (#40145)\n\nThis commit updates the logic that calculates `useFactory` function arguments to avoid relying on `instanceof`\nchecks (thus always retaining symbols) and relies on flags that DI decorators contain (as a monkey-patched property).\n\nAnother perf benefit is having less megamorphic reads while calculating args for the `useFactory` call: we used to\ncheck whether a token has `ngMetadataName` property 4 times (in worst case), now we have just 1 megamorphic read in\nall cases.\n\nCloses #40143.\n\nPR Close #40145",
+    "sha": "6cff877f4f48cfe8460b0262d04ea333b79dd56a",
+    "files": [
+        {
+            "sha": "115a93cfbdac6d0f955d6b26602ac5918e594390",
+            "filename": "goldens/public-api/core/core.d.ts",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/angular/angular/blob/6cff877f4f48cfe8460b0262d04ea333b79dd56a/goldens%2Fpublic-api%2Fcore%2Fcore.d.ts",
+            "raw_url": "https://github.com/angular/angular/raw/6cff877f4f48cfe8460b0262d04ea333b79dd56a/goldens%2Fpublic-api%2Fcore%2Fcore.d.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/goldens%2Fpublic-api%2Fcore%2Fcore.d.ts?ref=6cff877f4f48cfe8460b0262d04ea333b79dd56a",
+            "patch": "@@ -838,11 +838,11 @@ export declare interface RendererType2 {\n }\n \n export declare class ResolvedReflectiveFactory {\n-    dependencies: ɵangular_packages_core_core_d[];\n+    dependencies: ɵangular_packages_core_core_e[];\n     factory: Function;\n     constructor(\n     factory: Function,\n-    dependencies: ɵangular_packages_core_core_d[]);\n+    dependencies: ɵangular_packages_core_core_e[]);\n }\n \n export declare interface ResolvedReflectiveProvider {"
+        },
+        {
+            "sha": "8dc6e32116bc022bad7eb74c0a1ca21a29dc28f5",
+            "filename": "packages/core/src/di/injector_compatibility.ts",
+            "status": "modified",
+            "additions": 40,
+            "deletions": 13,
+            "changes": 53,
+            "blob_url": "https://github.com/angular/angular/blob/6cff877f4f48cfe8460b0262d04ea333b79dd56a/packages%2Fcore%2Fsrc%2Fdi%2Finjector_compatibility.ts",
+            "raw_url": "https://github.com/angular/angular/raw/6cff877f4f48cfe8460b0262d04ea333b79dd56a/packages%2Fcore%2Fsrc%2Fdi%2Finjector_compatibility.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcore%2Fsrc%2Fdi%2Finjector_compatibility.ts?ref=6cff877f4f48cfe8460b0262d04ea333b79dd56a",
+            "patch": "@@ -16,14 +16,20 @@ import {resolveForwardRef} from './forward_ref';\n import {getInjectImplementation, injectRootLimpMode} from './inject_switch';\n import {InjectionToken} from './injection_token';\n import {Injector} from './injector';\n-import {InjectFlags} from './interface/injector';\n+import {DecoratorFlags, InjectFlags, InternalInjectFlags} from './interface/injector';\n import {ValueProvider} from './interface/provider';\n-import {Host, Inject, Optional, Self, SkipSelf} from './metadata';\n \n \n const _THROW_IF_NOT_FOUND = {};\n export const THROW_IF_NOT_FOUND = _THROW_IF_NOT_FOUND;\n \n+/*\n+ * Name of a property (that we patch onto DI decorator), which is used as an annotation of which\n+ * InjectFlag this decorator represents. This allows to avoid direct references to the DI decorators\n+ * in the code, thus making them tree-shakable.\n+ */\n+const DI_DECORATOR_FLAG = '__NG_DI_FLAG__';\n+\n export const NG_TEMP_TOKEN_PATH = 'ngTempTokenPath';\n const NG_TOKEN_PATH = 'ngTokenPath';\n const NEW_LINE = /\\n/gm;\n@@ -145,17 +151,14 @@ export function injectArgs(types: (Type<any>|InjectionToken<any>|any[])[]): any[\n \n       for (let j = 0; j < arg.length; j++) {\n         const meta = arg[j];\n-        if (meta instanceof Optional || meta.ngMetadataName === 'Optional' || meta === Optional) {\n-          flags |= InjectFlags.Optional;\n-        } else if (\n-            meta instanceof SkipSelf || meta.ngMetadataName === 'SkipSelf' || meta === SkipSelf) {\n-          flags |= InjectFlags.SkipSelf;\n-        } else if (meta instanceof Self || meta.ngMetadataName === 'Self' || meta === Self) {\n-          flags |= InjectFlags.Self;\n-        } else if (meta instanceof Host || meta.ngMetadataName === 'Host' || meta === Host) {\n-          flags |= InjectFlags.Host;\n-        } else if (meta instanceof Inject || meta === Inject) {\n-          type = meta.token;\n+        const flag = getInjectFlag(meta);\n+        if (typeof flag === 'number') {\n+          // Special case when we handle @Inject decorator.\n+          if (flag === DecoratorFlags.Inject) {\n+            type = meta.token;\n+          } else {\n+            flags |= flag;\n+          }\n         } else {\n           type = meta;\n         }\n@@ -169,6 +172,30 @@ export function injectArgs(types: (Type<any>|InjectionToken<any>|any[])[]): any[\n   return args;\n }\n \n+/**\n+ * Attaches a given InjectFlag to a given decorator using monkey-patching.\n+ * Since DI decorators can be used in providers `deps` array (when provider is configured using\n+ * `useFactory`) without initialization (e.g. `Host`) and as an instance (e.g. `new Host()`), we\n+ * attach the flag to make it available both as a static property and as a field on decorator\n+ * instance.\n+ *\n+ * @param decorator Provided DI decorator.\n+ * @param flag InjectFlag that should be applied.\n+ */\n+export function attachInjectFlag(decorator: any, flag: InternalInjectFlags|DecoratorFlags): any {\n+  decorator[DI_DECORATOR_FLAG] = flag;\n+  decorator.prototype[DI_DECORATOR_FLAG] = flag;\n+  return decorator;\n+}\n+\n+/**\n+ * Reads monkey-patched property that contains InjectFlag attached to a decorator.\n+ *\n+ * @param token Token that may contain monkey-patched DI flags property.\n+ */\n+export function getInjectFlag(token: any): number|undefined {\n+  return token[DI_DECORATOR_FLAG];\n+}\n \n export function catchInjectorError(\n     e: any, token: any, injectorErrorName: string, source: string|null): never {"
+        },
+        {
+            "sha": "7d11dd5980505fb46743e29c6bba6a92a59c6b43",
+            "filename": "packages/core/src/di/interface/injector.ts",
+            "status": "modified",
+            "additions": 43,
+            "deletions": 1,
+            "changes": 44,
+            "blob_url": "https://github.com/angular/angular/blob/6cff877f4f48cfe8460b0262d04ea333b79dd56a/packages%2Fcore%2Fsrc%2Fdi%2Finterface%2Finjector.ts",
+            "raw_url": "https://github.com/angular/angular/raw/6cff877f4f48cfe8460b0262d04ea333b79dd56a/packages%2Fcore%2Fsrc%2Fdi%2Finterface%2Finjector.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcore%2Fsrc%2Fdi%2Finterface%2Finjector.ts?ref=6cff877f4f48cfe8460b0262d04ea333b79dd56a",
+            "patch": "@@ -7,25 +7,67 @@\n  */\n \n \n+/**\n+ * Special flag indicating that a decorator is of type `Inject`. It's used to make `Inject`\n+ * decorator tree-shakable (so we don't have to rely on the `instanceof` checks).\n+ * Note: this flag is not included into the `InjectFlags` since it's an internal-only API.\n+ */\n+export const enum DecoratorFlags {\n+  Inject = -1\n+}\n+\n /**\n  * Injection flags for DI.\n  *\n  * @publicApi\n  */\n export enum InjectFlags {\n-  // TODO(alxhub): make this 'const' when ngc no longer writes exports of it into ngfactory files.\n+  // TODO(alxhub): make this 'const' (and remove `InternalInjectFlags` enum) when ngc no longer\n+  // writes exports of it into ngfactory files.\n \n   /** Check self and check parent injector if needed */\n   Default = 0b0000,\n+\n   /**\n    * Specifies that an injector should retrieve a dependency from any injector until reaching the\n    * host element of the current component. (Only used with Element Injector)\n    */\n   Host = 0b0001,\n+\n   /** Don't ascend to ancestors of the node requesting injection. */\n   Self = 0b0010,\n+\n   /** Skip the node that is requesting injection. */\n   SkipSelf = 0b0100,\n+\n   /** Inject `defaultValue` instead if token not found. */\n   Optional = 0b1000,\n }\n+\n+/**\n+ * This enum is an exact copy of the `InjectFlags` enum above, but the difference is that this is a\n+ * const enum, so actual enum values would be inlined in generated code. The `InjectFlags` enum can\n+ * be turned into a const enum when ViewEngine is removed (see TODO at the `InjectFlags` enum\n+ * above). The benefit of inlining is that we can use these flags at the top level without affecting\n+ * tree-shaking (see \"no-toplevel-property-access\" tslint rule for more info).\n+ * Keep this enum in sync with `InjectFlags` enum above.\n+ */\n+export const enum InternalInjectFlags {\n+  /** Check self and check parent injector if needed */\n+  Default = 0b0000,\n+\n+  /**\n+   * Specifies that an injector should retrieve a dependency from any injector until reaching the\n+   * host element of the current component. (Only used with Element Injector)\n+   */\n+  Host = 0b0001,\n+\n+  /** Don't ascend to ancestors of the node requesting injection. */\n+  Self = 0b0010,\n+\n+  /** Skip the node that is requesting injection. */\n+  SkipSelf = 0b0100,\n+\n+  /** Inject `defaultValue` instead if token not found. */\n+  Optional = 0b1000,\n+}\n\\ No newline at end of file"
+        },
+        {
+            "sha": "913f3e8ce8437d2871424e568c6fac56f14f969f",
+            "filename": "packages/core/src/di/metadata.ts",
+            "status": "modified",
+            "additions": 23,
+            "deletions": 6,
+            "changes": 29,
+            "blob_url": "https://github.com/angular/angular/blob/6cff877f4f48cfe8460b0262d04ea333b79dd56a/packages%2Fcore%2Fsrc%2Fdi%2Fmetadata.ts",
+            "raw_url": "https://github.com/angular/angular/raw/6cff877f4f48cfe8460b0262d04ea333b79dd56a/packages%2Fcore%2Fsrc%2Fdi%2Fmetadata.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcore%2Fsrc%2Fdi%2Fmetadata.ts?ref=6cff877f4f48cfe8460b0262d04ea333b79dd56a",
+            "patch": "@@ -8,6 +8,9 @@\n \n import {makeParamDecorator} from '../util/decorators';\n \n+import {attachInjectFlag} from './injector_compatibility';\n+import {DecoratorFlags, InternalInjectFlags} from './interface/injector';\n+\n \n /**\n  * Type of the Inject decorator / constructor function.\n@@ -54,8 +57,10 @@ export interface Inject {\n  * @Annotation\n  * @publicApi\n  */\n-export const Inject: InjectDecorator = makeParamDecorator('Inject', (token: any) => ({token}));\n-\n+export const Inject: InjectDecorator = attachInjectFlag(\n+    // Disable tslint because `DecoratorFlags` is a const enum which gets inlined.\n+    // tslint:disable-next-line: no-toplevel-property-access\n+    makeParamDecorator('Inject', (token: any) => ({token})), DecoratorFlags.Inject);\n \n /**\n  * Type of the Optional decorator / constructor function.\n@@ -97,7 +102,10 @@ export interface Optional {}\n  * @Annotation\n  * @publicApi\n  */\n-export const Optional: OptionalDecorator = makeParamDecorator('Optional');\n+export const Optional: OptionalDecorator =\n+    // Disable tslint because `InternalInjectFlags` is a const enum which gets inlined.\n+    // tslint:disable-next-line: no-toplevel-property-access\n+    attachInjectFlag(makeParamDecorator('Optional'), InternalInjectFlags.Optional);\n \n /**\n  * Type of the Self decorator / constructor function.\n@@ -142,7 +150,10 @@ export interface Self {}\n  * @Annotation\n  * @publicApi\n  */\n-export const Self: SelfDecorator = makeParamDecorator('Self');\n+export const Self: SelfDecorator =\n+    // Disable tslint because `InternalInjectFlags` is a const enum which gets inlined.\n+    // tslint:disable-next-line: no-toplevel-property-access\n+    attachInjectFlag(makeParamDecorator('Self'), InternalInjectFlags.Self);\n \n \n /**\n@@ -187,7 +198,10 @@ export interface SkipSelf {}\n  * @Annotation\n  * @publicApi\n  */\n-export const SkipSelf: SkipSelfDecorator = makeParamDecorator('SkipSelf');\n+export const SkipSelf: SkipSelfDecorator =\n+    // Disable tslint because `InternalInjectFlags` is a const enum which gets inlined.\n+    // tslint:disable-next-line: no-toplevel-property-access\n+    attachInjectFlag(makeParamDecorator('SkipSelf'), InternalInjectFlags.SkipSelf);\n \n /**\n  * Type of the `Host` decorator / constructor function.\n@@ -227,4 +241,7 @@ export interface Host {}\n  * @Annotation\n  * @publicApi\n  */\n-export const Host: HostDecorator = makeParamDecorator('Host');\n+export const Host: HostDecorator =\n+    // Disable tslint because `InternalInjectFlags` is a const enum which gets inlined.\n+    // tslint:disable-next-line: no-toplevel-property-access\n+    attachInjectFlag(makeParamDecorator('Host'), InternalInjectFlags.Host);\n\\ No newline at end of file"
+        },
+        {
+            "sha": "8ef0dcdff914b1000640d3fea55b3da0eb5ff929",
+            "filename": "packages/core/test/bundling/forms/bundle.golden_symbols.json",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 6,
+            "changes": 9,
+            "blob_url": "https://github.com/angular/angular/blob/6cff877f4f48cfe8460b0262d04ea333b79dd56a/packages%2Fcore%2Ftest%2Fbundling%2Fforms%2Fbundle.golden_symbols.json",
+            "raw_url": "https://github.com/angular/angular/raw/6cff877f4f48cfe8460b0262d04ea333b79dd56a/packages%2Fcore%2Ftest%2Fbundling%2Fforms%2Fbundle.golden_symbols.json",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcore%2Ftest%2Fbundling%2Fforms%2Fbundle.golden_symbols.json?ref=6cff877f4f48cfe8460b0262d04ea333b79dd56a",
+            "patch": "@@ -236,9 +236,6 @@\n   {\n     \"name\": \"FormsModule\"\n   },\n-  {\n-    \"name\": \"Host\"\n-  },\n   {\n     \"name\": \"INJECTOR\"\n   },\n@@ -569,9 +566,6 @@\n   {\n     \"name\": \"SelectMultipleControlValueAccessor\"\n   },\n-  {\n-    \"name\": \"Self\"\n-  },\n   {\n     \"name\": \"ShadowDomRenderer\"\n   },\n@@ -743,6 +737,9 @@\n   {\n     \"name\": \"applyView\"\n   },\n+  {\n+    \"name\": \"attachInjectFlag\"\n+  },\n   {\n     \"name\": \"attachPatchData\"\n   },"
+        },
+        {
+            "sha": "951bb4b9af32fcf16d22d3ba1958444c8ee28457",
+            "filename": "packages/core/test/bundling/injection/bundle.golden_symbols.json",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 18,
+            "changes": 18,
+            "blob_url": "https://github.com/angular/angular/blob/6cff877f4f48cfe8460b0262d04ea333b79dd56a/packages%2Fcore%2Ftest%2Fbundling%2Finjection%2Fbundle.golden_symbols.json",
+            "raw_url": "https://github.com/angular/angular/raw/6cff877f4f48cfe8460b0262d04ea333b79dd56a/packages%2Fcore%2Ftest%2Fbundling%2Finjection%2Fbundle.golden_symbols.json",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcore%2Ftest%2Fbundling%2Finjection%2Fbundle.golden_symbols.json?ref=6cff877f4f48cfe8460b0262d04ea333b79dd56a",
+            "patch": "@@ -5,18 +5,12 @@\n   {\n     \"name\": \"EMPTY_ARRAY\"\n   },\n-  {\n-    \"name\": \"Host\"\n-  },\n   {\n     \"name\": \"INJECTOR\"\n   },\n   {\n     \"name\": \"INJECTOR_SCOPE\"\n   },\n-  {\n-    \"name\": \"Inject\"\n-  },\n   {\n     \"name\": \"InjectFlags\"\n   },\n@@ -50,21 +44,12 @@\n   {\n     \"name\": \"NullInjector\"\n   },\n-  {\n-    \"name\": \"Optional\"\n-  },\n   {\n     \"name\": \"R3Injector\"\n   },\n   {\n     \"name\": \"ScopedService\"\n   },\n-  {\n-    \"name\": \"Self\"\n-  },\n-  {\n-    \"name\": \"SkipSelf\"\n-  },\n   {\n     \"name\": \"THROW_IF_NOT_FOUND\"\n   },\n@@ -113,9 +98,6 @@\n   {\n     \"name\": \"isValueProvider\"\n   },\n-  {\n-    \"name\": \"makeParamDecorator\"\n-  },\n   {\n     \"name\": \"makeRecord\"\n   },"
+        },
+        {
+            "sha": "02cdefc89a6870f62ef66ff1c14e082a52f763ea",
+            "filename": "packages/core/test/bundling/router/bundle.golden_symbols.json",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 6,
+            "changes": 9,
+            "blob_url": "https://github.com/angular/angular/blob/6cff877f4f48cfe8460b0262d04ea333b79dd56a/packages%2Fcore%2Ftest%2Fbundling%2Frouter%2Fbundle.golden_symbols.json",
+            "raw_url": "https://github.com/angular/angular/raw/6cff877f4f48cfe8460b0262d04ea333b79dd56a/packages%2Fcore%2Ftest%2Fbundling%2Frouter%2Fbundle.golden_symbols.json",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcore%2Ftest%2Fbundling%2Frouter%2Fbundle.golden_symbols.json?ref=6cff877f4f48cfe8460b0262d04ea333b79dd56a",
+            "patch": "@@ -290,9 +290,6 @@\n   {\n     \"name\": \"HashLocationStrategy\"\n   },\n-  {\n-    \"name\": \"Host\"\n-  },\n   {\n     \"name\": \"INITIAL_VALUE\"\n   },\n@@ -731,9 +728,6 @@\n   {\n     \"name\": \"SecurityContext\"\n   },\n-  {\n-    \"name\": \"Self\"\n-  },\n   {\n     \"name\": \"ShadowDomRenderer\"\n   },\n@@ -971,6 +965,9 @@\n   {\n     \"name\": \"applyView\"\n   },\n+  {\n+    \"name\": \"attachInjectFlag\"\n+  },\n   {\n     \"name\": \"attachPatchData\"\n   },"
+        },
+        {
+            "sha": "86bd5b20cfe68d205d64c70b1ee2dd20882834bc",
+            "filename": "packages/core/test/bundling/todo/bundle.golden_symbols.json",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/angular/angular/blob/6cff877f4f48cfe8460b0262d04ea333b79dd56a/packages%2Fcore%2Ftest%2Fbundling%2Ftodo%2Fbundle.golden_symbols.json",
+            "raw_url": "https://github.com/angular/angular/raw/6cff877f4f48cfe8460b0262d04ea333b79dd56a/packages%2Fcore%2Ftest%2Fbundling%2Ftodo%2Fbundle.golden_symbols.json",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcore%2Ftest%2Fbundling%2Ftodo%2Fbundle.golden_symbols.json?ref=6cff877f4f48cfe8460b0262d04ea333b79dd56a",
+            "patch": "@@ -221,6 +221,9 @@\n   {\n     \"name\": \"assertTemplate\"\n   },\n+  {\n+    \"name\": \"attachInjectFlag\"\n+  },\n   {\n     \"name\": \"attachPatchData\"\n   },"
+        },
+        {
+            "sha": "b680ff8c5fb74303d17ff4582184db6662da7a91",
+            "filename": "packages/core/test/di/inject_flags_spec.ts",
+            "status": "added",
+            "additions": 19,
+            "deletions": 0,
+            "changes": 19,
+            "blob_url": "https://github.com/angular/angular/blob/6cff877f4f48cfe8460b0262d04ea333b79dd56a/packages%2Fcore%2Ftest%2Fdi%2Finject_flags_spec.ts",
+            "raw_url": "https://github.com/angular/angular/raw/6cff877f4f48cfe8460b0262d04ea333b79dd56a/packages%2Fcore%2Ftest%2Fdi%2Finject_flags_spec.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcore%2Ftest%2Fdi%2Finject_flags_spec.ts?ref=6cff877f4f48cfe8460b0262d04ea333b79dd56a",
+            "patch": "@@ -0,0 +1,19 @@\n+/**\n+ * @license\n+ * Copyright Google LLC All Rights Reserved.\n+ *\n+ * Use of this source code is governed by an MIT-style license that can be\n+ * found in the LICENSE file at https://angular.io/license\n+ */\n+\n+import {InjectFlags, InternalInjectFlags} from '../../src/di/interface/injector';\n+\n+describe('InjectFlags', () => {\n+  it('should always match InternalInjectFlags', () => {\n+    expect(InjectFlags.Default).toEqual(InternalInjectFlags.Default as number);\n+    expect(InjectFlags.Host).toEqual(InternalInjectFlags.Host as number);\n+    expect(InjectFlags.Self).toEqual(InternalInjectFlags.Self as number);\n+    expect(InjectFlags.SkipSelf).toEqual(InternalInjectFlags.SkipSelf as number);\n+    expect(InjectFlags.Optional).toEqual(InternalInjectFlags.Optional as number);\n+  });\n+});\n\\ No newline at end of file"
+        }
+    ],
+    "stats": {
+        "total": 188,
+        "additions": 136,
+        "deletions": 52
+    }
+}

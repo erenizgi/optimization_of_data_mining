@@ -1,0 +1,60 @@
+{
+    "author": "apapirovski",
+    "message": "http2: fix end without read\n\nAdjust http2 behaviour to allow ending a stream even after some\ndata comes in (when the user has no intention of reading that\ndata). Also correctly end a stream when trailers are present.\n\nPR-URL: https://github.com/nodejs/node/pull/20621\nFixes: https://github.com/nodejs/node/issues/20060\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Matteo Collina <matteo.collina@gmail.com>\nReviewed-By: Trivikram Kamat <trivikr.dev@gmail.com>",
+    "sha": "8d38288a8099fa282f4e86657f4f7d696039cf96",
+    "files": [
+        {
+            "sha": "88879484ebaab7f75cbdae54d44bc5e6233e93ef",
+            "filename": "lib/internal/http2/compat.js",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 4,
+            "changes": 10,
+            "blob_url": "https://github.com/nodejs/node/blob/8d38288a8099fa282f4e86657f4f7d696039cf96/lib%2Finternal%2Fhttp2%2Fcompat.js",
+            "raw_url": "https://github.com/nodejs/node/raw/8d38288a8099fa282f4e86657f4f7d696039cf96/lib%2Finternal%2Fhttp2%2Fcompat.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fhttp2%2Fcompat.js?ref=8d38288a8099fa282f4e86657f4f7d696039cf96",
+            "patch": "@@ -260,8 +260,6 @@ class Http2ServerRequest extends Readable {\n     stream[kRequest] = this;\n \n     // Pause the stream..\n-    stream.pause();\n-    stream.on('data', onStreamData);\n     stream.on('trailers', onStreamTrailers);\n     stream.on('end', onStreamEnd);\n     stream.on('error', onStreamError);\n@@ -328,8 +326,12 @@ class Http2ServerRequest extends Readable {\n   _read(nread) {\n     const state = this[kState];\n     if (!state.closed) {\n-      state.didRead = true;\n-      process.nextTick(resumeStream, this[kStream]);\n+      if (!state.didRead) {\n+        state.didRead = true;\n+        this[kStream].on('data', onStreamData);\n+      } else {\n+        process.nextTick(resumeStream, this[kStream]);\n+      }\n     } else {\n       this.emit('error', new ERR_HTTP2_INVALID_STREAM());\n     }"
+        },
+        {
+            "sha": "dfd74accabbd22e69cead51c0b95ac50889ef86e",
+            "filename": "lib/internal/http2/core.js",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 5,
+            "changes": 12,
+            "blob_url": "https://github.com/nodejs/node/blob/8d38288a8099fa282f4e86657f4f7d696039cf96/lib%2Finternal%2Fhttp2%2Fcore.js",
+            "raw_url": "https://github.com/nodejs/node/raw/8d38288a8099fa282f4e86657f4f7d696039cf96/lib%2Finternal%2Fhttp2%2Fcore.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fhttp2%2Fcore.js?ref=8d38288a8099fa282f4e86657f4f7d696039cf96",
+            "patch": "@@ -349,11 +349,11 @@ function onStreamClose(code) {\n     // Push a null so the stream can end whenever the client consumes\n     // it completely.\n     stream.push(null);\n-\n-    // Same as net.\n-    if (stream.readableLength === 0) {\n-      stream.read(0);\n-    }\n+    // If the client hasn't tried to consume the stream and there is no\n+    // resume scheduled (which would indicate they would consume in the future),\n+    // then just dump the incoming data so that the stream can be destroyed.\n+    if (!stream[kState].didRead && !stream._readableState.resumeScheduled)\n+      stream.resume();\n   }\n }\n \n@@ -1795,6 +1795,8 @@ class Http2Stream extends Duplex {\n     const ret = this[kHandle].trailers(headersList);\n     if (ret < 0)\n       this.destroy(new NghttpError(ret));\n+    else\n+      this[kMaybeDestroy]();\n   }\n \n   get closed() {"
+        },
+        {
+            "sha": "678114130e3dba8980a0c92dab65e655e5793525",
+            "filename": "test/parallel/test-http2-client-upload-reject.js",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 6,
+            "changes": 15,
+            "blob_url": "https://github.com/nodejs/node/blob/8d38288a8099fa282f4e86657f4f7d696039cf96/test%2Fparallel%2Ftest-http2-client-upload-reject.js",
+            "raw_url": "https://github.com/nodejs/node/raw/8d38288a8099fa282f4e86657f4f7d696039cf96/test%2Fparallel%2Ftest-http2-client-upload-reject.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-http2-client-upload-reject.js?ref=8d38288a8099fa282f4e86657f4f7d696039cf96",
+            "patch": "@@ -20,12 +20,15 @@ fs.readFile(loc, common.mustCall((err, data) => {\n   const server = http2.createServer();\n \n   server.on('stream', common.mustCall((stream) => {\n-    stream.on('close', common.mustCall(() => {\n-      assert.strictEqual(stream.rstCode, 0);\n-    }));\n-\n-    stream.respond({ ':status': 400 });\n-    stream.end();\n+    // Wait for some data to come through.\n+    setImmediate(() => {\n+      stream.on('close', common.mustCall(() => {\n+        assert.strictEqual(stream.rstCode, 0);\n+      }));\n+\n+      stream.respond({ ':status': 400 });\n+      stream.end();\n+    });\n   }));\n \n   server.listen(0, common.mustCall(() => {"
+        },
+        {
+            "sha": "e6a187cb12b264f7b20a847623cd03a837ecac7b",
+            "filename": "test/parallel/test-http2-compat-client-upload-reject.js",
+            "status": "added",
+            "additions": 44,
+            "deletions": 0,
+            "changes": 44,
+            "blob_url": "https://github.com/nodejs/node/blob/8d38288a8099fa282f4e86657f4f7d696039cf96/test%2Fparallel%2Ftest-http2-compat-client-upload-reject.js",
+            "raw_url": "https://github.com/nodejs/node/raw/8d38288a8099fa282f4e86657f4f7d696039cf96/test%2Fparallel%2Ftest-http2-compat-client-upload-reject.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-http2-compat-client-upload-reject.js?ref=8d38288a8099fa282f4e86657f4f7d696039cf96",
+            "patch": "@@ -0,0 +1,44 @@\n+'use strict';\n+\n+// Verifies that uploading data from a client works\n+\n+const common = require('../common');\n+if (!common.hasCrypto)\n+  common.skip('missing crypto');\n+const assert = require('assert');\n+const http2 = require('http2');\n+const fs = require('fs');\n+const fixtures = require('../common/fixtures');\n+\n+const loc = fixtures.path('person-large.jpg');\n+\n+assert(fs.existsSync(loc));\n+\n+fs.readFile(loc, common.mustCall((err, data) => {\n+  assert.ifError(err);\n+\n+  const server = http2.createServer(common.mustCall((req, res) => {\n+    setImmediate(() => {\n+      res.writeHead(400);\n+      res.end();\n+    });\n+  }));\n+\n+  server.listen(0, common.mustCall(() => {\n+    const client = http2.connect(`http://localhost:${server.address().port}`);\n+\n+    const req = client.request({ ':method': 'POST' });\n+    req.on('response', common.mustCall((headers) => {\n+      assert.strictEqual(headers[':status'], 400);\n+    }));\n+\n+    req.resume();\n+    req.on('end', common.mustCall(() => {\n+      server.close();\n+      client.close();\n+    }));\n+\n+    const str = fs.createReadStream(loc);\n+    str.pipe(req);\n+  }));\n+}));"
+        }
+    ],
+    "stats": {
+        "total": 81,
+        "additions": 66,
+        "deletions": 15
+    }
+}

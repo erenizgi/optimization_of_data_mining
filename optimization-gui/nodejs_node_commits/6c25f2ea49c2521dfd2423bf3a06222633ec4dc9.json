@@ -1,0 +1,96 @@
+{
+    "author": "joyeecheung",
+    "message": "fs: improve errors thrown from fs.watch()\n\n- Add an accessor property `initialized `to FSEventWrap to\n  check the state of the handle from the JS land\n- Introduce ERR_FS_WATCHER_ALREADY_STARTED so calling start()\n  on a watcher that is already started will throw instead of\n  doing nothing silently.\n- Introduce ERR_FS_WATCHER_NOT_STARTED so calling close()\n  on a watcher that is already closed will throw instead of\n  doing nothing silently.\n- Validate the filename passed to fs.watch()\n- Assert that the handle in the watcher are instances of\n  FSEvent instead of relying on the illegal invocation error\n  from the VM.\n- Add more assertions in FSEventWrap methods now that we check\n  `initialized` and the filename in JS land before invoking\n  the binding.\n- Use uvException instead of errornoException to create\n  the errors with the error numbers from libuv to make them\n  consistent with other errors in fs.\n\nTODO:\n\n- Improve fs.watchFile() the same way this patch improves fs.watch()\n- It seems possible to fire both rename and change event from libuv\n  together now that we can check if the handle is closed via\n  `initialized` in JS land.\n\nPR-URL: https://github.com/nodejs/node/pull/19089\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Ben Noordhuis <info@bnoordhuis.nl>\nReviewed-By: Matteo Collina <matteo.collina@gmail.com>\nReviewed-By: Ruben Bridgewater <ruben@bridgewater.de>",
+    "sha": "6c25f2ea49c2521dfd2423bf3a06222633ec4dc9",
+    "files": [
+        {
+            "sha": "7d6e238f93bdaa8b310b17b5e06c3375141a3b05",
+            "filename": "doc/api/errors.md",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 0,
+            "changes": 12,
+            "blob_url": "https://github.com/nodejs/node/blob/6c25f2ea49c2521dfd2423bf3a06222633ec4dc9/doc%2Fapi%2Ferrors.md",
+            "raw_url": "https://github.com/nodejs/node/raw/6c25f2ea49c2521dfd2423bf3a06222633ec4dc9/doc%2Fapi%2Ferrors.md",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/doc%2Fapi%2Ferrors.md?ref=6c25f2ea49c2521dfd2423bf3a06222633ec4dc9",
+            "patch": "@@ -783,6 +783,18 @@ falsy value.\n An invalid symlink type was passed to the [`fs.symlink()`][] or\n [`fs.symlinkSync()`][] methods.\n \n+<a id=\"ERR_FS_WATCHER_ALREADY_STARTED\"></a>\n+### ERR_FS_WATCHER_ALREADY_STARTED\n+\n+An attempt was made to start a watcher returned by `fs.watch()` that has\n+already been started.\n+\n+<a id=\"ERR_FS_WATCHER_NOT_STARTED\"></a>\n+### ERR_FS_WATCHER_NOT_STARTED\n+\n+An attempt was made to initiate operations on a watcher returned by\n+`fs.watch()` that has not yet been started.\n+\n <a id=\"ERR_HTTP_HEADERS_SENT\"></a>\n ### ERR_HTTP_HEADERS_SENT\n "
+        },
+        {
+            "sha": "321fbe8d54ef8e0729ec2073968e79de7989b861",
+            "filename": "lib/fs.js",
+            "status": "modified",
+            "additions": 33,
+            "deletions": 8,
+            "changes": 41,
+            "blob_url": "https://github.com/nodejs/node/blob/6c25f2ea49c2521dfd2423bf3a06222633ec4dc9/lib%2Ffs.js",
+            "raw_url": "https://github.com/nodejs/node/raw/6c25f2ea49c2521dfd2423bf3a06222633ec4dc9/lib%2Ffs.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Ffs.js?ref=6c25f2ea49c2521dfd2423bf3a06222633ec4dc9",
+            "patch": "@@ -77,13 +77,19 @@ Object.defineProperty(exports, 'constants', {\n   value: constants\n });\n \n+let assert_ = null;\n+function lazyAssert() {\n+  if (assert_ === null) {\n+    assert_ = require('assert');\n+  }\n+  return assert_;\n+}\n+\n const kMinPoolSpace = 128;\n const { kMaxLength } = require('buffer');\n \n const isWindows = process.platform === 'win32';\n \n-const errnoException = errors.errnoException;\n-\n let truncateWarn = true;\n \n function showTruncateDeprecation() {\n@@ -1312,11 +1318,17 @@ function FSWatcher() {\n   this._handle.owner = this;\n \n   this._handle.onchange = function(status, eventType, filename) {\n+    // TODO(joyeecheung): we may check self._handle.initialized here\n+    // and return if that is false. This allows us to avoid firing the event\n+    // after the handle is closed, and to fire both UV_RENAME and UV_CHANGE\n+    // if they are set by libuv at the same time.\n     if (status < 0) {\n       self._handle.close();\n-      const error = !filename ?\n-        errnoException(status, 'Error watching file for changes:') :\n-        errnoException(status, `Error watching file ${filename} for changes:`);\n+      const error = errors.uvException({\n+        errno: status,\n+        syscall: 'watch',\n+        path: filename\n+      });\n       error.filename = filename;\n       self.emit('error', error);\n     } else {\n@@ -1335,21 +1347,34 @@ FSWatcher.prototype.start = function(filename,\n                                      persistent,\n                                      recursive,\n                                      encoding) {\n+  lazyAssert()(this._handle instanceof FSEvent, 'handle must be a FSEvent');\n+  if (this._handle.initialized) {\n+    throw new errors.Error('ERR_FS_WATCHER_ALREADY_STARTED');\n+  }\n+\n   filename = getPathFromURL(filename);\n-  nullCheck(filename, 'filename');\n+  validatePath(filename, 'filename');\n+\n   var err = this._handle.start(pathModule.toNamespacedPath(filename),\n                                persistent,\n                                recursive,\n                                encoding);\n   if (err) {\n-    this._handle.close();\n-    const error = errnoException(err, `watch ${filename}`);\n+    const error = errors.uvException({\n+      errno: err,\n+      syscall: 'watch',\n+      path: filename\n+    });\n     error.filename = filename;\n     throw error;\n   }\n };\n \n FSWatcher.prototype.close = function() {\n+  lazyAssert()(this._handle instanceof FSEvent, 'handle must be a FSEvent');\n+  if (!this._handle.initialized) {\n+    throw new errors.Error('ERR_FS_WATCHER_NOT_STARTED');\n+  }\n   this._handle.close();\n };\n "
+        },
+        {
+            "sha": "fd93547d26d37e8c5e71031abac8add538650878",
+            "filename": "lib/internal/errors.js",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/nodejs/node/blob/6c25f2ea49c2521dfd2423bf3a06222633ec4dc9/lib%2Finternal%2Ferrors.js",
+            "raw_url": "https://github.com/nodejs/node/raw/6c25f2ea49c2521dfd2423bf3a06222633ec4dc9/lib%2Finternal%2Ferrors.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Ferrors.js?ref=6c25f2ea49c2521dfd2423bf3a06222633ec4dc9",
+            "patch": "@@ -658,6 +658,10 @@ E('ERR_FALSY_VALUE_REJECTION', 'Promise was rejected with falsy value', Error);\n E('ERR_FS_INVALID_SYMLINK_TYPE',\n   'Symlink type must be one of \"dir\", \"file\", or \"junction\". Received \"%s\"',\n   Error); // Switch to TypeError. The current implementation does not seem right\n+E('ERR_FS_WATCHER_ALREADY_STARTED',\n+  'The watcher has already been started', Error);\n+E('ERR_FS_WATCHER_NOT_STARTED',\n+  'The watcher has not been started', Error);\n E('ERR_HTTP2_ALTSVC_INVALID_ORIGIN',\n   'HTTP/2 ALTSVC frames require a valid origin', TypeError);\n E('ERR_HTTP2_ALTSVC_LENGTH',"
+        },
+        {
+            "sha": "b3fa3e8d9a075bbed472e0beed196d2c0e71bb96",
+            "filename": "src/fs_event_wrap.cc",
+            "status": "modified",
+            "additions": 46,
+            "deletions": 27,
+            "changes": 73,
+            "blob_url": "https://github.com/nodejs/node/blob/6c25f2ea49c2521dfd2423bf3a06222633ec4dc9/src%2Ffs_event_wrap.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/6c25f2ea49c2521dfd2423bf3a06222633ec4dc9/src%2Ffs_event_wrap.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Ffs_event_wrap.cc?ref=6c25f2ea49c2521dfd2423bf3a06222633ec4dc9",
+            "patch": "@@ -31,13 +31,18 @@\n namespace node {\n \n using v8::Context;\n+using v8::DontDelete;\n+using v8::DontEnum;\n using v8::FunctionCallbackInfo;\n using v8::FunctionTemplate;\n using v8::HandleScope;\n using v8::Integer;\n using v8::Local;\n using v8::MaybeLocal;\n using v8::Object;\n+using v8::PropertyAttribute;\n+using v8::ReadOnly;\n+using v8::Signature;\n using v8::String;\n using v8::Value;\n \n@@ -51,7 +56,7 @@ class FSEventWrap: public HandleWrap {\n   static void New(const FunctionCallbackInfo<Value>& args);\n   static void Start(const FunctionCallbackInfo<Value>& args);\n   static void Close(const FunctionCallbackInfo<Value>& args);\n-\n+  static void GetInitialized(const FunctionCallbackInfo<Value>& args);\n   size_t self_size() const override { return sizeof(*this); }\n \n  private:\n@@ -80,6 +85,11 @@ FSEventWrap::~FSEventWrap() {\n   CHECK_EQ(initialized_, false);\n }\n \n+void FSEventWrap::GetInitialized(const FunctionCallbackInfo<Value>& args) {\n+  FSEventWrap* wrap = Unwrap<FSEventWrap>(args.This());\n+  CHECK(wrap != nullptr);\n+  args.GetReturnValue().Set(wrap->initialized_);\n+}\n \n void FSEventWrap::Initialize(Local<Object> target,\n                              Local<Value> unused,\n@@ -95,6 +105,18 @@ void FSEventWrap::Initialize(Local<Object> target,\n   env->SetProtoMethod(t, \"start\", Start);\n   env->SetProtoMethod(t, \"close\", Close);\n \n+  Local<FunctionTemplate> get_initialized_templ =\n+      FunctionTemplate::New(env->isolate(),\n+                            GetInitialized,\n+                            env->as_external(),\n+                            Signature::New(env->isolate(), t));\n+\n+  t->PrototypeTemplate()->SetAccessorProperty(\n+      FIXED_ONE_BYTE_STRING(env->isolate(), \"initialized\"),\n+      get_initialized_templ,\n+      Local<FunctionTemplate>(),\n+      static_cast<PropertyAttribute>(ReadOnly | DontDelete | v8::DontEnum));\n+\n   target->Set(fsevent_string, t->GetFunction());\n }\n \n@@ -105,22 +127,19 @@ void FSEventWrap::New(const FunctionCallbackInfo<Value>& args) {\n   new FSEventWrap(env, args.This());\n }\n \n-\n+// wrap.start(filename, persistent, recursive, encoding)\n void FSEventWrap::Start(const FunctionCallbackInfo<Value>& args) {\n   Environment* env = Environment::GetCurrent(args);\n \n-  FSEventWrap* wrap;\n-  ASSIGN_OR_RETURN_UNWRAP(&wrap, args.Holder());\n-  if (wrap->initialized_)\n-    return args.GetReturnValue().Set(0);\n+  FSEventWrap* wrap = Unwrap<FSEventWrap>(args.Holder());\n+  CHECK_NE(wrap, nullptr);\n+  CHECK(!wrap->initialized_);\n \n-  static const char kErrMsg[] = \"filename must be a string or Buffer\";\n-  if (args.Length() < 1)\n-    return env->ThrowTypeError(kErrMsg);\n+  const int argc = args.Length();\n+  CHECK_GE(argc, 4);\n \n   BufferValue path(env->isolate(), args[0]);\n-  if (*path == nullptr)\n-    return env->ThrowTypeError(kErrMsg);\n+  CHECK_NE(*path, nullptr);\n \n   unsigned int flags = 0;\n   if (args[2]->IsTrue())\n@@ -129,19 +148,21 @@ void FSEventWrap::Start(const FunctionCallbackInfo<Value>& args) {\n   wrap->encoding_ = ParseEncoding(env->isolate(), args[3], kDefaultEncoding);\n \n   int err = uv_fs_event_init(wrap->env()->event_loop(), &wrap->handle_);\n-  if (err == 0) {\n-    wrap->initialized_ = true;\n+  if (err != 0) {\n+    return args.GetReturnValue().Set(err);\n+  }\n \n-    err = uv_fs_event_start(&wrap->handle_, OnEvent, *path, flags);\n+  err = uv_fs_event_start(&wrap->handle_, OnEvent, *path, flags);\n+  wrap->initialized_ = true;\n \n-    if (err == 0) {\n-      // Check for persistent argument\n-      if (!args[1]->IsTrue()) {\n-        uv_unref(reinterpret_cast<uv_handle_t*>(&wrap->handle_));\n-      }\n-    } else {\n-      FSEventWrap::Close(args);\n-    }\n+  if (err != 0) {\n+    FSEventWrap::Close(args);\n+    return args.GetReturnValue().Set(err);\n+  }\n+\n+  // Check for persistent argument\n+  if (!args[1]->IsTrue()) {\n+    uv_unref(reinterpret_cast<uv_handle_t*>(&wrap->handle_));\n   }\n \n   args.GetReturnValue().Set(err);\n@@ -209,13 +230,11 @@ void FSEventWrap::OnEvent(uv_fs_event_t* handle, const char* filename,\n \n \n void FSEventWrap::Close(const FunctionCallbackInfo<Value>& args) {\n-  FSEventWrap* wrap;\n-  ASSIGN_OR_RETURN_UNWRAP(&wrap, args.Holder());\n+  FSEventWrap* wrap = Unwrap<FSEventWrap>(args.Holder());\n+  CHECK_NE(wrap, nullptr);\n+  CHECK(wrap->initialized_);\n \n-  if (wrap == nullptr || wrap->initialized_ == false)\n-    return;\n   wrap->initialized_ = false;\n-\n   HandleWrap::Close(args);\n }\n "
+        },
+        {
+            "sha": "e6db65993d666e3fa099e1dc65945a48ca36c5ad",
+            "filename": "test/parallel/test-fs-watch-enoent.js",
+            "status": "modified",
+            "additions": 59,
+            "deletions": 16,
+            "changes": 75,
+            "blob_url": "https://github.com/nodejs/node/blob/6c25f2ea49c2521dfd2423bf3a06222633ec4dc9/test%2Fparallel%2Ftest-fs-watch-enoent.js",
+            "raw_url": "https://github.com/nodejs/node/raw/6c25f2ea49c2521dfd2423bf3a06222633ec4dc9/test%2Fparallel%2Ftest-fs-watch-enoent.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-fs-watch-enoent.js?ref=6c25f2ea49c2521dfd2423bf3a06222633ec4dc9",
+            "patch": "@@ -1,21 +1,64 @@\n 'use strict';\n+\n+// This verifies the error thrown by fs.watch.\n+\n const common = require('../common');\n const assert = require('assert');\n const fs = require('fs');\n+const tmpdir = require('../common/tmpdir');\n+const path = require('path');\n+const nonexistentFile = path.join(tmpdir.path, 'non-existent');\n+const uv = process.binding('uv');\n+\n+tmpdir.refresh();\n+\n+{\n+  const validateError = (err) => {\n+    assert.strictEqual(err.path, nonexistentFile);\n+    assert.strictEqual(err.filename, nonexistentFile);\n+    assert.strictEqual(err.syscall, 'watch');\n+    if (err.code === 'ENOENT') {\n+      assert.strictEqual(\n+        err.message,\n+        `ENOENT: no such file or directory, watch '${nonexistentFile}'`);\n+      assert.strictEqual(err.errno, uv.UV_ENOENT);\n+      assert.strictEqual(err.code, 'ENOENT');\n+    } else {  // AIX\n+      assert.strictEqual(\n+        err.message,\n+        `ENODEV: no such device, watch '${nonexistentFile}'`);\n+      assert.strictEqual(err.errno, uv.UV_ENODEV);\n+      assert.strictEqual(err.code, 'ENODEV');\n+    }\n+    return true;\n+  };\n+\n+  assert.throws(\n+    () => fs.watch(nonexistentFile, common.mustNotCall()),\n+    validateError\n+  );\n+}\n+\n+{\n+  const file = path.join(tmpdir.path, 'file-to-watch');\n+  fs.writeFileSync(file, 'test');\n+  const watcher = fs.watch(file, common.mustNotCall());\n+\n+  const validateError = (err) => {\n+    assert.strictEqual(err.path, nonexistentFile);\n+    assert.strictEqual(err.filename, nonexistentFile);\n+    assert.strictEqual(\n+      err.message,\n+      `ENOENT: no such file or directory, watch '${nonexistentFile}'`);\n+    assert.strictEqual(err.errno, uv.UV_ENOENT);\n+    assert.strictEqual(err.code, 'ENOENT');\n+    assert.strictEqual(err.syscall, 'watch');\n+    fs.unlinkSync(file);\n+    return true;\n+  };\n+\n+  watcher.on('error', common.mustCall(validateError));\n \n-assert.throws(function() {\n-  fs.watch('non-existent-file');\n-}, function(err) {\n-  assert(err);\n-  assert(/non-existent-file/.test(err));\n-  assert.strictEqual(err.filename, 'non-existent-file');\n-  return true;\n-});\n-\n-const watcher = fs.watch(__filename);\n-watcher.on('error', common.mustCall(function(err) {\n-  assert(err);\n-  assert(/non-existent-file/.test(err));\n-  assert.strictEqual(err.filename, 'non-existent-file');\n-}));\n-watcher._handle.onchange(-1, 'ENOENT', 'non-existent-file');\n+  // Simulate the invocation from the binding\n+  watcher._handle.onchange(uv.UV_ENOENT, 'ENOENT', nonexistentFile);\n+}"
+        },
+        {
+            "sha": "f980363b9fd87e29d1f07e64f9c6595c9009d21c",
+            "filename": "test/parallel/test-fs-watch.js",
+            "status": "modified",
+            "additions": 20,
+            "deletions": 2,
+            "changes": 22,
+            "blob_url": "https://github.com/nodejs/node/blob/6c25f2ea49c2521dfd2423bf3a06222633ec4dc9/test%2Fparallel%2Ftest-fs-watch.js",
+            "raw_url": "https://github.com/nodejs/node/raw/6c25f2ea49c2521dfd2423bf3a06222633ec4dc9/test%2Fparallel%2Ftest-fs-watch.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-fs-watch.js?ref=6c25f2ea49c2521dfd2423bf3a06222633ec4dc9",
+            "patch": "@@ -65,10 +65,16 @@ for (const testCase of cases) {\n       assert.strictEqual(eventType, 'change');\n     assert.strictEqual(argFilename, testCase.fileName);\n \n-    watcher.start();  // should not crash\n-\n+    common.expectsError(() => watcher.start(), {\n+      code: 'ERR_FS_WATCHER_ALREADY_STARTED',\n+      message: 'The watcher has already been started'\n+    });\n     // end of test case\n     watcher.close();\n+    common.expectsError(() => watcher.close(), {\n+      code: 'ERR_FS_WATCHER_NOT_STARTED',\n+      message: 'The watcher has not been started'\n+    });\n   }));\n \n   // long content so it's actually flushed. toUpperCase so there's real change.\n@@ -78,3 +84,15 @@ for (const testCase of cases) {\n     fs.writeFileSync(testCase.filePath, content2);\n   }, 100);\n }\n+\n+[false, 1, {}, [], null, undefined].forEach((i) => {\n+  common.expectsError(\n+    () => fs.watch(i, common.mustNotCall()),\n+    {\n+      code: 'ERR_INVALID_ARG_TYPE',\n+      type: TypeError,\n+      message: 'The \"filename\" argument must be one of ' +\n+               'type string, Buffer, or URL'\n+    }\n+  );\n+});"
+        },
+        {
+            "sha": "91d750acd00fe29e67a3ebe69af01b29c063e656",
+            "filename": "test/sequential/test-fs-watch.js",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 2,
+            "changes": 7,
+            "blob_url": "https://github.com/nodejs/node/blob/6c25f2ea49c2521dfd2423bf3a06222633ec4dc9/test%2Fsequential%2Ftest-fs-watch.js",
+            "raw_url": "https://github.com/nodejs/node/raw/6c25f2ea49c2521dfd2423bf3a06222633ec4dc9/test%2Fsequential%2Ftest-fs-watch.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fsequential%2Ftest-fs-watch.js?ref=6c25f2ea49c2521dfd2423bf3a06222633ec4dc9",
+            "patch": "@@ -112,12 +112,15 @@ tmpdir.refresh();\n // https://github.com/joyent/node/issues/6690\n {\n   let oldhandle;\n-  assert.throws(function() {\n+  assert.throws(() => {\n     const w = fs.watch(__filename, common.mustNotCall());\n     oldhandle = w._handle;\n     w._handle = { close: w._handle.close };\n     w.close();\n-  }, /^TypeError: Illegal invocation$/);\n+  }, {\n+    message: 'handle must be a FSEvent',\n+    code: 'ERR_ASSERTION'\n+  });\n   oldhandle.close(); // clean up\n \n   assert.throws(function() {"
+        }
+    ],
+    "stats": {
+        "total": 234,
+        "additions": 179,
+        "deletions": 55
+    }
+}

@@ -1,0 +1,108 @@
+{
+    "author": "joyeecheung",
+    "message": "src: perform integrity checks on built-in code cache\n\nCurrently V8 only checks that the length of the source code is the\nsame as the code used to generate the hash, so we add an additional\ncheck here:\n\n1. During compile time, when generating node_javascript.cc and\n   node_code_cache.cc, we compute and include the hash of the\n  (unwrapped) JavaScript source in both.\n2. At runtime, we check that the hash of the code being compiled\n  and the hash of the code used to generate the cache\n  (inside the wrapper) is the same.\n\nThis is based on the assumptions:\n\n1. `internalBinding('code_cache_hash')` must be in sync with\n   `internalBinding('code_cache')` (same C++ file)\n2. `internalBinding('natives_hash')` must be in sync with\n   `process.binding('natives')` (same C++ file)\n3. If `internalBinding('natives_hash')` is in sync with\n   `internalBinding('natives_hash')`, then the (unwrapped)\n   code used to generate `internalBinding('code_cache')`\n   should be in sync with the (unwrapped) code in\n   `process.binding('natives')`\n\nThere will be, however, false positives if the wrapper used\nto generate the cache is different from the one used at run time,\nand the length of the wrapper somehow stays the same.\nBut that should be rare and can be eased once we make the\ntwo bootstrappers cached and checked as well.\n\nPR-URL: https://github.com/nodejs/node/pull/22152\nReviewed-By: Anna Henningsen <anna@addaleax.net>\nReviewed-By: Tiancheng \"Timothy\" Gu <timothygu99@gmail.com>\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Gus Caplan <me@gus.host>",
+    "sha": "7cbbb27c0721ced7b74fc39033c8485b8d2ad864",
+    "files": [
+        {
+            "sha": "41fe1e3a914ba0fea091fb9dda8b6eaf530af255",
+            "filename": "lib/internal/bootstrap/cache.js",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/7cbbb27c0721ced7b74fc39033c8485b8d2ad864/lib%2Finternal%2Fbootstrap%2Fcache.js",
+            "raw_url": "https://github.com/nodejs/node/raw/7cbbb27c0721ced7b74fc39033c8485b8d2ad864/lib%2Finternal%2Fbootstrap%2Fcache.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fbootstrap%2Fcache.js?ref=7cbbb27c0721ced7b74fc39033c8485b8d2ad864",
+            "patch": "@@ -48,6 +48,7 @@ module.exports = {\n   ),\n   builtinSource: Object.assign({}, NativeModule._source),\n   getCodeCache,\n+  getSource: NativeModule.getSource,\n   codeCache: internalBinding('code_cache'),\n   compiledWithoutCache: NativeModule.compiledWithoutCache,\n   compiledWithCache: NativeModule.compiledWithCache,"
+        },
+        {
+            "sha": "c04a4207c0b48245d580bf890e8c626efc23e071",
+            "filename": "lib/internal/bootstrap/loaders.js",
+            "status": "modified",
+            "additions": 37,
+            "deletions": 11,
+            "changes": 48,
+            "blob_url": "https://github.com/nodejs/node/blob/7cbbb27c0721ced7b74fc39033c8485b8d2ad864/lib%2Finternal%2Fbootstrap%2Floaders.js",
+            "raw_url": "https://github.com/nodejs/node/raw/7cbbb27c0721ced7b74fc39033c8485b8d2ad864/lib%2Finternal%2Fbootstrap%2Floaders.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fbootstrap%2Floaders.js?ref=7cbbb27c0721ced7b74fc39033c8485b8d2ad864",
+            "patch": "@@ -127,6 +127,8 @@\n   const config = getBinding('config');\n \n   const codeCache = getInternalBinding('code_cache');\n+  const codeCacheHash = getInternalBinding('code_cache_hash');\n+  const sourceHash = getInternalBinding('natives_hash');\n   const compiledWithoutCache = NativeModule.compiledWithoutCache = [];\n   const compiledWithCache = NativeModule.compiledWithCache = [];\n \n@@ -232,32 +234,56 @@\n   };\n \n   NativeModule.prototype.compile = function() {\n-    let source = NativeModule.getSource(this.id);\n+    const id = this.id;\n+    let source = NativeModule.getSource(id);\n     source = NativeModule.wrap(source);\n \n     this.loading = true;\n \n     try {\n+      // Currently V8 only checks that the length of the source code is the\n+      // same as the code used to generate the hash, so we add an additional\n+      // check here:\n+      // 1. During compile time, when generating node_javascript.cc and\n+      //    node_code_cache.cc, we compute and include the hash of the\n+      //   (unwrapped) JavaScript source in both.\n+      // 2. At runtime, we check that the hash of the code being compiled\n+      //   and the hash of the code used to generate the cache\n+      //   (inside the wrapper) is the same.\n+      // This is based on the assumptions:\n+      // 1. `internalBinding('code_cache_hash')` must be in sync with\n+      //    `internalBinding('code_cache')` (same C++ file)\n+      // 2. `internalBinding('natives_hash')` must be in sync with\n+      //    `process.binding('natives')` (same C++ file)\n+      // 3. If `internalBinding('natives_hash')` is in sync with\n+      //    `internalBinding('natives_hash')`, then the (unwrapped)\n+      //    code used to generate `internalBinding('code_cache')`\n+      //    should be in sync with the (unwrapped) code in\n+      //    `process.binding('natives')`\n+      // There will be, however, false positives if the wrapper used\n+      // to generate the cache is different from the one used at run time,\n+      // and the length of the wrapper somehow stays the same.\n+      // But that should be rare and can be eased once we make the\n+      // two bootstrappers cached and checked as well.\n+      const cache = codeCacheHash[id] &&\n+        (codeCacheHash[id] === sourceHash[id]) ? codeCache[id] : undefined;\n+\n       // (code, filename, lineOffset, columnOffset\n       // cachedData, produceCachedData, parsingContext)\n       const script = new ContextifyScript(\n         source, this.filename, 0, 0,\n-        codeCache[this.id], false, undefined\n+        cache, false, undefined\n       );\n \n+      // This will be used to create code cache in tools/generate_code_cache.js\n       this.script = script;\n \n       // One of these conditions may be false when any of the inputs\n       // of the `node_js2c` target in node.gyp is modified.\n-      // FIXME(joyeecheung):\n-      // 1. Figure out how to resolve the dependency issue. When the\n-      //    code cache was introduced we were at a point where refactoring\n-      //    node.gyp may not be worth the effort.\n-      // 2. Calculate checksums in both js2c and generate_code_cache.js\n-      //    and compare them before compiling the native modules since\n-      //    V8 only checks the length of the source to decide whether to\n-      //    reject the cache.\n-      if (!codeCache[this.id] || script.cachedDataRejected) {\n+      // FIXME(joyeecheung): Figure out how to resolve the dependency issue.\n+      // When the code cache was introduced we were at a point where refactoring\n+      // node.gyp may not be worth the effort.\n+      if (!cache || script.cachedDataRejected) {\n         compiledWithoutCache.push(this.id);\n       } else {\n         compiledWithCache.push(this.id);"
+        },
+        {
+            "sha": "6ff2493a1fbbf328b8e5775dfac1bcb252d07518",
+            "filename": "src/node.cc",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 0,
+            "changes": 8,
+            "blob_url": "https://github.com/nodejs/node/blob/7cbbb27c0721ced7b74fc39033c8485b8d2ad864/src%2Fnode.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/7cbbb27c0721ced7b74fc39033c8485b8d2ad864/src%2Fnode.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode.cc?ref=7cbbb27c0721ced7b74fc39033c8485b8d2ad864",
+            "patch": "@@ -1731,6 +1731,14 @@ static void GetInternalBinding(const FunctionCallbackInfo<Value>& args) {\n     // internalBinding('code_cache')\n     exports = Object::New(env->isolate());\n     DefineCodeCache(env, exports);\n+  } else if (!strcmp(*module_v, \"code_cache_hash\")) {\n+    // internalBinding('code_cache_hash')\n+    exports = Object::New(env->isolate());\n+    DefineCodeCacheHash(env, exports);\n+  } else if (!strcmp(*module_v, \"natives_hash\")) {\n+    // internalBinding('natives_hash')\n+    exports = Object::New(env->isolate());\n+    DefineJavaScriptHash(env, exports);\n   } else {\n     return ThrowIfNoSuchModule(env, *module_v);\n   }"
+        },
+        {
+            "sha": "db8012286172a95dcf9b6cd3d4cc52d0ca8bd11b",
+            "filename": "src/node_code_cache.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/7cbbb27c0721ced7b74fc39033c8485b8d2ad864/src%2Fnode_code_cache.h",
+            "raw_url": "https://github.com/nodejs/node/raw/7cbbb27c0721ced7b74fc39033c8485b8d2ad864/src%2Fnode_code_cache.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_code_cache.h?ref=7cbbb27c0721ced7b74fc39033c8485b8d2ad864",
+            "patch": "@@ -8,6 +8,7 @@\n namespace node {\n \n void DefineCodeCache(Environment* env, v8::Local<v8::Object> target);\n+void DefineCodeCacheHash(Environment* env, v8::Local<v8::Object> target);\n \n }  // namespace node\n "
+        },
+        {
+            "sha": "35780e13f026b0b1639d95f82bd640f00c0c6b10",
+            "filename": "src/node_code_cache_stub.cc",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/nodejs/node/blob/7cbbb27c0721ced7b74fc39033c8485b8d2ad864/src%2Fnode_code_cache_stub.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/7cbbb27c0721ced7b74fc39033c8485b8d2ad864/src%2Fnode_code_cache_stub.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_code_cache_stub.cc?ref=7cbbb27c0721ced7b74fc39033c8485b8d2ad864",
+            "patch": "@@ -11,4 +11,10 @@ void DefineCodeCache(Environment* env, v8::Local<v8::Object> target) {\n   // (here as `target`) so this is a noop.\n }\n \n+void DefineCodeCacheHash(Environment* env, v8::Local<v8::Object> target) {\n+  // When we do not produce code cache for builtin modules,\n+  // `internalBinding('code_cache_hash')` returns an empty object\n+  // (here as `target`) so this is a noop.\n+}\n+\n }  // namespace node"
+        },
+        {
+            "sha": "80ef40b4ec414f59726a633128913ac97537d564",
+            "filename": "src/node_javascript.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/7cbbb27c0721ced7b74fc39033c8485b8d2ad864/src%2Fnode_javascript.h",
+            "raw_url": "https://github.com/nodejs/node/raw/7cbbb27c0721ced7b74fc39033c8485b8d2ad864/src%2Fnode_javascript.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_javascript.h?ref=7cbbb27c0721ced7b74fc39033c8485b8d2ad864",
+            "patch": "@@ -29,6 +29,7 @@\n namespace node {\n \n void DefineJavaScript(Environment* env, v8::Local<v8::Object> target);\n+void DefineJavaScriptHash(Environment* env, v8::Local<v8::Object> target);\n v8::Local<v8::String> NodePerContextSource(v8::Isolate* isolate);\n v8::Local<v8::String> LoadersBootstrapperSource(Environment* env);\n v8::Local<v8::String> NodeBootstrapperSource(Environment* env);"
+        },
+        {
+            "sha": "35411bc5af182ad9d9d952187cbf541630854903",
+            "filename": "tools/generate_code_cache.js",
+            "status": "modified",
+            "additions": 29,
+            "deletions": 3,
+            "changes": 32,
+            "blob_url": "https://github.com/nodejs/node/blob/7cbbb27c0721ced7b74fc39033c8485b8d2ad864/tools%2Fgenerate_code_cache.js",
+            "raw_url": "https://github.com/nodejs/node/raw/7cbbb27c0721ced7b74fc39033c8485b8d2ad864/tools%2Fgenerate_code_cache.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/tools%2Fgenerate_code_cache.js?ref=7cbbb27c0721ced7b74fc39033c8485b8d2ad864",
+            "patch": "@@ -9,9 +9,17 @@\n \n const {\n   getCodeCache,\n+  getSource,\n   cachableBuiltins\n } = require('internal/bootstrap/cache');\n \n+function hash(str) {\n+  if (process.versions.openssl) {\n+    return require('crypto').createHash('sha256').update(str).digest('hex');\n+  }\n+  return '';\n+}\n+\n const fs = require('fs');\n \n const resultPath = process.argv[2];\n@@ -51,6 +59,8 @@ function getInitalizer(key, cache) {\n   const defName = key.replace(/\\//g, '_').replace(/-/g, '_');\n   const definition = `static uint8_t ${defName}_raw[] = {\\n` +\n                      `${cache.join(',')}\\n};`;\n+  const source = getSource(key);\n+  const sourceHash = hash(source);\n   const initializer = `\n   v8::Local<v8::ArrayBuffer> ${defName}_ab =\n     v8::ArrayBuffer::New(isolate, ${defName}_raw, ${cache.length});\n@@ -60,13 +70,19 @@ function getInitalizer(key, cache) {\n               FIXED_ONE_BYTE_STRING(isolate, \"${key}\"),\n               ${defName}_array).FromJust();\n   `;\n+  const hashIntializer = `\n+  target->Set(context,\n+              FIXED_ONE_BYTE_STRING(isolate, \"${key}\"),\n+              OneByteString(isolate, \"${sourceHash}\")).FromJust();\n+  `;\n   return {\n-    definition, initializer\n+    definition, initializer, hashIntializer, sourceHash\n   };\n }\n \n const cacheDefinitions = [];\n const cacheInitializers = [];\n+const cacheHashInitializers = [];\n let totalCacheSize = 0;\n \n \n@@ -79,11 +95,14 @@ for (const key of cachableBuiltins) {\n \n   const length = cachedData.length;\n   totalCacheSize += length;\n-  const { definition, initializer } = getInitalizer(key, cachedData);\n+  const {\n+    definition, initializer, hashIntializer, sourceHash\n+  } = getInitalizer(key, cachedData);\n   cacheDefinitions.push(definition);\n   cacheInitializers.push(initializer);\n+  cacheHashInitializers.push(hashIntializer);\n   console.log(`Generated cache for '${key}', size = ${formatSize(length)}` +\n-              `, total = ${formatSize(totalCacheSize)}`);\n+              `, hash = ${sourceHash}, total = ${formatSize(totalCacheSize)}`);\n }\n \n const result = `#include \"node.h\"\n@@ -106,6 +125,13 @@ void DefineCodeCache(Environment* env, v8::Local<v8::Object> target) {\n   ${cacheInitializers.join('\\n')}\n }\n \n+// The target here will be returned as \\`internalBinding('code_cache_hash')\\`\n+void DefineCodeCacheHash(Environment* env, v8::Local<v8::Object> target) {\n+  v8::Isolate* isolate = env->isolate();\n+  v8::Local<v8::Context> context = env->context();\n+  ${cacheHashInitializers.join('\\n')}\n+}\n+\n }  // namespace node\n `;\n "
+        },
+        {
+            "sha": "40f2bc6f48f483c59fe01b79be2143c0b0b9297a",
+            "filename": "tools/js2c.py",
+            "status": "modified",
+            "additions": 17,
+            "deletions": 1,
+            "changes": 18,
+            "blob_url": "https://github.com/nodejs/node/blob/7cbbb27c0721ced7b74fc39033c8485b8d2ad864/tools%2Fjs2c.py",
+            "raw_url": "https://github.com/nodejs/node/raw/7cbbb27c0721ced7b74fc39033c8485b8d2ad864/tools%2Fjs2c.py",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/tools%2Fjs2c.py?ref=7cbbb27c0721ced7b74fc39033c8485b8d2ad864",
+            "patch": "@@ -35,6 +35,7 @@\n import re\n import sys\n import string\n+import hashlib\n \n \n def ToCArray(elements, step=10):\n@@ -205,6 +206,10 @@ def ReadMacros(lines):\n   {initializers}\n }}\n \n+void DefineJavaScriptHash(Environment* env, v8::Local<v8::Object> target) {{\n+  {hash_initializers}\n+}}\n+\n }}  // namespace node\n \"\"\"\n \n@@ -240,6 +245,12 @@ def ReadMacros(lines):\n                   {value}.ToStringChecked(env->isolate())).FromJust());\n \"\"\"\n \n+HASH_INITIALIZER = \"\"\"\\\n+CHECK(target->Set(env->context(),\n+                  FIXED_ONE_BYTE_STRING(env->isolate(), \"{key}\"),\n+                  FIXED_ONE_BYTE_STRING(env->isolate(), \"{value}\")).FromJust());\n+\"\"\"\n+\n DEPRECATED_DEPS = \"\"\"\\\n 'use strict';\n process.emitWarning(\n@@ -280,6 +291,7 @@ def JS2C(source, target):\n   # Build source code lines\n   definitions = []\n   initializers = []\n+  hash_initializers = [];\n \n   for name in modules:\n     lines = ReadFile(str(name))\n@@ -309,10 +321,12 @@ def JS2C(source, target):\n     var = name.replace('-', '_').replace('/', '_')\n     key = '%s_key' % var\n     value = '%s_value' % var\n+    hash_value = hashlib.sha256(lines).hexdigest()\n \n     definitions.append(Render(key, name))\n     definitions.append(Render(value, lines))\n     initializers.append(INITIALIZER.format(key=key, value=value))\n+    hash_initializers.append(HASH_INITIALIZER.format(key=name, value=hash_value))\n \n     if deprecated_deps is not None:\n       name = '/'.join(deprecated_deps)\n@@ -324,11 +338,13 @@ def JS2C(source, target):\n       definitions.append(Render(key, name))\n       definitions.append(Render(value, DEPRECATED_DEPS.format(module=name)))\n       initializers.append(INITIALIZER.format(key=key, value=value))\n+      hash_initializers.append(HASH_INITIALIZER.format(key=name, value=hash_value))\n \n   # Emit result\n   output = open(str(target[0]), \"w\")\n   output.write(TEMPLATE.format(definitions=''.join(definitions),\n-                               initializers=''.join(initializers)))\n+                               initializers=''.join(initializers),\n+                               hash_initializers=''.join(hash_initializers)))\n   output.close()\n \n def main():"
+        }
+    ],
+    "stats": {
+        "total": 115,
+        "additions": 100,
+        "deletions": 15
+    }
+}

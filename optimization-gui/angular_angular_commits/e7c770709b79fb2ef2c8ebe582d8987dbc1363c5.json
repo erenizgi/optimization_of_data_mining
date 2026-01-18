@@ -1,0 +1,48 @@
+{
+    "author": "gkalpak",
+    "message": "fix(docs-infra): correctly handle reported errors (#42883)\n\nError-handling in AIO happens mainly in two places:\n1. For errors happening inside the app we have a custom `ErrorHandler`\n   implementation, `ReportingErrorHandler`. `ReportingErrorHandler`\n   passes errors to the default `ErrorHandler` (for them to be logged to\n   the console) and also forwards them to `window.onerror()`.\n2. Errors happening outside the app and errors forwarded by\n   `ReportingErrorHandler` are handled by `window.onerror()`, which in\n   turn reports them to Google analytics.\n\nPreviously, we were making some assumptions (which turned out to be\nincorrect based on the info captured in Google analytics - see #28106):\n- `ReportingErrorHandler` assumed that the errors passed to its\n  `handleError()` method would be either strings or `Error` instances.\n  _Apparently, other values (such as `null` or `undefined`) may also be\n  passed._\n- `window.onerror()` assumed that if an `Error` instance was passed in,\n  it would always have a stacktrace (i.e. its `stack` property would be\n  defined).\n  _This is not necessarily true, although it is not clear (based on the\n  logs) whether reported errors of this type are caused by `Error`\n  instance with no stacktrace or by non-string error objects which are\n  incorrectly treated as `Error` instances.\n\nThis commit ensures that all types of error arguments can be handled\ncorrectly, including `Error` instances with no stacktrace and other\ntypes of objects or primitives.\n\nNOTE:\nPR #42881 is related as it fixes handling `null` and `undefined`\narguments in the default `ErrorHandler`.\n\nFixes #28106\n\nPR Close #42883",
+    "sha": "e7c770709b79fb2ef2c8ebe582d8987dbc1363c5",
+    "files": [
+        {
+            "sha": "941327b22f57b5917b3f2cc49fcc0e8c1f6b07f3",
+            "filename": "aio/src/app/shared/reporting-error-handler.spec.ts",
+            "status": "modified",
+            "additions": 30,
+            "deletions": 0,
+            "changes": 30,
+            "blob_url": "https://github.com/angular/angular/blob/e7c770709b79fb2ef2c8ebe582d8987dbc1363c5/aio%2Fsrc%2Fapp%2Fshared%2Freporting-error-handler.spec.ts",
+            "raw_url": "https://github.com/angular/angular/raw/e7c770709b79fb2ef2c8ebe582d8987dbc1363c5/aio%2Fsrc%2Fapp%2Fshared%2Freporting-error-handler.spec.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/aio%2Fsrc%2Fapp%2Fshared%2Freporting-error-handler.spec.ts?ref=e7c770709b79fb2ef2c8ebe582d8987dbc1363c5",
+            "patch": "@@ -56,10 +56,40 @@ describe('ReportingErrorHandler service', () => {\n       expect(onerrorSpy).toHaveBeenCalledWith(error.message, undefined, undefined, undefined, error);\n     });\n \n+    it('should send a non-error object to window.onerror', () => {\n+      const error = {reason: 'this is an error message'};\n+      handler.handleError(error);\n+      expect(onerrorSpy).toHaveBeenCalledWith(JSON.stringify(error));\n+    });\n+\n+    it('should send a non-error object with circular references to window.onerror', () => {\n+      const error = {\n+        reason: 'this is an error message',\n+        get self() { return this; },\n+        toString() { return `{reason: ${this.reason}}`; },\n+      };\n+      handler.handleError(error);\n+      expect(onerrorSpy).toHaveBeenCalledWith('{reason: this is an error message}');\n+    });\n+\n     it('should send an error string to window.onerror', () => {\n       const error = 'this is an error message';\n       handler.handleError(error);\n       expect(onerrorSpy).toHaveBeenCalledWith(error);\n     });\n+\n+    it('should send a non-object, non-string error stringified to window.onerror', () => {\n+      handler.handleError(404);\n+      handler.handleError(false);\n+      handler.handleError(null);\n+      handler.handleError(undefined);\n+\n+      expect(onerrorSpy.calls.allArgs()).toEqual([\n+        ['404'],\n+        ['false'],\n+        ['null'],\n+        ['undefined'],\n+      ]);\n+    });\n   });\n });"
+        },
+        {
+            "sha": "badb88bdfffe10533792decde71054a34b83d5a6",
+            "filename": "aio/src/app/shared/reporting-error-handler.ts",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 6,
+            "changes": 18,
+            "blob_url": "https://github.com/angular/angular/blob/e7c770709b79fb2ef2c8ebe582d8987dbc1363c5/aio%2Fsrc%2Fapp%2Fshared%2Freporting-error-handler.ts",
+            "raw_url": "https://github.com/angular/angular/raw/e7c770709b79fb2ef2c8ebe582d8987dbc1363c5/aio%2Fsrc%2Fapp%2Fshared%2Freporting-error-handler.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/aio%2Fsrc%2Fapp%2Fshared%2Freporting-error-handler.ts?ref=e7c770709b79fb2ef2c8ebe582d8987dbc1363c5",
+            "patch": "@@ -17,8 +17,7 @@ export class ReportingErrorHandler extends ErrorHandler {\n    * Send error info to Google Analytics, in addition to the default handling.\n    * @param error Information about the error.\n    */\n-  handleError(error: string | Error) {\n-\n+  handleError(error: any) {\n     try {\n       super.handleError(error);\n     } catch (e) {\n@@ -27,12 +26,19 @@ export class ReportingErrorHandler extends ErrorHandler {\n     this.reportError(error);\n   }\n \n-  private reportError(error: string | Error) {\n+  private reportError(error: unknown) {\n     if (this.window.onerror) {\n-      if (typeof error === 'string') {\n-        this.window.onerror(error);\n-      } else {\n+      if (error instanceof Error) {\n         this.window.onerror(error.message, undefined, undefined, undefined, error);\n+      } else {\n+        if (typeof error === 'object') {\n+          try {\n+            error = JSON.stringify(error);\n+          } catch {\n+            // Ignore the error and just let it be stringified.\n+          }\n+        }\n+        this.window.onerror(`${error}`);\n       }\n     }\n   }"
+        },
+        {
+            "sha": "db945765a5dd98855138f5dd41854d68088029a2",
+            "filename": "aio/src/index.html",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/angular/angular/blob/e7c770709b79fb2ef2c8ebe582d8987dbc1363c5/aio%2Fsrc%2Findex.html",
+            "raw_url": "https://github.com/angular/angular/raw/e7c770709b79fb2ef2c8ebe582d8987dbc1363c5/aio%2Fsrc%2Findex.html",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/aio%2Fsrc%2Findex.html?ref=e7c770709b79fb2ef2c8ebe582d8987dbc1363c5",
+            "patch": "@@ -69,7 +69,7 @@\n       function formatError(msg, url, line, col, e) {\n         var stack;\n         msg = msg.replace(/^Error: /, '');\n-        if (e) {\n+        if (e && e.stack) {\n           stack = e.stack\n             // strip the leading \"Error: \" from the stack trace\n             .replace(/^Error: /, '')"
+        }
+    ],
+    "stats": {
+        "total": 50,
+        "additions": 43,
+        "deletions": 7
+    }
+}

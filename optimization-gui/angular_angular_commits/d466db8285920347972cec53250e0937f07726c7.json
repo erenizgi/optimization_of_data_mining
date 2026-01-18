@@ -1,0 +1,72 @@
+{
+    "author": "atscott",
+    "message": "fix(language-service): Do not include $event parameter in reference results (#40158)\n\nGiven the template\n`<div (click)=\"doSomething($event)\"></div>`\n\nIf you request references for the `$event`, the results include both `$event` and `(click)=\"doSomething($event)\"`.\n\nThis happens because in the TCB, `$event` is passed to the `subscribe`/`addEventListener`\nfunction as an argument. So when we ask typescript to give us the references, we\nget the result from the usage in the subscribe body as well as the one passed in as an argument.\n\nThis commit adds an identifier to the `$event` parameter in the TCB so\nthat the result returned from `getReferencesAtPosition` can be\nidentified and filtered out.\n\nfixes #40157\n\nPR Close #40158",
+    "sha": "d466db8285920347972cec53250e0937f07726c7",
+    "files": [
+        {
+            "sha": "7e114f47740c5deb50e051bd7bf27520870e4d69",
+            "filename": "packages/compiler-cli/src/ngtsc/typecheck/src/comments.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/angular/angular/blob/d466db8285920347972cec53250e0937f07726c7/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Fsrc%2Fcomments.ts",
+            "raw_url": "https://github.com/angular/angular/raw/d466db8285920347972cec53250e0937f07726c7/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Fsrc%2Fcomments.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Fsrc%2Fcomments.ts?ref=d466db8285920347972cec53250e0937f07726c7",
+            "patch": "@@ -43,6 +43,7 @@ export enum CommentTriviaType {\n export enum ExpressionIdentifier {\n   DIRECTIVE = 'DIR',\n   COMPONENT_COMPLETION = 'COMPCOMP',\n+  EVENT_PARAMETER = 'EP',\n }\n \n /** Tags the node with the given expression identifier. */"
+        },
+        {
+            "sha": "1940aa5504a01cb47d7c71bbf08053ee5c2edbc0",
+            "filename": "packages/compiler-cli/src/ngtsc/typecheck/src/type_check_block.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/angular/angular/blob/d466db8285920347972cec53250e0937f07726c7/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Fsrc%2Ftype_check_block.ts",
+            "raw_url": "https://github.com/angular/angular/raw/d466db8285920347972cec53250e0937f07726c7/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Fsrc%2Ftype_check_block.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Fsrc%2Ftype_check_block.ts?ref=d466db8285920347972cec53250e0937f07726c7",
+            "patch": "@@ -1837,6 +1837,7 @@ function tcbCreateEventHandler(\n       /* name */ EVENT_PARAMETER,\n       /* questionToken */ undefined,\n       /* type */ eventParamType);\n+  addExpressionIdentifier(eventParam, ExpressionIdentifier.EVENT_PARAMETER);\n \n   return ts.createFunctionExpression(\n       /* modifier */ undefined,"
+        },
+        {
+            "sha": "13a79ee1bef63d546d8a5c6b0090fd71c0f1eef2",
+            "filename": "packages/language-service/ivy/references.ts",
+            "status": "modified",
+            "additions": 47,
+            "deletions": 32,
+            "changes": 79,
+            "blob_url": "https://github.com/angular/angular/blob/d466db8285920347972cec53250e0937f07726c7/packages%2Flanguage-service%2Fivy%2Freferences.ts",
+            "raw_url": "https://github.com/angular/angular/raw/d466db8285920347972cec53250e0937f07726c7/packages%2Flanguage-service%2Fivy%2Freferences.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Flanguage-service%2Fivy%2Freferences.ts?ref=d466db8285920347972cec53250e0937f07726c7",
+            "patch": "@@ -9,9 +9,11 @@ import {TmplAstBoundAttribute, TmplAstTextAttribute, TmplAstVariable} from '@ang\n import {NgCompiler} from '@angular/compiler-cli/src/ngtsc/core';\n import {absoluteFrom, absoluteFromSourceFile, AbsoluteFsPath} from '@angular/compiler-cli/src/ngtsc/file_system';\n import {DirectiveSymbol, SymbolKind, TemplateTypeChecker, TypeCheckingProgramStrategy} from '@angular/compiler-cli/src/ngtsc/typecheck/api';\n+import {ExpressionIdentifier, hasExpressionIdentifier} from '@angular/compiler-cli/src/ngtsc/typecheck/src/comments';\n import * as ts from 'typescript';\n \n import {getTargetAtPosition} from './template_target';\n+import {findTightestNode} from './ts_utils';\n import {getDirectiveMatchesForAttribute, getDirectiveMatchesForElementTag, getTemplateInfoAtPosition, isWithin, TemplateInfo, toTextSpan} from './utils';\n \n export class ReferenceBuilder {\n@@ -135,7 +137,7 @@ export class ReferenceBuilder {\n     const entries: ts.ReferenceEntry[] = [];\n     for (const ref of refs) {\n       if (this.ttc.isTrackedTypeCheckFile(absoluteFrom(ref.fileName))) {\n-        const entry = convertToTemplateReferenceEntry(ref, this.ttc);\n+        const entry = this.convertToTemplateReferenceEntry(ref, this.ttc);\n         if (entry !== null) {\n           entries.push(entry);\n         }\n@@ -145,37 +147,50 @@ export class ReferenceBuilder {\n     }\n     return entries;\n   }\n-}\n \n-function convertToTemplateReferenceEntry(\n-    shimReferenceEntry: ts.ReferenceEntry,\n-    templateTypeChecker: TemplateTypeChecker): ts.ReferenceEntry|null {\n-  // TODO(atscott): Determine how to consistently resolve paths. i.e. with the project serverHost or\n-  // LSParseConfigHost in the adapter. We should have a better defined way to normalize paths.\n-  const mapping = templateTypeChecker.getTemplateMappingAtShimLocation({\n-    shimPath: absoluteFrom(shimReferenceEntry.fileName),\n-    positionInShimFile: shimReferenceEntry.textSpan.start,\n-  });\n-  if (mapping === null) {\n-    return null;\n-  }\n-  const {templateSourceMapping, span} = mapping;\n-\n-  let templateUrl: AbsoluteFsPath;\n-  if (templateSourceMapping.type === 'direct') {\n-    templateUrl = absoluteFromSourceFile(templateSourceMapping.node.getSourceFile());\n-  } else if (templateSourceMapping.type === 'external') {\n-    templateUrl = absoluteFrom(templateSourceMapping.templateUrl);\n-  } else {\n-    // This includes indirect mappings, which are difficult to map directly to the code location.\n-    // Diagnostics similarly return a synthetic template string for this case rather than a real\n-    // location.\n-    return null;\n-  }\n+  private convertToTemplateReferenceEntry(\n+      shimReferenceEntry: ts.ReferenceEntry,\n+      templateTypeChecker: TemplateTypeChecker): ts.ReferenceEntry|null {\n+    const sf = this.strategy.getProgram().getSourceFile(shimReferenceEntry.fileName);\n+    if (sf === undefined) {\n+      return null;\n+    }\n+    const tcbNode = findTightestNode(sf, shimReferenceEntry.textSpan.start);\n+    if (tcbNode === undefined ||\n+        hasExpressionIdentifier(sf, tcbNode, ExpressionIdentifier.EVENT_PARAMETER)) {\n+      // If the reference result is the $event parameter in the subscribe/addEventListener function\n+      // in the TCB, we want to filter this result out of the references. We really only want to\n+      // return references to the parameter in the template itself.\n+      return null;\n+    }\n \n-  return {\n-    ...shimReferenceEntry,\n-    fileName: templateUrl,\n-    textSpan: toTextSpan(span),\n-  };\n+    // TODO(atscott): Determine how to consistently resolve paths. i.e. with the project serverHost\n+    // or LSParseConfigHost in the adapter. We should have a better defined way to normalize paths.\n+    const mapping = templateTypeChecker.getTemplateMappingAtShimLocation({\n+      shimPath: absoluteFrom(shimReferenceEntry.fileName),\n+      positionInShimFile: shimReferenceEntry.textSpan.start,\n+    });\n+    if (mapping === null) {\n+      return null;\n+    }\n+    const {templateSourceMapping, span} = mapping;\n+\n+    let templateUrl: AbsoluteFsPath;\n+    if (templateSourceMapping.type === 'direct') {\n+      templateUrl = absoluteFromSourceFile(templateSourceMapping.node.getSourceFile());\n+    } else if (templateSourceMapping.type === 'external') {\n+      templateUrl = absoluteFrom(templateSourceMapping.templateUrl);\n+    } else {\n+      // This includes indirect mappings, which are difficult to map directly to the code location.\n+      // Diagnostics similarly return a synthetic template string for this case rather than a real\n+      // location.\n+      return null;\n+    }\n+\n+    return {\n+      ...shimReferenceEntry,\n+      fileName: templateUrl,\n+      textSpan: toTextSpan(span),\n+    };\n+  }\n }"
+        },
+        {
+            "sha": "fa21130919c4d228d2ca8da4b755689564b1e36d",
+            "filename": "packages/language-service/ivy/test/references_spec.ts",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 0,
+            "changes": 16,
+            "blob_url": "https://github.com/angular/angular/blob/d466db8285920347972cec53250e0937f07726c7/packages%2Flanguage-service%2Fivy%2Ftest%2Freferences_spec.ts",
+            "raw_url": "https://github.com/angular/angular/raw/d466db8285920347972cec53250e0937f07726c7/packages%2Flanguage-service%2Fivy%2Ftest%2Freferences_spec.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Flanguage-service%2Fivy%2Ftest%2Freferences_spec.ts?ref=d466db8285920347972cec53250e0937f07726c7",
+            "patch": "@@ -107,6 +107,22 @@ describe('find references', () => {\n     assertTextSpans(refs, ['title']);\n   });\n \n+  it('should work for $event in method call arguments', () => {\n+    const {text, cursor} = extractCursorInfo(`\n+          import {Component} from '@angular/core';\n+\n+          @Component({template: '<div (click)=\"setTitle($even¦t)\"></div>'})\n+          export class AppCmp {\n+            setTitle(s: any) {}\n+          }`);\n+    const appFile = {name: _('/app.ts'), contents: text};\n+    env = createModuleWithDeclarations([appFile]);\n+    const refs = getReferencesAtPosition(_('/app.ts'), cursor)!;\n+    expect(refs.length).toBe(1);\n+\n+    assertTextSpans(refs, ['$event']);\n+  });\n+\n   it('should work for property writes', () => {\n     const appFile = {\n       name: _('/app.ts'),"
+        },
+        {
+            "sha": "4021407b03c6b946324fe49dcf6da700579612f6",
+            "filename": "packages/language-service/ivy/ts_utils.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/angular/angular/blob/d466db8285920347972cec53250e0937f07726c7/packages%2Flanguage-service%2Fivy%2Fts_utils.ts",
+            "raw_url": "https://github.com/angular/angular/raw/d466db8285920347972cec53250e0937f07726c7/packages%2Flanguage-service%2Fivy%2Fts_utils.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Flanguage-service%2Fivy%2Fts_utils.ts?ref=d466db8285920347972cec53250e0937f07726c7",
+            "patch": "@@ -27,4 +27,4 @@ export function getParentClassDeclaration(startNode: ts.Node): ts.ClassDeclarati\n     startNode = startNode.parent;\n   }\n   return undefined;\n-}\n+}\n\\ No newline at end of file"
+        }
+    ],
+    "stats": {
+        "total": 99,
+        "additions": 66,
+        "deletions": 33
+    }
+}

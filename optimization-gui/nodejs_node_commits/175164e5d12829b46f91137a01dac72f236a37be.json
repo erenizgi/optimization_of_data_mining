@@ -1,0 +1,36 @@
+{
+    "author": "indutny",
+    "message": "http: fix error return in `Finish()`\n\n`http_parser_execute(..., nullptr, 0)` returns either `0` or `1`. The\nexpectation is that no error must be returned if it is `0`, and if\nit is `1` - a `Error` object must be returned back to user.\n\nThe introduction of `llhttp` and the refactor that happened during it\naccidentally removed the error-returning code. This commit reverts it\nback to its original state.\n\nFix: #24585\nPR-URL: https://github.com/nodejs/node/pull/24738\nReviewed-By: Luigi Pinca <luigipinca@gmail.com>\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "175164e5d12829b46f91137a01dac72f236a37be",
+    "files": [
+        {
+            "sha": "4d683b4db2cfaad2c90bd073e7ab012f4e1cd3db",
+            "filename": "src/node_http_parser.cc",
+            "status": "modified",
+            "additions": 28,
+            "deletions": 4,
+            "changes": 32,
+            "blob_url": "https://github.com/nodejs/node/blob/175164e5d12829b46f91137a01dac72f236a37be/src%2Fnode_http_parser.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/175164e5d12829b46f91137a01dac72f236a37be/src%2Fnode_http_parser.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_http_parser.cc?ref=175164e5d12829b46f91137a01dac72f236a37be",
+            "patch": "@@ -491,7 +491,10 @@ class Parser : public AsyncWrap, public StreamListener {\n     ASSIGN_OR_RETURN_UNWRAP(&parser, args.Holder());\n \n     CHECK(parser->current_buffer_.IsEmpty());\n-    parser->Execute(nullptr, 0);\n+    Local<Value> ret = parser->Execute(nullptr, 0);\n+\n+    if (!ret.IsEmpty())\n+      args.GetReturnValue().Set(ret);\n   }\n \n \n@@ -684,11 +687,28 @@ class Parser : public AsyncWrap, public StreamListener {\n     }\n #else  /* !NODE_EXPERIMENTAL_HTTP */\n     size_t nread = http_parser_execute(&parser_, &settings, data, len);\n-    if (data != nullptr) {\n+    err = HTTP_PARSER_ERRNO(&parser_);\n+\n+    // Finish()\n+    if (data == nullptr) {\n+      // `http_parser_execute()` returns either `0` or `1` when `len` is 0\n+      // (part of the finishing sequence).\n+      CHECK_EQ(len, 0);\n+      switch (nread) {\n+        case 0:\n+          err = HPE_OK;\n+          break;\n+        case 1:\n+          nread = 0;\n+          break;\n+        default:\n+          UNREACHABLE();\n+      }\n+\n+    // Regular Execute()\n+    } else {\n       Save();\n     }\n-\n-    err = HTTP_PARSER_ERRNO(&parser_);\n #endif  /* NODE_EXPERIMENTAL_HTTP */\n \n     // Unassign the 'buffer_' variable\n@@ -738,6 +758,10 @@ class Parser : public AsyncWrap, public StreamListener {\n       return scope.Escape(e);\n     }\n \n+    // No return value is needed for `Finish()`\n+    if (data == nullptr) {\n+      return scope.Escape(Local<Value>());\n+    }\n     return scope.Escape(nread_obj);\n   }\n "
+        },
+        {
+            "sha": "6d47a762dc8bfad63d29469c8babfa098781a9c3",
+            "filename": "test/parallel/test-http-parser-finish-error.js",
+            "status": "added",
+            "additions": 27,
+            "deletions": 0,
+            "changes": 27,
+            "blob_url": "https://github.com/nodejs/node/blob/175164e5d12829b46f91137a01dac72f236a37be/test%2Fparallel%2Ftest-http-parser-finish-error.js",
+            "raw_url": "https://github.com/nodejs/node/raw/175164e5d12829b46f91137a01dac72f236a37be/test%2Fparallel%2Ftest-http-parser-finish-error.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-http-parser-finish-error.js?ref=175164e5d12829b46f91137a01dac72f236a37be",
+            "patch": "@@ -0,0 +1,27 @@\n+'use strict';\n+\n+const common = require('../common');\n+const net = require('net');\n+const http = require('http');\n+const assert = require('assert');\n+\n+const str = 'GET / HTTP/1.1\\r\\n' +\n+            'Content-Length:';\n+\n+\n+const server = http.createServer(common.mustNotCall());\n+server.on('clientError', common.mustCall((err, socket) => {\n+  assert(/^Parse Error/.test(err.message));\n+  assert.strictEqual(err.code, 'HPE_INVALID_EOF_STATE');\n+  socket.destroy();\n+}, 1));\n+server.listen(0, () => {\n+  const client = net.connect({ port: server.address().port }, () => {\n+    client.on('data', common.mustNotCall());\n+    client.on('end', common.mustCall(() => {\n+      server.close();\n+    }));\n+    client.write(str);\n+    client.end();\n+  });\n+});"
+        }
+    ],
+    "stats": {
+        "total": 59,
+        "additions": 55,
+        "deletions": 4
+    }
+}

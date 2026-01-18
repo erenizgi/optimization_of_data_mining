@@ -1,0 +1,108 @@
+{
+    "author": "unknown",
+    "message": "src: unload addons when environment quits\n\nThis is an alternative to https://github.com/nodejs/node/pull/23319\nwhich attaches the loaded addons to the environment and closes them\nwhen the environment is destroyed.\n\nPR-URL: https://github.com/nodejs/node/pull/24861\nReviewed-By: Anna Henningsen <anna@addaleax.net>\nReviewed-By: Joyee Cheung <joyeec9h3@gmail.com>",
+    "sha": "13abc6adfb9f6a53618ca7d533d31b6a5d26dcec",
+    "files": [
+        {
+            "sha": "ea257a1d6051db565b8bdc5d9f5888156b80d38f",
+            "filename": "src/env-inl.h",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 0,
+            "changes": 10,
+            "blob_url": "https://github.com/nodejs/node/blob/13abc6adfb9f6a53618ca7d533d31b6a5d26dcec/src%2Fenv-inl.h",
+            "raw_url": "https://github.com/nodejs/node/raw/13abc6adfb9f6a53618ca7d533d31b6a5d26dcec/src%2Fenv-inl.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv-inl.h?ref=13abc6adfb9f6a53618ca7d533d31b6a5d26dcec",
+            "patch": "@@ -396,6 +396,16 @@ inline uv_loop_t* Environment::event_loop() const {\n   return isolate_data()->event_loop();\n }\n \n+inline void Environment::TryLoadAddon(\n+    const char* filename,\n+    int flags,\n+    std::function<bool(binding::DLib*)> was_loaded) {\n+  loaded_addons_.emplace_back(filename, flags);\n+  if (!was_loaded(&loaded_addons_.back())) {\n+    loaded_addons_.pop_back();\n+  }\n+}\n+\n inline Environment::AsyncHooks* Environment::async_hooks() {\n   return &async_hooks_;\n }"
+        },
+        {
+            "sha": "afdebc304f473c8611a375500e5aee18df155294",
+            "filename": "src/env.cc",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/nodejs/node/blob/13abc6adfb9f6a53618ca7d533d31b6a5d26dcec/src%2Fenv.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/13abc6adfb9f6a53618ca7d533d31b6a5d26dcec/src%2Fenv.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv.cc?ref=13abc6adfb9f6a53618ca7d533d31b6a5d26dcec",
+            "patch": "@@ -276,6 +276,11 @@ Environment::~Environment() {\n \n   TRACE_EVENT_NESTABLE_ASYNC_END0(\n     TRACING_CATEGORY_NODE1(environment), \"Environment\", this);\n+\n+  // Dereference all addons that were loaded into this environment.\n+  for (binding::DLib& addon : loaded_addons_) {\n+    addon.Close();\n+  }\n }\n \n void Environment::Start(const std::vector<std::string>& args,"
+        },
+        {
+            "sha": "934c160197d7a4c7ed14127e3c942d7d060efbcf",
+            "filename": "src/env.h",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 2,
+            "changes": 10,
+            "blob_url": "https://github.com/nodejs/node/blob/13abc6adfb9f6a53618ca7d533d31b6a5d26dcec/src%2Fenv.h",
+            "raw_url": "https://github.com/nodejs/node/raw/13abc6adfb9f6a53618ca7d533d31b6a5d26dcec/src%2Fenv.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv.h?ref=13abc6adfb9f6a53618ca7d533d31b6a5d26dcec",
+            "patch": "@@ -30,18 +30,20 @@\n #endif\n #include \"handle_wrap.h\"\n #include \"node.h\"\n+#include \"node_binding.h\"\n #include \"node_http2_state.h\"\n #include \"node_options.h\"\n #include \"req_wrap.h\"\n #include \"util.h\"\n #include \"uv.h\"\n #include \"v8.h\"\n \n-#include <list>\n #include <stdint.h>\n-#include <vector>\n+#include <functional>\n+#include <list>\n #include <unordered_map>\n #include <unordered_set>\n+#include <vector>\n \n struct nghttp2_rcbuf;\n \n@@ -637,6 +639,9 @@ class Environment {\n   inline v8::Isolate* isolate() const;\n   inline uv_loop_t* event_loop() const;\n   inline uint32_t watched_providers() const;\n+  inline void TryLoadAddon(const char* filename,\n+                           int flags,\n+                           std::function<bool(binding::DLib*)> was_loaded);\n \n   static inline Environment* from_timer_handle(uv_timer_t* handle);\n   inline uv_timer_t* timer_handle();\n@@ -923,6 +928,7 @@ class Environment {\n   inline void ThrowError(v8::Local<v8::Value> (*fun)(v8::Local<v8::String>),\n                          const char* errmsg);\n \n+  std::list<binding::DLib> loaded_addons_;\n   v8::Isolate* const isolate_;\n   IsolateData* const isolate_data_;\n   uv_timer_t timer_handle_;"
+        },
+        {
+            "sha": "0758741ffcb85250c38ae57ff4d1da7bc5fac447",
+            "filename": "src/node_binding.cc",
+            "status": "modified",
+            "additions": 80,
+            "deletions": 102,
+            "changes": 182,
+            "blob_url": "https://github.com/nodejs/node/blob/13abc6adfb9f6a53618ca7d533d31b6a5d26dcec/src%2Fnode_binding.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/13abc6adfb9f6a53618ca7d533d31b6a5d26dcec/src%2Fnode_binding.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_binding.cc?ref=13abc6adfb9f6a53618ca7d533d31b6a5d26dcec",
+            "patch": "@@ -2,10 +2,6 @@\n #include \"node_internals.h\"\n #include \"node_native_module.h\"\n \n-#if defined(__POSIX__)\n-#include <dlfcn.h>\n-#endif\n-\n #if HAVE_OPENSSL\n #define NODE_BUILTIN_OPENSSL_MODULES(V) V(crypto) V(tls_wrap)\n #else\n@@ -127,31 +123,8 @@ extern \"C\" void node_module_register(void* m) {\n \n namespace binding {\n \n-class DLib {\n- public:\n-#ifdef __POSIX__\n-  static const int kDefaultFlags = RTLD_LAZY;\n-#else\n-  static const int kDefaultFlags = 0;\n-#endif\n-\n-  inline DLib(const char* filename, int flags)\n-      : filename_(filename), flags_(flags), handle_(nullptr) {}\n-\n-  inline bool Open();\n-  inline void Close();\n-  inline void* GetSymbolAddress(const char* name);\n-\n-  const std::string filename_;\n-  const int flags_;\n-  std::string errmsg_;\n-  void* handle_;\n-#ifndef __POSIX__\n-  uv_lib_t lib_;\n-#endif\n- private:\n-  DISALLOW_COPY_AND_ASSIGN(DLib);\n-};\n+DLib::DLib(const char* filename, int flags)\n+    : filename_(filename), flags_(flags), handle_(nullptr) {}\n \n #ifdef __POSIX__\n bool DLib::Open() {\n@@ -248,87 +221,92 @@ void DLOpen(const FunctionCallbackInfo<Value>& args) {\n   }\n \n   node::Utf8Value filename(env->isolate(), args[1]);  // Cast\n-  DLib dlib(*filename, flags);\n-  bool is_opened = dlib.Open();\n-\n-  // Objects containing v14 or later modules will have registered themselves\n-  // on the pending list.  Activate all of them now.  At present, only one\n-  // module per object is supported.\n-  node_module* const mp =\n-      static_cast<node_module*>(uv_key_get(&thread_local_modpending));\n-  uv_key_set(&thread_local_modpending, nullptr);\n-\n-  if (!is_opened) {\n-    Local<String> errmsg = OneByteString(env->isolate(), dlib.errmsg_.c_str());\n-    dlib.Close();\n+  env->TryLoadAddon(*filename, flags, [&](DLib* dlib) {\n+    const bool is_opened = dlib->Open();\n+\n+    // Objects containing v14 or later modules will have registered themselves\n+    // on the pending list.  Activate all of them now.  At present, only one\n+    // module per object is supported.\n+    node_module* const mp =\n+        static_cast<node_module*>(uv_key_get(&thread_local_modpending));\n+    uv_key_set(&thread_local_modpending, nullptr);\n+\n+    if (!is_opened) {\n+      Local<String> errmsg =\n+          OneByteString(env->isolate(), dlib->errmsg_.c_str());\n+      dlib->Close();\n #ifdef _WIN32\n-    // Windows needs to add the filename into the error message\n-    errmsg = String::Concat(\n-        env->isolate(), errmsg, args[1]->ToString(context).ToLocalChecked());\n+      // Windows needs to add the filename into the error message\n+      errmsg = String::Concat(\n+          env->isolate(), errmsg, args[1]->ToString(context).ToLocalChecked());\n #endif  // _WIN32\n-    env->isolate()->ThrowException(Exception::Error(errmsg));\n-    return;\n-  }\n+      env->isolate()->ThrowException(Exception::Error(errmsg));\n+      return false;\n+    }\n \n-  if (mp == nullptr) {\n-    if (auto callback = GetInitializerCallback(&dlib)) {\n-      callback(exports, module, context);\n-    } else if (auto napi_callback = GetNapiInitializerCallback(&dlib)) {\n-      napi_module_register_by_symbol(exports, module, context, napi_callback);\n-    } else {\n-      dlib.Close();\n-      env->ThrowError(\"Module did not self-register.\");\n+    if (mp == nullptr) {\n+      if (auto callback = GetInitializerCallback(dlib)) {\n+        callback(exports, module, context);\n+      } else if (auto napi_callback = GetNapiInitializerCallback(dlib)) {\n+        napi_module_register_by_symbol(exports, module, context, napi_callback);\n+      } else {\n+        dlib->Close();\n+        env->ThrowError(\"Module did not self-register.\");\n+        return false;\n+      }\n+      return true;\n     }\n-    return;\n-  }\n \n-  // -1 is used for N-API modules\n-  if ((mp->nm_version != -1) && (mp->nm_version != NODE_MODULE_VERSION)) {\n-    // Even if the module did self-register, it may have done so with the wrong\n-    // version. We must only give up after having checked to see if it has an\n-    // appropriate initializer callback.\n-    if (auto callback = GetInitializerCallback(&dlib)) {\n-      callback(exports, module, context);\n-      return;\n+    // -1 is used for N-API modules\n+    if ((mp->nm_version != -1) && (mp->nm_version != NODE_MODULE_VERSION)) {\n+      // Even if the module did self-register, it may have done so with the\n+      // wrong version. We must only give up after having checked to see if it\n+      // has an appropriate initializer callback.\n+      if (auto callback = GetInitializerCallback(dlib)) {\n+        callback(exports, module, context);\n+        return true;\n+      }\n+      char errmsg[1024];\n+      snprintf(errmsg,\n+               sizeof(errmsg),\n+               \"The module '%s'\"\n+               \"\\nwas compiled against a different Node.js version using\"\n+               \"\\nNODE_MODULE_VERSION %d. This version of Node.js requires\"\n+               \"\\nNODE_MODULE_VERSION %d. Please try re-compiling or \"\n+               \"re-installing\\nthe module (for instance, using `npm rebuild` \"\n+               \"or `npm install`).\",\n+               *filename,\n+               mp->nm_version,\n+               NODE_MODULE_VERSION);\n+\n+      // NOTE: `mp` is allocated inside of the shared library's memory, calling\n+      // `dlclose` will deallocate it\n+      dlib->Close();\n+      env->ThrowError(errmsg);\n+      return false;\n+    }\n+    if (mp->nm_flags & NM_F_BUILTIN) {\n+      dlib->Close();\n+      env->ThrowError(\"Built-in module self-registered.\");\n+      return false;\n     }\n-    char errmsg[1024];\n-    snprintf(errmsg,\n-             sizeof(errmsg),\n-             \"The module '%s'\"\n-             \"\\nwas compiled against a different Node.js version using\"\n-             \"\\nNODE_MODULE_VERSION %d. This version of Node.js requires\"\n-             \"\\nNODE_MODULE_VERSION %d. Please try re-compiling or \"\n-             \"re-installing\\nthe module (for instance, using `npm rebuild` \"\n-             \"or `npm install`).\",\n-             *filename,\n-             mp->nm_version,\n-             NODE_MODULE_VERSION);\n-\n-    // NOTE: `mp` is allocated inside of the shared library's memory, calling\n-    // `dlclose` will deallocate it\n-    dlib.Close();\n-    env->ThrowError(errmsg);\n-    return;\n-  }\n-  if (mp->nm_flags & NM_F_BUILTIN) {\n-    dlib.Close();\n-    env->ThrowError(\"Built-in module self-registered.\");\n-    return;\n-  }\n \n-  mp->nm_dso_handle = dlib.handle_;\n-  mp->nm_link = modlist_addon;\n-  modlist_addon = mp;\n+    mp->nm_dso_handle = dlib->handle_;\n+    mp->nm_link = modlist_addon;\n+    modlist_addon = mp;\n \n-  if (mp->nm_context_register_func != nullptr) {\n-    mp->nm_context_register_func(exports, module, context, mp->nm_priv);\n-  } else if (mp->nm_register_func != nullptr) {\n-    mp->nm_register_func(exports, module, mp->nm_priv);\n-  } else {\n-    dlib.Close();\n-    env->ThrowError(\"Module has no declared entry point.\");\n-    return;\n-  }\n+    if (mp->nm_context_register_func != nullptr) {\n+      mp->nm_context_register_func(exports, module, context, mp->nm_priv);\n+    } else if (mp->nm_register_func != nullptr) {\n+      mp->nm_register_func(exports, module, mp->nm_priv);\n+    } else {\n+      dlib->Close();\n+      env->ThrowError(\"Module has no declared entry point.\");\n+      return false;\n+    }\n+\n+    return true;\n+  });\n \n   // Tell coverity that 'handle' should not be freed when we return.\n   // coverity[leaked_storage]"
+        },
+        {
+            "sha": "7d79dae80d8e39ced4912682f8bea04d4416a6c4",
+            "filename": "src/node_binding.h",
+            "status": "modified",
+            "additions": 34,
+            "deletions": 0,
+            "changes": 34,
+            "blob_url": "https://github.com/nodejs/node/blob/13abc6adfb9f6a53618ca7d533d31b6a5d26dcec/src%2Fnode_binding.h",
+            "raw_url": "https://github.com/nodejs/node/raw/13abc6adfb9f6a53618ca7d533d31b6a5d26dcec/src%2Fnode_binding.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_binding.h?ref=13abc6adfb9f6a53618ca7d533d31b6a5d26dcec",
+            "patch": "@@ -3,8 +3,14 @@\n \n #if defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS\n \n+#if defined(__POSIX__)\n+#include <dlfcn.h>\n+#endif\n+\n #include \"node.h\"\n+#define NAPI_EXPERIMENTAL\n #include \"node_api.h\"\n+#include \"util.h\"\n #include \"uv.h\"\n #include \"v8.h\"\n \n@@ -46,6 +52,32 @@ extern bool node_is_initialized;\n \n namespace binding {\n \n+class DLib {\n+ public:\n+#ifdef __POSIX__\n+  static const int kDefaultFlags = RTLD_LAZY;\n+#else\n+  static const int kDefaultFlags = 0;\n+#endif\n+\n+  DLib(const char* filename, int flags);\n+\n+  bool Open();\n+  void Close();\n+  void* GetSymbolAddress(const char* name);\n+\n+  const std::string filename_;\n+  const int flags_;\n+  std::string errmsg_;\n+  void* handle_;\n+#ifndef __POSIX__\n+  uv_lib_t lib_;\n+#endif\n+\n+ private:\n+  DISALLOW_COPY_AND_ASSIGN(DLib);\n+};\n+\n // Call _register<module_name> functions for all of\n // the built-in modules. Because built-in modules don't\n // use the __attribute__((constructor)). Need to\n@@ -60,5 +92,7 @@ void DLOpen(const v8::FunctionCallbackInfo<v8::Value>& args);\n \n }  // namespace node\n \n+#include \"node_binding.h\"\n+\n #endif  // defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS\n #endif  // SRC_NODE_BINDING_H_"
+        },
+        {
+            "sha": "b67c5f7136af6ef4a79215bbb96eb378a4a8c345",
+            "filename": "test/abort/test-addon-uv-handle-leak.js",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 0,
+            "changes": 10,
+            "blob_url": "https://github.com/nodejs/node/blob/13abc6adfb9f6a53618ca7d533d31b6a5d26dcec/test%2Fabort%2Ftest-addon-uv-handle-leak.js",
+            "raw_url": "https://github.com/nodejs/node/raw/13abc6adfb9f6a53618ca7d533d31b6a5d26dcec/test%2Fabort%2Ftest-addon-uv-handle-leak.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fabort%2Ftest-addon-uv-handle-leak.js?ref=13abc6adfb9f6a53618ca7d533d31b6a5d26dcec",
+            "patch": "@@ -18,6 +18,16 @@ if (!fs.existsSync(bindingPath))\n   common.skip('binding not built yet');\n \n if (process.argv[2] === 'child') {\n+\n+  // The worker thread loads and then unloads `bindingPath`. Because of this the\n+  // symbols in `bindingPath` are lost when the worker thread quits, but the\n+  // number of open handles in the worker thread's event loop is assessed in the\n+  // main thread afterwards, and the names of the callbacks associated with the\n+  // open handles is retrieved at that time as well. Thus, we require\n+  // `bindingPath` here so that the symbols and their names survive the life\n+  // cycle of the worker thread.\n+  require(bindingPath);\n+\n   new Worker(`\n   const binding = require(${JSON.stringify(bindingPath)});\n "
+        },
+        {
+            "sha": "3a27bcd7c30756d101129d225fbcd7ed272f64fd",
+            "filename": "test/addons/at-exit/binding.cc",
+            "status": "modified",
+            "additions": 14,
+            "deletions": 2,
+            "changes": 16,
+            "blob_url": "https://github.com/nodejs/node/blob/13abc6adfb9f6a53618ca7d533d31b6a5d26dcec/test%2Faddons%2Fat-exit%2Fbinding.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/13abc6adfb9f6a53618ca7d533d31b6a5d26dcec/test%2Faddons%2Fat-exit%2Fbinding.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Faddons%2Fat-exit%2Fbinding.cc?ref=13abc6adfb9f6a53618ca7d533d31b6a5d26dcec",
+            "patch": "@@ -9,6 +9,19 @@ using v8::Isolate;\n using v8::Local;\n using v8::Object;\n \n+#if defined(_MSC_VER)\n+#pragma section(\".CRT$XPU\", read)\n+#define NODE_C_DTOR(fn)                                               \\\n+  NODE_CTOR_PREFIX void __cdecl fn(void);                             \\\n+  __declspec(dllexport, allocate(\".CRT$XPU\"))                         \\\n+      void (__cdecl*fn ## _)(void) = fn;                              \\\n+  NODE_CTOR_PREFIX void __cdecl fn(void)\n+#else\n+#define NODE_C_DTOR(fn)                                               \\\n+  NODE_CTOR_PREFIX void fn(void) __attribute__((destructor));         \\\n+  NODE_CTOR_PREFIX void fn(void)\n+#endif\n+\n static char cookie[] = \"yum yum\";\n static int at_exit_cb1_called = 0;\n static int at_exit_cb2_called = 0;\n@@ -27,7 +40,7 @@ static void at_exit_cb2(void* arg) {\n   at_exit_cb2_called++;\n }\n \n-static void sanity_check(void) {\n+NODE_C_DTOR(sanity_check) {\n   assert(at_exit_cb1_called == 1);\n   assert(at_exit_cb2_called == 2);\n }\n@@ -36,7 +49,6 @@ void init(Local<Object> exports) {\n   AtExit(at_exit_cb1, exports->GetIsolate());\n   AtExit(at_exit_cb2, cookie);\n   AtExit(at_exit_cb2, cookie);\n-  atexit(sanity_check);\n }\n \n NODE_MODULE(NODE_GYP_MODULE_NAME, init)"
+        },
+        {
+            "sha": "221a1284323171c4cd4616649e34f8e2040f6deb",
+            "filename": "test/addons/uv-handle-leak/binding.cc",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 3,
+            "changes": 5,
+            "blob_url": "https://github.com/nodejs/node/blob/13abc6adfb9f6a53618ca7d533d31b6a5d26dcec/test%2Faddons%2Fuv-handle-leak%2Fbinding.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/13abc6adfb9f6a53618ca7d533d31b6a5d26dcec/test%2Faddons%2Fuv-handle-leak%2Fbinding.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Faddons%2Fuv-handle-leak%2Fbinding.cc?ref=13abc6adfb9f6a53618ca7d533d31b6a5d26dcec",
+            "patch": "@@ -41,8 +41,7 @@ void LeakHandle(const FunctionCallbackInfo<Value>& args) {\n   uv_unref(reinterpret_cast<uv_handle_t*>(leaked_timer));\n }\n \n-void Initialize(v8::Local<v8::Object> exports) {\n+// This module gets loaded multiple times in some tests so it must support that.\n+NODE_MODULE_INIT(/*exports, module, context*/) {\n   NODE_SET_METHOD(exports, \"leakHandle\", LeakHandle);\n }\n-\n-NODE_MODULE(NODE_GYP_MODULE_NAME, Initialize)"
+        }
+    ],
+    "stats": {
+        "total": 272,
+        "additions": 163,
+        "deletions": 109
+    }
+}

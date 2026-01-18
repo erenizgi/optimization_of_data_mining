@@ -1,0 +1,132 @@
+{
+    "author": "addaleax",
+    "message": "src: implement debug output utilities\n\nImplement utilities for easier debugging of Node.js core code,\ninspired by the HTTP/2 debugging code. Debugging is, however,\nimplemented at runtime rather than at compile time, controlled\nthrough a new `NODE_DEBUG_NATIVE=categories` environment variable.\n\nThe runtime overhead in the debugging-disabled case amounts to\n1 well-cachable one-byte read per debug call.\n\nPR-URL: https://github.com/nodejs/node/pull/20987\nReviewed-By: Daniel Bevenius <daniel.bevenius@gmail.com>\nReviewed-By: Joyee Cheung <joyeec9h3@gmail.com>\nReviewed-By: Minwoo Jung <minwoo@nodesource.com>\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "bd85844c4e80c7aa1fc02a986c7619c3956b0061",
+    "files": [
+        {
+            "sha": "008e415a0579f06192b654c2a5901e3cd0094eef",
+            "filename": "node.gyp",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/bd85844c4e80c7aa1fc02a986c7619c3956b0061/node.gyp",
+            "raw_url": "https://github.com/nodejs/node/raw/bd85844c4e80c7aa1fc02a986c7619c3956b0061/node.gyp",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/node.gyp?ref=bd85844c4e80c7aa1fc02a986c7619c3956b0061",
+            "patch": "@@ -374,6 +374,7 @@\n         'src/base_object-inl.h',\n         'src/connection_wrap.h',\n         'src/connect_wrap.h',\n+        'src/debug_utils.h',\n         'src/env.h',\n         'src/env-inl.h',\n         'src/handle_wrap.h',"
+        },
+        {
+            "sha": "11ce5a387a950c52050159a5dff5b74bc35987e6",
+            "filename": "src/async_wrap.cc",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/nodejs/node/blob/bd85844c4e80c7aa1fc02a986c7619c3956b0061/src%2Fasync_wrap.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/bd85844c4e80c7aa1fc02a986c7619c3956b0061/src%2Fasync_wrap.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fasync_wrap.cc?ref=bd85844c4e80c7aa1fc02a986c7619c3956b0061",
+            "patch": "@@ -769,6 +769,11 @@ void EmitAsyncDestroy(Isolate* isolate, async_context asyncContext) {\n       Environment::GetCurrent(isolate), asyncContext.async_id);\n }\n \n+std::string AsyncWrap::diagnostic_name() const {\n+  return std::string(provider_names[provider_type()]) +\n+      \" (\" + std::to_string(static_cast<int64_t>(async_id_)) + \")\";\n+}\n+\n }  // namespace node\n \n NODE_BUILTIN_MODULE_CONTEXT_AWARE(async_wrap, node::AsyncWrap::Initialize)"
+        },
+        {
+            "sha": "451bcfe12e671784dddb9f0a199150c68f7be06e",
+            "filename": "src/async_wrap.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/bd85844c4e80c7aa1fc02a986c7619c3956b0061/src%2Fasync_wrap.h",
+            "raw_url": "https://github.com/nodejs/node/raw/bd85844c4e80c7aa1fc02a986c7619c3956b0061/src%2Fasync_wrap.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fasync_wrap.h?ref=bd85844c4e80c7aa1fc02a986c7619c3956b0061",
+            "patch": "@@ -167,6 +167,7 @@ class AsyncWrap : public BaseObject {\n                                                 v8::Local<v8::Value>* argv);\n \n   virtual size_t self_size() const = 0;\n+  virtual std::string diagnostic_name() const;\n \n   static void WeakCallback(const v8::WeakCallbackInfo<DestroyParam> &info);\n "
+        },
+        {
+            "sha": "f10342c79d35be16fbe4cfdb27c9629728d4541d",
+            "filename": "src/debug_utils.h",
+            "status": "added",
+            "additions": 92,
+            "deletions": 0,
+            "changes": 92,
+            "blob_url": "https://github.com/nodejs/node/blob/bd85844c4e80c7aa1fc02a986c7619c3956b0061/src%2Fdebug_utils.h",
+            "raw_url": "https://github.com/nodejs/node/raw/bd85844c4e80c7aa1fc02a986c7619c3956b0061/src%2Fdebug_utils.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fdebug_utils.h?ref=bd85844c4e80c7aa1fc02a986c7619c3956b0061",
+            "patch": "@@ -0,0 +1,92 @@\n+#ifndef SRC_DEBUG_UTILS_H_\n+#define SRC_DEBUG_UTILS_H_\n+\n+#if defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS\n+\n+#include \"async_wrap.h\"\n+#include \"env.h\"\n+#include <string>\n+\n+// Use FORCE_INLINE on functions that have a debug-category-enabled check first\n+// and then ideally only a single function call following it, to maintain\n+// performance for the common case (no debugging used).\n+#ifdef __GNUC__\n+#define FORCE_INLINE __attribute__((always_inline))\n+#define COLD_NOINLINE __attribute__((cold, noinline))\n+#else\n+#define FORCE_INLINE\n+#define COLD_NOINLINE\n+#endif\n+\n+namespace node {\n+\n+template <typename... Args>\n+inline void FORCE_INLINE Debug(Environment* env,\n+                               DebugCategory cat,\n+                               const char* format,\n+                               Args&&... args) {\n+  if (!UNLIKELY(env->debug_enabled(cat)))\n+    return;\n+  fprintf(stderr, format, std::forward<Args>(args)...);\n+}\n+\n+inline void FORCE_INLINE Debug(Environment* env,\n+                               DebugCategory cat,\n+                               const char* message) {\n+  if (!UNLIKELY(env->debug_enabled(cat)))\n+    return;\n+  fprintf(stderr, \"%s\", message);\n+}\n+\n+template <typename... Args>\n+inline void Debug(Environment* env,\n+                  DebugCategory cat,\n+                  const std::string& format,\n+                  Args&&... args) {\n+  Debug(env, cat, format.c_str(), std::forward<Args>(args)...);\n+}\n+\n+// Used internally by the 'real' Debug(AsyncWrap*, ...) functions below, so that\n+// the FORCE_INLINE flag on them doesn't apply to the contents of this function\n+// as well.\n+// We apply COLD_NOINLINE to tell the compiler that it's not worth optimizing\n+// this function for speed and it should rather focus on keeping it out of\n+// hot code paths. In particular, we want to keep the string concatenating code\n+// out of the function containing the original `Debug()` call.\n+template <typename... Args>\n+void COLD_NOINLINE UnconditionalAsyncWrapDebug(AsyncWrap* async_wrap,\n+                                               const char* format,\n+                                               Args&&... args) {\n+  Debug(async_wrap->env(),\n+        static_cast<DebugCategory>(async_wrap->provider_type()),\n+        async_wrap->diagnostic_name() + \" \" + format + \"\\n\",\n+        std::forward<Args>(args)...);\n+}\n+\n+template <typename... Args>\n+inline void FORCE_INLINE Debug(AsyncWrap* async_wrap,\n+                               const char* format,\n+                               Args&&... args) {\n+#ifdef DEBUG\n+  CHECK_NOT_NULL(async_wrap);\n+#endif\n+  DebugCategory cat =\n+      static_cast<DebugCategory>(async_wrap->provider_type());\n+  if (!UNLIKELY(async_wrap->env()->debug_enabled(cat)))\n+    return;\n+  UnconditionalAsyncWrapDebug(async_wrap, format, std::forward<Args>(args)...);\n+}\n+\n+template <typename... Args>\n+inline void FORCE_INLINE Debug(AsyncWrap* async_wrap,\n+                               const std::string& format,\n+                               Args&&... args) {\n+  Debug(async_wrap, format.c_str(), std::forward<Args>(args)...);\n+}\n+\n+\n+}  // namespace node\n+\n+#endif  // defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS\n+\n+#endif  // SRC_DEBUG_UTILS_H_"
+        },
+        {
+            "sha": "cb8d0c4efe0405768dad362ac478b30994b9bfbc",
+            "filename": "src/env-inl.h",
+            "status": "modified",
+            "additions": 18,
+            "deletions": 0,
+            "changes": 18,
+            "blob_url": "https://github.com/nodejs/node/blob/bd85844c4e80c7aa1fc02a986c7619c3956b0061/src%2Fenv-inl.h",
+            "raw_url": "https://github.com/nodejs/node/raw/bd85844c4e80c7aa1fc02a986c7619c3956b0061/src%2Fenv-inl.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv-inl.h?ref=bd85844c4e80c7aa1fc02a986c7619c3956b0061",
+            "patch": "@@ -519,6 +519,24 @@ inline void Environment::set_http2_state(\n   http2_state_ = std::move(buffer);\n }\n \n+bool Environment::debug_enabled(DebugCategory category) const {\n+#ifdef DEBUG\n+  CHECK_GE(static_cast<int>(category), 0);\n+  CHECK_LT(static_cast<int>(category),\n+           static_cast<int>(DebugCategory::CATEGORY_COUNT));\n+#endif\n+  return debug_enabled_[static_cast<int>(category)];\n+}\n+\n+void Environment::set_debug_enabled(DebugCategory category, bool enabled) {\n+#ifdef DEBUG\n+  CHECK_GE(static_cast<int>(category), 0);\n+  CHECK_LT(static_cast<int>(category),\n+           static_cast<int>(DebugCategory::CATEGORY_COUNT));\n+#endif\n+  debug_enabled_[static_cast<int>(category)] = enabled;\n+}\n+\n inline AliasedBuffer<double, v8::Float64Array>*\n Environment::fs_stats_field_array() {\n   return &fs_stats_field_array_;"
+        },
+        {
+            "sha": "f6303e6011f54c9b53ff9f46ace6a4022e34b997",
+            "filename": "src/env.cc",
+            "status": "modified",
+            "additions": 26,
+            "deletions": 0,
+            "changes": 26,
+            "blob_url": "https://github.com/nodejs/node/blob/bd85844c4e80c7aa1fc02a986c7619c3956b0061/src%2Fenv.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/bd85844c4e80c7aa1fc02a986c7619c3956b0061/src%2Fenv.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv.cc?ref=bd85844c4e80c7aa1fc02a986c7619c3956b0061",
+            "patch": "@@ -130,6 +130,10 @@ Environment::Environment(IsolateData* isolate_data,\n \n   // By default, always abort when --abort-on-uncaught-exception was passed.\n   should_abort_on_uncaught_toggle_[0] = 1;\n+\n+  std::string debug_cats;\n+  SafeGetenv(\"NODE_DEBUG_NATIVE\", &debug_cats);\n+  set_debug_categories(debug_cats, true);\n }\n \n Environment::~Environment() {\n@@ -496,6 +500,28 @@ Local<Value> Environment::GetNow() {\n }\n \n \n+void Environment::set_debug_categories(const std::string& cats, bool enabled) {\n+  std::string debug_categories = cats;\n+  while (!debug_categories.empty()) {\n+    std::string::size_type comma_pos = debug_categories.find(',');\n+    std::string wanted = ToLower(debug_categories.substr(0, comma_pos));\n+\n+#define V(name)                                                          \\\n+    {                                                                    \\\n+      static const std::string available_category = ToLower(#name);      \\\n+      if (available_category.find(wanted) != std::string::npos)          \\\n+        set_debug_enabled(DebugCategory::name, enabled);                 \\\n+    }\n+\n+    DEBUG_CATEGORY_NAMES(V)\n+\n+    if (comma_pos == std::string::npos)\n+      break;\n+    // Use everything after the `,` as the list for the next iteration.\n+    debug_categories = debug_categories.substr(comma_pos);\n+  }\n+}\n+\n void CollectExceptionInfo(Environment* env,\n                           v8::Local<v8::Object> obj,\n                           int errorno,"
+        },
+        {
+            "sha": "c17cc59b5b5ccd895d46077b8f263381089b5c13",
+            "filename": "src/env.h",
+            "status": "modified",
+            "additions": 19,
+            "deletions": 0,
+            "changes": 19,
+            "blob_url": "https://github.com/nodejs/node/blob/bd85844c4e80c7aa1fc02a986c7619c3956b0061/src%2Fenv.h",
+            "raw_url": "https://github.com/nodejs/node/raw/bd85844c4e80c7aa1fc02a986c7619c3956b0061/src%2Fenv.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv.h?ref=bd85844c4e80c7aa1fc02a986c7619c3956b0061",
+            "patch": "@@ -398,6 +398,19 @@ struct ContextInfo {\n   bool is_default = false;\n };\n \n+// Listing the AsyncWrap provider types first enables us to cast directly\n+// from a provider type to a debug category. Currently no other debug\n+// categories are available.\n+#define DEBUG_CATEGORY_NAMES(V) \\\n+    NODE_ASYNC_PROVIDER_TYPES(V)\n+\n+enum class DebugCategory {\n+#define V(name) name,\n+  DEBUG_CATEGORY_NAMES(V)\n+#undef V\n+  CATEGORY_COUNT\n+};\n+\n class Environment {\n  public:\n   class AsyncHooks {\n@@ -654,6 +667,10 @@ class Environment {\n   inline http2::Http2State* http2_state() const;\n   inline void set_http2_state(std::unique_ptr<http2::Http2State> state);\n \n+  inline bool debug_enabled(DebugCategory category) const;\n+  inline void set_debug_enabled(DebugCategory category, bool enabled);\n+  void set_debug_categories(const std::string& cats, bool enabled);\n+\n   inline AliasedBuffer<double, v8::Float64Array>* fs_stats_field_array();\n \n   // stat fields contains twice the number of entries because `fs.StatWatcher`\n@@ -853,6 +870,8 @@ class Environment {\n   bool http_parser_buffer_in_use_ = false;\n   std::unique_ptr<http2::Http2State> http2_state_;\n \n+  bool debug_enabled_[static_cast<int>(DebugCategory::CATEGORY_COUNT)] = {0};\n+\n   AliasedBuffer<double, v8::Float64Array> fs_stats_field_array_;\n \n   std::vector<std::unique_ptr<fs::FileHandleReadWrap>>"
+        },
+        {
+            "sha": "f927c0d6f019949bb958cc95168787e89c18147a",
+            "filename": "src/node.cc",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/nodejs/node/blob/bd85844c4e80c7aa1fc02a986c7619c3956b0061/src%2Fnode.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/bd85844c4e80c7aa1fc02a986c7619c3956b0061/src%2Fnode.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode.cc?ref=bd85844c4e80c7aa1fc02a986c7619c3956b0061",
+            "patch": "@@ -3288,6 +3288,9 @@ static void PrintHelp() {\n          \"Environment variables:\\n\"\n          \"NODE_DEBUG                   ','-separated list of core modules\\n\"\n          \"                             that should print debug information\\n\"\n+         \"NODE_DEBUG_NATIVE            ','-separated list of C++ core debug\\n\"\n+         \"                             categories that should print debug\\n\"\n+         \"                             output\\n\"\n          \"NODE_DISABLE_COLORS          set to 1 to disable colors in the REPL\\n\"\n          \"NODE_EXTRA_CA_CERTS          path to additional CA certificates\\n\"\n          \"                             file\\n\""
+        },
+        {
+            "sha": "90c7447f7e105fc51e54e486f82f65e3bfc56d73",
+            "filename": "src/util-inl.h",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/nodejs/node/blob/bd85844c4e80c7aa1fc02a986c7619c3956b0061/src%2Futil-inl.h",
+            "raw_url": "https://github.com/nodejs/node/raw/bd85844c4e80c7aa1fc02a986c7619c3956b0061/src%2Futil-inl.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Futil-inl.h?ref=bd85844c4e80c7aa1fc02a986c7619c3956b0061",
+            "patch": "@@ -293,6 +293,13 @@ char ToLower(char c) {\n   return c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c;\n }\n \n+std::string ToLower(const std::string& in) {\n+  std::string out(in.size(), 0);\n+  for (size_t i = 0; i < in.size(); ++i)\n+    out[i] = ToLower(in[i]);\n+  return out;\n+}\n+\n bool StringEqualNoCase(const char* a, const char* b) {\n   do {\n     if (*a == '\\0')"
+        },
+        {
+            "sha": "e272286d3e4b963506081d9f51aa32456e4106bb",
+            "filename": "src/util.h",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/bd85844c4e80c7aa1fc02a986c7619c3956b0061/src%2Futil.h",
+            "raw_url": "https://github.com/nodejs/node/raw/bd85844c4e80c7aa1fc02a986c7619c3956b0061/src%2Futil.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Futil.h?ref=bd85844c4e80c7aa1fc02a986c7619c3956b0061",
+            "patch": "@@ -34,6 +34,7 @@\n #include <stdlib.h>\n #include <string.h>\n \n+#include <string>\n #include <functional>  // std::function\n \n namespace node {\n@@ -250,6 +251,7 @@ inline void SwapBytes64(char* data, size_t nbytes);\n \n // tolower() is locale-sensitive.  Use ToLower() instead.\n inline char ToLower(char c);\n+inline std::string ToLower(const std::string& in);\n \n // strcasecmp() is locale-sensitive.  Use StringEqualNoCase() instead.\n inline bool StringEqualNoCase(const char* a, const char* b);"
+        }
+    ],
+    "stats": {
+        "total": 174,
+        "additions": 174,
+        "deletions": 0
+    }
+}

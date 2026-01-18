@@ -1,0 +1,36 @@
+{
+    "author": "crisbeto",
+    "message": "fix(core): error in TestBed if module is reset mid-compilation in ViewEngine (#42669)\n\nWhen `TestBed.compileComponents` is called under ViewEngine, we kick off a compilation and return a promise that resolves once the compilation is done. In most cases the consumer doesn't _have_ to await the returned promise, unless their components have external resources.\n\nThe problem is that the test could be over by the time the promise has resolved, in which case we still cache the factory of the test module. This becomes a problem if another compilation is triggered right afterwards, because it'll see that we still have a `_moduleFactory` and it won't recreate the factory.\n\nThese changes resolve the issue by saving a reference to the module type that is being compiled and checking against it when the promise resolves.\n\nNote that while this problem was discovered while trying to roll out the new test module teardown behavior in the Components repo (https://github.com/angular/components/pull/23070), it has been there for a long time. The new test behavior made it more apparent.\n\nPR Close #42669",
+    "sha": "0f23f7343ec9bdcd2d40f6f474d2a4f5e38e2627",
+    "files": [
+        {
+            "sha": "5874e4e88827a8db204f1466f1bf628cde651b5f",
+            "filename": "packages/core/test/test_bed_spec.ts",
+            "status": "modified",
+            "additions": 29,
+            "deletions": 0,
+            "changes": 29,
+            "blob_url": "https://github.com/angular/angular/blob/0f23f7343ec9bdcd2d40f6f474d2a4f5e38e2627/packages%2Fcore%2Ftest%2Ftest_bed_spec.ts",
+            "raw_url": "https://github.com/angular/angular/raw/0f23f7343ec9bdcd2d40f6f474d2a4f5e38e2627/packages%2Fcore%2Ftest%2Ftest_bed_spec.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcore%2Ftest%2Ftest_bed_spec.ts?ref=0f23f7343ec9bdcd2d40f6f474d2a4f5e38e2627",
+            "patch": "@@ -307,6 +307,35 @@ describe('TestBed', () => {\n     expect(SimpleService.ngOnDestroyCalls).toBe(0);\n   });\n \n+  it('should be able to create a fixture if a test module is reset mid-compilation', async () => {\n+    const token = new InjectionToken<number>('value');\n+\n+    @Component({template: 'hello {{_token}}'})\n+    class TestComponent {\n+      constructor(@Inject(token) public _token: number) {}\n+    }\n+\n+    TestBed.resetTestingModule();  // Reset the state from `beforeEach`.\n+\n+    function compile(tokenValue: number) {\n+      return TestBed\n+          .configureTestingModule({\n+            declarations: [TestComponent],\n+            providers: [{provide: token, useValue: tokenValue}],\n+            teardown: {destroyAfterEach: true}\n+          })\n+          .compileComponents();\n+    }\n+\n+    const initialCompilation = compile(1);\n+    TestBed.resetTestingModule();\n+    await initialCompilation;\n+    await compile(2);\n+    const fixture = TestBed.createComponent(TestComponent);\n+    fixture.detectChanges();\n+    expect(fixture.nativeElement).toHaveText('hello 2');\n+  });\n+\n   describe('module overrides using TestBed.overrideModule', () => {\n     @Component({\n       selector: 'test-cmp',"
+        },
+        {
+            "sha": "61c4a0535774d080557f95f90fcc3a716662bbef",
+            "filename": "packages/core/testing/src/test_bed.ts",
+            "status": "modified",
+            "additions": 14,
+            "deletions": 6,
+            "changes": 20,
+            "blob_url": "https://github.com/angular/angular/blob/0f23f7343ec9bdcd2d40f6f474d2a4f5e38e2627/packages%2Fcore%2Ftesting%2Fsrc%2Ftest_bed.ts",
+            "raw_url": "https://github.com/angular/angular/raw/0f23f7343ec9bdcd2d40f6f474d2a4f5e38e2627/packages%2Fcore%2Ftesting%2Fsrc%2Ftest_bed.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcore%2Ftesting%2Fsrc%2Ftest_bed.ts?ref=0f23f7343ec9bdcd2d40f6f474d2a4f5e38e2627",
+            "patch": "@@ -263,7 +263,8 @@ export class TestBedViewEngine implements TestBed {\n \n   private _compiler: TestingCompiler = null!;\n   private _moduleRef: NgModuleRef<any>|null = null;\n-  private _moduleFactory: NgModuleFactory<any> = null!;\n+  private _moduleFactory: NgModuleFactory<any>|null = null;\n+  private _pendingModuleFactory: Type<unknown>|null = null;\n \n   private _compilerOptions: CompilerOptions[] = [];\n \n@@ -341,7 +342,8 @@ export class TestBedViewEngine implements TestBed {\n     this._isRoot = true;\n     this._rootProviderOverrides = [];\n \n-    this._moduleFactory = null!;\n+    this._moduleFactory = null;\n+    this._pendingModuleFactory = null;\n     this._compilerOptions = [];\n     this._providers = [];\n     this._declarations = [];\n@@ -399,10 +401,16 @@ export class TestBedViewEngine implements TestBed {\n     }\n \n     const moduleType = this._createCompilerAndModule();\n-    return this._compiler.compileModuleAndAllComponentsAsync(moduleType)\n-        .then((moduleAndComponentFactories) => {\n-          this._moduleFactory = moduleAndComponentFactories.ngModuleFactory;\n-        });\n+    this._pendingModuleFactory = moduleType;\n+    return this._compiler.compileModuleAndAllComponentsAsync(moduleType).then(result => {\n+      // If the module mismatches by the time the promise resolves, it means that the module has\n+      // already been destroyed and a new compilation has started. If that's the case, avoid\n+      // overwriting the module factory, because it can cause downstream errors.\n+      if (this._pendingModuleFactory === moduleType) {\n+        this._moduleFactory = result.ngModuleFactory;\n+        this._pendingModuleFactory = null;\n+      }\n+    });\n   }\n \n   private _initIfNeeded(): void {"
+        }
+    ],
+    "stats": {
+        "total": 49,
+        "additions": 43,
+        "deletions": 6
+    }
+}

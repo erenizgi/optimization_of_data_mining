@@ -1,0 +1,108 @@
+{
+    "author": "jasnell",
+    "message": "trace_events: add trace category enabled tracking\n\nTrack state of async_hooks trace event category enablement.\nEnable/disable the async_hooks trace event dynamically.\n\nPR-URL: https://github.com/nodejs/node/pull/22128\nReviewed-By: Matteo Collina <matteo.collina@gmail.com>\nReviewed-By: Andreas Madsen <amwebdk@gmail.com>",
+    "sha": "4b7cd4bd60623b9c69d791112f4500575a3e9e7d",
+    "files": [
+        {
+            "sha": "26ab0c3198cd56b4f71cf0453487c403e91c5a97",
+            "filename": "lib/internal/bootstrap/node.js",
+            "status": "modified",
+            "additions": 30,
+            "deletions": 13,
+            "changes": 43,
+            "blob_url": "https://github.com/nodejs/node/blob/4b7cd4bd60623b9c69d791112f4500575a3e9e7d/lib%2Finternal%2Fbootstrap%2Fnode.js",
+            "raw_url": "https://github.com/nodejs/node/raw/4b7cd4bd60623b9c69d791112f4500575a3e9e7d/lib%2Finternal%2Fbootstrap%2Fnode.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fbootstrap%2Fnode.js?ref=4b7cd4bd60623b9c69d791112f4500575a3e9e7d",
+            "patch": "@@ -16,7 +16,8 @@\n                               // bootstrapper properties... destructured to\n                               // avoid retaining a reference to the bootstrap\n                               // object.\n-                              { _setupProcessObject, _setupNextTick,\n+                              { _setupTraceCategoryState,\n+                                _setupProcessObject, _setupNextTick,\n                                 _setupPromises, _chdir, _cpuUsage,\n                                 _hrtime, _hrtimeBigInt,\n                                 _memoryUsage, _rawDebug,\n@@ -35,6 +36,8 @@\n \n     EventEmitter.call(process);\n \n+    setupTraceCategoryState();\n+\n     setupProcessObject();\n \n     // Do this good and early, since it handles errors.\n@@ -98,18 +101,6 @@\n     if (global.__coverage__)\n       NativeModule.require('internal/process/write-coverage').setup();\n \n-\n-    {\n-      const traceEvents = internalBinding('trace_events');\n-      const traceEventCategory = 'node,node.async_hooks';\n-\n-      if (traceEvents.isTraceCategoryEnabled(traceEventCategory)) {\n-        NativeModule.require('internal/trace_events_async_hooks')\n-          .setup(traceEvents, traceEventCategory);\n-      }\n-    }\n-\n-\n     if (process.config.variables.v8_enable_inspector) {\n       NativeModule.require('internal/inspector_async_hook').setup();\n     }\n@@ -311,6 +302,32 @@\n     }\n   }\n \n+  function setupTraceCategoryState() {\n+    const { traceCategoryState } = internalBinding('trace_events');\n+    const kCategoryAsyncHooks = 0;\n+    let traceEventsAsyncHook;\n+\n+    function toggleTraceCategoryState() {\n+      // Dynamically enable/disable the traceEventsAsyncHook\n+      const asyncHooksEnabled = !!traceCategoryState[kCategoryAsyncHooks];\n+\n+      if (asyncHooksEnabled) {\n+        // Lazy load internal/trace_events_async_hooks only if the async_hooks\n+        // trace event category is enabled.\n+        if (!traceEventsAsyncHook) {\n+          traceEventsAsyncHook =\n+            NativeModule.require('internal/trace_events_async_hooks');\n+        }\n+        traceEventsAsyncHook.enable();\n+      } else if (traceEventsAsyncHook) {\n+        traceEventsAsyncHook.disable();\n+      }\n+    }\n+\n+    toggleTraceCategoryState();\n+    _setupTraceCategoryState(toggleTraceCategoryState);\n+  }\n+\n   function setupProcessObject() {\n     _setupProcessObject(pushValueToArray);\n "
+        },
+        {
+            "sha": "a983cb2fa2e0bd821c421d0c91097e29d896b304",
+            "filename": "lib/internal/trace_events_async_hooks.js",
+            "status": "modified",
+            "additions": 48,
+            "deletions": 24,
+            "changes": 72,
+            "blob_url": "https://github.com/nodejs/node/blob/4b7cd4bd60623b9c69d791112f4500575a3e9e7d/lib%2Finternal%2Ftrace_events_async_hooks.js",
+            "raw_url": "https://github.com/nodejs/node/raw/4b7cd4bd60623b9c69d791112f4500575a3e9e7d/lib%2Finternal%2Ftrace_events_async_hooks.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Ftrace_events_async_hooks.js?ref=4b7cd4bd60623b9c69d791112f4500575a3e9e7d",
+            "patch": "@@ -1,34 +1,39 @@\n 'use strict';\n \n-exports.setup = function(traceEvents, traceEventCategory) {\n-  const { trace } = traceEvents;\n-  const async_wrap = process.binding('async_wrap');\n-  const async_hooks = require('async_hooks');\n+const { internalBinding } = require('internal/bootstrap/loaders');\n+const { trace } = internalBinding('trace_events');\n+const async_wrap = process.binding('async_wrap');\n+const async_hooks = require('async_hooks');\n+const { SafeMap, SafeSet } = require('internal/safe_globals');\n \n-  // Use small letters such that chrome://tracing groups by the name.\n-  // The behavior is not only useful but the same as the events emitted using\n-  // the specific C++ macros.\n-  const BEFORE_EVENT = 'b'.charCodeAt(0);\n-  const END_EVENT = 'e'.charCodeAt(0);\n+// Use small letters such that chrome://tracing groups by the name.\n+// The behavior is not only useful but the same as the events emitted using\n+// the specific C++ macros.\n+const kBeforeEvent = 'b'.charCodeAt(0);\n+const kEndEvent = 'e'.charCodeAt(0);\n+const kTraceEventCategory = 'node,node.async_hooks';\n \n+const kEnabled = Symbol('enabled');\n+\n+// It is faster to emit traceEvents directly from C++. Thus, this happens\n+// in async_wrap.cc. However, events emitted from the JavaScript API or the\n+// Embedder C++ API can't be emitted from async_wrap.cc. Thus they are\n+// emitted using the JavaScript API. To prevent emitting the same event\n+// twice the async_wrap.Providers list is used to filter the events.\n+const nativeProviders = new SafeSet(Object.keys(async_wrap.Providers));\n+const typeMemory = new SafeMap();\n+\n+function createHook() {\n   // In traceEvents it is not only the id but also the name that needs to be\n   // repeated. Since async_hooks doesn't expose the provider type in the\n   // non-init events, use a map to manually map the asyncId to the type name.\n-  const typeMemory = new Map();\n \n-  // It is faster to emit traceEvents directly from C++. Thus, this happens\n-  // in async_wrap.cc. However, events emitted from the JavaScript API or the\n-  // Embedder C++ API can't be emitted from async_wrap.cc. Thus they are\n-  // emitted using the JavaScript API. To prevent emitting the same event\n-  // twice the async_wrap.Providers list is used to filter the events.\n-  const nativeProviders = new Set(Object.keys(async_wrap.Providers));\n-\n-  async_hooks.createHook({\n+  const hook = async_hooks.createHook({\n     init(asyncId, type, triggerAsyncId, resource) {\n       if (nativeProviders.has(type)) return;\n \n       typeMemory.set(asyncId, type);\n-      trace(BEFORE_EVENT, traceEventCategory,\n+      trace(kBeforeEvent, kTraceEventCategory,\n             type, asyncId,\n             {\n               triggerAsyncId,\n@@ -40,24 +45,43 @@ exports.setup = function(traceEvents, traceEventCategory) {\n       const type = typeMemory.get(asyncId);\n       if (type === undefined) return;\n \n-      trace(BEFORE_EVENT, traceEventCategory, `${type}_CALLBACK`, asyncId);\n+      trace(kBeforeEvent, kTraceEventCategory, `${type}_CALLBACK`, asyncId);\n     },\n \n     after(asyncId) {\n       const type = typeMemory.get(asyncId);\n       if (type === undefined) return;\n \n-      trace(END_EVENT, traceEventCategory, `${type}_CALLBACK`, asyncId);\n+      trace(kEndEvent, kTraceEventCategory, `${type}_CALLBACK`, asyncId);\n     },\n \n     destroy(asyncId) {\n       const type = typeMemory.get(asyncId);\n       if (type === undefined) return;\n \n-      trace(END_EVENT, traceEventCategory, type, asyncId);\n+      trace(kEndEvent, kTraceEventCategory, type, asyncId);\n \n       // cleanup asyncId to type map\n       typeMemory.delete(asyncId);\n     }\n-  }).enable();\n-};\n+  });\n+\n+  return {\n+    enable() {\n+      if (this[kEnabled])\n+        return;\n+      this[kEnabled] = true;\n+      hook.enable();\n+    },\n+\n+    disable() {\n+      if (!this[kEnabled])\n+        return;\n+      this[kEnabled] = false;\n+      hook.disable();\n+      typeMemory.clear();\n+    }\n+  };\n+}\n+\n+module.exports = createHook();"
+        },
+        {
+            "sha": "720f89c011801eff559c355cf696c1a935f7b529",
+            "filename": "src/bootstrapper.cc",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/nodejs/node/blob/4b7cd4bd60623b9c69d791112f4500575a3e9e7d/src%2Fbootstrapper.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/4b7cd4bd60623b9c69d791112f4500575a3e9e7d/src%2Fbootstrapper.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fbootstrapper.cc?ref=4b7cd4bd60623b9c69d791112f4500575a3e9e7d",
+            "patch": "@@ -31,6 +31,12 @@ void RunMicrotasks(const FunctionCallbackInfo<Value>& args) {\n   args.GetIsolate()->RunMicrotasks();\n }\n \n+void SetupTraceCategoryState(const FunctionCallbackInfo<Value>& args) {\n+  Environment* env = Environment::GetCurrent(args);\n+  CHECK(args[0]->IsFunction());\n+  env->set_trace_category_state_function(args[0].As<Function>());\n+}\n+\n void SetupNextTick(const FunctionCallbackInfo<Value>& args) {\n   Environment* env = Environment::GetCurrent(args);\n   Isolate* isolate = env->isolate();\n@@ -117,6 +123,7 @@ void SetupPromises(const FunctionCallbackInfo<Value>& args) {\n // completes so that it can be gc'd as soon as possible.\n void SetupBootstrapObject(Environment* env,\n                           Local<Object> bootstrapper) {\n+  BOOTSTRAP_METHOD(_setupTraceCategoryState, SetupTraceCategoryState);\n   BOOTSTRAP_METHOD(_setupProcessObject, SetupProcessObject);\n   BOOTSTRAP_METHOD(_setupNextTick, SetupNextTick);\n   BOOTSTRAP_METHOD(_setupPromises, SetupPromises);"
+        },
+        {
+            "sha": "3bca20c81ce4cee78f69f19c3730a63a9c4e1c3d",
+            "filename": "src/env-inl.h",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/nodejs/node/blob/4b7cd4bd60623b9c69d791112f4500575a3e9e7d/src%2Fenv-inl.h",
+            "raw_url": "https://github.com/nodejs/node/raw/4b7cd4bd60623b9c69d791112f4500575a3e9e7d/src%2Fenv-inl.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv-inl.h?ref=4b7cd4bd60623b9c69d791112f4500575a3e9e7d",
+            "patch": "@@ -432,6 +432,11 @@ Environment::should_abort_on_uncaught_toggle() {\n   return should_abort_on_uncaught_toggle_;\n }\n \n+inline AliasedBuffer<uint8_t, v8::Uint8Array>&\n+Environment::trace_category_state() {\n+  return trace_category_state_;\n+}\n+\n Environment::ShouldNotAbortOnUncaughtScope::ShouldNotAbortOnUncaughtScope(\n     Environment* env)\n     : env_(env) {"
+        },
+        {
+            "sha": "97405fe4b1006ff0ce5064fbadad85cd9d6a19fb",
+            "filename": "src/env.cc",
+            "status": "modified",
+            "additions": 33,
+            "deletions": 0,
+            "changes": 33,
+            "blob_url": "https://github.com/nodejs/node/blob/4b7cd4bd60623b9c69d791112f4500575a3e9e7d/src%2Fenv.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/4b7cd4bd60623b9c69d791112f4500575a3e9e7d/src%2Fenv.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv.cc?ref=4b7cd4bd60623b9c69d791112f4500575a3e9e7d",
+            "patch": "@@ -31,6 +31,8 @@ using v8::TryCatch;\n using v8::Value;\n using worker::Worker;\n \n+#define kTraceCategoryCount 1\n+\n int const Environment::kNodeContextTag = 0x6e6f64;\n void* Environment::kNodeContextTagPtr = const_cast<void*>(\n     static_cast<const void*>(&Environment::kNodeContextTag));\n@@ -103,6 +105,21 @@ void InitThreadLocalOnce() {\n   CHECK_EQ(0, uv_key_create(&Environment::thread_local_env));\n }\n \n+void Environment::TrackingTraceStateObserver::UpdateTraceCategoryState() {\n+  env_->trace_category_state()[0] =\n+      *TRACE_EVENT_API_GET_CATEGORY_GROUP_ENABLED(\n+          TRACING_CATEGORY_NODE1(async_hooks));\n+\n+  Isolate* isolate = env_->isolate();\n+  Local<Function> cb = env_->trace_category_state_function();\n+  if (cb.IsEmpty())\n+    return;\n+  TryCatch try_catch(isolate);\n+  try_catch.SetVerbose(true);\n+  cb->Call(env_->context(), v8::Undefined(isolate),\n+           0, nullptr).ToLocalChecked();\n+}\n+\n Environment::Environment(IsolateData* isolate_data,\n                          Local<Context> context,\n                          tracing::AgentWriterHandle* tracing_agent_writer)\n@@ -118,6 +135,7 @@ Environment::Environment(IsolateData* isolate_data,\n       emit_env_nonstring_warning_(true),\n       makecallback_cntr_(0),\n       should_abort_on_uncaught_toggle_(isolate_, 1),\n+      trace_category_state_(isolate_, kTraceCategoryCount),\n #if HAVE_INSPECTOR\n       inspector_agent_(new inspector::Agent(this)),\n #endif\n@@ -132,6 +150,14 @@ Environment::Environment(IsolateData* isolate_data,\n \n   AssignToContext(context, ContextInfo(\"\"));\n \n+  if (tracing_agent_writer_ != nullptr) {\n+    trace_state_observer_.reset(new TrackingTraceStateObserver(this));\n+    v8::TracingController* tracing_controller =\n+        tracing_agent_writer_->GetTracingController();\n+    if (tracing_controller != nullptr)\n+      tracing_controller->AddTraceStateObserver(trace_state_observer_.get());\n+  }\n+\n   destroy_async_id_list_.reserve(512);\n   performance_state_.reset(new performance::performance_state(isolate()));\n   performance_state_->Mark(\n@@ -173,6 +199,13 @@ Environment::~Environment() {\n   context()->SetAlignedPointerInEmbedderData(\n       ContextEmbedderIndex::kEnvironment, nullptr);\n \n+  if (tracing_agent_writer_ != nullptr) {\n+    v8::TracingController* tracing_controller =\n+        tracing_agent_writer_->GetTracingController();\n+    if (tracing_controller != nullptr)\n+      tracing_controller->RemoveTraceStateObserver(trace_state_observer_.get());\n+  }\n+\n   delete[] heap_statistics_buffer_;\n   delete[] heap_space_statistics_buffer_;\n   delete[] http_parser_buffer_;"
+        },
+        {
+            "sha": "28aa936c246d2576ca62357f75880e1b87638b70",
+            "filename": "src/env.h",
+            "status": "modified",
+            "additions": 26,
+            "deletions": 0,
+            "changes": 26,
+            "blob_url": "https://github.com/nodejs/node/blob/4b7cd4bd60623b9c69d791112f4500575a3e9e7d/src%2Fenv.h",
+            "raw_url": "https://github.com/nodejs/node/raw/4b7cd4bd60623b9c69d791112f4500575a3e9e7d/src%2Fenv.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv.h?ref=4b7cd4bd60623b9c69d791112f4500575a3e9e7d",
+            "patch": "@@ -344,6 +344,7 @@ struct PackageConfig {\n   V(tick_callback_function, v8::Function)                                     \\\n   V(timers_callback_function, v8::Function)                                   \\\n   V(tls_wrap_constructor_function, v8::Function)                              \\\n+  V(trace_category_state_function, v8::Function)                              \\\n   V(tty_constructor_template, v8::FunctionTemplate)                           \\\n   V(udp_constructor_function, v8::Function)                                   \\\n   V(url_constructor_function, v8::Function)                                   \\\n@@ -649,6 +650,8 @@ class Environment {\n   inline AliasedBuffer<uint32_t, v8::Uint32Array>&\n   should_abort_on_uncaught_toggle();\n \n+  inline AliasedBuffer<uint8_t, v8::Uint8Array>& trace_category_state();\n+\n   // The necessary API for async_hooks.\n   inline double new_async_id();\n   inline double execution_async_id();\n@@ -830,6 +833,25 @@ class Environment {\n   // This needs to be available for the JS-land setImmediate().\n   void ToggleImmediateRef(bool ref);\n \n+  class TrackingTraceStateObserver :\n+      public v8::TracingController::TraceStateObserver {\n+   public:\n+    explicit TrackingTraceStateObserver(Environment* env) : env_(env) {}\n+\n+    void OnTraceEnabled() override {\n+      UpdateTraceCategoryState();\n+    }\n+\n+    void OnTraceDisabled() override {\n+      UpdateTraceCategoryState();\n+    }\n+\n+   private:\n+    void UpdateTraceCategoryState();\n+\n+    Environment* env_;\n+  };\n+\n   class ShouldNotAbortOnUncaughtScope {\n    public:\n     explicit inline ShouldNotAbortOnUncaughtScope(Environment* env);\n@@ -889,6 +911,10 @@ class Environment {\n   AliasedBuffer<uint32_t, v8::Uint32Array> should_abort_on_uncaught_toggle_;\n   int should_not_abort_scope_counter_ = 0;\n \n+  // Attached to a Uint8Array that tracks the state of trace category\n+  AliasedBuffer<uint8_t, v8::Uint8Array> trace_category_state_;\n+  std::unique_ptr<TrackingTraceStateObserver> trace_state_observer_;\n+\n   std::unique_ptr<performance::performance_state> performance_state_;\n   std::unordered_map<std::string, uint64_t> performance_marks_;\n "
+        },
+        {
+            "sha": "6e70cfce7bed2ebe7ddd5f60498ee2606ee52c71",
+            "filename": "src/node_trace_events.cc",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/nodejs/node/blob/4b7cd4bd60623b9c69d791112f4500575a3e9e7d/src%2Fnode_trace_events.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/4b7cd4bd60623b9c69d791112f4500575a3e9e7d/src%2Fnode_trace_events.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_trace_events.cc?ref=4b7cd4bd60623b9c69d791112f4500575a3e9e7d",
+            "patch": "@@ -127,6 +127,10 @@ void Initialize(Local<Object> target,\n                   .FromJust();\n   target->Set(context, trace,\n               binding->Get(context, trace).ToLocalChecked()).FromJust();\n+\n+  target->Set(context,\n+              FIXED_ONE_BYTE_STRING(env->isolate(), \"traceCategoryState\"),\n+              env->trace_category_state().GetJSArray()).FromJust();\n }\n \n }  // namespace node"
+        },
+        {
+            "sha": "e79480a0369ff7b33ea09aedcb3f78dd88d8fef5",
+            "filename": "src/tracing/agent.h",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/nodejs/node/blob/4b7cd4bd60623b9c69d791112f4500575a3e9e7d/src%2Ftracing%2Fagent.h",
+            "raw_url": "https://github.com/nodejs/node/raw/4b7cd4bd60623b9c69d791112f4500575a3e9e7d/src%2Ftracing%2Fagent.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Ftracing%2Fagent.h?ref=4b7cd4bd60623b9c69d791112f4500575a3e9e7d",
+            "patch": "@@ -51,6 +51,8 @@ class AgentWriterHandle {\n \n   inline Agent* agent() { return agent_; }\n \n+  inline v8::TracingController* GetTracingController();\n+\n  private:\n   inline AgentWriterHandle(Agent* agent, int id) : agent_(agent), id_(id) {}\n \n@@ -155,6 +157,10 @@ void AgentWriterHandle::Disable(const std::set<std::string>& categories) {\n   if (agent_ != nullptr) agent_->Disable(id_, categories);\n }\n \n+inline v8::TracingController* AgentWriterHandle::GetTracingController() {\n+  return agent_ != nullptr ? agent_->GetTracingController() : nullptr;\n+}\n+\n }  // namespace tracing\n }  // namespace node\n "
+        }
+    ],
+    "stats": {
+        "total": 196,
+        "additions": 159,
+        "deletions": 37
+    }
+}

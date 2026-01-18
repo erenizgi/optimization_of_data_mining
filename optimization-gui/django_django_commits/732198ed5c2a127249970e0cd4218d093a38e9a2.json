@@ -1,0 +1,60 @@
+{
+    "author": "alex",
+    "message": "Fix a security issue in the admin. Disclosure and new release forthcoming.\n\ngit-svn-id: http://code.djangoproject.com/svn/django/trunk@15031 bcc190cf-cafb-0310-a4f2-bffc1f526a37",
+    "sha": "732198ed5c2a127249970e0cd4218d093a38e9a2",
+    "files": [
+        {
+            "sha": "0351ef65c12d6135f58656337872f4c46fc9408e",
+            "filename": "django/contrib/admin/options.py",
+            "status": "modified",
+            "additions": 40,
+            "deletions": 1,
+            "changes": 41,
+            "blob_url": "https://github.com/django/django/blob/732198ed5c2a127249970e0cd4218d093a38e9a2/django%2Fcontrib%2Fadmin%2Foptions.py",
+            "raw_url": "https://github.com/django/django/raw/732198ed5c2a127249970e0cd4218d093a38e9a2/django%2Fcontrib%2Fadmin%2Foptions.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fcontrib%2Fadmin%2Foptions.py?ref=732198ed5c2a127249970e0cd4218d093a38e9a2",
+            "patch": "@@ -11,7 +11,9 @@\n from django.core.exceptions import PermissionDenied, ValidationError\n from django.core.paginator import Paginator\n from django.db import models, transaction, router\n-from django.db.models.fields import BLANK_CHOICE_DASH\n+from django.db.models.related import RelatedObject\n+from django.db.models.fields import BLANK_CHOICE_DASH, FieldDoesNotExist\n+from django.db.models.sql.constants import LOOKUP_SEP, QUERY_TERMS\n from django.http import Http404, HttpResponse, HttpResponseRedirect\n from django.shortcuts import get_object_or_404, render_to_response\n from django.utils.decorators import method_decorator\n@@ -203,6 +205,43 @@ def queryset(self, request):\n             qs = qs.order_by(*ordering)\n         return qs\n \n+    def lookup_allowed(self, lookup):\n+        parts = lookup.split(LOOKUP_SEP)\n+\n+        # Last term in lookup is a query term (__exact, __startswith etc)\n+        # This term can be ignored.\n+        if len(parts) > 1 and parts[-1] in QUERY_TERMS:\n+            parts.pop()\n+\n+        # Special case -- foo__id__exact and foo__id queries are implied\n+        # if foo has been specificially included in the lookup list; so\n+        # drop __id if it is the last part. However, first we need to find\n+        # the pk attribute name.\n+        model = self.model\n+        pk_attr_name = None\n+        for part in parts[:-1]:\n+            field, _, _, _ = model._meta.get_field_by_name(part)\n+            if hasattr(field, 'rel'):\n+                model = field.rel.to\n+                pk_attr_name = model._meta.pk.name\n+            elif isinstance(field, RelatedObject):\n+                model = field.model\n+                pk_attr_name = model._meta.pk.name\n+            else:\n+                pk_attr_name = None\n+        if pk_attr_name and len(parts) > 1 and parts[-1] == pk_attr_name:\n+            parts.pop()\n+\n+        try:\n+            self.model._meta.get_field_by_name(parts[0])\n+        except FieldDoesNotExist:\n+            # Lookups on non-existants fields are ok, since they're ignored\n+            # later.\n+            return True\n+        else:\n+            clean_lookup = LOOKUP_SEP.join(parts)\n+            return clean_lookup in self.list_filter or clean_lookup == self.date_hierarchy\n+\n class ModelAdmin(BaseModelAdmin):\n     \"Encapsulates all admin options and functionality for a given model.\"\n "
+        },
+        {
+            "sha": "0b98f11a499126eec42a3d3387e258d655373eab",
+            "filename": "django/contrib/admin/views/main.py",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 1,
+            "changes": 8,
+            "blob_url": "https://github.com/django/django/blob/732198ed5c2a127249970e0cd4218d093a38e9a2/django%2Fcontrib%2Fadmin%2Fviews%2Fmain.py",
+            "raw_url": "https://github.com/django/django/raw/732198ed5c2a127249970e0cd4218d093a38e9a2/django%2Fcontrib%2Fadmin%2Fviews%2Fmain.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fcontrib%2Fadmin%2Fviews%2Fmain.py?ref=732198ed5c2a127249970e0cd4218d093a38e9a2",
+            "patch": "@@ -1,6 +1,7 @@\n from django.contrib.admin.filterspecs import FilterSpec\n from django.contrib.admin.options import IncorrectLookupParameters\n from django.contrib.admin.util import quote, get_fields_from_path\n+from django.core.exceptions import SuspiciousOperation\n from django.core.paginator import Paginator, InvalidPage\n from django.db import models\n from django.utils.encoding import force_unicode, smart_str\n@@ -188,13 +189,18 @@ def get_query_set(self):\n                 else:\n                     lookup_params[key] = True\n \n+            if not self.model_admin.lookup_allowed(key):\n+                raise SuspiciousOperation(\n+                    \"Filtering by %s not allowed\" % key\n+                )\n+\n         # Apply lookup parameters from the query string.\n         try:\n             qs = qs.filter(**lookup_params)\n         # Naked except! Because we don't have any other way of validating \"params\".\n         # They might be invalid if the keyword arguments are incorrect, or if the\n         # values are not in the correct type, so we might get FieldError, ValueError,\n-        # ValicationError, or ? from a custom field that raises yet something else \n+        # ValicationError, or ? from a custom field that raises yet something else\n         # when handed impossible data.\n         except:\n             raise IncorrectLookupParameters"
+        },
+        {
+            "sha": "df2f60c024240e05aebb7646dff28f406bbaf5ba",
+            "filename": "tests/regressiontests/admin_views/models.py",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 2,
+            "changes": 7,
+            "blob_url": "https://github.com/django/django/blob/732198ed5c2a127249970e0cd4218d093a38e9a2/tests%2Fregressiontests%2Fadmin_views%2Fmodels.py",
+            "raw_url": "https://github.com/django/django/raw/732198ed5c2a127249970e0cd4218d093a38e9a2/tests%2Fregressiontests%2Fadmin_views%2Fmodels.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fadmin_views%2Fmodels.py?ref=732198ed5c2a127249970e0cd4218d093a38e9a2",
+            "patch": "@@ -100,7 +100,7 @@ class ChapterXtra1Admin(admin.ModelAdmin):\n \n class ArticleAdmin(admin.ModelAdmin):\n     list_display = ('content', 'date', callable_year, 'model_year', 'modeladmin_year')\n-    list_filter = ('date',)\n+    list_filter = ('date', 'section')\n \n     def changelist_view(self, request):\n         \"Test that extra_context works\"\n@@ -611,6 +611,9 @@ class Album(models.Model):\n     owner = models.ForeignKey(User)\n     title = models.CharField(max_length=30)\n \n+class AlbumAdmin(admin.ModelAdmin):\n+    list_filter = ['title']\n+\n admin.site.register(Article, ArticleAdmin)\n admin.site.register(CustomArticle, CustomArticleAdmin)\n admin.site.register(Section, save_as=True, inlines=[ArticleInline])\n@@ -657,4 +660,4 @@ class Album(models.Model):\n admin.site.register(ChapterXtra1, ChapterXtra1Admin)\n admin.site.register(Pizza, PizzaAdmin)\n admin.site.register(Topping)\n-admin.site.register(Album)\n+admin.site.register(Album, AlbumAdmin)"
+        },
+        {
+            "sha": "75c6698db10c4c73989964262f79867d75f365d9",
+            "filename": "tests/regressiontests/admin_views/tests.py",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 0,
+            "changes": 10,
+            "blob_url": "https://github.com/django/django/blob/732198ed5c2a127249970e0cd4218d093a38e9a2/tests%2Fregressiontests%2Fadmin_views%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/732198ed5c2a127249970e0cd4218d093a38e9a2/tests%2Fregressiontests%2Fadmin_views%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fadmin_views%2Ftests.py?ref=732198ed5c2a127249970e0cd4218d093a38e9a2",
+            "patch": "@@ -5,6 +5,7 @@\n \n from django.conf import settings\n from django.core import mail\n+from django.core.exceptions import SuspiciousOperation\n from django.core.files import temp as tempfile\n from django.core.urlresolvers import reverse\n # Register auth models with the admin.\n@@ -348,6 +349,15 @@ def testI18NLanguageNonEnglishFallback(self):\n         self.assertContains(response, 'Choisir une heure')\n         deactivate()\n \n+    def test_disallowed_filtering(self):\n+        self.assertRaises(SuspiciousOperation,\n+            self.client.get, \"/test_admin/admin/admin_views/album/?owner__email__startswith=fuzzy\"\n+        )\n+\n+        try:\n+            self.client.get(\"/test_admin/admin/admin_views/stuff/?color__value__startswith=red\")\n+        except SuspiciousOperation:\n+            self.fail(\"Filters are allowed if explicitly included in list_filter\")\n \n class SaveAsTests(TestCase):\n     fixtures = ['admin-views-users.xml','admin-views-person.xml']"
+        }
+    ],
+    "stats": {
+        "total": 66,
+        "additions": 62,
+        "deletions": 4
+    }
+}

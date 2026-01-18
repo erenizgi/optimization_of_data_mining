@@ -1,0 +1,120 @@
+{
+    "author": "joyeecheung",
+    "message": "process: make tick callback and promise rejection callback more robust\n\n- Rename `internalTickCallback` to `processTicksAndRejections`, make\n  sure it does not get called if it's not set in C++.\n- Rename `emitPromiseRejectionWarnings` to `processPromiseRejections`\n  since it also emit events that are not warnings.\n- Sets `SetPromiseRejectCallback` in the `Environment` constructor\n  to make sure it only gets called once per-isolate, and make\n  sure it does not get called if it's not set in C++.\n- Wrap promise rejection callback initialization into\n  `listenForRejections()`.\n- Add comments.\n\nPR-URL: https://github.com/nodejs/node/pull/25200\nReviewed-By: Anna Henningsen <anna@addaleax.net>\nReviewed-By: Ruben Bridgewater <ruben@bridgewater.de>\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "d18b0a01320e392e48f0c475effd8d4db2bb71a8",
+    "files": [
+        {
+            "sha": "24104ec34abaeec190d48a570bb8448adb2014fc",
+            "filename": "lib/internal/process/next_tick.js",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 11,
+            "changes": 20,
+            "blob_url": "https://github.com/nodejs/node/blob/d18b0a01320e392e48f0c475effd8d4db2bb71a8/lib%2Finternal%2Fprocess%2Fnext_tick.js",
+            "raw_url": "https://github.com/nodejs/node/raw/d18b0a01320e392e48f0c475effd8d4db2bb71a8/lib%2Finternal%2Fprocess%2Fnext_tick.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fprocess%2Fnext_tick.js?ref=d18b0a01320e392e48f0c475effd8d4db2bb71a8",
+            "patch": "@@ -6,15 +6,14 @@ const {\n   tickInfo,\n   // Used to run V8's micro task queue.\n   runMicrotasks,\n-  setTickCallback,\n-  initializePromiseRejectCallback\n+  setTickCallback\n } = internalBinding('task_queue');\n \n const {\n   setHasRejectionToWarn,\n   hasRejectionToWarn,\n-  promiseRejectHandler,\n-  emitPromiseRejectionWarnings\n+  listenForRejections,\n+  processPromiseRejections\n } = require('internal/process/promises');\n \n const {\n@@ -49,10 +48,10 @@ function runNextTicks() {\n   if (!hasTickScheduled() && !hasRejectionToWarn())\n     return;\n \n-  internalTickCallback();\n+  processTicksAndRejections();\n }\n \n-function internalTickCallback() {\n+function processTicksAndRejections() {\n   let tock;\n   do {\n     while (tock = queue.shift()) {\n@@ -80,7 +79,7 @@ function internalTickCallback() {\n     }\n     setHasTickScheduled(false);\n     runMicrotasks();\n-  } while (!queue.isEmpty() || emitPromiseRejectionWarnings());\n+  } while (!queue.isEmpty() || processPromiseRejections());\n   setHasRejectionToWarn(false);\n }\n \n@@ -134,11 +133,10 @@ function nextTick(callback) {\n // TODO(joyeecheung): make this a factory class so that node.js can\n // control the side effects caused by the initializers.\n exports.setup = function() {\n-  // Initializes the per-isolate promise rejection callback which\n-  // will call the handler being passed into this function.\n-  initializePromiseRejectCallback(promiseRejectHandler);\n+  // Sets the per-isolate promise rejection callback\n+  listenForRejections();\n   // Sets the callback to be run in every tick.\n-  setTickCallback(internalTickCallback);\n+  setTickCallback(processTicksAndRejections);\n   return {\n     nextTick,\n     runNextTicks"
+        },
+        {
+            "sha": "f3e118e2ce7509e95024af2489ab642043cc8daa",
+            "filename": "lib/internal/process/promises.js",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 4,
+            "changes": 15,
+            "blob_url": "https://github.com/nodejs/node/blob/d18b0a01320e392e48f0c475effd8d4db2bb71a8/lib%2Finternal%2Fprocess%2Fpromises.js",
+            "raw_url": "https://github.com/nodejs/node/raw/d18b0a01320e392e48f0c475effd8d4db2bb71a8/lib%2Finternal%2Fprocess%2Fpromises.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fprocess%2Fpromises.js?ref=d18b0a01320e392e48f0c475effd8d4db2bb71a8",
+            "patch": "@@ -8,7 +8,8 @@ const {\n     kPromiseHandlerAddedAfterReject,\n     kPromiseResolveAfterResolved,\n     kPromiseRejectAfterResolved\n-  }\n+  },\n+  setPromiseRejectCallback\n } = internalBinding('task_queue');\n \n // *Must* match Environment::TickInfo::Fields in src/env.h.\n@@ -117,7 +118,9 @@ function emitDeprecationWarning() {\n   }\n }\n \n-function emitPromiseRejectionWarnings() {\n+// If this method returns true, at least one more tick need to be\n+// scheduled to process any potential pending rejections\n+function processPromiseRejections() {\n   while (asyncHandledRejections.length > 0) {\n     const { promise, warning } = asyncHandledRejections.shift();\n     if (!process.emit('rejectionHandled', promise)) {\n@@ -142,9 +145,13 @@ function emitPromiseRejectionWarnings() {\n   return maybeScheduledTicks || pendingUnhandledRejections.length !== 0;\n }\n \n+function listenForRejections() {\n+  setPromiseRejectCallback(promiseRejectHandler);\n+}\n+\n module.exports = {\n   hasRejectionToWarn,\n   setHasRejectionToWarn,\n-  promiseRejectHandler,\n-  emitPromiseRejectionWarnings\n+  listenForRejections,\n+  processPromiseRejections\n };"
+        },
+        {
+            "sha": "fee7417fd371875f27dbf48f267de51e5721c53b",
+            "filename": "src/callback_scope.cc",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 2,
+            "changes": 10,
+            "blob_url": "https://github.com/nodejs/node/blob/d18b0a01320e392e48f0c475effd8d4db2bb71a8/src%2Fcallback_scope.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/d18b0a01320e392e48f0c475effd8d4db2bb71a8/src%2Fcallback_scope.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fcallback_scope.cc?ref=d18b0a01320e392e48f0c475effd8d4db2bb71a8",
+            "patch": "@@ -5,6 +5,7 @@\n \n namespace node {\n \n+using v8::Function;\n using v8::HandleScope;\n using v8::Isolate;\n using v8::Local;\n@@ -114,8 +115,13 @@ void InternalCallbackScope::Close() {\n \n   if (!env_->can_call_into_js()) return;\n \n-  if (env_->tick_callback_function()\n-      ->Call(env_->context(), process, 0, nullptr).IsEmpty()) {\n+  Local<Function> tick_callback = env_->tick_callback_function();\n+\n+  // The tick is triggered before JS land calls SetTickCallback\n+  // to initializes the tick callback during bootstrap.\n+  CHECK(!tick_callback.IsEmpty());\n+\n+  if (tick_callback->Call(env_->context(), process, 0, nullptr).IsEmpty()) {\n     failed_ = true;\n   }\n }"
+        },
+        {
+            "sha": "3d06ebe2082b080e131576f6741d3faf3a03ff02",
+            "filename": "src/env.cc",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/nodejs/node/blob/d18b0a01320e392e48f0c475effd8d4db2bb71a8/src%2Fenv.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/d18b0a01320e392e48f0c475effd8d4db2bb71a8/src%2Fenv.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv.cc?ref=d18b0a01320e392e48f0c475effd8d4db2bb71a8",
+            "patch": "@@ -241,6 +241,10 @@ Environment::Environment(IsolateData* isolate_data,\n   if (options_->no_force_async_hooks_checks) {\n     async_hooks_.no_force_checks();\n   }\n+\n+  // TODO(addaleax): the per-isolate state should not be controlled by\n+  // a single Environment.\n+  isolate()->SetPromiseRejectCallback(task_queue::PromiseRejectCallback);\n }\n \n Environment::~Environment() {"
+        },
+        {
+            "sha": "4ed75385f9aa48801f4ac06c1606e78d23d3f1b1",
+            "filename": "src/node_internals.h",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/nodejs/node/blob/d18b0a01320e392e48f0c475effd8d4db2bb71a8/src%2Fnode_internals.h",
+            "raw_url": "https://github.com/nodejs/node/raw/d18b0a01320e392e48f0c475effd8d4db2bb71a8/src%2Fnode_internals.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_internals.h?ref=d18b0a01320e392e48f0c475effd8d4db2bb71a8",
+            "patch": "@@ -180,6 +180,10 @@ SlicedArguments::SlicedArguments(\n   size_ = size;\n }\n \n+namespace task_queue {\n+void PromiseRejectCallback(v8::PromiseRejectMessage message);\n+}  // namespace task_queue\n+\n v8::Maybe<bool> ProcessEmitWarning(Environment* env, const char* fmt, ...);\n v8::Maybe<bool> ProcessEmitDeprecationWarning(Environment* env,\n                                               const char* warning,"
+        },
+        {
+            "sha": "43d8e1cc246b8c79cd8de58faba869e1ecc5042a",
+            "filename": "src/node_task_queue.cc",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 9,
+            "changes": 17,
+            "blob_url": "https://github.com/nodejs/node/blob/d18b0a01320e392e48f0c475effd8d4db2bb71a8/src%2Fnode_task_queue.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/d18b0a01320e392e48f0c475effd8d4db2bb71a8/src%2Fnode_task_queue.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_task_queue.cc?ref=d18b0a01320e392e48f0c475effd8d4db2bb71a8",
+            "patch": "@@ -36,7 +36,7 @@ static void SetTickCallback(const FunctionCallbackInfo<Value>& args) {\n   env->set_tick_callback_function(args[0].As<Function>());\n }\n \n-static void PromiseRejectCallback(PromiseRejectMessage message) {\n+void PromiseRejectCallback(PromiseRejectMessage message) {\n   static std::atomic<uint64_t> unhandledRejections{0};\n   static std::atomic<uint64_t> rejectionsHandledAfter{0};\n \n@@ -49,6 +49,10 @@ static void PromiseRejectCallback(PromiseRejectMessage message) {\n   if (env == nullptr) return;\n \n   Local<Function> callback = env->promise_reject_callback();\n+  // The promise is rejected before JS land calls SetPromiseRejectCallback\n+  // to initializes the promise reject callback during bootstrap.\n+  CHECK(!callback.IsEmpty());\n+\n   Local<Value> value;\n   Local<Value> type = Number::New(env->isolate(), event);\n \n@@ -83,17 +87,12 @@ static void PromiseRejectCallback(PromiseRejectMessage message) {\n       env->context(), Undefined(isolate), arraysize(args), args));\n }\n \n-static void InitializePromiseRejectCallback(\n+static void SetPromiseRejectCallback(\n     const FunctionCallbackInfo<Value>& args) {\n   Environment* env = Environment::GetCurrent(args);\n   Isolate* isolate = env->isolate();\n \n   CHECK(args[0]->IsFunction());\n-\n-  // TODO(joyeecheung): this may be moved to somewhere earlier in the bootstrap\n-  // to make sure it's only called once\n-  isolate->SetPromiseRejectCallback(PromiseRejectCallback);\n-\n   env->set_promise_reject_callback(args[0].As<Function>());\n }\n \n@@ -120,8 +119,8 @@ static void Initialize(Local<Object> target,\n               FIXED_ONE_BYTE_STRING(isolate, \"promiseRejectEvents\"),\n               events).FromJust();\n   env->SetMethod(target,\n-                 \"initializePromiseRejectCallback\",\n-                 InitializePromiseRejectCallback);\n+                 \"setPromiseRejectCallback\",\n+                 SetPromiseRejectCallback);\n }\n \n }  // namespace task_queue"
+        },
+        {
+            "sha": "e661b32d8fb17d0a91a42b6442eb7ccf37572348",
+            "filename": "test/message/events_unhandled_error_nexttick.out",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/d18b0a01320e392e48f0c475effd8d4db2bb71a8/test%2Fmessage%2Fevents_unhandled_error_nexttick.out",
+            "raw_url": "https://github.com/nodejs/node/raw/d18b0a01320e392e48f0c475effd8d4db2bb71a8/test%2Fmessage%2Fevents_unhandled_error_nexttick.out",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fmessage%2Fevents_unhandled_error_nexttick.out?ref=d18b0a01320e392e48f0c475effd8d4db2bb71a8",
+            "patch": "@@ -14,7 +14,7 @@ Error\n     at startExecution (internal/bootstrap/node.js:*:*)\n Emitted 'error' event at:\n     at process.nextTick (*events_unhandled_error_nexttick.js:*:*)\n-    at internalTickCallback (internal/process/next_tick.js:*:*)\n+    at processTicksAndRejections (internal/process/next_tick.js:*:*)\n     at process.runNextTicks [as _tickCallback] (internal/process/next_tick.js:*:*)\n     at Function.Module.runMain (internal/modules/cjs/loader.js:*:*)\n     at executeUserCode (internal/bootstrap/node.js:*:*)"
+        },
+        {
+            "sha": "a2169b2f056fe1a854ed9cec267706f27cf200a9",
+            "filename": "test/message/nexttick_throw.out",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/d18b0a01320e392e48f0c475effd8d4db2bb71a8/test%2Fmessage%2Fnexttick_throw.out",
+            "raw_url": "https://github.com/nodejs/node/raw/d18b0a01320e392e48f0c475effd8d4db2bb71a8/test%2Fmessage%2Fnexttick_throw.out",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fmessage%2Fnexttick_throw.out?ref=d18b0a01320e392e48f0c475effd8d4db2bb71a8",
+            "patch": "@@ -4,7 +4,7 @@\n         ^\n ReferenceError: undefined_reference_error_maker is not defined\n     at *test*message*nexttick_throw.js:*:*\n-    at internalTickCallback (internal/process/next_tick.js:*:*)\n+    at processTicksAndRejections (internal/process/next_tick.js:*:*)\n     at process.runNextTicks [as _tickCallback] (internal/process/next_tick.js:*:*)\n     at Function.Module.runMain (internal/modules/cjs/loader.js:*:*)\n     at executeUserCode (internal/bootstrap/node.js:*:*)"
+        },
+        {
+            "sha": "2bf935d7cbd16f77a91db61ff6b8eb078b39c5f0",
+            "filename": "test/message/stdin_messages.out",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 4,
+            "changes": 8,
+            "blob_url": "https://github.com/nodejs/node/blob/d18b0a01320e392e48f0c475effd8d4db2bb71a8/test%2Fmessage%2Fstdin_messages.out",
+            "raw_url": "https://github.com/nodejs/node/raw/d18b0a01320e392e48f0c475effd8d4db2bb71a8/test%2Fmessage%2Fstdin_messages.out",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fmessage%2Fstdin_messages.out?ref=d18b0a01320e392e48f0c475effd8d4db2bb71a8",
+            "patch": "@@ -12,7 +12,7 @@ SyntaxError: Strict mode code may not include a with statement\n     at Socket.process.stdin.on (internal/bootstrap/node.js:*:*)\n     at Socket.emit (events.js:*:*)\n     at endReadableNT (_stream_readable.js:*:*)\n-    at process.internalTickCallback (internal/process/next_tick.js:*:*)\n+    at processTicksAndRejections (internal/process/next_tick.js:*:*)\n 42\n 42\n [stdin]:1\n@@ -29,7 +29,7 @@ Error: hello\n     at Socket.process.stdin.on (internal/bootstrap/node.js:*:*)\n     at Socket.emit (events.js:*:*)\n     at endReadableNT (_stream_readable.js:*:*)\n-    at process.internalTickCallback (internal/process/next_tick.js:*:*)\n+    at processTicksAndRejections (internal/process/next_tick.js:*:*)\n [stdin]:1\n throw new Error(\"hello\")\n ^\n@@ -44,7 +44,7 @@ Error: hello\n     at Socket.process.stdin.on (internal/bootstrap/node.js:*:*)\n     at Socket.emit (events.js:*:*)\n     at endReadableNT (_stream_readable.js:*:*)\n-    at process.internalTickCallback (internal/process/next_tick.js:*:*)\n+    at processTicksAndRejections (internal/process/next_tick.js:*:*)\n 100\n [stdin]:1\n var x = 100; y = x;\n@@ -60,7 +60,7 @@ ReferenceError: y is not defined\n     at Socket.process.stdin.on (internal/bootstrap/node.js:*:*)\n     at Socket.emit (events.js:*:*)\n     at endReadableNT (_stream_readable.js:*:*)\n-    at process.internalTickCallback (internal/process/next_tick.js:*:*)\n+    at processTicksAndRejections (internal/process/next_tick.js:*:*)\n \n [stdin]:1\n var ______________________________________________; throw 10"
+        }
+    ],
+    "stats": {
+        "total": 82,
+        "additions": 50,
+        "deletions": 32
+    }
+}

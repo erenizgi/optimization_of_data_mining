@@ -1,0 +1,84 @@
+{
+    "author": "alxhub",
+    "message": "refactor(compiler-cli): make template parsing errors into diagnostics (#38576)\n\nPreviously, the compiler was not able to display template parsing errors as\ntrue `ts.Diagnostic`s that point inside the template. Instead, it would\nthrow an actual `Error`, and \"crash\" with a stack trace containing the\ntemplate errors.\n\nNot only is this a poor user experience, but it causes the Language Service\nto also crash as the user is editing a template (in actuality the LS has to\nwork around this bug).\n\nWith this commit, such parsing errors are converted to true template\ndiagnostics with appropriate span information to be displayed contextually\nalong with all other diagnostics. This majorly improves the user experience\nand unblocks the Language Service from having to deal with the compiler\n\"crashing\" to report errors.\n\nPR Close #38576",
+    "sha": "c90eb5450d8e2089145f1c9506fb787760e5d682",
+    "files": [
+        {
+            "sha": "7e089a796f80d77d99de2c7bbf3ca845ddd72167",
+            "filename": "packages/compiler-cli/src/ngtsc/annotations/BUILD.bazel",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/angular/angular/blob/c90eb5450d8e2089145f1c9506fb787760e5d682/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fannotations%2FBUILD.bazel",
+            "raw_url": "https://github.com/angular/angular/raw/c90eb5450d8e2089145f1c9506fb787760e5d682/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fannotations%2FBUILD.bazel",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fannotations%2FBUILD.bazel?ref=c90eb5450d8e2089145f1c9506fb787760e5d682",
+            "patch": "@@ -23,6 +23,7 @@ ts_library(\n         \"//packages/compiler-cli/src/ngtsc/shims:api\",\n         \"//packages/compiler-cli/src/ngtsc/transform\",\n         \"//packages/compiler-cli/src/ngtsc/typecheck/api\",\n+        \"//packages/compiler-cli/src/ngtsc/typecheck/diagnostics\",\n         \"//packages/compiler-cli/src/ngtsc/util\",\n         \"@npm//@types/node\",\n         \"@npm//typescript\","
+        },
+        {
+            "sha": "964aaebf870ec97b3352f5308092893d768388c4",
+            "filename": "packages/compiler-cli/src/ngtsc/annotations/src/component.ts",
+            "status": "modified",
+            "additions": 22,
+            "deletions": 3,
+            "changes": 25,
+            "blob_url": "https://github.com/angular/angular/blob/c90eb5450d8e2089145f1c9506fb787760e5d682/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fannotations%2Fsrc%2Fcomponent.ts",
+            "raw_url": "https://github.com/angular/angular/raw/c90eb5450d8e2089145f1c9506fb787760e5d682/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fannotations%2Fsrc%2Fcomponent.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fannotations%2Fsrc%2Fcomponent.ts?ref=c90eb5450d8e2089145f1c9506fb787760e5d682",
+            "patch": "@@ -10,7 +10,7 @@ import {compileComponentFromMetadata, ConstantPool, CssSelector, DEFAULT_INTERPO\n import * as ts from 'typescript';\n \n import {CycleAnalyzer} from '../../cycles';\n-import {ErrorCode, FatalDiagnosticError} from '../../diagnostics';\n+import {ErrorCode, FatalDiagnosticError, ngErrorCode} from '../../diagnostics';\n import {absoluteFrom, relative} from '../../file_system';\n import {DefaultImportRecorder, ModuleResolver, Reference, ReferenceEmitter} from '../../imports';\n import {DependencyTracker} from '../../incremental/api';\n@@ -22,6 +22,7 @@ import {ClassDeclaration, Decorator, ReflectionHost, reflectObjectLiteral} from\n import {ComponentScopeReader, LocalModuleScopeRegistry} from '../../scope';\n import {AnalysisOutput, CompileResult, DecoratorHandler, DetectResult, HandlerFlags, HandlerPrecedence, ResolveResult} from '../../transform';\n import {TemplateSourceMapping, TypeCheckContext} from '../../typecheck/api';\n+import {getTemplateId, makeTemplateDiagnostic} from '../../typecheck/diagnostics';\n import {tsSourceMapBug29300Fixed} from '../../util/src/ts_source_map_bug_29300';\n import {SubsetOfKeys} from '../../util/src/typescript';\n \n@@ -254,9 +255,26 @@ export class ComponentDecoratorHandler implements\n       }\n     }\n \n+    let diagnostics: ts.Diagnostic[]|undefined = undefined;\n+\n     if (template.errors !== undefined) {\n-      throw new Error(\n-          `Errors parsing template: ${template.errors.map(e => e.toString()).join(', ')}`);\n+      // If there are any template parsing errors, convert them to `ts.Diagnostic`s for display.\n+      const id = getTemplateId(node);\n+      diagnostics = template.errors.map(error => {\n+        const span = error.span;\n+\n+        if (span.start.offset === span.end.offset) {\n+          // Template errors can contain zero-length spans, if the error occurs at a single point.\n+          // However, TypeScript does not handle displaying a zero-length diagnostic very well, so\n+          // increase the ending offset by 1 for such errors, to ensure the position is shown in the\n+          // diagnostic.\n+          span.end.offset++;\n+        }\n+\n+        return makeTemplateDiagnostic(\n+            id, template.sourceMapping, span, ts.DiagnosticCategory.Error,\n+            ngErrorCode(ErrorCode.TEMPLATE_PARSE_ERROR), error.msg);\n+      });\n     }\n \n     // Figure out the set of styles. The ordering here is important: external resources (styleUrls)\n@@ -335,6 +353,7 @@ export class ComponentDecoratorHandler implements\n         providersRequiringFactory,\n         viewProvidersRequiringFactory,\n       },\n+      diagnostics,\n     };\n     if (changeDetection !== null) {\n       output.analysis!.meta.changeDetection = changeDetection;"
+        },
+        {
+            "sha": "b1e767dcf25e78ac58ab69504909e3b37d2f30fc",
+            "filename": "packages/compiler-cli/src/ngtsc/diagnostics/src/error_code.ts",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/angular/angular/blob/c90eb5450d8e2089145f1c9506fb787760e5d682/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fdiagnostics%2Fsrc%2Ferror_code.ts",
+            "raw_url": "https://github.com/angular/angular/raw/c90eb5450d8e2089145f1c9506fb787760e5d682/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fdiagnostics%2Fsrc%2Ferror_code.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fdiagnostics%2Fsrc%2Ferror_code.ts?ref=c90eb5450d8e2089145f1c9506fb787760e5d682",
+            "patch": "@@ -56,6 +56,11 @@ export enum ErrorCode {\n    */\n   HOST_BINDING_PARSE_ERROR = 5001,\n \n+  /**\n+   * Raised when the compiler cannot parse a component's template.\n+   */\n+  TEMPLATE_PARSE_ERROR = 5002,\n+\n   /**\n    * Raised when an NgModule contains an invalid reference in `declarations`.\n    */"
+        },
+        {
+            "sha": "74b4fdc6014c6b9814bc5d0e5d6e1aa552508327",
+            "filename": "packages/compiler-cli/test/ngtsc/ngtsc_spec.ts",
+            "status": "modified",
+            "additions": 48,
+            "deletions": 0,
+            "changes": 48,
+            "blob_url": "https://github.com/angular/angular/blob/c90eb5450d8e2089145f1c9506fb787760e5d682/packages%2Fcompiler-cli%2Ftest%2Fngtsc%2Fngtsc_spec.ts",
+            "raw_url": "https://github.com/angular/angular/raw/c90eb5450d8e2089145f1c9506fb787760e5d682/packages%2Fcompiler-cli%2Ftest%2Fngtsc%2Fngtsc_spec.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Ftest%2Fngtsc%2Fngtsc_spec.ts?ref=c90eb5450d8e2089145f1c9506fb787760e5d682",
+            "patch": "@@ -7378,6 +7378,54 @@ export const Foo = Foo__PRE_R3__;\n            const diags = env.driveDiagnostics();\n            expect(diags.length).toBe(0);\n          });\n+\n+      describe('template parsing diagnostics', () => {\n+        // These tests validate that errors which occur during template parsing are expressed as\n+        // diagnostics instead of a compiler crash (which used to be the case). They only assert\n+        // that the error is produced with an accurate span - the exact semantics of the errors are\n+        // tested separately, via the parser tests.\n+        it('should emit a diagnostic for a template parsing error', () => {\n+          env.write('test.ts', `\n+            import {Component} from '@angular/core';\n+            @Component({\n+              template: '<div></span>',\n+              selector: 'test-cmp',\n+            })\n+            export class TestCmp {}\n+          `);\n+          const diags = env.driveDiagnostics();\n+          expect(diags.length).toBe(1);\n+          expect(getDiagnosticSourceCode(diags[0])).toBe('</span>');\n+        });\n+\n+        it('should emit a diagnostic for an expression parsing error', () => {\n+          env.write('test.ts', `\n+            import {Component} from '@angular/core';\n+            @Component({\n+              template: '<cmp [input]=\"x ? y\">',\n+              selector: 'test-cmp',\n+            })\n+            export class TestCmp {}\n+          `);\n+          const diags = env.driveDiagnostics();\n+          expect(diags.length).toBe(1);\n+          expect(getDiagnosticSourceCode(diags[0])).toBe('x ? y');\n+        });\n+\n+        it('should use a single character span for an unexpected EOF parsing error', () => {\n+          env.write('test.ts', `\n+              import {Component} from '@angular/core';\n+              @Component({\n+                template: '<cmp [input]=\"x>',\n+                selector: 'test-cmp',\n+              })\n+              export class TestCmp {}\n+            `);\n+          const diags = env.driveDiagnostics();\n+          expect(diags.length).toBe(1);\n+          expect(getDiagnosticSourceCode(diags[0])).toBe('\\'');\n+        });\n+      });\n     });\n   });\n "
+        },
+        {
+            "sha": "16d899a173af57124fe3cbd1e311210bcb60739d",
+            "filename": "packages/compiler/src/render3/r3_template_transform.ts",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 6,
+            "changes": 6,
+            "blob_url": "https://github.com/angular/angular/blob/c90eb5450d8e2089145f1c9506fb787760e5d682/packages%2Fcompiler%2Fsrc%2Frender3%2Fr3_template_transform.ts",
+            "raw_url": "https://github.com/angular/angular/raw/c90eb5450d8e2089145f1c9506fb787760e5d682/packages%2Fcompiler%2Fsrc%2Frender3%2Fr3_template_transform.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler%2Fsrc%2Frender3%2Fr3_template_transform.ts?ref=c90eb5450d8e2089145f1c9506fb787760e5d682",
+            "patch": "@@ -62,12 +62,6 @@ export function htmlAstToRender3Ast(\n \n   // Errors might originate in either the binding parser or the html to ivy transformer\n   const allErrors = bindingParser.errors.concat(transformer.errors);\n-  const errors: ParseError[] = allErrors.filter(e => e.level === ParseErrorLevel.ERROR);\n-\n-  if (errors.length > 0) {\n-    const errorString = errors.join('\\n');\n-    throw syntaxError(`Template parse errors:\\n${errorString}`, errors);\n-  }\n \n   return {\n     nodes: ivyNodes,"
+        },
+        {
+            "sha": "af3ed25c1182018cc48405007abe0bae72d3d08a",
+            "filename": "packages/compiler/test/render3/view/util.ts",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 1,
+            "changes": 9,
+            "blob_url": "https://github.com/angular/angular/blob/c90eb5450d8e2089145f1c9506fb787760e5d682/packages%2Fcompiler%2Ftest%2Frender3%2Fview%2Futil.ts",
+            "raw_url": "https://github.com/angular/angular/raw/c90eb5450d8e2089145f1c9506fb787760e5d682/packages%2Fcompiler%2Ftest%2Frender3%2Fview%2Futil.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler%2Ftest%2Frender3%2Fview%2Futil.ts?ref=c90eb5450d8e2089145f1c9506fb787760e5d682",
+            "patch": "@@ -101,7 +101,14 @@ export function parseR3(\n       ['onEvent'], ['onEvent']);\n   const bindingParser =\n       new BindingParser(expressionParser, DEFAULT_INTERPOLATION_CONFIG, schemaRegistry, null, []);\n-  return htmlAstToRender3Ast(htmlNodes, bindingParser);\n+  const r3Result = htmlAstToRender3Ast(htmlNodes, bindingParser);\n+\n+  if (r3Result.errors.length > 0) {\n+    const msg = r3Result.errors.map(e => e.toString()).join('\\n');\n+    throw new Error(msg);\n+  }\n+\n+  return r3Result;\n }\n \n export function processI18nMeta("
+        }
+    ],
+    "stats": {
+        "total": 94,
+        "additions": 84,
+        "deletions": 10
+    }
+}

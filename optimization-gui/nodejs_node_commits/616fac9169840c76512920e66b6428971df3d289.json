@@ -1,0 +1,96 @@
+{
+    "author": "unknown",
+    "message": "lib: make coverage work for Node.js\n\nPR-URL: https://github.com/nodejs/node/pull/23941\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Yang Guo <yangguo@chromium.org>",
+    "sha": "616fac9169840c76512920e66b6428971df3d289",
+    "files": [
+        {
+            "sha": "aceb15cc63fc69f2183b45d1700b50114e2ce6c2",
+            "filename": "lib/internal/bootstrap/loaders.js",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/nodejs/node/blob/616fac9169840c76512920e66b6428971df3d289/lib%2Finternal%2Fbootstrap%2Floaders.js",
+            "raw_url": "https://github.com/nodejs/node/raw/616fac9169840c76512920e66b6428971df3d289/lib%2Finternal%2Fbootstrap%2Floaders.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fbootstrap%2Floaders.js?ref=616fac9169840c76512920e66b6428971df3d289",
+            "patch": "@@ -362,6 +362,12 @@\n     NativeModule._cache[this.id] = this;\n   };\n \n+  // coverage must be turned on early, so that we can collect\n+  // it for Node.js' own internal libraries.\n+  if (process.env.NODE_V8_COVERAGE) {\n+    NativeModule.require('internal/process/coverage').setup();\n+  }\n+\n   // This will be passed to the bootstrapNodeJSCore function in\n   // bootstrap/node.js.\n   return loaderExports;"
+        },
+        {
+            "sha": "6b5f1f7f8e561cf52eb73b37cc2c57f9db8a9d81",
+            "filename": "lib/internal/bootstrap/node.js",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 3,
+            "changes": 4,
+            "blob_url": "https://github.com/nodejs/node/blob/616fac9169840c76512920e66b6428971df3d289/lib%2Finternal%2Fbootstrap%2Fnode.js",
+            "raw_url": "https://github.com/nodejs/node/raw/616fac9169840c76512920e66b6428971df3d289/lib%2Finternal%2Fbootstrap%2Fnode.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fbootstrap%2Fnode.js?ref=616fac9169840c76512920e66b6428971df3d289",
+            "patch": "@@ -103,9 +103,7 @@\n       NativeModule.require('internal/process/write-coverage').setup();\n \n     if (process.env.NODE_V8_COVERAGE) {\n-      const { resolve } = NativeModule.require('path');\n-      process.env.NODE_V8_COVERAGE = resolve(process.env.NODE_V8_COVERAGE);\n-      NativeModule.require('internal/process/coverage').setup();\n+      NativeModule.require('internal/process/coverage').setupExitHooks();\n     }\n \n     if (process.config.variables.v8_enable_inspector) {"
+        },
+        {
+            "sha": "9c9b2b47119ea7399de54f30f64e1d927e4cdc56",
+            "filename": "lib/internal/process/coverage.js",
+            "status": "modified",
+            "additions": 59,
+            "deletions": 31,
+            "changes": 90,
+            "blob_url": "https://github.com/nodejs/node/blob/616fac9169840c76512920e66b6428971df3d289/lib%2Finternal%2Fprocess%2Fcoverage.js",
+            "raw_url": "https://github.com/nodejs/node/raw/616fac9169840c76512920e66b6428971df3d289/lib%2Finternal%2Fprocess%2Fcoverage.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fprocess%2Fcoverage.js?ref=616fac9169840c76512920e66b6428971df3d289",
+            "patch": "@@ -1,65 +1,93 @@\n 'use strict';\n-const path = require('path');\n-const { mkdirSync, writeFileSync } = require('fs');\n-const hasInspector = process.config.variables.v8_enable_inspector === 1;\n-let inspector = null;\n-if (hasInspector) inspector = require('inspector');\n-\n-let session;\n+let coverageConnection = null;\n+let coverageDirectory;\n \n function writeCoverage() {\n-  if (!session) {\n+  if (!coverageConnection && coverageDirectory) {\n     return;\n   }\n \n+  const { join } = require('path');\n+  const { mkdirSync, writeFileSync } = require('fs');\n   const { threadId } = require('internal/worker');\n \n   const filename = `coverage-${process.pid}-${Date.now()}-${threadId}.json`;\n   try {\n-    // TODO(bcoe): switch to mkdirp once #22302 is addressed.\n-    mkdirSync(process.env.NODE_V8_COVERAGE);\n+    mkdirSync(coverageDirectory, { recursive: true });\n   } catch (err) {\n     if (err.code !== 'EEXIST') {\n       console.error(err);\n       return;\n     }\n   }\n \n-  const target = path.join(process.env.NODE_V8_COVERAGE, filename);\n-\n+  const target = join(coverageDirectory, filename);\n   try {\n-    session.post('Profiler.takePreciseCoverage', (err, coverageInfo) => {\n-      if (err) return console.error(err);\n-      try {\n-        writeFileSync(target, JSON.stringify(coverageInfo));\n-      } catch (err) {\n-        console.error(err);\n-      }\n-    });\n+    disableAllAsyncHooks();\n+    let msg;\n+    coverageConnection._coverageCallback = function(_msg) {\n+      msg = _msg;\n+    };\n+    coverageConnection.dispatch(JSON.stringify({\n+      id: 3,\n+      method: 'Profiler.takePreciseCoverage'\n+    }));\n+    const coverageInfo = JSON.parse(msg).result;\n+    writeFileSync(target, JSON.stringify(coverageInfo));\n   } catch (err) {\n     console.error(err);\n   } finally {\n-    session.disconnect();\n-    session = null;\n+    coverageConnection.disconnect();\n+    coverageConnection = null;\n   }\n }\n \n+function disableAllAsyncHooks() {\n+  const { getHookArrays } = require('internal/async_hooks');\n+  const [hooks_array] = getHookArrays();\n+  hooks_array.forEach((hook) => { hook.disable(); });\n+}\n+\n exports.writeCoverage = writeCoverage;\n \n function setup() {\n-  if (!hasInspector) {\n-    console.warn('coverage currently only supported in main thread');\n+  const { Connection } = process.binding('inspector');\n+  if (!Connection) {\n+    console.warn('inspector not enabled');\n     return;\n   }\n \n-  session = new inspector.Session();\n-  session.connect();\n-  session.post('Profiler.enable');\n-  session.post('Profiler.startPreciseCoverage', { callCount: true,\n-                                                  detailed: true });\n+  coverageConnection = new Connection((res) => {\n+    if (coverageConnection._coverageCallback) {\n+      coverageConnection._coverageCallback(res);\n+    }\n+  });\n+  coverageConnection.dispatch(JSON.stringify({\n+    id: 1,\n+    method: 'Profiler.enable'\n+  }));\n+  coverageConnection.dispatch(JSON.stringify({\n+    id: 2,\n+    method: 'Profiler.startPreciseCoverage',\n+    params: {\n+      callCount: true,\n+      detailed: true\n+    }\n+  }));\n \n-  const reallyReallyExit = process.reallyExit;\n+  try {\n+    const { resolve } = require('path');\n+    coverageDirectory = process.env.NODE_V8_COVERAGE =\n+      resolve(process.env.NODE_V8_COVERAGE);\n+  } catch (err) {\n+    console.error(err);\n+  }\n+}\n \n+exports.setup = setup;\n+\n+function setupExitHooks() {\n+  const reallyReallyExit = process.reallyExit;\n   process.reallyExit = function(code) {\n     writeCoverage();\n     reallyReallyExit(code);\n@@ -68,4 +96,4 @@ function setup() {\n   process.on('exit', writeCoverage);\n }\n \n-exports.setup = setup;\n+exports.setupExitHooks = setupExitHooks;"
+        },
+        {
+            "sha": "855f41ed3b3449bed6df72324728c6a357eb1fe3",
+            "filename": "test/fixtures/v8-coverage/async-hooks.js",
+            "status": "added",
+            "additions": 11,
+            "deletions": 0,
+            "changes": 11,
+            "blob_url": "https://github.com/nodejs/node/blob/616fac9169840c76512920e66b6428971df3d289/test%2Ffixtures%2Fv8-coverage%2Fasync-hooks.js",
+            "raw_url": "https://github.com/nodejs/node/raw/616fac9169840c76512920e66b6428971df3d289/test%2Ffixtures%2Fv8-coverage%2Fasync-hooks.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Ffixtures%2Fv8-coverage%2Fasync-hooks.js?ref=616fac9169840c76512920e66b6428971df3d289",
+            "patch": "@@ -0,0 +1,11 @@\n+const async_hooks = require('async_hooks');\n+const common = require('../../common');\n+\n+const hook = async_hooks.createHook({\n+  init: common.mustNotCall(),\n+  before: common.mustNotCall(),\n+  after: common.mustNotCall(),\n+  destroy: common.mustNotCall()\n+});\n+\n+hook.enable();"
+        },
+        {
+            "sha": "963b85ac3a029a40c261528e96734d0f59a36bd4",
+            "filename": "test/parallel/test-heapdump-inspector.js",
+            "status": "modified",
+            "additions": 34,
+            "deletions": 13,
+            "changes": 47,
+            "blob_url": "https://github.com/nodejs/node/blob/616fac9169840c76512920e66b6428971df3d289/test%2Fparallel%2Ftest-heapdump-inspector.js",
+            "raw_url": "https://github.com/nodejs/node/raw/616fac9169840c76512920e66b6428971df3d289/test%2Fparallel%2Ftest-heapdump-inspector.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-heapdump-inspector.js?ref=616fac9169840c76512920e66b6428971df3d289",
+            "patch": "@@ -7,17 +7,38 @@ common.skipIfInspectorDisabled();\n const { validateSnapshotNodes } = require('../common/heap');\n const inspector = require('inspector');\n \n-const session = new inspector.Session();\n-validateSnapshotNodes('Node / JSBindingsConnection', []);\n-session.connect();\n-validateSnapshotNodes('Node / JSBindingsConnection', [\n-  {\n-    children: [\n-      { node_name: 'Node / InspectorSession', edge_name: 'session' },\n-      { node_name: 'Connection', edge_name: 'wrapped' },\n-      (edge) => edge.name === 'callback' &&\n-        (edge.to.type === undefined || // embedded graph\n-         edge.to.type === 'closure') // snapshot\n-    ]\n+const snapshotNode = {\n+  children: [\n+    { node_name: 'Node / InspectorSession', edge_name: 'session' }\n+  ]\n+};\n+\n+// starts with no JSBindingsConnection (or 1 if coverage enabled).\n+{\n+  const expected = [];\n+  if (process.env.NODE_V8_COVERAGE) {\n+    expected.push(snapshotNode);\n+  }\n+  validateSnapshotNodes('Node / JSBindingsConnection', expected);\n+}\n+\n+// JSBindingsConnection should be added.\n+{\n+  const session = new inspector.Session();\n+  session.connect();\n+  const expected = [\n+    {\n+      children: [\n+        { node_name: 'Node / InspectorSession', edge_name: 'session' },\n+        { node_name: 'Connection', edge_name: 'wrapped' },\n+        (edge) => edge.name === 'callback' &&\n+          (edge.to.type === undefined || // embedded graph\n+           edge.to.type === 'closure') // snapshot\n+      ]\n+    }\n+  ];\n+  if (process.env.NODE_V8_COVERAGE) {\n+    expected.push(snapshotNode);\n   }\n-]);\n+  validateSnapshotNodes('Node / JSBindingsConnection', expected);\n+}"
+        },
+        {
+            "sha": "191835fe0f5af94e9e01c12df2bd2b165138e13a",
+            "filename": "test/parallel/test-v8-coverage.js",
+            "status": "modified",
+            "additions": 14,
+            "deletions": 0,
+            "changes": 14,
+            "blob_url": "https://github.com/nodejs/node/blob/616fac9169840c76512920e66b6428971df3d289/test%2Fparallel%2Ftest-v8-coverage.js",
+            "raw_url": "https://github.com/nodejs/node/raw/616fac9169840c76512920e66b6428971df3d289/test%2Fparallel%2Ftest-v8-coverage.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-v8-coverage.js?ref=616fac9169840c76512920e66b6428971df3d289",
+            "patch": "@@ -108,6 +108,20 @@ function nextdir() {\n   assert.strictEqual(fixtureCoverage, undefined);\n }\n \n+// disables async hooks before writing coverage.\n+{\n+  const coverageDirectory = path.join(tmpdir.path, nextdir());\n+  const output = spawnSync(process.execPath, [\n+    require.resolve('../fixtures/v8-coverage/async-hooks')\n+  ], { env: { ...process.env, NODE_V8_COVERAGE: coverageDirectory } });\n+  assert.strictEqual(output.status, 0);\n+  const fixtureCoverage = getFixtureCoverage('async-hooks.js',\n+                                             coverageDirectory);\n+  assert.ok(fixtureCoverage);\n+  // first branch executed.\n+  assert.strictEqual(fixtureCoverage.functions[1].ranges[0].count, 1);\n+}\n+\n // extracts the coverage object for a given fixture name.\n function getFixtureCoverage(fixtureFile, coverageDirectory) {\n   const coverageFiles = fs.readdirSync(coverageDirectory);"
+        },
+        {
+            "sha": "f14e7c17d817c56f036ede1d39f430a8e877a76e",
+            "filename": "test/sequential/test-inspector-enabled.js",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 1,
+            "changes": 5,
+            "blob_url": "https://github.com/nodejs/node/blob/616fac9169840c76512920e66b6428971df3d289/test%2Fsequential%2Ftest-inspector-enabled.js",
+            "raw_url": "https://github.com/nodejs/node/raw/616fac9169840c76512920e66b6428971df3d289/test%2Fsequential%2Ftest-inspector-enabled.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fsequential%2Ftest-inspector-enabled.js?ref=616fac9169840c76512920e66b6428971df3d289",
+            "patch": "@@ -20,7 +20,10 @@ assert(\n `;\n \n const args = ['--inspect', '-e', script];\n-const child = spawn(process.execPath, args, { stdio: 'inherit' });\n+const child = spawn(process.execPath, args, {\n+  stdio: 'inherit',\n+  env: { ...process.env, NODE_V8_COVERAGE: '' }\n+});\n child.on('exit', (code, signal) => {\n   process.exit(code || signal);\n });"
+        }
+    ],
+    "stats": {
+        "total": 177,
+        "additions": 129,
+        "deletions": 48
+    }
+}

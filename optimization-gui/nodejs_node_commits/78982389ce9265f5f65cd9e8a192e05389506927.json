@@ -1,0 +1,72 @@
+{
+    "author": "bmeck",
+    "message": "policy: ensure workers do not read fs for policy\n\nThis prevents a main thread from rewriting the policy file and loading\na worker that has a different policy from the main thread.\n\nPR-URL: https://github.com/nodejs/node/pull/25710\nReviewed-By: Anna Henningsen <anna@addaleax.net>\nReviewed-By: Joyee Cheung <joyeec9h3@gmail.com>",
+    "sha": "78982389ce9265f5f65cd9e8a192e05389506927",
+    "files": [
+        {
+            "sha": "789d8c1754bd754cd18a51c07f883ae26232da6b",
+            "filename": "lib/internal/bootstrap/node.js",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 5,
+            "changes": 10,
+            "blob_url": "https://github.com/nodejs/node/blob/78982389ce9265f5f65cd9e8a192e05389506927/lib%2Finternal%2Fbootstrap%2Fnode.js",
+            "raw_url": "https://github.com/nodejs/node/raw/78982389ce9265f5f65cd9e8a192e05389506927/lib%2Finternal%2Fbootstrap%2Fnode.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fbootstrap%2Fnode.js?ref=78982389ce9265f5f65cd9e8a192e05389506927",
+            "patch": "@@ -181,7 +181,7 @@ function startup() {\n \n   // TODO(joyeecheung): move this down further to get better snapshotting\n   const experimentalPolicy = getOptionValue('--experimental-policy');\n-  if (experimentalPolicy) {\n+  if (isMainThread && experimentalPolicy) {\n     process.emitWarning('Policies are experimental.',\n                         'ExperimentalWarning');\n     const { pathToFileURL, URL } = NativeModule.require('url');\n@@ -348,8 +348,6 @@ function startup() {\n }\n \n function startWorkerThreadExecution() {\n-  prepareUserCodeExecution();\n-\n   // If we are in a worker thread, execute the script sent through the\n   // message port.\n   const {\n@@ -366,7 +364,9 @@ function startWorkerThreadExecution() {\n   debug(`[${threadId}] is setting up worker child environment`);\n \n   const port = getEnvMessagePort();\n-  port.on('message', createMessageHandler(port));\n+  port.on('message', createMessageHandler(\n+    port,\n+    prepareUserCodeExecution));\n   port.start();\n \n   // Overwrite fatalException\n@@ -460,7 +460,7 @@ function prepareUserCodeExecution() {\n \n   // For user code, we preload modules if `-r` is passed\n   const preloadModules = getOptionValue('--require');\n-  if (preloadModules) {\n+  if (preloadModules.length) {\n     const {\n       _preloadModules\n     } = NativeModule.require('internal/modules/cjs/loader');"
+        },
+        {
+            "sha": "823130e3c1d74c1c799b2d02d059d41e1da4d7f6",
+            "filename": "lib/internal/process/policy.js",
+            "status": "modified",
+            "additions": 18,
+            "deletions": 0,
+            "changes": 18,
+            "blob_url": "https://github.com/nodejs/node/blob/78982389ce9265f5f65cd9e8a192e05389506927/lib%2Finternal%2Fprocess%2Fpolicy.js",
+            "raw_url": "https://github.com/nodejs/node/raw/78982389ce9265f5f65cd9e8a192e05389506927/lib%2Finternal%2Fprocess%2Fpolicy.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fprocess%2Fpolicy.js?ref=78982389ce9265f5f65cd9e8a192e05389506927",
+            "patch": "@@ -5,10 +5,14 @@ const {\n } = require('internal/errors').codes;\n const { Manifest } = require('internal/policy/manifest');\n let manifest;\n+let manifestSrc;\n+let manifestURL;\n \n module.exports = Object.freeze({\n   __proto__: null,\n   setup(src, url) {\n+    manifestSrc = src;\n+    manifestURL = url;\n     if (src === null) {\n       manifest = null;\n       return;\n@@ -31,6 +35,20 @@ module.exports = Object.freeze({\n     return manifest;\n   },\n \n+  get src() {\n+    if (typeof manifestSrc === 'undefined') {\n+      throw new ERR_MANIFEST_TDZ();\n+    }\n+    return manifestSrc;\n+  },\n+\n+  get url() {\n+    if (typeof manifestURL === 'undefined') {\n+      throw new ERR_MANIFEST_TDZ();\n+    }\n+    return manifestURL;\n+  },\n+\n   assertIntegrity(moduleURL, content) {\n     this.manifest.matchesIntegrity(moduleURL, content);\n   }"
+        },
+        {
+            "sha": "2171d2b586a4ca0ded181bf24d4b8cb9a516c4df",
+            "filename": "lib/internal/process/worker_thread_only.js",
+            "status": "modified",
+            "additions": 14,
+            "deletions": 2,
+            "changes": 16,
+            "blob_url": "https://github.com/nodejs/node/blob/78982389ce9265f5f65cd9e8a192e05389506927/lib%2Finternal%2Fprocess%2Fworker_thread_only.js",
+            "raw_url": "https://github.com/nodejs/node/raw/78982389ce9265f5f65cd9e8a192e05389506927/lib%2Finternal%2Fprocess%2Fworker_thread_only.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fprocess%2Fworker_thread_only.js?ref=78982389ce9265f5f65cd9e8a192e05389506927",
+            "patch": "@@ -43,12 +43,24 @@ function initializeWorkerStdio() {\n   };\n }\n \n-function createMessageHandler(port) {\n+function createMessageHandler(port, prepareUserCodeExecution) {\n   const publicWorker = require('worker_threads');\n \n   return function(message) {\n     if (message.type === messageTypes.LOAD_SCRIPT) {\n-      const { filename, doEval, workerData, publicPort, hasStdin } = message;\n+      const {\n+        filename,\n+        doEval,\n+        workerData,\n+        publicPort,\n+        manifestSrc,\n+        manifestURL,\n+        hasStdin\n+      } = message;\n+      if (manifestSrc) {\n+        require('internal/process/policy').setup(manifestSrc, manifestURL);\n+      }\n+      prepareUserCodeExecution();\n       publicWorker.parentPort = publicPort;\n       publicWorker.workerData = workerData;\n "
+        },
+        {
+            "sha": "1640a9dd88a2bac32bae426b086efd56ba0afa90",
+            "filename": "lib/internal/worker.js",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/nodejs/node/blob/78982389ce9265f5f65cd9e8a192e05389506927/lib%2Finternal%2Fworker.js",
+            "raw_url": "https://github.com/nodejs/node/raw/78982389ce9265f5f65cd9e8a192e05389506927/lib%2Finternal%2Fworker.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fworker.js?ref=78982389ce9265f5f65cd9e8a192e05389506927",
+            "patch": "@@ -12,6 +12,7 @@ const {\n   ERR_INVALID_ARG_TYPE,\n } = require('internal/errors').codes;\n const { validateString } = require('internal/validators');\n+const { getOptionValue } = require('internal/options');\n \n const {\n   drainMessagePort,\n@@ -112,6 +113,9 @@ class Worker extends EventEmitter {\n       doEval: !!options.eval,\n       workerData: options.workerData,\n       publicPort: port2,\n+      manifestSrc: getOptionValue('--experimental-policy') ?\n+        require('internal/process/policy').src :\n+        null,\n       hasStdin: !!options.stdin\n     }, [port2]);\n     // Actually start the new thread now that everything is in place."
+        },
+        {
+            "sha": "86d1078d9f24b347f76edc52d75ef99abda9fd43",
+            "filename": "test/parallel/test-policy-integrity.js",
+            "status": "modified",
+            "additions": 97,
+            "deletions": 9,
+            "changes": 106,
+            "blob_url": "https://github.com/nodejs/node/blob/78982389ce9265f5f65cd9e8a192e05389506927/test%2Fparallel%2Ftest-policy-integrity.js",
+            "raw_url": "https://github.com/nodejs/node/raw/78982389ce9265f5f65cd9e8a192e05389506927/test%2Fparallel%2Ftest-policy-integrity.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-policy-integrity.js?ref=78982389ce9265f5f65cd9e8a192e05389506927",
+            "patch": "@@ -33,6 +33,17 @@ const parentFilepath = path.join(tmpdir.path, 'parent.js');\n const parentURL = pathToFileURL(parentFilepath);\n const parentBody = 'require(\\'./dep.js\\')';\n \n+const workerSpawningFilepath = path.join(tmpdir.path, 'worker_spawner.js');\n+const workerSpawningURL = pathToFileURL(workerSpawningFilepath);\n+const workerSpawningBody = `\n+const { Worker } = require('worker_threads');\n+// make sure this is gone to ensure we don't do another fs read of it\n+// will error out if we do\n+require('fs').unlinkSync(${JSON.stringify(policyFilepath)});\n+const w = new Worker(${JSON.stringify(parentFilepath)});\n+w.on('exit', process.exit);\n+`;\n+\n const depFilepath = path.join(tmpdir.path, 'dep.js');\n const depURL = pathToFileURL(depFilepath);\n const depBody = '';\n@@ -49,8 +60,9 @@ if (!tmpdirURL.pathname.endsWith('/')) {\n }\n function test({\n   shouldFail = false,\n+  preload = [],\n   entry,\n-  onerror,\n+  onerror = undefined,\n   resources = {}\n }) {\n   const manifest = {\n@@ -65,7 +77,9 @@ function test({\n   }\n   fs.writeFileSync(policyFilepath, JSON.stringify(manifest, null, 2));\n   const { status } = spawnSync(process.execPath, [\n-    '--experimental-policy', policyFilepath, entry\n+    '--experimental-policy', policyFilepath,\n+    ...preload.map((m) => ['-r', m]).flat(),\n+    entry\n   ]);\n   if (shouldFail) {\n     assert.notStrictEqual(status, 0);\n@@ -74,13 +88,25 @@ function test({\n   }\n }\n \n-const { status } = spawnSync(process.execPath, [\n-  '--experimental-policy', policyFilepath,\n-  '--experimental-policy', policyFilepath\n-], {\n-  stdio: 'pipe'\n-});\n-assert.notStrictEqual(status, 0, 'Should not allow multiple policies');\n+{\n+  const { status } = spawnSync(process.execPath, [\n+    '--experimental-policy', policyFilepath,\n+    '--experimental-policy', policyFilepath\n+  ], {\n+    stdio: 'pipe'\n+  });\n+  assert.notStrictEqual(status, 0, 'Should not allow multiple policies');\n+}\n+{\n+  const enoentFilepath = path.join(tmpdir.path, 'enoent');\n+  try { fs.unlinkSync(enoentFilepath); } catch {}\n+  const { status } = spawnSync(process.execPath, [\n+    '--experimental-policy', enoentFilepath, '-e', ''\n+  ], {\n+    stdio: 'pipe'\n+  });\n+  assert.notStrictEqual(status, 0, 'Should not allow missing policies');\n+}\n \n test({\n   shouldFail: true,\n@@ -195,6 +221,21 @@ test({\n     }\n   }\n });\n+test({\n+  shouldFail: false,\n+  preload: [depFilepath],\n+  entry: parentFilepath,\n+  resources: {\n+    [parentURL]: {\n+      body: parentBody,\n+      match: true,\n+    },\n+    [depURL]: {\n+      body: depBody,\n+      match: true,\n+    }\n+  }\n+});\n test({\n   shouldFail: true,\n   entry: parentFilepath,\n@@ -295,3 +336,50 @@ test({\n     }\n   }\n });\n+test({\n+  shouldFail: true,\n+  entry: workerSpawningFilepath,\n+  resources: {\n+    [workerSpawningURL]: {\n+      body: workerSpawningBody,\n+      match: true,\n+    },\n+  }\n+});\n+test({\n+  shouldFail: false,\n+  entry: workerSpawningFilepath,\n+  resources: {\n+    [workerSpawningURL]: {\n+      body: workerSpawningBody,\n+      match: true,\n+    },\n+    [parentURL]: {\n+      body: parentBody,\n+      match: true,\n+    },\n+    [depURL]: {\n+      body: depBody,\n+      match: true,\n+    }\n+  }\n+});\n+test({\n+  shouldFail: false,\n+  entry: workerSpawningFilepath,\n+  preload: [parentFilepath],\n+  resources: {\n+    [workerSpawningURL]: {\n+      body: workerSpawningBody,\n+      match: true,\n+    },\n+    [parentURL]: {\n+      body: parentBody,\n+      match: true,\n+    },\n+    [depURL]: {\n+      body: depBody,\n+      match: true,\n+    }\n+  }\n+});"
+        }
+    ],
+    "stats": {
+        "total": 154,
+        "additions": 138,
+        "deletions": 16
+    }
+}

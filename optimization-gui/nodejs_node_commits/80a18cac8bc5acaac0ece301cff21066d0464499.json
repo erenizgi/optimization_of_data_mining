@@ -1,0 +1,84 @@
+{
+    "author": "unknown",
+    "message": "inspector, trace_events: make sure messages are sent on a main thread\n\nFixes: https://github.com/nodejs/node/issues/23185\nPR-URL: https://github.com/nodejs/node/pull/24814\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "80a18cac8bc5acaac0ece301cff21066d0464499",
+    "files": [
+        {
+            "sha": "15ffb49d74d1d488df4581c3626b315cafe6aba9",
+            "filename": "src/inspector/main_thread_interface.cc",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 3,
+            "changes": 12,
+            "blob_url": "https://github.com/nodejs/node/blob/80a18cac8bc5acaac0ece301cff21066d0464499/src%2Finspector%2Fmain_thread_interface.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/80a18cac8bc5acaac0ece301cff21066d0464499/src%2Finspector%2Fmain_thread_interface.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Finspector%2Fmain_thread_interface.cc?ref=80a18cac8bc5acaac0ece301cff21066d0464499",
+            "patch": "@@ -316,15 +316,21 @@ void MainThreadInterface::RemoveObject(int id) {\n }\n \n Deletable* MainThreadInterface::GetObject(int id) {\n-  auto iterator = managed_objects_.find(id);\n+  Deletable* pointer = GetObjectIfExists(id);\n   // This would mean the object is requested after it was disposed, which is\n   // a coding error.\n-  CHECK_NE(managed_objects_.end(), iterator);\n-  Deletable* pointer = iterator->second.get();\n   CHECK_NE(nullptr, pointer);\n   return pointer;\n }\n \n+Deletable* MainThreadInterface::GetObjectIfExists(int id) {\n+  auto iterator = managed_objects_.find(id);\n+  if (iterator == managed_objects_.end()) {\n+    return nullptr;\n+  }\n+  return iterator->second.get();\n+}\n+\n std::unique_ptr<StringBuffer> Utf8ToStringView(const std::string& message) {\n   icu::UnicodeString utf16 = icu::UnicodeString::fromUTF8(\n       icu::StringPiece(message.data(), message.length()));"
+        },
+        {
+            "sha": "3e8eb13645b009f874aa15854058820be4189fcf",
+            "filename": "src/inspector/main_thread_interface.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/80a18cac8bc5acaac0ece301cff21066d0464499/src%2Finspector%2Fmain_thread_interface.h",
+            "raw_url": "https://github.com/nodejs/node/raw/80a18cac8bc5acaac0ece301cff21066d0464499/src%2Finspector%2Fmain_thread_interface.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Finspector%2Fmain_thread_interface.h?ref=80a18cac8bc5acaac0ece301cff21066d0464499",
+            "patch": "@@ -84,6 +84,7 @@ class MainThreadInterface {\n   }\n   void AddObject(int handle, std::unique_ptr<Deletable> object);\n   Deletable* GetObject(int id);\n+  Deletable* GetObjectIfExists(int id);\n   void RemoveObject(int handle);\n \n  private:"
+        },
+        {
+            "sha": "79fccbf8aa47acd826a4a295f8b22afe7fe2da4b",
+            "filename": "src/inspector/tracing_agent.cc",
+            "status": "modified",
+            "additions": 88,
+            "deletions": 13,
+            "changes": 101,
+            "blob_url": "https://github.com/nodejs/node/blob/80a18cac8bc5acaac0ece301cff21066d0464499/src%2Finspector%2Ftracing_agent.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/80a18cac8bc5acaac0ece301cff21066d0464499/src%2Finspector%2Ftracing_agent.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Finspector%2Ftracing_agent.cc?ref=80a18cac8bc5acaac0ece301cff21066d0464499",
+            "patch": "@@ -1,4 +1,5 @@\n #include \"tracing_agent.h\"\n+#include \"main_thread_interface.h\"\n #include \"node_internals.h\"\n \n #include \"env-inl.h\"\n@@ -14,10 +15,76 @@ namespace protocol {\n namespace {\n using v8::platform::tracing::TraceWriter;\n \n+class DeletableFrontendWrapper : public Deletable {\n+ public:\n+  explicit DeletableFrontendWrapper(\n+      std::weak_ptr<NodeTracing::Frontend> frontend)\n+      : frontend_(frontend) {}\n+\n+  // This should only be called from the main thread, meaning frontend should\n+  // not be destroyed concurrently.\n+  NodeTracing::Frontend* get() { return frontend_.lock().get(); }\n+\n+ private:\n+  std::weak_ptr<NodeTracing::Frontend> frontend_;\n+};\n+\n+class CreateFrontendWrapperRequest : public Request {\n+ public:\n+  CreateFrontendWrapperRequest(int object_id,\n+                               std::weak_ptr<NodeTracing::Frontend> frontend)\n+      : object_id_(object_id) {\n+    frontend_wrapper_ = std::make_unique<DeletableFrontendWrapper>(frontend);\n+  }\n+\n+  void Call(MainThreadInterface* thread) override {\n+    thread->AddObject(object_id_, std::move(frontend_wrapper_));\n+  }\n+\n+ private:\n+  int object_id_;\n+  std::unique_ptr<DeletableFrontendWrapper> frontend_wrapper_;\n+};\n+\n+class DestroyFrontendWrapperRequest : public Request {\n+ public:\n+  explicit DestroyFrontendWrapperRequest(int object_id)\n+      : object_id_(object_id) {}\n+\n+  void Call(MainThreadInterface* thread) override {\n+    thread->RemoveObject(object_id_);\n+  }\n+\n+ private:\n+  int object_id_;\n+};\n+\n+class SendMessageRequest : public Request {\n+ public:\n+  explicit SendMessageRequest(int object_id, const std::string& message)\n+      : object_id_(object_id), message_(message) {}\n+\n+  void Call(MainThreadInterface* thread) override {\n+    DeletableFrontendWrapper* frontend_wrapper =\n+        static_cast<DeletableFrontendWrapper*>(\n+            thread->GetObjectIfExists(object_id_));\n+    if (frontend_wrapper == nullptr) return;\n+    auto frontend = frontend_wrapper->get();\n+    if (frontend != nullptr) {\n+      frontend->sendRawNotification(message_);\n+    }\n+  }\n+\n+ private:\n+  int object_id_;\n+  std::string message_;\n+};\n+\n class InspectorTraceWriter : public node::tracing::AsyncTraceWriter {\n  public:\n-  explicit InspectorTraceWriter(NodeTracing::Frontend* frontend)\n-                                : frontend_(frontend) {}\n+  explicit InspectorTraceWriter(int frontend_object_id,\n+                                std::shared_ptr<MainThreadHandle> main_thread)\n+      : frontend_object_id_(frontend_object_id), main_thread_(main_thread) {}\n \n   void AppendTraceEvent(\n       v8::platform::tracing::TraceObject* trace_event) override {\n@@ -35,27 +102,35 @@ class InspectorTraceWriter : public node::tracing::AsyncTraceWriter {\n         std::ostringstream::ate);\n     result << stream_.str();\n     result << \"}\";\n-    frontend_->sendRawNotification(result.str());\n+    main_thread_->Post(std::make_unique<SendMessageRequest>(frontend_object_id_,\n+                                                            result.str()));\n     stream_.str(\"\");\n   }\n \n  private:\n   std::unique_ptr<TraceWriter> json_writer_;\n   std::ostringstream stream_;\n-  NodeTracing::Frontend* frontend_;\n+  int frontend_object_id_;\n+  std::shared_ptr<MainThreadHandle> main_thread_;\n };\n }  // namespace\n \n-TracingAgent::TracingAgent(Environment* env)\n-                           : env_(env) {\n-}\n+TracingAgent::TracingAgent(Environment* env,\n+                           std::shared_ptr<MainThreadHandle> main_thread)\n+    : env_(env), main_thread_(main_thread) {}\n \n TracingAgent::~TracingAgent() {\n   trace_writer_.reset();\n+  main_thread_->Post(\n+      std::make_unique<DestroyFrontendWrapperRequest>(frontend_object_id_));\n }\n \n void TracingAgent::Wire(UberDispatcher* dispatcher) {\n-  frontend_.reset(new NodeTracing::Frontend(dispatcher->channel()));\n+  // Note that frontend is still owned by TracingAgent\n+  frontend_ = std::make_shared<NodeTracing::Frontend>(dispatcher->channel());\n+  frontend_object_id_ = main_thread_->newObjectId();\n+  main_thread_->Post(std::make_unique<CreateFrontendWrapperRequest>(\n+      frontend_object_id_, frontend_));\n   NodeTracing::Dispatcher::wire(dispatcher, this);\n }\n \n@@ -81,11 +156,11 @@ DispatchResponse TracingAgent::start(\n \n   tracing::AgentWriterHandle* writer = GetTracingAgentWriter();\n   if (writer != nullptr) {\n-    trace_writer_ = writer->agent()->AddClient(\n-        categories_set,\n-        std::unique_ptr<InspectorTraceWriter>(\n-            new InspectorTraceWriter(frontend_.get())),\n-        tracing::Agent::kIgnoreDefaultCategories);\n+    trace_writer_ =\n+        writer->agent()->AddClient(categories_set,\n+                                   std::make_unique<InspectorTraceWriter>(\n+                                       frontend_object_id_, main_thread_),\n+                                   tracing::Agent::kIgnoreDefaultCategories);\n   }\n   return DispatchResponse::OK();\n }"
+        },
+        {
+            "sha": "29587b03c88211fca160178e96038d577ecdf040",
+            "filename": "src/inspector/tracing_agent.h",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 2,
+            "changes": 8,
+            "blob_url": "https://github.com/nodejs/node/blob/80a18cac8bc5acaac0ece301cff21066d0464499/src%2Finspector%2Ftracing_agent.h",
+            "raw_url": "https://github.com/nodejs/node/raw/80a18cac8bc5acaac0ece301cff21066d0464499/src%2Finspector%2Ftracing_agent.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Finspector%2Ftracing_agent.h?ref=80a18cac8bc5acaac0ece301cff21066d0464499",
+            "patch": "@@ -10,11 +10,13 @@ namespace node {\n class Environment;\n \n namespace inspector {\n+class MainThreadHandle;\n+\n namespace protocol {\n \n class TracingAgent : public NodeTracing::Backend {\n  public:\n-  explicit TracingAgent(Environment*);\n+  explicit TracingAgent(Environment*, std::shared_ptr<MainThreadHandle>);\n   ~TracingAgent() override;\n \n   void Wire(UberDispatcher* dispatcher);\n@@ -29,8 +31,10 @@ class TracingAgent : public NodeTracing::Backend {\n   void DisconnectTraceClient();\n \n   Environment* env_;\n+  std::shared_ptr<MainThreadHandle> main_thread_;\n   tracing::AgentWriterHandle trace_writer_;\n-  std::unique_ptr<NodeTracing::Frontend> frontend_;\n+  int frontend_object_id_;\n+  std::shared_ptr<NodeTracing::Frontend> frontend_;\n };\n \n "
+        },
+        {
+            "sha": "2d919b9210bf656520470bf795590096334e6a56",
+            "filename": "src/inspector_agent.cc",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 8,
+            "changes": 20,
+            "blob_url": "https://github.com/nodejs/node/blob/80a18cac8bc5acaac0ece301cff21066d0464499/src%2Finspector_agent.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/80a18cac8bc5acaac0ece301cff21066d0464499/src%2Finspector_agent.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Finspector_agent.cc?ref=80a18cac8bc5acaac0ece301cff21066d0464499",
+            "patch": "@@ -211,14 +211,15 @@ class ChannelImpl final : public v8_inspector::V8Inspector::Channel,\n                        const std::unique_ptr<V8Inspector>& inspector,\n                        std::shared_ptr<WorkerManager> worker_manager,\n                        std::unique_ptr<InspectorSessionDelegate> delegate,\n+                       std::shared_ptr<MainThreadHandle> main_thread_,\n                        bool prevent_shutdown)\n-                       : delegate_(std::move(delegate)),\n-                         prevent_shutdown_(prevent_shutdown) {\n+      : delegate_(std::move(delegate)), prevent_shutdown_(prevent_shutdown) {\n     session_ = inspector->connect(1, this, StringView());\n-    node_dispatcher_.reset(new protocol::UberDispatcher(this));\n-    tracing_agent_.reset(new protocol::TracingAgent(env));\n+    node_dispatcher_ = std::make_unique<protocol::UberDispatcher>(this);\n+    tracing_agent_ =\n+        std::make_unique<protocol::TracingAgent>(env, main_thread_);\n     tracing_agent_->Wire(node_dispatcher_.get());\n-    worker_agent_.reset(new protocol::WorkerAgent(worker_manager));\n+    worker_agent_ = std::make_unique<protocol::WorkerAgent>(worker_manager);\n     worker_agent_->Wire(node_dispatcher_.get());\n   }\n \n@@ -467,9 +468,12 @@ class NodeInspectorClient : public V8InspectorClient {\n                       bool prevent_shutdown) {\n     events_dispatched_ = true;\n     int session_id = next_session_id_++;\n-    channels_[session_id] =\n-        std::make_unique<ChannelImpl>(env_, client_, getWorkerManager(),\n-                                      std::move(delegate), prevent_shutdown);\n+    channels_[session_id] = std::make_unique<ChannelImpl>(env_,\n+                                                          client_,\n+                                                          getWorkerManager(),\n+                                                          std::move(delegate),\n+                                                          getThreadHandle(),\n+                                                          prevent_shutdown);\n     return session_id;\n   }\n "
+        },
+        {
+            "sha": "634017f95ad051f0b45150c26d2032e0b43ea9a2",
+            "filename": "test/parallel/test-trace-events-dynamic-enable-workers-disabled.js",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/80a18cac8bc5acaac0ece301cff21066d0464499/test%2Fparallel%2Ftest-trace-events-dynamic-enable-workers-disabled.js",
+            "raw_url": "https://github.com/nodejs/node/raw/80a18cac8bc5acaac0ece301cff21066d0464499/test%2Fparallel%2Ftest-trace-events-dynamic-enable-workers-disabled.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-trace-events-dynamic-enable-workers-disabled.js?ref=80a18cac8bc5acaac0ece301cff21066d0464499",
+            "patch": "@@ -25,3 +25,4 @@ session.post('NodeTracing.start', {\n       'Tracing properties can only be changed through main thread sessions'\n   });\n }));\n+session.disconnect();"
+        }
+    ],
+    "stats": {
+        "total": 143,
+        "additions": 117,
+        "deletions": 26
+    }
+}

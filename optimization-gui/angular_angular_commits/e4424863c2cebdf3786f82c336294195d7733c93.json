@@ -1,0 +1,96 @@
+{
+    "author": "JoostK",
+    "message": "fix(ngcc): fix compilation of `ChangeDetectorRef` in pipe constructors (#38892)\n\nIn #38666 we changed how ngcc deals with type expressions, where it\nwould now always emit the original type expression into the generated\ncode as a \"local\" type value reference instead of synthesizing new\nimports using an \"imported\" type value reference. This was done as a fix\nto properly deal with renamed symbols, however it turns out that the\ncompiler has special handling for certain imported symbols, e.g.\n`ChangeDetectorRef` from `@angular/core`. The \"local\" type value\nreference prevented this special logic from being hit, resulting in\nincorrect compilation of pipe factories.\n\nThis commit fixes the issue by manually inspecting the import of the\ntype expression, in order to return an \"imported\" type value reference.\nBy manually inspecting the import we continue to handle renamed symbols.\n\nFixes #38883\n\nPR Close #38892",
+    "sha": "e4424863c2cebdf3786f82c336294195d7733c93",
+    "files": [
+        {
+            "sha": "3ce41f290e868d38052d12d9659bbfe97f8b7396",
+            "filename": "packages/compiler-cli/ngcc/src/host/esm2015_host.ts",
+            "status": "modified",
+            "additions": 38,
+            "deletions": 8,
+            "changes": 46,
+            "blob_url": "https://github.com/angular/angular/blob/e4424863c2cebdf3786f82c336294195d7733c93/packages%2Fcompiler-cli%2Fngcc%2Fsrc%2Fhost%2Fesm2015_host.ts",
+            "raw_url": "https://github.com/angular/angular/raw/e4424863c2cebdf3786f82c336294195d7733c93/packages%2Fcompiler-cli%2Fngcc%2Fsrc%2Fhost%2Fesm2015_host.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fngcc%2Fsrc%2Fhost%2Fesm2015_host.ts?ref=e4424863c2cebdf3786f82c336294195d7733c93",
+            "patch": "@@ -10,7 +10,7 @@ import * as ts from 'typescript';\n \n import {absoluteFromSourceFile} from '../../../src/ngtsc/file_system';\n import {Logger} from '../../../src/ngtsc/logging';\n-import {ClassDeclaration, ClassMember, ClassMemberKind, CtorParameter, Declaration, Decorator, EnumMember, isDecoratorIdentifier, isNamedClassDeclaration, isNamedFunctionDeclaration, isNamedVariableDeclaration, KnownDeclaration, reflectObjectLiteral, SpecialDeclarationKind, TypeScriptReflectionHost, TypeValueReference, TypeValueReferenceKind, ValueUnavailableKind} from '../../../src/ngtsc/reflection';\n+import {ClassDeclaration, ClassMember, ClassMemberKind, CtorParameter, Declaration, Decorator, EnumMember, Import, isDecoratorIdentifier, isNamedClassDeclaration, isNamedFunctionDeclaration, isNamedVariableDeclaration, KnownDeclaration, reflectObjectLiteral, SpecialDeclarationKind, TypeScriptReflectionHost, TypeValueReference, TypeValueReferenceKind, ValueUnavailableKind} from '../../../src/ngtsc/reflection';\n import {isWithinPackage} from '../analysis/util';\n import {BundleProgram} from '../packages/bundle_program';\n import {findAll, getNameText, hasNameIdentifier, isDefined, stripDollarSuffix} from '../utils';\n@@ -1608,10 +1608,11 @@ export class Esm2015ReflectionHost extends TypeScriptReflectionHost implements N\n   /**\n    * Compute the `TypeValueReference` for the given `typeExpression`.\n    *\n-   * In ngcc, all the `typeExpression` are guaranteed to be \"values\" because it is working in JS and\n-   * not TS. This means that the TS compiler is not going to remove the \"type\" import and so we can\n-   * always use a LOCAL `TypeValueReference` kind, rather than trying to force an additional import\n-   * for non-local expressions.\n+   * Although `typeExpression` is a valid `ts.Expression` that could be emitted directly into the\n+   * generated code, ngcc still needs to resolve the declaration and create an `IMPORTED` type\n+   * value reference as the compiler has specialized handling for some symbols, for example\n+   * `ChangeDetectorRef` from `@angular/core`. Such an `IMPORTED` type value reference will result\n+   * in a newly generated namespace import, instead of emitting the original `typeExpression` as is.\n    */\n   private typeToValue(typeExpression: ts.Expression|null): TypeValueReference {\n     if (typeExpression === null) {\n@@ -1621,13 +1622,42 @@ export class Esm2015ReflectionHost extends TypeScriptReflectionHost implements N\n       };\n     }\n \n+    const imp = this.getImportOfExpression(typeExpression);\n+    const decl = this.getDeclarationOfExpression(typeExpression);\n+    if (imp === null || decl === null || decl.node === null) {\n+      return {\n+        kind: TypeValueReferenceKind.LOCAL,\n+        expression: typeExpression,\n+        defaultImportStatement: null,\n+      };\n+    }\n+\n     return {\n-      kind: TypeValueReferenceKind.LOCAL,\n-      expression: typeExpression,\n-      defaultImportStatement: null,\n+      kind: TypeValueReferenceKind.IMPORTED,\n+      valueDeclaration: decl.node,\n+      moduleName: imp.from,\n+      importedName: imp.name,\n+      nestedPath: null,\n     };\n   }\n \n+  /**\n+   * Determines where the `expression` is imported from.\n+   *\n+   * @param expression the expression to determine the import details for.\n+   * @returns the `Import` for the expression, or `null` if the expression is not imported or the\n+   * expression syntax is not supported.\n+   */\n+  private getImportOfExpression(expression: ts.Expression): Import|null {\n+    if (ts.isIdentifier(expression)) {\n+      return this.getImportOfIdentifier(expression);\n+    } else if (ts.isPropertyAccessExpression(expression) && ts.isIdentifier(expression.name)) {\n+      return this.getImportOfIdentifier(expression.name);\n+    } else {\n+      return null;\n+    }\n+  }\n+\n   /**\n    * Get the parameter type and decorators for the constructor of a class,\n    * where the information is stored on a static property of the class."
+        },
+        {
+            "sha": "366c15ff6113a1e324451288b1789b4d775a50b9",
+            "filename": "packages/compiler-cli/ngcc/test/host/commonjs_host_spec.ts",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/angular/angular/blob/e4424863c2cebdf3786f82c336294195d7733c93/packages%2Fcompiler-cli%2Fngcc%2Ftest%2Fhost%2Fcommonjs_host_spec.ts",
+            "raw_url": "https://github.com/angular/angular/raw/e4424863c2cebdf3786f82c336294195d7733c93/packages%2Fcompiler-cli%2Fngcc%2Ftest%2Fhost%2Fcommonjs_host_spec.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fngcc%2Ftest%2Fhost%2Fcommonjs_host_spec.ts?ref=e4424863c2cebdf3786f82c336294195d7733c93",
+            "patch": "@@ -1211,7 +1211,7 @@ exports.MissingClass2 = MissingClass2;\n       });\n \n       describe('getConstructorParameters', () => {\n-        it('should always specify LOCAL type value references for decorated constructor parameter types',\n+        it('should retain imported name for type value references for decorated constructor parameter types',\n            () => {\n              const files = [\n                {\n@@ -1271,7 +1271,7 @@ exports.MissingClass2 = MissingClass2;\n \n              expect(parameters.map(p => p.name)).toEqual(['arg1', 'arg2', 'arg3']);\n              expectTypeValueReferencesForParameters(\n-                 parameters, ['shared.Baz', 'local.External', 'SameFile']);\n+                 parameters, ['Baz', 'External', 'SameFile'], ['shared-lib', './local', null]);\n            });\n \n         it('should find the decorated constructor parameters', () => {"
+        },
+        {
+            "sha": "a0be48dc70935ae86600407eaf537153b3fd1e37",
+            "filename": "packages/compiler-cli/ngcc/test/host/esm2015_host_spec.ts",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 3,
+            "changes": 8,
+            "blob_url": "https://github.com/angular/angular/blob/e4424863c2cebdf3786f82c336294195d7733c93/packages%2Fcompiler-cli%2Fngcc%2Ftest%2Fhost%2Fesm2015_host_spec.ts",
+            "raw_url": "https://github.com/angular/angular/raw/e4424863c2cebdf3786f82c336294195d7733c93/packages%2Fcompiler-cli%2Fngcc%2Ftest%2Fhost%2Fesm2015_host_spec.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fngcc%2Ftest%2Fhost%2Fesm2015_host_spec.ts?ref=e4424863c2cebdf3786f82c336294195d7733c93",
+            "patch": "@@ -1140,7 +1140,7 @@ runInEachFileSystem(() => {\n     });\n \n     describe('getConstructorParameters()', () => {\n-      it('should always specify LOCAL type value references for decorated constructor parameter types',\n+      it('should retain imported name for type value references for decorated constructor parameter types',\n          () => {\n            const files = [\n              {\n@@ -1188,7 +1188,8 @@ runInEachFileSystem(() => {\n            const parameters = host.getConstructorParameters(classNode)!;\n \n            expect(parameters.map(p => p.name)).toEqual(['arg1', 'arg2', 'arg3']);\n-           expectTypeValueReferencesForParameters(parameters, ['Baz', 'External', 'SameFile']);\n+           expectTypeValueReferencesForParameters(\n+               parameters, ['Baz', 'External', 'SameFile'], ['shared-lib', './local', null]);\n          });\n \n       it('should find the decorated constructor parameters', () => {\n@@ -1205,7 +1206,8 @@ runInEachFileSystem(() => {\n           '_viewContainer', '_template', 'injected'\n         ]);\n         expectTypeValueReferencesForParameters(\n-            parameters, ['ViewContainerRef', 'TemplateRef', null]);\n+            parameters, ['ViewContainerRef', 'TemplateRef', null],\n+            ['@angular/core', '@angular/core', null]);\n       });\n \n       it('should accept `ctorParameters` as an array', () => {"
+        },
+        {
+            "sha": "e5e3f0c75de0c7efe960740822d45e07ac306135",
+            "filename": "packages/compiler-cli/ngcc/test/host/esm5_host_spec.ts",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 2,
+            "changes": 5,
+            "blob_url": "https://github.com/angular/angular/blob/e4424863c2cebdf3786f82c336294195d7733c93/packages%2Fcompiler-cli%2Fngcc%2Ftest%2Fhost%2Fesm5_host_spec.ts",
+            "raw_url": "https://github.com/angular/angular/raw/e4424863c2cebdf3786f82c336294195d7733c93/packages%2Fcompiler-cli%2Fngcc%2Ftest%2Fhost%2Fesm5_host_spec.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fngcc%2Ftest%2Fhost%2Fesm5_host_spec.ts?ref=e4424863c2cebdf3786f82c336294195d7733c93",
+            "patch": "@@ -1252,7 +1252,7 @@ runInEachFileSystem(() => {\n     });\n \n     describe('getConstructorParameters()', () => {\n-      it('should always specify LOCAL type value references for decorated constructor parameter types',\n+      it('should retain imported name for type value references for decorated constructor parameter types',\n          () => {\n            const files = [\n              {\n@@ -1310,7 +1310,8 @@ runInEachFileSystem(() => {\n            const parameters = host.getConstructorParameters(classNode)!;\n \n            expect(parameters.map(p => p.name)).toEqual(['arg1', 'arg2', 'arg3']);\n-           expectTypeValueReferencesForParameters(parameters, ['Baz', 'External', 'SameFile']);\n+           expectTypeValueReferencesForParameters(\n+               parameters, ['Baz', 'External', 'SameFile'], ['shared-lib', './local', null]);\n          });\n \n       it('should find the decorated constructor parameters', () => {"
+        },
+        {
+            "sha": "25a40b862671247708a636d88294b32399b2745d",
+            "filename": "packages/compiler-cli/ngcc/test/host/umd_host_spec.ts",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 3,
+            "changes": 6,
+            "blob_url": "https://github.com/angular/angular/blob/e4424863c2cebdf3786f82c336294195d7733c93/packages%2Fcompiler-cli%2Fngcc%2Ftest%2Fhost%2Fumd_host_spec.ts",
+            "raw_url": "https://github.com/angular/angular/raw/e4424863c2cebdf3786f82c336294195d7733c93/packages%2Fcompiler-cli%2Fngcc%2Ftest%2Fhost%2Fumd_host_spec.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fngcc%2Ftest%2Fhost%2Fumd_host_spec.ts?ref=e4424863c2cebdf3786f82c336294195d7733c93",
+            "patch": "@@ -1332,7 +1332,7 @@ runInEachFileSystem(() => {\n     });\n \n     describe('getConstructorParameters', () => {\n-      it('should always specify LOCAL type value references for decorated constructor parameter types',\n+      it('should retain imported name for type value references for decorated constructor parameter types',\n          () => {\n            const files = [\n              {\n@@ -1369,7 +1369,7 @@ runInEachFileSystem(() => {\n                name: _('/main.js'),\n                contents: `\n   (function (global, factory) {\n-    typeof exports === 'object' && typeof module !== 'undefined' ? factory(exports, require('shared-lib), require('./local')) :\n+    typeof exports === 'object' && typeof module !== 'undefined' ? factory(exports, require('shared-lib'), require('./local')) :\n     typeof define === 'function' && define.amd ? define('main', ['exports', 'shared-lib', './local'], factory) :\n     (factory(global.main, global.shared, global.local));\n   }(this, (function (exports, shared, local) { 'use strict';\n@@ -1401,7 +1401,7 @@ runInEachFileSystem(() => {\n \n            expect(parameters.map(p => p.name)).toEqual(['arg1', 'arg2', 'arg3']);\n            expectTypeValueReferencesForParameters(\n-               parameters, ['shared.Baz', 'local.External', 'SameFile']);\n+               parameters, ['Baz', 'External', 'SameFile'], ['shared-lib', './local', null]);\n          });\n \n       it('should find the decorated constructor parameters', () => {"
+        },
+        {
+            "sha": "7208abe4df885f788104b46386b6dfb1184f1666",
+            "filename": "packages/compiler-cli/ngcc/test/integration/ngcc_spec.ts",
+            "status": "modified",
+            "additions": 29,
+            "deletions": 0,
+            "changes": 29,
+            "blob_url": "https://github.com/angular/angular/blob/e4424863c2cebdf3786f82c336294195d7733c93/packages%2Fcompiler-cli%2Fngcc%2Ftest%2Fintegration%2Fngcc_spec.ts",
+            "raw_url": "https://github.com/angular/angular/raw/e4424863c2cebdf3786f82c336294195d7733c93/packages%2Fcompiler-cli%2Fngcc%2Ftest%2Fintegration%2Fngcc_spec.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fngcc%2Ftest%2Fintegration%2Fngcc_spec.ts?ref=e4424863c2cebdf3786f82c336294195d7733c93",
+            "patch": "@@ -576,6 +576,35 @@ runInEachFileSystem(() => {\n               `TestClass.ɵprov = ɵngcc0.ɵɵdefineInjectable({`);\n     });\n \n+    // https://github.com/angular/angular/issues/38883\n+    it('should recognize ChangeDetectorRef as special symbol for pipes', () => {\n+      compileIntoFlatEs2015Package('test-package', {\n+        '/index.ts': `\n+        import {ChangeDetectorRef, Pipe, PipeTransform} from '@angular/core';\n+\n+        @Pipe({\n+          name: 'myTestPipe'\n+        })\n+        export class TestClass implements PipeTransform {\n+          constructor(cdr: ChangeDetectorRef) {}\n+          transform(value: any) { return value; }\n+        }\n+        `,\n+      });\n+\n+      mainNgcc({\n+        basePath: '/node_modules',\n+        targetEntryPointPath: 'test-package',\n+        propertiesToConsider: ['esm2015'],\n+      });\n+\n+      const jsContents = fs.readFile(_(`/node_modules/test-package/index.js`));\n+      expect(jsContents)\n+          .toContain(\n+              `TestClass.ɵfac = function TestClass_Factory(t) { ` +\n+              `return new (t || TestClass)(ɵngcc0.ɵɵinjectPipeChangeDetectorRef()); };`);\n+    });\n+\n     it('should use the correct type name in typings files when an export has a different name in source files',\n        () => {\n          // We need to make sure that changes to the typings files use the correct name"
+        },
+        {
+            "sha": "e8ab286ee2422734b093ebb8e53c6ee43cd0c6df",
+            "filename": "packages/compiler-cli/ngcc/test/integration/util.ts",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 1,
+            "changes": 13,
+            "blob_url": "https://github.com/angular/angular/blob/e4424863c2cebdf3786f82c336294195d7733c93/packages%2Fcompiler-cli%2Fngcc%2Ftest%2Fintegration%2Futil.ts",
+            "raw_url": "https://github.com/angular/angular/raw/e4424863c2cebdf3786f82c336294195d7733c93/packages%2Fcompiler-cli%2Fngcc%2Ftest%2Fintegration%2Futil.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fngcc%2Ftest%2Fintegration%2Futil.ts?ref=e4424863c2cebdf3786f82c336294195d7733c93",
+            "patch": "@@ -99,7 +99,14 @@ function compileIntoFlatPackage(\n     program.emit();\n   };\n \n-  emit({declaration: true, module: options.module, target: options.target, lib: []});\n+  emit({\n+    declaration: true,\n+    emitDecoratorMetadata: true,\n+    moduleResolution: ts.ModuleResolutionKind.NodeJs,\n+    module: options.module,\n+    target: options.target,\n+    lib: [],\n+  });\n \n   // Copy over the JS and .d.ts files, and add a .metadata.json for each .d.ts file.\n   for (const file of rootNames) {\n@@ -152,7 +159,9 @@ export function compileIntoApf(\n   compileFs.ensureDir(compileFs.resolve('esm2015'));\n   emit({\n     declaration: true,\n+    emitDecoratorMetadata: true,\n     outDir: './esm2015',\n+    moduleResolution: ts.ModuleResolutionKind.NodeJs,\n     module: ts.ModuleKind.ESNext,\n     target: ts.ScriptTarget.ES2015,\n     lib: [],\n@@ -178,7 +187,9 @@ export function compileIntoApf(\n   compileFs.ensureDir(compileFs.resolve('esm5'));\n   emit({\n     declaration: false,\n+    emitDecoratorMetadata: true,\n     outDir: './esm5',\n+    moduleResolution: ts.ModuleResolutionKind.NodeJs,\n     module: ts.ModuleKind.ESNext,\n     target: ts.ScriptTarget.ES5,\n     lib: [],"
+        }
+    ],
+    "stats": {
+        "total": 111,
+        "additions": 92,
+        "deletions": 19
+    }
+}

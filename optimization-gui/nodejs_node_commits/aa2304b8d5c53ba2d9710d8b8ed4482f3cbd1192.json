@@ -1,0 +1,144 @@
+{
+    "author": "addaleax",
+    "message": "worker,src: display remaining handles if `uv_loop_close` fails\n\nRight now, we crash the process if there are handles remaining\non the event loop when we exit (except for the main thread).\n\nThis does not provide a lot of information about causes, though;\nin particular, we don’t show which handles are pending and\nwho own them.\n\nThis patch adds debug output to these cases to help with the\nsituation.\n\nPR-URL: https://github.com/nodejs/node/pull/21238\nReviewed-By: Tiancheng \"Timothy\" Gu <timothygu99@gmail.com>\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Gus Caplan <me@gus.host>\nReviewed-By: Ben Noordhuis <info@bnoordhuis.nl>\nReviewed-By: Benjamin Gruenbaum <benjamingr@gmail.com>\nReviewed-By: Colin Ihrig <cjihrig@gmail.com>",
+    "sha": "aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192",
+    "files": [
+        {
+            "sha": "a24c51de39cf2d186b231da541353df99ab5f6e3",
+            "filename": "src/debug_utils.cc",
+            "status": "modified",
+            "additions": 52,
+            "deletions": 7,
+            "changes": 59,
+            "blob_url": "https://github.com/nodejs/node/blob/aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192/src%2Fdebug_utils.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192/src%2Fdebug_utils.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fdebug_utils.cc?ref=aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192",
+            "patch": "@@ -97,11 +97,11 @@ class Win32SymbolDebuggingContext final : public NativeSymbolDebuggingContext {\n  public:\n   Win32SymbolDebuggingContext() {\n     current_process_ = GetCurrentProcess();\n-    USE(SymInitialize(process, nullptr, true));\n+    USE(SymInitialize(current_process_, nullptr, true));\n   }\n \n   ~Win32SymbolDebuggingContext() {\n-    USE(SymCleanup(process));\n+    USE(SymCleanup(current_process_));\n   }\n \n   SymbolInfo LookupSymbol(void* address) override {\n@@ -114,16 +114,16 @@ class Win32SymbolDebuggingContext final : public NativeSymbolDebuggingContext {\n     info->SizeOfStruct = sizeof(SYMBOL_INFO);\n \n     SymbolInfo ret;\n-    const bool have_info = SymFromAddr(process,\n+    const bool have_info = SymFromAddr(current_process_,\n                                        reinterpret_cast<DWORD64>(address),\n                                        nullptr,\n                                        info);\n     if (have_info && strlen(info->Name) == 0) {\n       if (UnDecorateSymbolName(info->Name,\n-                               demangled_,\n-                               sizeof(demangled_),\n+                               demangled,\n+                               sizeof(demangled),\n                                UNDNAME_COMPLETE)) {\n-        ret.name = demangled_;\n+        ret.name = demangled;\n       } else {\n         ret.name = info->Name;\n       }\n@@ -135,7 +135,7 @@ class Win32SymbolDebuggingContext final : public NativeSymbolDebuggingContext {\n   bool IsMapped(void* address) override {\n     MEMORY_BASIC_INFORMATION info;\n \n-    if (VirtualQuery(address, &info, sizeof(info)) != info)\n+    if (VirtualQuery(address, &info, sizeof(info)) != sizeof(info))\n       return false;\n \n     return info.State == MEM_COMMIT && info.Protect != 0;\n@@ -149,6 +149,7 @@ class Win32SymbolDebuggingContext final : public NativeSymbolDebuggingContext {\n   HANDLE current_process_;\n };\n \n+std::unique_ptr<NativeSymbolDebuggingContext>\n NativeSymbolDebuggingContext::New() {\n   return std::unique_ptr<NativeSymbolDebuggingContext>(\n       new Win32SymbolDebuggingContext());\n@@ -177,4 +178,48 @@ void DumpBacktrace(FILE* fp) {\n   }\n }\n \n+void CheckedUvLoopClose(uv_loop_t* loop) {\n+  if (uv_loop_close(loop) == 0) return;\n+\n+  auto sym_ctx = NativeSymbolDebuggingContext::New();\n+\n+  fprintf(stderr, \"uv loop at [%p] has active handles\\n\", loop);\n+\n+  uv_walk(loop, [](uv_handle_t* handle, void* arg) {\n+    auto sym_ctx = static_cast<NativeSymbolDebuggingContext*>(arg);\n+\n+    fprintf(stderr, \"[%p] %s\\n\", handle, uv_handle_type_name(handle->type));\n+\n+    void* close_cb = reinterpret_cast<void*>(handle->close_cb);\n+    fprintf(stderr, \"\\tClose callback: %p %s\\n\",\n+        close_cb, sym_ctx->LookupSymbol(close_cb).Display().c_str());\n+\n+    fprintf(stderr, \"\\tData: %p %s\\n\",\n+        handle->data, sym_ctx->LookupSymbol(handle->data).Display().c_str());\n+\n+    // We are also interested in the first field of what `handle->data`\n+    // points to, because for C++ code that is usually the virtual table pointer\n+    // and gives us information about the exact kind of object we're looking at.\n+    void* first_field = nullptr;\n+    // `handle->data` might be any value, including `nullptr`, or something\n+    // cast from a completely different type; therefore, check that it’s\n+    // dereferencable first.\n+    if (sym_ctx->IsMapped(handle->data))\n+      first_field = *reinterpret_cast<void**>(handle->data);\n+\n+    if (first_field != nullptr) {\n+      fprintf(stderr, \"\\t(First field): %p %s\\n\",\n+          first_field, sym_ctx->LookupSymbol(first_field).Display().c_str());\n+    }\n+  }, sym_ctx.get());\n+\n+  fflush(stderr);\n+  // Finally, abort.\n+  CHECK(0 && \"uv_loop_close() while having open handles\");\n+}\n+\n }  // namespace node\n+\n+extern \"C\" void __DumpBacktrace(FILE* fp) {\n+  node::DumpBacktrace(fp);\n+}"
+        },
+        {
+            "sha": "2fd9e7dab7f8f4d7ec3988b716ec31db70c8f8da",
+            "filename": "src/debug_utils.h",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/nodejs/node/blob/aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192/src%2Fdebug_utils.h",
+            "raw_url": "https://github.com/nodejs/node/raw/aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192/src%2Fdebug_utils.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fdebug_utils.h?ref=aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192",
+            "patch": "@@ -103,6 +103,11 @@ class NativeSymbolDebuggingContext {\n   virtual int GetStackTrace(void** frames, int count) { return 0; }\n };\n \n+// Variant of `uv_loop_close` that tries to be as helpful as possible\n+// about giving information on currently existing handles, if there are any,\n+// but still aborts the process.\n+void CheckedUvLoopClose(uv_loop_t* loop);\n+\n }  // namespace node\n \n #endif  // defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS"
+        },
+        {
+            "sha": "8f861316dadb812f87570d09ef61a01ed0a8929a",
+            "filename": "src/inspector_io.cc",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 4,
+            "changes": 9,
+            "blob_url": "https://github.com/nodejs/node/blob/aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192/src%2Finspector_io.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192/src%2Finspector_io.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Finspector_io.cc?ref=aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192",
+            "patch": "@@ -3,6 +3,7 @@\n #include \"inspector_socket_server.h\"\n #include \"inspector/node_string.h\"\n #include \"env-inl.h\"\n+#include \"debug_utils.h\"\n #include \"node.h\"\n #include \"node_crypto.h\"\n #include \"node_mutex.h\"\n@@ -67,14 +68,14 @@ void HandleSyncCloseCb(uv_handle_t* handle) {\n   *static_cast<bool*>(handle->data) = true;\n }\n \n-int CloseAsyncAndLoop(uv_async_t* async) {\n+void CloseAsyncAndLoop(uv_async_t* async) {\n   bool is_closed = false;\n   async->data = &is_closed;\n   uv_close(reinterpret_cast<uv_handle_t*>(async), HandleSyncCloseCb);\n   while (!is_closed)\n     uv_run(async->loop, UV_RUN_ONCE);\n   async->data = nullptr;\n-  return uv_loop_close(async->loop);\n+  CheckedUvLoopClose(async->loop);\n }\n \n // Delete main_thread_req_ on async handle close\n@@ -281,7 +282,7 @@ void InspectorIo::ThreadMain() {\n   thread_req_.data = &queue_transport;\n   if (!server.Start()) {\n     state_ = State::kError;  // Safe, main thread is waiting on semaphore\n-    CHECK_EQ(0, CloseAsyncAndLoop(&thread_req_));\n+    CloseAsyncAndLoop(&thread_req_);\n     uv_sem_post(&thread_start_sem_);\n     return;\n   }\n@@ -291,7 +292,7 @@ void InspectorIo::ThreadMain() {\n   }\n   uv_run(&loop, UV_RUN_DEFAULT);\n   thread_req_.data = nullptr;\n-  CHECK_EQ(uv_loop_close(&loop), 0);\n+  CheckedUvLoopClose(&loop);\n }\n \n template <typename ActionType>"
+        },
+        {
+            "sha": "09b10d169371dae0c7e64bc8763117909f6ea60f",
+            "filename": "src/node_watchdog.cc",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/nodejs/node/blob/aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192/src%2Fnode_watchdog.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192/src%2Fnode_watchdog.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_watchdog.cc?ref=aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192",
+            "patch": "@@ -21,6 +21,7 @@\n \n #include \"node_watchdog.h\"\n #include \"node_internals.h\"\n+#include \"debug_utils.h\"\n #include <algorithm>\n \n namespace node {\n@@ -60,8 +61,7 @@ Watchdog::~Watchdog() {\n   // UV_RUN_DEFAULT so that libuv has a chance to clean up.\n   uv_run(loop_, UV_RUN_DEFAULT);\n \n-  int rc = uv_loop_close(loop_);\n-  CHECK_EQ(0, rc);\n+  CheckedUvLoopClose(loop_);\n   delete loop_;\n   loop_ = nullptr;\n }"
+        },
+        {
+            "sha": "320b6703d40d213967ae01f237d092ce393c2acf",
+            "filename": "src/node_worker.cc",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/nodejs/node/blob/aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192/src%2Fnode_worker.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192/src%2Fnode_worker.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_worker.cc?ref=aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192",
+            "patch": "@@ -1,4 +1,5 @@\n #include \"node_worker.h\"\n+#include \"debug_utils.h\"\n #include \"node_errors.h\"\n #include \"node_internals.h\"\n #include \"node_buffer.h\"\n@@ -304,7 +305,7 @@ Worker::~Worker() {\n   CHECK(stopped_);\n   CHECK(thread_joined_);\n   CHECK_EQ(child_port_, nullptr);\n-  CHECK_EQ(uv_loop_close(&loop_), 0);\n+  CheckedUvLoopClose(&loop_);\n \n   // This has most likely already happened within the worker thread -- this\n   // is just in case Worker creation failed early."
+        },
+        {
+            "sha": "edfa2dfcf57803cec44482b1693a8340ece33709",
+            "filename": "src/spawn_sync.cc",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/nodejs/node/blob/aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192/src%2Fspawn_sync.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192/src%2Fspawn_sync.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fspawn_sync.cc?ref=aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192",
+            "patch": "@@ -20,6 +20,7 @@\n // USE OR OTHER DEALINGS IN THE SOFTWARE.\n \n #include \"spawn_sync.h\"\n+#include \"debug_utils.h\"\n #include \"env-inl.h\"\n #include \"string_bytes.h\"\n #include \"util.h\"\n@@ -528,7 +529,7 @@ void SyncProcessRunner::CloseHandlesAndDeleteLoop() {\n     if (r < 0)\n       ABORT();\n \n-    CHECK_EQ(uv_loop_close(uv_loop_), 0);\n+    CheckedUvLoopClose(uv_loop_);\n     delete uv_loop_;\n     uv_loop_ = nullptr;\n "
+        },
+        {
+            "sha": "3944cb79c784946c35f43780c10d88553fcf5a5f",
+            "filename": "test/abort/test-addon-uv-handle-leak.js",
+            "status": "added",
+            "additions": 97,
+            "deletions": 0,
+            "changes": 97,
+            "blob_url": "https://github.com/nodejs/node/blob/aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192/test%2Fabort%2Ftest-addon-uv-handle-leak.js",
+            "raw_url": "https://github.com/nodejs/node/raw/aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192/test%2Fabort%2Ftest-addon-uv-handle-leak.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fabort%2Ftest-addon-uv-handle-leak.js?ref=aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192",
+            "patch": "@@ -0,0 +1,97 @@\n+// Flags: --experimental-worker\n+'use strict';\n+const common = require('../common');\n+const assert = require('assert');\n+const fs = require('fs');\n+const path = require('path');\n+const cp = require('child_process');\n+const { Worker } = require('worker_threads');\n+\n+// This is a sibling test to test/addons/uv-handle-leak.\n+\n+const bindingPath = path.resolve(\n+  __dirname, '..', 'addons', 'uv-handle-leak', 'build',\n+  `${common.buildType}/binding.node`);\n+\n+if (!fs.existsSync(bindingPath))\n+  common.skip('binding not built yet');\n+\n+if (process.argv[2] === 'child') {\n+  new Worker(`\n+  const binding = require(${JSON.stringify(bindingPath)});\n+\n+  binding.leakHandle();\n+  binding.leakHandle(0);\n+  binding.leakHandle(0x42);\n+  `, { eval: true });\n+} else {\n+  const child = cp.spawnSync(process.execPath,\n+                             ['--experimental-worker', __filename, 'child']);\n+  const stderr = child.stderr.toString();\n+\n+  assert.strictEqual(child.stdout.toString(), '');\n+\n+  const lines = stderr.split('\\n');\n+\n+  let state = 'initial';\n+\n+  // parse output that is formatted like this:\n+\n+  // uv loop at [0x559b65ed5770] has active handles\n+  // [0x7f2de0018430] timer\n+  //         Close callback: 0x7f2df31de220 CloseCallback(uv_handle_s*) [...]\n+  //         Data: 0x7f2df33df140 example_instance [...]\n+  //         (First field): 0x7f2df33dedc0 vtable for ExampleOwnerClass [...]\n+  // [0x7f2de000b870] timer\n+  //         Close callback: 0x7f2df31de220 CloseCallback(uv_handle_s*) [...]\n+  //         Data: (nil)\n+  // [0x7f2de000b910] timer\n+  //         Close callback: 0x7f2df31de220 CloseCallback(uv_handle_s*) [...]\n+  //         Data: 0x42\n+\n+  if (!(common.isFreeBSD ||\n+        common.isAIX ||\n+        (common.isLinux && !common.isGlibc()) ||\n+        common.isWindows)) {\n+    assert(stderr.includes('ExampleOwnerClass'), stderr);\n+    assert(stderr.includes('CloseCallback'), stderr);\n+    assert(stderr.includes('example_instance'), stderr);\n+  }\n+\n+  while (lines.length > 0) {\n+    const line = lines.shift().trim();\n+\n+    switch (state) {\n+      case 'initial':\n+        assert(/^uv loop at \\[.+\\] has active handles$/.test(line), line);\n+        state = 'handle-start';\n+        break;\n+      case 'handle-start':\n+        if (/Assertion .+ failed/.test(line)) {\n+          state = 'done';\n+          break;\n+        }\n+        assert(/^\\[.+\\] timer$/.test(line), line);\n+        state = 'close-callback';\n+        break;\n+      case 'close-callback':\n+        assert(/^Close callback:/.test(line), line);\n+        state = 'data';\n+        break;\n+      case 'data':\n+        assert(/^Data: .+$/.test(line), line);\n+        state = 'maybe-first-field';\n+        break;\n+      case 'maybe-first-field':\n+        if (/^\\(First field\\)$/.test(line)) {\n+          lines.unshift(line);\n+          state = 'handle-start';\n+          break;\n+        }\n+        state = 'maybe-first-field';\n+        break;\n+      case 'done':\n+        break;\n+    }\n+  }\n+}"
+        },
+        {
+            "sha": "c2e5f0bf27bf166af8d3a872f47f95afc65b8e64",
+            "filename": "test/addons/uv-handle-leak/binding.cc",
+            "status": "added",
+            "additions": 48,
+            "deletions": 0,
+            "changes": 48,
+            "blob_url": "https://github.com/nodejs/node/blob/aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192/test%2Faddons%2Fuv-handle-leak%2Fbinding.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192/test%2Faddons%2Fuv-handle-leak%2Fbinding.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Faddons%2Fuv-handle-leak%2Fbinding.cc?ref=aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192",
+            "patch": "@@ -0,0 +1,48 @@\n+#include <node.h>\n+#include <v8.h>\n+#include <uv.h>\n+\n+using v8::Context;\n+using v8::FunctionCallbackInfo;\n+using v8::Isolate;\n+using v8::Local;\n+using v8::Object;\n+using v8::Value;\n+\n+// Give these things names in the public namespace so that we can see\n+// them show up in symbol dumps.\n+void CloseCallback(uv_handle_t* handle) {}\n+\n+class ExampleOwnerClass {\n+ public:\n+  virtual ~ExampleOwnerClass() {}\n+};\n+\n+ExampleOwnerClass example_instance;\n+\n+void LeakHandle(const FunctionCallbackInfo<Value>& args) {\n+  Isolate* isolate = args.GetIsolate();\n+  Local<Context> context = isolate->GetCurrentContext();\n+  uv_loop_t* loop = node::GetCurrentEventLoop(isolate);\n+  assert(loop != nullptr);\n+\n+  uv_timer_t* leaked_timer = new uv_timer_t;\n+  leaked_timer->close_cb = CloseCallback;\n+\n+  if (args[0]->IsNumber()) {\n+    leaked_timer->data =\n+        reinterpret_cast<void*>(args[0]->IntegerValue(context).FromJust());\n+  } else {\n+    leaked_timer->data = &example_instance;\n+  }\n+\n+  uv_timer_init(loop, leaked_timer);\n+  uv_timer_start(leaked_timer, [](uv_timer_t*){}, 1000, 1000);\n+  uv_unref(reinterpret_cast<uv_handle_t*>(leaked_timer));\n+}\n+\n+void Initialize(v8::Local<v8::Object> exports) {\n+  NODE_SET_METHOD(exports, \"leakHandle\", LeakHandle);\n+}\n+\n+NODE_MODULE(NODE_GYP_MODULE_NAME, Initialize)"
+        },
+        {
+            "sha": "7ede63d94a0d77635ff78b8ad2d0079216eefa1a",
+            "filename": "test/addons/uv-handle-leak/binding.gyp",
+            "status": "added",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/nodejs/node/blob/aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192/test%2Faddons%2Fuv-handle-leak%2Fbinding.gyp",
+            "raw_url": "https://github.com/nodejs/node/raw/aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192/test%2Faddons%2Fuv-handle-leak%2Fbinding.gyp",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Faddons%2Fuv-handle-leak%2Fbinding.gyp?ref=aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192",
+            "patch": "@@ -0,0 +1,9 @@\n+{\n+  'targets': [\n+    {\n+      'target_name': 'binding',\n+      'defines': [ 'V8_DEPRECATION_WARNINGS=1' ],\n+      'sources': [ 'binding.cc' ]\n+    }\n+  ]\n+}"
+        },
+        {
+            "sha": "73d40ca7996274ddc5c5211b047f2d90f2d7690d",
+            "filename": "test/addons/uv-handle-leak/test.js",
+            "status": "added",
+            "additions": 23,
+            "deletions": 0,
+            "changes": 23,
+            "blob_url": "https://github.com/nodejs/node/blob/aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192/test%2Faddons%2Fuv-handle-leak%2Ftest.js",
+            "raw_url": "https://github.com/nodejs/node/raw/aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192/test%2Faddons%2Fuv-handle-leak%2Ftest.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Faddons%2Fuv-handle-leak%2Ftest.js?ref=aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192",
+            "patch": "@@ -0,0 +1,23 @@\n+'use strict';\n+const common = require('../../common');\n+const bindingPath = require.resolve(`./build/${common.buildType}/binding`);\n+const binding = require(bindingPath);\n+\n+// This tests checks that addons may leak libuv handles until process exit.\n+// It’s really not a good idea to do so, but it tests existing behaviour\n+// that likely can never be removed for backwards compatibility.\n+\n+// This has a sibling test in test/abort/ which checks output for failures\n+// from workers.\n+\n+try {\n+  // We don’t want to run this in Workers because they do actually enforce\n+  // a clean-exit policy.\n+  const { isMainThread } = require('worker_threads');\n+  if (!isMainThread)\n+    common.skip('Cannot run test in environment with clean-exit policy');\n+} catch {}\n+\n+binding.leakHandle();\n+binding.leakHandle(0);\n+binding.leakHandle(1);"
+        },
+        {
+            "sha": "bf6b1077d1859b7bf07c93aa36c6d6e633fd2aae",
+            "filename": "test/common/index.js",
+            "status": "modified",
+            "additions": 17,
+            "deletions": 0,
+            "changes": 17,
+            "blob_url": "https://github.com/nodejs/node/blob/aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192/test%2Fcommon%2Findex.js",
+            "raw_url": "https://github.com/nodejs/node/raw/aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192/test%2Fcommon%2Findex.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fcommon%2Findex.js?ref=aa2304b8d5c53ba2d9710d8b8ed4482f3cbd1192",
+            "patch": "@@ -68,6 +68,23 @@ exports.isOpenBSD = process.platform === 'openbsd';\n exports.isLinux = process.platform === 'linux';\n exports.isOSX = process.platform === 'darwin';\n \n+let isGlibc;\n+exports.isGlibc = () => {\n+  if (isGlibc !== undefined)\n+    return isGlibc;\n+  try {\n+    const lddOut = spawnSync('ldd', [process.execPath]).stdout;\n+    const libcInfo = lddOut.toString().split('\\n').map(\n+      (line) => line.match(/libc\\.so.+=>\\s*(\\S+)\\s/)).filter((info) => info);\n+    if (libcInfo.length === 0)\n+      return isGlibc = false;\n+    const nmOut = spawnSync('nm', ['-D', libcInfo[0][1]]).stdout;\n+    if (/gnu_get_libc_version/.test(nmOut))\n+      return isGlibc = true;\n+  } catch {}\n+  return isGlibc = false;\n+};\n+\n exports.enoughTestMem = os.totalmem() > 0x70000000; /* 1.75 Gb */\n const cpus = os.cpus();\n exports.enoughTestCpu = Array.isArray(cpus) &&"
+        }
+    ],
+    "stats": {
+        "total": 277,
+        "additions": 262,
+        "deletions": 15
+    }
+}

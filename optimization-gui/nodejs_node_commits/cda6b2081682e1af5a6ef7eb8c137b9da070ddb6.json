@@ -1,0 +1,48 @@
+{
+    "author": "bzoz",
+    "message": "win, fs: detect if symlink target is a directory\n\nOn Windows creating a symlink to a directory will not work unless extra\n'dir' parameter is passed. This adds a check if link target is a\ndirectory, and if so automatically use 'dir' when creating symlink.\n\nPR-URL: https://github.com/nodejs/node/pull/23724\nRefs: https://github.com/nodejs/node/pull/23691\nReviewed-By: Refael Ackermann <refack@gmail.com>\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Rod Vagg <rod@vagg.org>\nReviewed-By: Matteo Collina <matteo.collina@gmail.com>",
+    "sha": "cda6b2081682e1af5a6ef7eb8c137b9da070ddb6",
+    "files": [
+        {
+            "sha": "7ce8262a3ee027b9ae4d09a8a6e211f611b624fe",
+            "filename": "doc/api/fs.md",
+            "status": "modified",
+            "additions": 17,
+            "deletions": 7,
+            "changes": 24,
+            "blob_url": "https://github.com/nodejs/node/blob/cda6b2081682e1af5a6ef7eb8c137b9da070ddb6/doc%2Fapi%2Ffs.md",
+            "raw_url": "https://github.com/nodejs/node/raw/cda6b2081682e1af5a6ef7eb8c137b9da070ddb6/doc%2Fapi%2Ffs.md",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/doc%2Fapi%2Ffs.md?ref=cda6b2081682e1af5a6ef7eb8c137b9da070ddb6",
+            "patch": "@@ -3028,20 +3028,26 @@ changes:\n     description: The `target` and `path` parameters can be WHATWG `URL` objects\n                  using `file:` protocol. Support is currently still\n                  *experimental*.\n+  - version: REPLACEME\n+    pr-url: https://github.com/nodejs/node/pull/23724\n+    description: If the `type` argument is left undefined, Node will autodetect\n+                 `target` type and automatically select `dir` or `file`\n -->\n \n * `target` {string|Buffer|URL}\n * `path` {string|Buffer|URL}\n-* `type` {string} **Default:** `'file'`\n+* `type` {string}\n * `callback` {Function}\n   * `err` {Error}\n \n Asynchronous symlink(2). No arguments other than a possible exception are given\n-to the completion callback. The `type` argument can be set to `'dir'`,\n-`'file'`, or `'junction'` and is only available on\n-Windows (ignored on other platforms). Windows junction points require the\n-destination path to be absolute. When using `'junction'`, the `target` argument\n-will automatically be normalized to absolute path.\n+to the completion callback. The `type` argument is only available on Windows\n+and ignored on other platforms. It can be set to `'dir'`, `'file'`, or\n+`'junction'`. If the `type` argument is not set, Node will autodetect `target`\n+type and use `'file'` or `'dir'`. If the `target` does not exist, `'file'` will\n+be used. Windows junction points require the destination path to be absolute.\n+When using `'junction'`, the `target` argument will automatically be normalized\n+to absolute path.\n \n Here is an example below:\n \n@@ -3060,11 +3066,15 @@ changes:\n     description: The `target` and `path` parameters can be WHATWG `URL` objects\n                  using `file:` protocol. Support is currently still\n                  *experimental*.\n+  - version: REPLACEME\n+    pr-url: https://github.com/nodejs/node/pull/23724\n+    description: If the `type` argument is left undefined, Node will autodetect\n+                 `target` type and automatically select `dir` or `file`\n -->\n \n * `target` {string|Buffer|URL}\n * `path` {string|Buffer|URL}\n-* `type` {string} **Default:** `'file'`\n+* `type` {string}\n \n Returns `undefined`.\n "
+        },
+        {
+            "sha": "2e4bdc89647aac4269de7d55dad05ad93823b3ca",
+            "filename": "lib/fs.js",
+            "status": "modified",
+            "additions": 32,
+            "deletions": 1,
+            "changes": 33,
+            "blob_url": "https://github.com/nodejs/node/blob/cda6b2081682e1af5a6ef7eb8c137b9da070ddb6/lib%2Ffs.js",
+            "raw_url": "https://github.com/nodejs/node/raw/cda6b2081682e1af5a6ef7eb8c137b9da070ddb6/lib%2Ffs.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Ffs.js?ref=cda6b2081682e1af5a6ef7eb8c137b9da070ddb6",
+            "patch": "@@ -905,16 +905,47 @@ function symlink(target, path, type_, callback_) {\n   validatePath(target, 'target');\n   validatePath(path);\n \n-  const flags = stringToSymlinkType(type);\n   const req = new FSReqCallback();\n   req.oncomplete = callback;\n \n+  if (isWindows && type === null) {\n+    let absoluteTarget;\n+    try {\n+      // Symlinks targets can be relative to the newly created path.\n+      // Calculate absolute file name of the symlink target, and check\n+      // if it is a directory. Ignore resolve error to keep symlink\n+      // errors consistent between platforms if invalid path is\n+      // provided.\n+      absoluteTarget = pathModule.resolve(path, '..', target);\n+    } catch { }\n+    if (absoluteTarget !== undefined) {\n+      stat(absoluteTarget, (err, stat) => {\n+        const resolvedType = !err && stat.isDirectory() ? 'dir' : 'file';\n+        const resolvedFlags = stringToSymlinkType(resolvedType);\n+        binding.symlink(preprocessSymlinkDestination(target,\n+                                                     resolvedType,\n+                                                     path),\n+                        pathModule.toNamespacedPath(path), resolvedFlags, req);\n+      });\n+      return;\n+    }\n+  }\n+\n+  const flags = stringToSymlinkType(type);\n   binding.symlink(preprocessSymlinkDestination(target, type, path),\n                   pathModule.toNamespacedPath(path), flags, req);\n }\n \n function symlinkSync(target, path, type) {\n   type = (typeof type === 'string' ? type : null);\n+  if (isWindows && type === null) {\n+    try {\n+      const absoluteTarget = pathModule.resolve(path, '..', target);\n+      if (statSync(absoluteTarget).isDirectory()) {\n+        type = 'dir';\n+      }\n+    } catch { }\n+  }\n   target = toPathIfFileURL(target);\n   path = toPathIfFileURL(path);\n   validatePath(target, 'target');"
+        },
+        {
+            "sha": "1ab1361a43fb9b10af9cbb8776d37c7c508b2fac",
+            "filename": "test/parallel/test-fs-symlink-dir.js",
+            "status": "added",
+            "additions": 46,
+            "deletions": 0,
+            "changes": 46,
+            "blob_url": "https://github.com/nodejs/node/blob/cda6b2081682e1af5a6ef7eb8c137b9da070ddb6/test%2Fparallel%2Ftest-fs-symlink-dir.js",
+            "raw_url": "https://github.com/nodejs/node/raw/cda6b2081682e1af5a6ef7eb8c137b9da070ddb6/test%2Fparallel%2Ftest-fs-symlink-dir.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-fs-symlink-dir.js?ref=cda6b2081682e1af5a6ef7eb8c137b9da070ddb6",
+            "patch": "@@ -0,0 +1,46 @@\n+'use strict';\n+const common = require('../common');\n+\n+// Test creating a symbolic link pointing to a directory.\n+// Ref: https://github.com/nodejs/node/pull/23724\n+// Ref: https://github.com/nodejs/node/issues/23596\n+\n+\n+if (!common.canCreateSymLink())\n+  common.skip('insufficient privileges');\n+\n+const assert = require('assert');\n+const path = require('path');\n+const fs = require('fs');\n+\n+const tmpdir = require('../common/tmpdir');\n+tmpdir.refresh();\n+\n+const linkTargets = [\n+  'relative-target',\n+  path.join(tmpdir.path, 'absolute-target')\n+];\n+const linkPaths = [\n+  path.relative(process.cwd(), path.join(tmpdir.path, 'relative-path')),\n+  path.join(tmpdir.path, 'absolute-path')\n+];\n+\n+function testSync(target, path) {\n+  fs.symlinkSync(target, path);\n+  fs.readdirSync(path);\n+}\n+\n+function testAsync(target, path) {\n+  fs.symlink(target, path, common.mustCall((err) => {\n+    assert.ifError(err);\n+    fs.readdirSync(path);\n+  }));\n+}\n+\n+for (const linkTarget of linkTargets) {\n+  fs.mkdirSync(path.resolve(tmpdir.path, linkTarget));\n+  for (const linkPath of linkPaths) {\n+    testSync(linkTarget, `${linkPath}-${path.basename(linkTarget)}-sync`);\n+    testAsync(linkTarget, `${linkPath}-${path.basename(linkTarget)}-async`);\n+  }\n+}"
+        }
+    ],
+    "stats": {
+        "total": 103,
+        "additions": 95,
+        "deletions": 8
+    }
+}

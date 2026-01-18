@@ -1,0 +1,48 @@
+{
+    "author": "addaleax",
+    "message": "n-api: turn NAPI_CALL_INTO_MODULE into a function\n\nThese do not need to be macros.\n\nPR-URL: https://github.com/nodejs/node/pull/26128\nReviewed-By: Colin Ihrig <cjihrig@gmail.com>\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "d2f652f12e5679530a12fed4a2da1db887813014",
+    "files": [
+        {
+            "sha": "fd3ed2af6afe067301d5e15228359d6f9695eb7a",
+            "filename": "src/js_native_api_v8.cc",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 3,
+            "changes": 7,
+            "blob_url": "https://github.com/nodejs/node/blob/d2f652f12e5679530a12fed4a2da1db887813014/src%2Fjs_native_api_v8.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/d2f652f12e5679530a12fed4a2da1db887813014/src%2Fjs_native_api_v8.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fjs_native_api_v8.cc?ref=d2f652f12e5679530a12fed4a2da1db887813014",
+            "patch": "@@ -303,11 +303,12 @@ class Reference : private Finalizer {\n     napi_env env = reference->_env;\n \n     if (reference->_finalize_callback != nullptr) {\n-      NAPI_CALL_INTO_MODULE_THROW(env,\n+      NapiCallIntoModuleThrow(env, [&]() {\n         reference->_finalize_callback(\n             reference->_env,\n             reference->_finalize_data,\n-            reference->_finalize_hint));\n+            reference->_finalize_hint);\n+      });\n     }\n \n     // this is safe because if a request to delete the reference\n@@ -448,7 +449,7 @@ class CallbackWrapperBase : public CallbackWrapper {\n     napi_callback cb = _bundle->*FunctionField;\n \n     napi_value result;\n-    NAPI_CALL_INTO_MODULE_THROW(env, result = cb(env, cbinfo_wrapper));\n+    NapiCallIntoModuleThrow(env, [&]() { result = cb(env, cbinfo_wrapper); });\n \n     if (result != nullptr) {\n       this->SetReturnValue(result);"
+        },
+        {
+            "sha": "d746660df42fd56b2dd66b5b30c3cabc2df20f07",
+            "filename": "src/js_native_api_v8.h",
+            "status": "modified",
+            "additions": 19,
+            "deletions": 16,
+            "changes": 35,
+            "blob_url": "https://github.com/nodejs/node/blob/d2f652f12e5679530a12fed4a2da1db887813014/src%2Fjs_native_api_v8.h",
+            "raw_url": "https://github.com/nodejs/node/raw/d2f652f12e5679530a12fed4a2da1db887813014/src%2Fjs_native_api_v8.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fjs_native_api_v8.h?ref=d2f652f12e5679530a12fed4a2da1db887813014",
+            "patch": "@@ -113,23 +113,26 @@ napi_status napi_set_last_error(napi_env env, napi_status error_code,\n     }                                                              \\\n   } while (0)\n \n-#define NAPI_CALL_INTO_MODULE(env, call, handle_exception)                   \\\n-  do {                                                                       \\\n-    int open_handle_scopes = (env)->open_handle_scopes;                      \\\n-    int open_callback_scopes = (env)->open_callback_scopes;                  \\\n-    napi_clear_last_error((env));                                            \\\n-    call;                                                                    \\\n-    CHECK_EQ((env)->open_handle_scopes, open_handle_scopes);                 \\\n-    CHECK_EQ((env)->open_callback_scopes, open_callback_scopes);             \\\n-    if (!(env)->last_exception.IsEmpty()) {                                  \\\n-      handle_exception(                                                      \\\n-          v8::Local<v8::Value>::New((env)->isolate, (env)->last_exception)); \\\n-      (env)->last_exception.Reset();                                         \\\n-    }                                                                        \\\n-  } while (0)\n+template <typename T, typename U>\n+void NapiCallIntoModule(napi_env env, T&& call, U&& handle_exception) {\n+  int open_handle_scopes = env->open_handle_scopes;\n+  int open_callback_scopes = env->open_callback_scopes;\n+  napi_clear_last_error(env);\n+  call();\n+  CHECK_EQ(env->open_handle_scopes, open_handle_scopes);\n+  CHECK_EQ(env->open_callback_scopes, open_callback_scopes);\n+  if (!env->last_exception.IsEmpty()) {\n+    handle_exception(env->last_exception.Get(env->isolate));\n+    env->last_exception.Reset();\n+  }\n+}\n \n-#define NAPI_CALL_INTO_MODULE_THROW(env, call) \\\n-  NAPI_CALL_INTO_MODULE((env), call, (env)->isolate->ThrowException)\n+template <typename T>\n+void NapiCallIntoModuleThrow(napi_env env, T&& call) {\n+  NapiCallIntoModule(env, call, [&](v8::Local<v8::Value> value) {\n+    env->isolate->ThrowException(value);\n+  });\n+}\n \n namespace v8impl {\n "
+        },
+        {
+            "sha": "282ef255dcaab4202990223b6108ce6dbfe6ee22",
+            "filename": "src/node_api.cc",
+            "status": "modified",
+            "additions": 14,
+            "deletions": 12,
+            "changes": 26,
+            "blob_url": "https://github.com/nodejs/node/blob/d2f652f12e5679530a12fed4a2da1db887813014/src%2Fnode_api.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/d2f652f12e5679530a12fed4a2da1db887813014/src%2Fnode_api.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_api.cc?ref=d2f652f12e5679530a12fed4a2da1db887813014",
+            "patch": "@@ -34,11 +34,12 @@ class BufferFinalizer: private Finalizer {\n   static void FinalizeBufferCallback(char* data, void* hint) {\n     BufferFinalizer* finalizer = static_cast<BufferFinalizer*>(hint);\n     if (finalizer->_finalize_callback != nullptr) {\n-      NAPI_CALL_INTO_MODULE_THROW(finalizer->_env,\n+      NapiCallIntoModuleThrow(finalizer->_env, [&]() {\n         finalizer->_finalize_callback(\n           finalizer->_env,\n           data,\n-          finalizer->_finalize_hint));\n+          finalizer->_finalize_hint);\n+      });\n     }\n \n     Delete(finalizer);\n@@ -465,8 +466,9 @@ void napi_module_register_by_symbol(v8::Local<v8::Object> exports,\n   napi_env env = v8impl::GetEnv(context);\n \n   napi_value _exports;\n-  NAPI_CALL_INTO_MODULE_THROW(env,\n-      _exports = init(env, v8impl::JsValueFromV8LocalValue(exports)));\n+  NapiCallIntoModuleThrow(env, [&]() {\n+    _exports = init(env, v8impl::JsValueFromV8LocalValue(exports));\n+  });\n \n   // If register function returned a non-null exports object different from\n   // the exports object we passed it, set that as the \"exports\" property of\n@@ -874,14 +876,14 @@ class Work : public node::AsyncResource, public node::ThreadPoolWork {\n     // stored.\n     napi_env env = _env;\n \n-    NAPI_CALL_INTO_MODULE(env,\n-        _complete(_env, ConvertUVErrorCode(status), _data),\n-        [env] (v8::Local<v8::Value> local_err) {\n-          // If there was an unhandled exception in the complete callback,\n-          // report it as a fatal exception. (There is no JavaScript on the\n-          // callstack that can possibly handle it.)\n-          v8impl::trigger_fatal_exception(env, local_err);\n-        });\n+    NapiCallIntoModule(env, [&]() {\n+      _complete(_env, ConvertUVErrorCode(status), _data);\n+    }, [env](v8::Local<v8::Value> local_err) {\n+      // If there was an unhandled exception in the complete callback,\n+      // report it as a fatal exception. (There is no JavaScript on the\n+      // callstack that can possibly handle it.)\n+      v8impl::trigger_fatal_exception(env, local_err);\n+    });\n \n     // Note: Don't access `work` after this point because it was\n     // likely deleted by the complete callback."
+        }
+    ],
+    "stats": {
+        "total": 68,
+        "additions": 37,
+        "deletions": 31
+    }
+}

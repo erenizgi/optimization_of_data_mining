@@ -1,0 +1,60 @@
+{
+    "author": "addaleax",
+    "message": "worker: reduce `MessagePort` prototype to documented API\n\n`MessagePort` is special because it has to be a C++ API\nthat is exposed to userland. Therefore, there is a number\nof internal methods on its native prototype; this commit\nreduces this set of methods to only what is documented in\nthe API.\n\nPR-URL: https://github.com/nodejs/node/pull/23037\nReviewed-By: Gus Caplan <me@gus.host>\nReviewed-By: Michaël Zasso <targos@protonmail.com>\nReviewed-By: Luigi Pinca <luigipinca@gmail.com>\nReviewed-By: Ruben Bridgewater <ruben@bridgewater.de>\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "0434d270c17303d1578586add2f842bd7f6b2fb7",
+    "files": [
+        {
+            "sha": "ceec8469b19a9acd74bb15044fce5cf7561ed569",
+            "filename": "lib/internal/worker.js",
+            "status": "modified",
+            "additions": 31,
+            "deletions": 18,
+            "changes": 49,
+            "blob_url": "https://github.com/nodejs/node/blob/0434d270c17303d1578586add2f842bd7f6b2fb7/lib%2Finternal%2Fworker.js",
+            "raw_url": "https://github.com/nodejs/node/raw/0434d270c17303d1578586add2f842bd7f6b2fb7/lib%2Finternal%2Fworker.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fworker.js?ref=0434d270c17303d1578586add2f842bd7f6b2fb7",
+            "patch": "@@ -14,18 +14,18 @@ const {\n \n const { internalBinding } = require('internal/bootstrap/loaders');\n const { MessagePort, MessageChannel } = internalBinding('messaging');\n-const { handle_onclose } = internalBinding('symbols');\n+const {\n+  handle_onclose: handleOnCloseSymbol,\n+  oninit: onInitSymbol\n+} = internalBinding('symbols');\n const { clearAsyncIdStack } = require('internal/async_hooks');\n const { serializeError, deserializeError } = require('internal/error-serdes');\n const { pathToFileURL } = require('url');\n \n-util.inherits(MessagePort, EventEmitter);\n-\n const {\n   Worker: WorkerImpl,\n   getEnvMessagePort,\n-  threadId,\n-  oninit: oninit_symbol\n+  threadId\n } = internalBinding('worker');\n \n const isMainThread = threadId === 0;\n@@ -58,6 +58,23 @@ const messageTypes = {\n   LOAD_SCRIPT: 'loadScript'\n };\n \n+// We have to mess with the MessagePort prototype a bit, so that a) we can make\n+// it inherit from EventEmitter, even though it is a C++ class, and b) we do\n+// not provide methods that are not present in the Browser and not documented\n+// on our side (e.g. hasRef).\n+// Save a copy of the original set of methods as a shallow clone.\n+const MessagePortPrototype = Object.create(\n+  Object.getPrototypeOf(MessagePort.prototype),\n+  Object.getOwnPropertyDescriptors(MessagePort.prototype));\n+// Set up the new inheritance chain.\n+Object.setPrototypeOf(MessagePort, EventEmitter);\n+Object.setPrototypeOf(MessagePort.prototype, EventEmitter.prototype);\n+// Finally, purge methods we don't want to be public.\n+delete MessagePort.prototype.stop;\n+delete MessagePort.prototype.drain;\n+delete MessagePort.prototype.hasRef;\n+delete MessagePort.prototype.getAsyncId;\n+\n // A communication channel consisting of a handle (that wraps around an\n // uv_async_t) which can receive information from other threads and emits\n // .onmessage events, and a function used for sending data to a MessagePort\n@@ -81,10 +98,10 @@ Object.defineProperty(MessagePort.prototype, 'onmessage', {\n     this[kOnMessageListener] = value;\n     if (typeof value === 'function') {\n       this.ref();\n-      this.start();\n+      MessagePortPrototype.start.call(this);\n     } else {\n       this.unref();\n-      this.stop();\n+      MessagePortPrototype.stop.call(this);\n     }\n   }\n });\n@@ -94,7 +111,7 @@ function oninit() {\n   setupPortReferencing(this, this, 'message');\n }\n \n-Object.defineProperty(MessagePort.prototype, oninit_symbol, {\n+Object.defineProperty(MessagePort.prototype, onInitSymbol, {\n   enumerable: true,\n   writable: false,\n   value: oninit\n@@ -111,22 +128,18 @@ function onclose() {\n   this.emit('close');\n }\n \n-Object.defineProperty(MessagePort.prototype, handle_onclose, {\n+Object.defineProperty(MessagePort.prototype, handleOnCloseSymbol, {\n   enumerable: false,\n   writable: false,\n   value: onclose\n });\n \n-const originalClose = MessagePort.prototype.close;\n MessagePort.prototype.close = function(cb) {\n   if (typeof cb === 'function')\n     this.once('close', cb);\n-  originalClose.call(this);\n+  MessagePortPrototype.close.call(this);\n };\n \n-const drainMessagePort = MessagePort.prototype.drain;\n-delete MessagePort.prototype.drain;\n-\n Object.defineProperty(MessagePort.prototype, util.inspect.custom, {\n   enumerable: false,\n   writable: false,\n@@ -135,7 +148,7 @@ Object.defineProperty(MessagePort.prototype, util.inspect.custom, {\n     try {\n       // This may throw when `this` does not refer to a native object,\n       // e.g. when accessing the prototype directly.\n-      ref = this.hasRef();\n+      ref = MessagePortPrototype.hasRef.call(this);\n     } catch { return this; }\n     return Object.assign(Object.create(MessagePort.prototype),\n                          ref === undefined ? {\n@@ -157,12 +170,12 @@ function setupPortReferencing(port, eventEmitter, eventName) {\n   eventEmitter.on('newListener', (name) => {\n     if (name === eventName && eventEmitter.listenerCount(eventName) === 0) {\n       port.ref();\n-      port.start();\n+      MessagePortPrototype.start.call(port);\n     }\n   });\n   eventEmitter.on('removeListener', (name) => {\n     if (name === eventName && eventEmitter.listenerCount(eventName) === 0) {\n-      port.stop();\n+      MessagePortPrototype.stop.call(port);\n       port.unref();\n     }\n   });\n@@ -304,7 +317,7 @@ class Worker extends EventEmitter {\n \n   [kOnExit](code) {\n     debug(`[${threadId}] hears end event for Worker ${this.threadId}`);\n-    drainMessagePort.call(this[kPublicPort]);\n+    MessagePortPrototype.drain.call(this[kPublicPort]);\n     this[kDispose]();\n     this.emit('exit', code);\n     this.removeAllListeners();"
+        },
+        {
+            "sha": "aee97095a436b8b4d1d33110b7e3beb9916d64e8",
+            "filename": "src/node_worker.cc",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 4,
+            "changes": 4,
+            "blob_url": "https://github.com/nodejs/node/blob/0434d270c17303d1578586add2f842bd7f6b2fb7/src%2Fnode_worker.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/0434d270c17303d1578586add2f842bd7f6b2fb7/src%2Fnode_worker.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_worker.cc?ref=0434d270c17303d1578586add2f842bd7f6b2fb7",
+            "patch": "@@ -502,10 +502,6 @@ void InitWorker(Local<Object> target,\n               thread_id_string,\n               Number::New(env->isolate(),\n                           static_cast<double>(env->thread_id()))).FromJust();\n-  Local<String> oninit_string = FIXED_ONE_BYTE_STRING(env->isolate(), \"oninit\");\n-  target->Set(env->context(),\n-              oninit_string,\n-              env->oninit_symbol()).FromJust();\n }\n \n }  // anonymous namespace"
+        },
+        {
+            "sha": "44a50dd66b5fcab76c9b2f46152ead22d70bcf29",
+            "filename": "test/parallel/test-heapdump-worker.js",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 2,
+            "changes": 3,
+            "blob_url": "https://github.com/nodejs/node/blob/0434d270c17303d1578586add2f842bd7f6b2fb7/test%2Fparallel%2Ftest-heapdump-worker.js",
+            "raw_url": "https://github.com/nodejs/node/raw/0434d270c17303d1578586add2f842bd7f6b2fb7/test%2Fparallel%2Ftest-heapdump-worker.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-heapdump-worker.js?ref=0434d270c17303d1578586add2f842bd7f6b2fb7",
+            "patch": "@@ -19,8 +19,7 @@ validateSnapshotNodes('Worker', [\n validateSnapshotNodes('MessagePort', [\n   {\n     children: [\n-      { name: 'MessagePortData' },\n-      { name: 'MessagePort' }\n+      { name: 'MessagePortData' }\n     ]\n   }\n ], { loose: true });"
+        },
+        {
+            "sha": "995868e9a770e0686d8d7a5fc5608a287ea2354d",
+            "filename": "test/parallel/test-worker-message-port.js",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/nodejs/node/blob/0434d270c17303d1578586add2f842bd7f6b2fb7/test%2Fparallel%2Ftest-worker-message-port.js",
+            "raw_url": "https://github.com/nodejs/node/raw/0434d270c17303d1578586add2f842bd7f6b2fb7/test%2Fparallel%2Ftest-worker-message-port.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-worker-message-port.js?ref=0434d270c17303d1578586add2f842bd7f6b2fb7",
+            "patch": "@@ -69,3 +69,12 @@ const { MessageChannel, MessagePort } = require('worker_threads');\n     });\n   });\n }\n+\n+{\n+  assert.deepStrictEqual(\n+    Object.getOwnPropertyNames(MessagePort.prototype).sort(),\n+    [\n+      'close', 'constructor', 'onmessage', 'postMessage', 'ref', 'start',\n+      'unref'\n+    ]);\n+}"
+        }
+    ],
+    "stats": {
+        "total": 65,
+        "additions": 41,
+        "deletions": 24
+    }
+}

@@ -1,0 +1,48 @@
+{
+    "author": "mcollina",
+    "message": "http2: fix condition where data is lost\n\nPR-URL: https://github.com/nodejs/node/pull/18895\nReviewed-By: Anna Henningsen <anna@addaleax.net>\nReviewed-By: Ruben Bridgewater <ruben@bridgewater.de>",
+    "sha": "dbe645f11460a8985f5f6e07f9ed829bee43e101",
+    "files": [
+        {
+            "sha": "e18f581955fec0c339d890e46fc4b4677f9dcce6",
+            "filename": "lib/internal/http2/core.js",
+            "status": "modified",
+            "additions": 41,
+            "deletions": 14,
+            "changes": 55,
+            "blob_url": "https://github.com/nodejs/node/blob/dbe645f11460a8985f5f6e07f9ed829bee43e101/lib%2Finternal%2Fhttp2%2Fcore.js",
+            "raw_url": "https://github.com/nodejs/node/raw/dbe645f11460a8985f5f6e07f9ed829bee43e101/lib%2Finternal%2Fhttp2%2Fcore.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fhttp2%2Fcore.js?ref=dbe645f11460a8985f5f6e07f9ed829bee43e101",
+            "patch": "@@ -307,8 +307,23 @@ function onStreamClose(code) {\n \n   if (state.fd !== undefined)\n     tryClose(state.fd);\n-  stream.push(null);\n-  stream[kMaybeDestroy](null, code);\n+\n+  // Defer destroy we actually emit end.\n+  if (stream._readableState.endEmitted || code !== NGHTTP2_NO_ERROR) {\n+    // If errored or ended, we can destroy immediately.\n+    stream[kMaybeDestroy](null, code);\n+  } else {\n+    // Wait for end to destroy.\n+    stream.on('end', stream[kMaybeDestroy]);\n+    // Push a null so the stream can end whenever the client consumes\n+    // it completely.\n+    stream.push(null);\n+\n+    // Same as net.\n+    if (stream.readableLength === 0) {\n+      stream.read(0);\n+    }\n+  }\n }\n \n // Receives a chunk of data for a given stream and forwards it on\n@@ -326,11 +341,19 @@ function onStreamRead(nread, buf) {\n     }\n     return;\n   }\n+\n   // Last chunk was received. End the readable side.\n   debug(`Http2Stream ${stream[kID]} [Http2Session ` +\n         `${sessionName(stream[kSession][kType])}]: ending readable.`);\n-  stream.push(null);\n-  stream[kMaybeDestroy]();\n+\n+  // defer this until we actually emit end\n+  if (stream._readableState.endEmitted) {\n+    stream[kMaybeDestroy]();\n+  } else {\n+    stream.on('end', stream[kMaybeDestroy]);\n+    stream.push(null);\n+    stream.read(0);\n+  }\n }\n \n // Called when the remote peer settings have been updated.\n@@ -1833,21 +1856,25 @@ class Http2Stream extends Duplex {\n     session[kMaybeDestroy]();\n     process.nextTick(emit, this, 'close', code);\n     callback(err);\n-  }\n \n+  }\n   // The Http2Stream can be destroyed if it has closed and if the readable\n   // side has received the final chunk.\n   [kMaybeDestroy](error, code = NGHTTP2_NO_ERROR) {\n-    if (error == null) {\n-      if (code === NGHTTP2_NO_ERROR &&\n-          (!this._readableState.ended ||\n-          !this._writableState.ended ||\n-          this._writableState.pendingcb > 0 ||\n-          !this.closed)) {\n-        return;\n-      }\n+    if (error || code !== NGHTTP2_NO_ERROR) {\n+      this.destroy(error);\n+      return;\n+    }\n+\n+    // TODO(mcollina): remove usage of _*State properties\n+    if (this._readableState.ended &&\n+        this._writableState.ended &&\n+        this._writableState.pendingcb === 0 &&\n+        this.closed) {\n+      this.destroy();\n+      // This should return, but eslint complains.\n+      // return\n     }\n-    this.destroy(error);\n   }\n }\n "
+        },
+        {
+            "sha": "f7ef9412106f59ee66a267bf229dc6362860d113",
+            "filename": "test/parallel/test-http2-compat-short-stream-client-server.js",
+            "status": "added",
+            "additions": 50,
+            "deletions": 0,
+            "changes": 50,
+            "blob_url": "https://github.com/nodejs/node/blob/dbe645f11460a8985f5f6e07f9ed829bee43e101/test%2Fparallel%2Ftest-http2-compat-short-stream-client-server.js",
+            "raw_url": "https://github.com/nodejs/node/raw/dbe645f11460a8985f5f6e07f9ed829bee43e101/test%2Fparallel%2Ftest-http2-compat-short-stream-client-server.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-http2-compat-short-stream-client-server.js?ref=dbe645f11460a8985f5f6e07f9ed829bee43e101",
+            "patch": "@@ -0,0 +1,50 @@\n+'use strict';\n+\n+const common = require('../common');\n+if (!common.hasCrypto)\n+  common.skip('missing crypto');\n+const assert = require('assert');\n+const http2 = require('http2');\n+const { Readable } = require('stream');\n+\n+const server = http2.createServer(common.mustCall((req, res) => {\n+  res.setHeader('content-type', 'text/html');\n+  const input = new Readable({\n+    read() {\n+      this.push('test');\n+      this.push(null);\n+    }\n+  });\n+  input.pipe(res);\n+}));\n+\n+server.listen(0, common.mustCall(() => {\n+  const port = server.address().port;\n+  const client = http2.connect(`http://localhost:${port}`);\n+\n+  const req = client.request();\n+\n+  req.on('response', common.mustCall((headers) => {\n+    assert.strictEqual(headers[':status'], 200);\n+    assert.strictEqual(headers['content-type'], 'text/html');\n+  }));\n+\n+  let data = '';\n+\n+  const notCallClose = common.mustNotCall();\n+\n+  setTimeout(() => {\n+    req.setEncoding('utf8');\n+    req.removeListener('close', notCallClose);\n+    req.on('close', common.mustCall(() => {\n+      server.close();\n+      client.close();\n+    }));\n+    req.on('data', common.mustCallAtLeast((d) => data += d));\n+    req.on('end', common.mustCall(() => {\n+      assert.strictEqual(data, 'test');\n+    }));\n+  }, common.platformTimeout(100));\n+\n+  req.on('close', notCallClose);\n+}));"
+        },
+        {
+            "sha": "e632b8d96b9ea921d0ea48cf7438892a3738d216",
+            "filename": "test/parallel/test-http2-short-stream-client-server.js",
+            "status": "added",
+            "additions": 55,
+            "deletions": 0,
+            "changes": 55,
+            "blob_url": "https://github.com/nodejs/node/blob/dbe645f11460a8985f5f6e07f9ed829bee43e101/test%2Fparallel%2Ftest-http2-short-stream-client-server.js",
+            "raw_url": "https://github.com/nodejs/node/raw/dbe645f11460a8985f5f6e07f9ed829bee43e101/test%2Fparallel%2Ftest-http2-short-stream-client-server.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-http2-short-stream-client-server.js?ref=dbe645f11460a8985f5f6e07f9ed829bee43e101",
+            "patch": "@@ -0,0 +1,55 @@\n+'use strict';\n+\n+const common = require('../common');\n+if (!common.hasCrypto)\n+  common.skip('missing crypto');\n+const assert = require('assert');\n+const http2 = require('http2');\n+const { Readable } = require('stream');\n+\n+const server = http2.createServer();\n+server.on('stream', common.mustCall((stream) => {\n+  stream.respond({\n+    ':status': 200,\n+    'content-type': 'text/html'\n+  });\n+  const input = new Readable({\n+    read() {\n+      this.push('test');\n+      this.push(null);\n+    }\n+  });\n+  input.pipe(stream);\n+}));\n+\n+\n+server.listen(0, common.mustCall(() => {\n+  const port = server.address().port;\n+  const client = http2.connect(`http://localhost:${port}`);\n+\n+  const req = client.request();\n+\n+  req.on('response', common.mustCall((headers) => {\n+    assert.strictEqual(headers[':status'], 200);\n+    assert.strictEqual(headers['content-type'], 'text/html');\n+  }));\n+\n+  let data = '';\n+\n+  const notCallClose = common.mustNotCall();\n+\n+  setTimeout(() => {\n+    req.setEncoding('utf8');\n+    req.removeListener('close', notCallClose);\n+    req.on('close', common.mustCall(() => {\n+      server.close();\n+      client.close();\n+    }));\n+    req.on('data', common.mustCallAtLeast((d) => data += d));\n+    req.on('end', common.mustCall(() => {\n+      assert.strictEqual(data, 'test');\n+    }));\n+  }, common.platformTimeout(100));\n+\n+  req.on('close', notCallClose);\n+}));"
+        }
+    ],
+    "stats": {
+        "total": 160,
+        "additions": 146,
+        "deletions": 14
+    }
+}

@@ -1,0 +1,36 @@
+{
+    "author": "SmileyChris",
+    "message": "Fixes #15814 -- Added a test util to abstract the process of using a test template loader\n\ngit-svn-id: http://code.djangoproject.com/svn/django/trunk@16030 bcc190cf-cafb-0310-a4f2-bffc1f526a37",
+    "sha": "89e25403ae9dfcdc3eabd66469226d3036c6cc06",
+    "files": [
+        {
+            "sha": "bf1dc4f16569e7dcf6129d44051bb2e0ff3ebb08",
+            "filename": "django/test/utils.py",
+            "status": "modified",
+            "additions": 42,
+            "deletions": 1,
+            "changes": 43,
+            "blob_url": "https://github.com/django/django/blob/89e25403ae9dfcdc3eabd66469226d3036c6cc06/django%2Ftest%2Futils.py",
+            "raw_url": "https://github.com/django/django/raw/89e25403ae9dfcdc3eabd66469226d3036c6cc06/django%2Ftest%2Futils.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Ftest%2Futils.py?ref=89e25403ae9dfcdc3eabd66469226d3036c6cc06",
+            "patch": "@@ -6,12 +6,15 @@\n from django.core import mail\n from django.core.mail.backends import locmem\n from django.test import signals\n-from django.template import Template\n+from django.template import Template, loader, TemplateDoesNotExist\n+from django.template.loaders import cached\n from django.utils.translation import deactivate\n \n __all__ = ('Approximate', 'ContextList', 'setup_test_environment',\n        'teardown_test_environment', 'get_runner')\n \n+RESTORE_LOADERS_ATTR = '_original_template_source_loaders'\n+\n \n class Approximate(object):\n     def __init__(self, val, places=7):\n@@ -119,3 +122,41 @@ def get_runner(settings):\n     test_module = __import__(test_module_name, {}, {}, test_path[-1])\n     test_runner = getattr(test_module, test_path[-1])\n     return test_runner\n+\n+\n+def setup_test_template_loader(templates_dict, use_cached_loader=False):\n+    \"\"\"\n+    Changes Django to only find templates from within a dictionary (where each\n+    key is the template name and each value is the corresponding template\n+    content to return).\n+\n+    Use meth:`restore_template_loaders` to restore the original loaders.\n+    \"\"\"\n+    if hasattr(loader, RESTORE_LOADERS_ATTR):\n+        raise Exception(\"loader.%s already exists\" % RESTORE_LOADERS_ATTR)\n+\n+    def test_template_loader(template_name, template_dirs=None):\n+        \"A custom template loader that loads templates from a dictionary.\"\n+        try:\n+            return (templates_dict[template_name], \"test:%s\" % template_name)\n+        except KeyError:\n+            raise TemplateDoesNotExist(template_name)\n+\n+    if use_cached_loader:\n+        template_loader = cached.Loader(('test_template_loader',))\n+        template_loader._cached_loaders = (test_template_loader,)\n+    else:\n+        template_loader = test_template_loader\n+\n+    setattr(loader, RESTORE_LOADERS_ATTR, loader.template_source_loaders)\n+    loader.template_source_loaders = (template_loader,)\n+    return template_loader\n+\n+\n+def restore_template_loaders():\n+    \"\"\"\n+    Restores the original template loaders after\n+    :meth:`setup_test_template_loader` has been run.\n+    \"\"\"\n+    loader.template_source_loaders = getattr(loader, RESTORE_LOADERS_ATTR)\n+    delattr(loader, RESTORE_LOADERS_ATTR)"
+        },
+        {
+            "sha": "a051d7335e54873638ac11ceaa0f81e0edc1bc02",
+            "filename": "tests/regressiontests/templates/tests.py",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 15,
+            "changes": 22,
+            "blob_url": "https://github.com/django/django/blob/89e25403ae9dfcdc3eabd66469226d3036c6cc06/tests%2Fregressiontests%2Ftemplates%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/89e25403ae9dfcdc3eabd66469226d3036c6cc06/tests%2Fregressiontests%2Ftemplates%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Ftemplates%2Ftests.py?ref=89e25403ae9dfcdc3eabd66469226d3036c6cc06",
+            "patch": "@@ -18,7 +18,8 @@\n from django.core import urlresolvers\n from django.template import loader\n from django.template.loaders import app_directories, filesystem, cached\n-from django.test.utils import get_warnings_state, restore_warnings_state\n+from django.test.utils import get_warnings_state, restore_warnings_state,\\\n+    setup_test_template_loader, restore_template_loaders\n from django.utils import unittest\n from django.utils.translation import activate, deactivate, ugettext as _\n from django.utils.safestring import mark_safe\n@@ -390,19 +391,10 @@ def test_templates(self):\n \n         template_tests.update(filter_tests)\n \n-        # Register our custom template loader.\n-        def test_template_loader(template_name, template_dirs=None):\n-            \"A custom template loader that loads the unit-test templates.\"\n-            try:\n-                return (template_tests[template_name][0] , \"test:%s\" % template_name)\n-            except KeyError:\n-                raise template.TemplateDoesNotExist(template_name)\n-\n-        cache_loader = cached.Loader(('test_template_loader',))\n-        cache_loader._cached_loaders = (test_template_loader,)\n-\n-        old_template_loaders = loader.template_source_loaders\n-        loader.template_source_loaders = [cache_loader]\n+        cache_loader = setup_test_template_loader(\n+            dict([(name, t[0]) for name, t in template_tests.iteritems()]),\n+            use_cached_loader=True,\n+        )\n \n         failures = []\n         tests = template_tests.items()\n@@ -490,7 +482,7 @@ def test_template_loader(template_name, template_dirs=None):\n                 expected_invalid_str = 'INVALID'\n                 template_base.invalid_var_format_string = False\n \n-        loader.template_source_loaders = old_template_loaders\n+        restore_template_loaders()\n         deactivate()\n         settings.TEMPLATE_DEBUG = old_td\n         settings.TEMPLATE_STRING_IF_INVALID = old_invalid"
+        }
+    ],
+    "stats": {
+        "total": 65,
+        "additions": 49,
+        "deletions": 16
+    }
+}

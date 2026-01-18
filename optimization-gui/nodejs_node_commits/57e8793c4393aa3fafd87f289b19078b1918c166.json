@@ -1,0 +1,72 @@
+{
+    "author": "addaleax",
+    "message": "console: add color support\n\nAdd a way to tell `Console` instances to either always use, never use\nor auto-detect color support and inspect objects accordingly.\n\nPR-URL: https://github.com/nodejs/node/pull/19372\nReviewed-By: Luigi Pinca <luigipinca@gmail.com>\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "57e8793c4393aa3fafd87f289b19078b1918c166",
+    "files": [
+        {
+            "sha": "cce2a4eb6edf1de165215eb7ed34ce87e17ee9a0",
+            "filename": "doc/api/console.md",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 1,
+            "changes": 8,
+            "blob_url": "https://github.com/nodejs/node/blob/57e8793c4393aa3fafd87f289b19078b1918c166/doc%2Fapi%2Fconsole.md",
+            "raw_url": "https://github.com/nodejs/node/raw/57e8793c4393aa3fafd87f289b19078b1918c166/doc%2Fapi%2Fconsole.md",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/doc%2Fapi%2Fconsole.md?ref=57e8793c4393aa3fafd87f289b19078b1918c166",
+            "patch": "@@ -87,14 +87,20 @@ changes:\n     description: The `ignoreErrors` option was introduced.\n   - version: REPLACEME\n     pr-url: https://github.com/nodejs/node/pull/19372\n-    description: The `Console` constructor now supports an `options` argument.\n+    description: The `Console` constructor now supports an `options` argument,\n+                 and the `colorMode` option was introduced.\n -->\n \n * `options` {Object}\n   * `stdout` {stream.Writable}\n   * `stderr` {stream.Writable}\n   * `ignoreErrors` {boolean} Ignore errors when writing to the underlying\n                              streams. **Default:** `true`.\n+  * `colorMode` {boolean|string} Set color support for this `Console` instance.\n+    Setting to `true` enables coloring while inspecting values, setting to\n+    `'auto'` will make color support depend on the value of the `isTTY` property\n+    and the value returned by `getColorDepth()` on the respective stream.\n+    **Default:** `false`\n \n Creates a new `Console` with one or two writable stream instances. `stdout` is a\n writable stream to print log or info output. `stderr` is used for warning or"
+        },
+        {
+            "sha": "e8f97397d30b27e53bb5585887be6cba455083db",
+            "filename": "doc/api/util.md",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/nodejs/node/blob/57e8793c4393aa3fafd87f289b19078b1918c166/doc%2Fapi%2Futil.md",
+            "raw_url": "https://github.com/nodejs/node/raw/57e8793c4393aa3fafd87f289b19078b1918c166/doc%2Fapi%2Futil.md",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/doc%2Fapi%2Futil.md?ref=57e8793c4393aa3fafd87f289b19078b1918c166",
+            "patch": "@@ -268,8 +268,8 @@ an `inspectOptions` argument which specifies options that are passed along to\n \n ```js\n util.formatWithOptions({ colors: true }, 'See object %O', { foo: 42 });\n-  // Returns 'See object { foo: 42 }', where `42` is colored as a number\n-  // when printed to a terminal.\n+// Returns 'See object { foo: 42 }', where `42` is colored as a number\n+// when printed to a terminal.\n ```\n \n ## util.getSystemErrorName(err)"
+        },
+        {
+            "sha": "2c35e9822346a7aa423e3a05846b4d2cac18d6ac",
+            "filename": "lib/console.js",
+            "status": "modified",
+            "additions": 49,
+            "deletions": 14,
+            "changes": 63,
+            "blob_url": "https://github.com/nodejs/node/blob/57e8793c4393aa3fafd87f289b19078b1918c166/lib%2Fconsole.js",
+            "raw_url": "https://github.com/nodejs/node/raw/57e8793c4393aa3fafd87f289b19078b1918c166/lib%2Fconsole.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Fconsole.js?ref=57e8793c4393aa3fafd87f289b19078b1918c166",
+            "patch": "@@ -26,6 +26,7 @@ const {\n   codes: {\n     ERR_CONSOLE_WRITABLE_STREAM,\n     ERR_INVALID_ARG_TYPE,\n+    ERR_INVALID_ARG_VALUE,\n   },\n } = require('internal/errors');\n const { previewMapIterator, previewSetIterator } = require('internal/v8');\n@@ -49,24 +50,32 @@ const {\n } = Array;\n \n // Track amount of indentation required via `console.group()`.\n-const kGroupIndent = Symbol('groupIndent');\n+const kGroupIndent = Symbol('kGroupIndent');\n+\n+const kFormatForStderr = Symbol('kFormatForStderr');\n+const kFormatForStdout = Symbol('kFormatForStdout');\n+const kGetInspectOptions = Symbol('kGetInspectOptions');\n+const kColorMode = Symbol('kColorMode');\n \n function Console(options /* or: stdout, stderr, ignoreErrors = true */) {\n   if (!(this instanceof Console)) {\n     return new Console(...arguments);\n   }\n \n-  let stdout, stderr, ignoreErrors;\n+  let stdout, stderr, ignoreErrors, colorMode;\n   if (options && typeof options.write !== 'function') {\n     ({\n       stdout,\n       stderr = stdout,\n-      ignoreErrors = true\n+      ignoreErrors = true,\n+      colorMode = false\n     } = options);\n   } else {\n-    stdout = options;\n-    stderr = arguments[1];\n-    ignoreErrors = arguments[2] === undefined ? true : arguments[2];\n+    return new Console({\n+      stdout: options,\n+      stderr: arguments[1],\n+      ignoreErrors: arguments[2]\n+    });\n   }\n \n   if (!stdout || typeof stdout.write !== 'function') {\n@@ -94,7 +103,11 @@ function Console(options /* or: stdout, stderr, ignoreErrors = true */) {\n   prop.value = createWriteErrorHandler(stderr);\n   Object.defineProperty(this, '_stderrErrorHandler', prop);\n \n+  if (typeof colorMode !== 'boolean' && colorMode !== 'auto')\n+    throw new ERR_INVALID_ARG_VALUE('colorMode', colorMode);\n+\n   this[kCounts] = new Map();\n+  this[kColorMode] = colorMode;\n \n   Object.defineProperty(this, kGroupIndent, { writable: true });\n   this[kGroupIndent] = '';\n@@ -156,13 +169,33 @@ function write(ignoreErrors, stream, string, errorhandler, groupIndent) {\n   }\n }\n \n+const kColorInspectOptions = { colors: true };\n+const kNoColorInspectOptions = {};\n+Console.prototype[kGetInspectOptions] = function(stream) {\n+  let color = this[kColorMode];\n+  if (color === 'auto') {\n+    color = stream.isTTY && (\n+      typeof stream.getColorDepth === 'function' ?\n+        stream.getColorDepth() > 2 : true);\n+  }\n+\n+  return color ? kColorInspectOptions : kNoColorInspectOptions;\n+};\n+\n+Console.prototype[kFormatForStdout] = function(args) {\n+  const opts = this[kGetInspectOptions](this._stdout);\n+  return util.formatWithOptions(opts, ...args);\n+};\n+\n+Console.prototype[kFormatForStderr] = function(args) {\n+  const opts = this[kGetInspectOptions](this._stderr);\n+  return util.formatWithOptions(opts, ...args);\n+};\n+\n Console.prototype.log = function log(...args) {\n   write(this._ignoreErrors,\n         this._stdout,\n-        // The performance of .apply and the spread operator seems on par in V8\n-        // 6.3 but the spread operator, unlike .apply(), pushes the elements\n-        // onto the stack. That is, it makes stack overflows more likely.\n-        util.format.apply(null, args),\n+        this[kFormatForStdout](args),\n         this._stdoutErrorHandler,\n         this[kGroupIndent]);\n };\n@@ -173,14 +206,16 @@ Console.prototype.dirxml = Console.prototype.log;\n Console.prototype.warn = function warn(...args) {\n   write(this._ignoreErrors,\n         this._stderr,\n-        util.format.apply(null, args),\n+        this[kFormatForStderr](args),\n         this._stderrErrorHandler,\n         this[kGroupIndent]);\n };\n Console.prototype.error = Console.prototype.warn;\n \n Console.prototype.dir = function dir(object, options) {\n-  options = Object.assign({ customInspect: false }, options);\n+  options = Object.assign({\n+    customInspect: false\n+  }, this[kGetInspectOptions](this._stdout), options);\n   write(this._ignoreErrors,\n         this._stdout,\n         util.inspect(object, options),\n@@ -211,7 +246,7 @@ Console.prototype.timeEnd = function timeEnd(label = 'default') {\n Console.prototype.trace = function trace(...args) {\n   const err = {\n     name: 'Trace',\n-    message: util.format.apply(null, args)\n+    message: this[kFormatForStderr](args)\n   };\n   Error.captureStackTrace(err, trace);\n   this.error(err.stack);\n@@ -220,7 +255,7 @@ Console.prototype.trace = function trace(...args) {\n Console.prototype.assert = function assert(expression, ...args) {\n   if (!expression) {\n     args[0] = `Assertion failed${args.length === 0 ? '' : `: ${args[0]}`}`;\n-    this.warn(util.format.apply(null, args));\n+    this.warn(this[kFormatForStderr](args));\n   }\n };\n "
+        },
+        {
+            "sha": "945c21f28a27de1860427d4fc9e421fa9ddb377a",
+            "filename": "test/parallel/test-console-tty-colors.js",
+            "status": "added",
+            "additions": 46,
+            "deletions": 0,
+            "changes": 46,
+            "blob_url": "https://github.com/nodejs/node/blob/57e8793c4393aa3fafd87f289b19078b1918c166/test%2Fparallel%2Ftest-console-tty-colors.js",
+            "raw_url": "https://github.com/nodejs/node/raw/57e8793c4393aa3fafd87f289b19078b1918c166/test%2Fparallel%2Ftest-console-tty-colors.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-console-tty-colors.js?ref=57e8793c4393aa3fafd87f289b19078b1918c166",
+            "patch": "@@ -0,0 +1,46 @@\n+'use strict';\n+const common = require('../common');\n+const assert = require('assert');\n+const util = require('util');\n+const { Writable } = require('stream');\n+const { Console } = require('console');\n+\n+function check(isTTY, colorMode, expectedColorMode) {\n+  const items = [\n+    1,\n+    { a: 2 },\n+    [ 'foo' ],\n+    { '\\\\a': '\\\\bar' }\n+  ];\n+\n+  let i = 0;\n+  const stream = new Writable({\n+    write: common.mustCall((chunk, enc, cb) => {\n+      assert.strictEqual(chunk.trim(),\n+                         util.inspect(items[i++], {\n+                           colors: expectedColorMode\n+                         }));\n+      cb();\n+    }, items.length),\n+    decodeStrings: false\n+  });\n+  stream.isTTY = isTTY;\n+\n+  // Set ignoreErrors to `false` here so that we see assertion failures\n+  // from the `write()` call happen.\n+  const testConsole = new Console({\n+    stdout: stream,\n+    ignoreErrors: false,\n+    colorMode\n+  });\n+  for (const item of items) {\n+    testConsole.log(item);\n+  }\n+}\n+\n+check(true, 'auto', true);\n+check(false, 'auto', false);\n+check(true, true, true);\n+check(false, true, true);\n+check(true, false, false);\n+check(false, false, false);"
+        },
+        {
+            "sha": "4bac35c65dfc7006eba8f988237baa579c84c493",
+            "filename": "test/parallel/test-console.js",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/57e8793c4393aa3fafd87f289b19078b1918c166/test%2Fparallel%2Ftest-console.js",
+            "raw_url": "https://github.com/nodejs/node/raw/57e8793c4393aa3fafd87f289b19078b1918c166/test%2Fparallel%2Ftest-console.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-console.js?ref=57e8793c4393aa3fafd87f289b19078b1918c166",
+            "patch": "@@ -51,9 +51,11 @@ const custom_inspect = { foo: 'bar', inspect: () => 'inspect' };\n \n const strings = [];\n const errStrings = [];\n+process.stdout.isTTY = false;\n common.hijackStdout(function(data) {\n   strings.push(data);\n });\n+process.stderr.isTTY = false;\n common.hijackStderr(function(data) {\n   errStrings.push(data);\n });"
+        }
+    ],
+    "stats": {
+        "total": 123,
+        "additions": 106,
+        "deletions": 17
+    }
+}

@@ -1,0 +1,86 @@
+{
+    "author": "joyeecheung",
+    "message": "process: refactor coverage setup during bootstrap\n\n- Renamed `internal/process/write-coverage.js` to\n  `internal/coverage-gen/with_instrumentation.js`,\n  `internal/process/coverage.js` to\n  `internal/coverage-gen/with_profiler.js` to distinguish\n  the two better and added comments.\n- Separate the coverage directory setup and the connection\n  setup, moves the directory setup into `node.js` and\n  closer to the exit hooks because that's where it's used.\n- Moves the `process.reallyExit` overwrite and\n  `process.on('exit')` hooks setup into bootstrap/node.js\n  for clarity, and move them to a later stage of\n  bootstrap since they do not have to happen that early.\n\nPR-URL: https://github.com/nodejs/node/pull/25398\nReviewed-By: Ben Coe <bencoe@gmail.com>",
+    "sha": "b367ab2a6624b41bd59b751c61cf64ad91a9e2d6",
+    "files": [
+        {
+            "sha": "4554526298b0a04fd671350bf1b0a249f786d8a8",
+            "filename": "lib/internal/bootstrap/loaders.js",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 1,
+            "changes": 9,
+            "blob_url": "https://github.com/nodejs/node/blob/b367ab2a6624b41bd59b751c61cf64ad91a9e2d6/lib%2Finternal%2Fbootstrap%2Floaders.js",
+            "raw_url": "https://github.com/nodejs/node/raw/b367ab2a6624b41bd59b751c61cf64ad91a9e2d6/lib%2Finternal%2Fbootstrap%2Floaders.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fbootstrap%2Floaders.js?ref=b367ab2a6624b41bd59b751c61cf64ad91a9e2d6",
+            "patch": "@@ -329,7 +329,14 @@ NativeModule.prototype.compile = function() {\n // Coverage must be turned on early, so that we can collect\n // it for Node.js' own internal libraries.\n if (process.env.NODE_V8_COVERAGE) {\n-  NativeModule.require('internal/process/coverage').setup();\n+  if (internalBinding('config').hasInspector) {\n+    const coverage =\n+      NativeModule.require('internal/coverage-gen/with_profiler');\n+    // Inform the profiler to start collecting coverage\n+    coverage.startCoverageCollection();\n+  } else {\n+    process._rawDebug('NODE_V8_COVERAGE cannot be used without inspector');\n+  }\n }\n \n function internalBindingWhitelistHas(name) {"
+        },
+        {
+            "sha": "ca979af258745d71d5b45700d91bed65781e1871",
+            "filename": "lib/internal/bootstrap/node.js",
+            "status": "modified",
+            "additions": 39,
+            "deletions": 7,
+            "changes": 46,
+            "blob_url": "https://github.com/nodejs/node/blob/b367ab2a6624b41bd59b751c61cf64ad91a9e2d6/lib%2Finternal%2Fbootstrap%2Fnode.js",
+            "raw_url": "https://github.com/nodejs/node/raw/b367ab2a6624b41bd59b751c61cf64ad91a9e2d6/lib%2Finternal%2Fbootstrap%2Fnode.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fbootstrap%2Fnode.js?ref=b367ab2a6624b41bd59b751c61cf64ad91a9e2d6",
+            "patch": "@@ -158,13 +158,6 @@ function startup() {\n     setupProcessStdio(getStdout, getStdin, getStderr);\n   }\n \n-  if (global.__coverage__)\n-    NativeModule.require('internal/process/write-coverage').setup();\n-\n-  if (process.env.NODE_V8_COVERAGE) {\n-    NativeModule.require('internal/process/coverage').setupExitHooks();\n-  }\n-\n   if (config.hasInspector) {\n     NativeModule.require('internal/inspector_async_hook').setup();\n   }\n@@ -295,6 +288,45 @@ function startup() {\n     }\n   });\n \n+  // Set up coverage exit hooks.\n+  let originalReallyExit = process.reallyExit;\n+  // Core coverage generation using nyc instrumented lib/ files.\n+  // See `make coverage-build`. This does not affect user land.\n+  // TODO(joyeecheung): this and `with_instrumentation.js` can be\n+  // removed in favor of NODE_V8_COVERAGE once we switch to that\n+  // in https://coverage.nodejs.org/\n+  if (global.__coverage__) {\n+    const {\n+      writeCoverage\n+    } = NativeModule.require('internal/coverage-gen/with_instrumentation');\n+    process.on('exit', writeCoverage);\n+    originalReallyExit = process.reallyExit = (code) => {\n+      writeCoverage();\n+      originalReallyExit(code);\n+    };\n+  }\n+  // User-facing NODE_V8_COVERAGE environment variable that writes\n+  // ScriptCoverage to a specified file.\n+  if (process.env.NODE_V8_COVERAGE) {\n+    const cwd = NativeModule.require('internal/process/execution').tryGetCwd();\n+    const { resolve } = NativeModule.require('path');\n+    // Resolve the coverage directory to an absolute path, and\n+    // overwrite process.env so that the original path gets passed\n+    // to child processes even when they switch cwd.\n+    const coverageDirectory = resolve(cwd, process.env.NODE_V8_COVERAGE);\n+    process.env.NODE_V8_COVERAGE = coverageDirectory;\n+    const {\n+      writeCoverage,\n+      setCoverageDirectory\n+    } = NativeModule.require('internal/coverage-gen/with_profiler');\n+    setCoverageDirectory(coverageDirectory);\n+    process.on('exit', writeCoverage);\n+    process.reallyExit = (code) => {\n+      writeCoverage();\n+      originalReallyExit(code);\n+    };\n+  }\n+\n   const perf = internalBinding('performance');\n   const {\n     NODE_PERFORMANCE_MILESTONE_BOOTSTRAP_COMPLETE,"
+        },
+        {
+            "sha": "711a3c3f12b1c8980167c6cb3a2896d0dcafc34f",
+            "filename": "lib/internal/coverage-gen/with_instrumentation.js",
+            "status": "renamed",
+            "additions": 9,
+            "deletions": 14,
+            "changes": 23,
+            "blob_url": "https://github.com/nodejs/node/blob/b367ab2a6624b41bd59b751c61cf64ad91a9e2d6/lib%2Finternal%2Fcoverage-gen%2Fwith_instrumentation.js",
+            "raw_url": "https://github.com/nodejs/node/raw/b367ab2a6624b41bd59b751c61cf64ad91a9e2d6/lib%2Finternal%2Fcoverage-gen%2Fwith_instrumentation.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fcoverage-gen%2Fwith_instrumentation.js?ref=b367ab2a6624b41bd59b751c61cf64ad91a9e2d6",
+            "patch": "@@ -1,12 +1,16 @@\n 'use strict';\n-const path = require('path');\n-const { mkdirSync, writeFileSync } = require('fs');\n \n+// This file contains hooks for nyc instrumented lib/ files to collect\n+// JS coverage for core.\n+// See `make coverage-build`.\n function writeCoverage() {\n   if (!global.__coverage__) {\n     return;\n   }\n \n+  const path = require('path');\n+  const { mkdirSync, writeFileSync } = require('fs');\n+\n   const dirname = path.join(path.dirname(process.execPath), '.coverage');\n   const filename = `coverage-${process.pid}-${Date.now()}.json`;\n   try {\n@@ -27,15 +31,6 @@ function writeCoverage() {\n   }\n }\n \n-function setup() {\n-  const reallyReallyExit = process.reallyExit;\n-\n-  process.reallyExit = function(code) {\n-    writeCoverage();\n-    reallyReallyExit(code);\n-  };\n-\n-  process.on('exit', writeCoverage);\n-}\n-\n-exports.setup = setup;\n+module.exports = {\n+  writeCoverage\n+};",
+            "previous_filename": "lib/internal/process/write-coverage.js"
+        },
+        {
+            "sha": "6b17073939b658c25a0d1814d562860247459ce3",
+            "filename": "lib/internal/coverage-gen/with_profiler.js",
+            "status": "renamed",
+            "additions": 12,
+            "deletions": 29,
+            "changes": 41,
+            "blob_url": "https://github.com/nodejs/node/blob/b367ab2a6624b41bd59b751c61cf64ad91a9e2d6/lib%2Finternal%2Fcoverage-gen%2Fwith_profiler.js",
+            "raw_url": "https://github.com/nodejs/node/raw/b367ab2a6624b41bd59b751c61cf64ad91a9e2d6/lib%2Finternal%2Fcoverage-gen%2Fwith_profiler.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fcoverage-gen%2Fwith_profiler.js?ref=b367ab2a6624b41bd59b751c61cf64ad91a9e2d6",
+            "patch": "@@ -1,4 +1,8 @@\n 'use strict';\n+\n+// Implements coverage collection exposed by the `NODE_V8_COVERAGE`\n+// environment variable which can also be used in the user land.\n+\n let coverageConnection = null;\n let coverageDirectory;\n \n@@ -48,15 +52,7 @@ function disableAllAsyncHooks() {\n   hooks_array.forEach((hook) => { hook.disable(); });\n }\n \n-exports.writeCoverage = writeCoverage;\n-\n-function setup() {\n-  const { hasInspector } = internalBinding('config');\n-  if (!hasInspector) {\n-    process._rawDebug('inspector not enabled');\n-    return;\n-  }\n-\n+function startCoverageCollection() {\n   const { Connection } = internalBinding('inspector');\n   coverageConnection = new Connection((res) => {\n     if (coverageConnection._coverageCallback) {\n@@ -75,27 +71,14 @@ function setup() {\n       detailed: true\n     }\n   }));\n-\n-  try {\n-    const { cwd } = internalBinding('process_methods');\n-    const { resolve } = require('path');\n-    coverageDirectory = process.env.NODE_V8_COVERAGE =\n-      resolve(cwd(), process.env.NODE_V8_COVERAGE);\n-  } catch (err) {\n-    process._rawDebug(err.toString());\n-  }\n }\n \n-exports.setup = setup;\n-\n-function setupExitHooks() {\n-  const reallyReallyExit = process.reallyExit;\n-  process.reallyExit = function(code) {\n-    writeCoverage();\n-    reallyReallyExit(code);\n-  };\n-\n-  process.on('exit', writeCoverage);\n+function setCoverageDirectory(dir) {\n+  coverageDirectory = dir;\n }\n \n-exports.setupExitHooks = setupExitHooks;\n+module.exports = {\n+  startCoverageCollection,\n+  writeCoverage,\n+  setCoverageDirectory\n+};",
+            "previous_filename": "lib/internal/process/coverage.js"
+        },
+        {
+            "sha": "6d64c636b244352e27c2e5693117ebbf87b4362f",
+            "filename": "lib/internal/process/per_thread.js",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/b367ab2a6624b41bd59b751c61cf64ad91a9e2d6/lib%2Finternal%2Fprocess%2Fper_thread.js",
+            "raw_url": "https://github.com/nodejs/node/raw/b367ab2a6624b41bd59b751c61cf64ad91a9e2d6/lib%2Finternal%2Fprocess%2Fper_thread.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fprocess%2Fper_thread.js?ref=b367ab2a6624b41bd59b751c61cf64ad91a9e2d6",
+            "patch": "@@ -155,7 +155,7 @@ function wrapProcessMethods(binding) {\n   function kill(pid, sig) {\n     var err;\n     if (process.env.NODE_V8_COVERAGE) {\n-      const { writeCoverage } = require('internal/process/coverage');\n+      const { writeCoverage } = require('internal/coverage-gen/with_profiler');\n       writeCoverage();\n     }\n "
+        },
+        {
+            "sha": "071a108e374fd30b5ecba4e8e22932088c129ad4",
+            "filename": "node.gyp",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/nodejs/node/blob/b367ab2a6624b41bd59b751c61cf64ad91a9e2d6/node.gyp",
+            "raw_url": "https://github.com/nodejs/node/raw/b367ab2a6624b41bd59b751c61cf64ad91a9e2d6/node.gyp",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/node.gyp?ref=b367ab2a6624b41bd59b751c61cf64ad91a9e2d6",
+            "patch": "@@ -98,6 +98,8 @@\n       'lib/internal/console/constructor.js',\n       'lib/internal/console/global.js',\n       'lib/internal/console/inspector.js',\n+      'lib/internal/coverage-gen/with_profiler.js',\n+      'lib/internal/coverage-gen/with_instrumentation.js',\n       'lib/internal/crypto/certificate.js',\n       'lib/internal/crypto/cipher.js',\n       'lib/internal/crypto/diffiehellman.js',\n@@ -152,8 +154,6 @@\n       'lib/internal/process/warning.js',\n       'lib/internal/process/worker_thread_only.js',\n       'lib/internal/querystring.js',\n-      'lib/internal/process/write-coverage.js',\n-      'lib/internal/process/coverage.js',\n       'lib/internal/queue_microtask.js',\n       'lib/internal/readline.js',\n       'lib/internal/repl.js',"
+        }
+    ],
+    "stats": {
+        "total": 125,
+        "additions": 71,
+        "deletions": 54
+    }
+}

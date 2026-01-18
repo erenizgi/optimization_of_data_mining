@@ -1,0 +1,96 @@
+{
+    "author": "unknown",
+    "message": "n-api: initialize a module via a special symbol\n\nMuch like regular modules, N-API modules can also benefit from having\na special symbol which they can expose.\n\nFixes: https://github.com/nodejs/node/issues/19845\nPR-URL: https://github.com/nodejs/node/pull/20161\nReviewed-By: Ben Noordhuis <info@bnoordhuis.nl>",
+    "sha": "0f8caf23bed91cbbb19121a3c97bb21c703258ac",
+    "files": [
+        {
+            "sha": "26b5e87463948e1d37a179f19ad83f8c59a2ed9e",
+            "filename": "doc/api/n-api.md",
+            "status": "modified",
+            "additions": 26,
+            "deletions": 0,
+            "changes": 26,
+            "blob_url": "https://github.com/nodejs/node/blob/0f8caf23bed91cbbb19121a3c97bb21c703258ac/doc%2Fapi%2Fn-api.md",
+            "raw_url": "https://github.com/nodejs/node/raw/0f8caf23bed91cbbb19121a3c97bb21c703258ac/doc%2Fapi%2Fn-api.md",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/doc%2Fapi%2Fn-api.md?ref=0f8caf23bed91cbbb19121a3c97bb21c703258ac",
+            "patch": "@@ -982,6 +982,32 @@ napi_value Init(napi_env env, napi_value exports) {\n }\n ```\n \n+If you expect that your module will be loaded multiple times during the lifetime\n+of the Node.js process, you can use the `NAPI_MODULE_INIT` macro to initialize\n+your module:\n+\n+```C\n+NAPI_MODULE_INIT() {\n+  napi_value answer;\n+  napi_status result;\n+\n+  status = napi_create_int64(env, 42, &answer);\n+  if (status != napi_ok) return NULL;\n+\n+  status = napi_set_named_property(env, exports, \"answer\", answer);\n+  if (status != napi_ok) return NULL;\n+\n+  return exports;\n+}\n+```\n+\n+This macro includes `NAPI_MODULE`, and declares an `Init` function with a\n+special name and with visibility beyond the addon. This will allow Node.js to\n+initialize the module even if it is loaded multiple times.\n+\n+The variables `env` and `exports` will be available inside the function body\n+following the macro invocation.\n+\n For more details on setting properties on objects, see the section on\n [Working with JavaScript Properties][].\n "
+        },
+        {
+            "sha": "73746781983c78d84f206d9acde521a19eacdb09",
+            "filename": "src/node.cc",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/nodejs/node/blob/0f8caf23bed91cbbb19121a3c97bb21c703258ac/src%2Fnode.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/0f8caf23bed91cbbb19121a3c97bb21c703258ac/src%2Fnode.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode.cc?ref=0f8caf23bed91cbbb19121a3c97bb21c703258ac",
+            "patch": "@@ -2229,6 +2229,13 @@ inline InitializerCallback GetInitializerCallback(DLib* dlib) {\n   return reinterpret_cast<InitializerCallback>(dlib->GetSymbolAddress(name));\n }\n \n+inline napi_addon_register_func GetNapiInitializerCallback(DLib* dlib) {\n+  const char* name =\n+      STRINGIFY(NAPI_MODULE_INITIALIZER_BASE) STRINGIFY(NAPI_MODULE_VERSION);\n+  return\n+      reinterpret_cast<napi_addon_register_func>(dlib->GetSymbolAddress(name));\n+}\n+\n // DLOpen is process.dlopen(module, filename, flags).\n // Used to load 'module.node' dynamically shared objects.\n //\n@@ -2285,6 +2292,8 @@ static void DLOpen(const FunctionCallbackInfo<Value>& args) {\n   if (mp == nullptr) {\n     if (auto callback = GetInitializerCallback(&dlib)) {\n       callback(exports, module, context);\n+    } else if (auto napi_callback = GetNapiInitializerCallback(&dlib)) {\n+      napi_module_register_by_symbol(exports, module, context, napi_callback);\n     } else {\n       dlib.Close();\n       env->ThrowError(\"Module did not self-register.\");"
+        },
+        {
+            "sha": "4878cf241edc04e5bf01c0b3b1d1185da5eca39b",
+            "filename": "src/node_api.cc",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 5,
+            "changes": 15,
+            "blob_url": "https://github.com/nodejs/node/blob/0f8caf23bed91cbbb19121a3c97bb21c703258ac/src%2Fnode_api.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/0f8caf23bed91cbbb19121a3c97bb21c703258ac/src%2Fnode_api.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_api.cc?ref=0f8caf23bed91cbbb19121a3c97bb21c703258ac",
+            "patch": "@@ -858,16 +858,23 @@ void napi_module_register_cb(v8::Local<v8::Object> exports,\n                              v8::Local<v8::Value> module,\n                              v8::Local<v8::Context> context,\n                              void* priv) {\n-  napi_module* mod = static_cast<napi_module*>(priv);\n+  napi_module_register_by_symbol(exports, module, context,\n+      static_cast<napi_module*>(priv)->nm_register_func);\n+}\n+\n+}  // end of anonymous namespace\n \n+void napi_module_register_by_symbol(v8::Local<v8::Object> exports,\n+                                    v8::Local<v8::Value> module,\n+                                    v8::Local<v8::Context> context,\n+                                    napi_addon_register_func init) {\n   // Create a new napi_env for this module or reference one if a pre-existing\n   // one is found.\n   napi_env env = v8impl::GetEnv(context);\n \n   napi_value _exports;\n   NAPI_CALL_INTO_MODULE_THROW(env,\n-      _exports = mod->nm_register_func(env,\n-          v8impl::JsValueFromV8LocalValue(exports)));\n+      _exports = init(env, v8impl::JsValueFromV8LocalValue(exports)));\n \n   // If register function returned a non-null exports object different from\n   // the exports object we passed it, set that as the \"exports\" property of\n@@ -879,8 +886,6 @@ void napi_module_register_cb(v8::Local<v8::Object> exports,\n   }\n }\n \n-}  // end of anonymous namespace\n-\n // Registers a NAPI module.\n void napi_module_register(napi_module* mod) {\n   node::node_module* nm = new node::node_module {"
+        },
+        {
+            "sha": "b010d32db7b086cb2fffed34d43f6d1aee55cb6a",
+            "filename": "src/node_api.h",
+            "status": "modified",
+            "additions": 20,
+            "deletions": 1,
+            "changes": 21,
+            "blob_url": "https://github.com/nodejs/node/blob/0f8caf23bed91cbbb19121a3c97bb21c703258ac/src%2Fnode_api.h",
+            "raw_url": "https://github.com/nodejs/node/raw/0f8caf23bed91cbbb19121a3c97bb21c703258ac/src%2Fnode_api.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_api.h?ref=0f8caf23bed91cbbb19121a3c97bb21c703258ac",
+            "patch": "@@ -90,9 +90,28 @@ typedef struct {\n     }                                                                 \\\n   EXTERN_C_END\n \n-#define NAPI_MODULE(modname, regfunc) \\\n+#define NAPI_MODULE(modname, regfunc)                                 \\\n   NAPI_MODULE_X(modname, regfunc, NULL, 0)  // NOLINT (readability/null_usage)\n \n+#define NAPI_MODULE_INITIALIZER_BASE napi_register_module_v\n+\n+#define NAPI_MODULE_INITIALIZER_X(base, version)                      \\\n+    NAPI_MODULE_INITIALIZER_X_HELPER(base, version)\n+#define NAPI_MODULE_INITIALIZER_X_HELPER(base, version) base##version\n+\n+#define NAPI_MODULE_INITIALIZER                                       \\\n+  NAPI_MODULE_INITIALIZER_X(NAPI_MODULE_INITIALIZER_BASE,             \\\n+      NAPI_MODULE_VERSION)\n+\n+#define NAPI_MODULE_INIT()                                            \\\n+  EXTERN_C_START                                                      \\\n+  NAPI_MODULE_EXPORT napi_value                                       \\\n+  NAPI_MODULE_INITIALIZER(napi_env env, napi_value exports);          \\\n+  EXTERN_C_END                                                        \\\n+  NAPI_MODULE(NODE_GYP_MODULE_NAME, NAPI_MODULE_INITIALIZER)          \\\n+  napi_value NAPI_MODULE_INITIALIZER(napi_env env,                    \\\n+                                     napi_value exports)\n+\n #define NAPI_AUTO_LENGTH SIZE_MAX\n \n EXTERN_C_START"
+        },
+        {
+            "sha": "b8acfa63c26ecf04cf8614d398f186a3e439e4fa",
+            "filename": "src/node_internals.h",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 0,
+            "changes": 5,
+            "blob_url": "https://github.com/nodejs/node/blob/0f8caf23bed91cbbb19121a3c97bb21c703258ac/src%2Fnode_internals.h",
+            "raw_url": "https://github.com/nodejs/node/raw/0f8caf23bed91cbbb19121a3c97bb21c703258ac/src%2Fnode_internals.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_internals.h?ref=0f8caf23bed91cbbb19121a3c97bb21c703258ac",
+            "patch": "@@ -33,6 +33,7 @@\n #include \"tracing/trace_event.h\"\n #include \"node_perf_common.h\"\n #include \"node_debug_options.h\"\n+#include \"node_api.h\"\n \n #include <stdint.h>\n #include <stdlib.h>\n@@ -840,6 +841,10 @@ static inline const char *errno_string(int errorno) {\n \n }  // namespace node\n \n+void napi_module_register_by_symbol(v8::Local<v8::Object> exports,\n+                                    v8::Local<v8::Value> module,\n+                                    v8::Local<v8::Context> context,\n+                                    napi_addon_register_func init);\n \n #endif  // defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS\n "
+        },
+        {
+            "sha": "6efc14ee66e18f1727da27160771f1af9ecc0d44",
+            "filename": "test/addons-napi/1_hello_world/binding.c",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 3,
+            "changes": 4,
+            "blob_url": "https://github.com/nodejs/node/blob/0f8caf23bed91cbbb19121a3c97bb21c703258ac/test%2Faddons-napi%2F1_hello_world%2Fbinding.c",
+            "raw_url": "https://github.com/nodejs/node/raw/0f8caf23bed91cbbb19121a3c97bb21c703258ac/test%2Faddons-napi%2F1_hello_world%2Fbinding.c",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Faddons-napi%2F1_hello_world%2Fbinding.c?ref=0f8caf23bed91cbbb19121a3c97bb21c703258ac",
+            "patch": "@@ -10,10 +10,8 @@ napi_value Method(napi_env env, napi_callback_info info) {\n   return world;\n }\n \n-napi_value Init(napi_env env, napi_value exports) {\n+NAPI_MODULE_INIT() {\n   napi_property_descriptor desc = DECLARE_NAPI_PROPERTY(\"hello\", Method);\n   NAPI_CALL(env, napi_define_properties(env, exports, 1, &desc));\n   return exports;\n }\n-\n-NAPI_MODULE(NODE_GYP_MODULE_NAME, Init)"
+        },
+        {
+            "sha": "d1d67d34f688c90aafc459fdbdd3b707d5dea37f",
+            "filename": "test/addons-napi/1_hello_world/test.js",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 2,
+            "changes": 11,
+            "blob_url": "https://github.com/nodejs/node/blob/0f8caf23bed91cbbb19121a3c97bb21c703258ac/test%2Faddons-napi%2F1_hello_world%2Ftest.js",
+            "raw_url": "https://github.com/nodejs/node/raw/0f8caf23bed91cbbb19121a3c97bb21c703258ac/test%2Faddons-napi%2F1_hello_world%2Ftest.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Faddons-napi%2F1_hello_world%2Ftest.js?ref=0f8caf23bed91cbbb19121a3c97bb21c703258ac",
+            "patch": "@@ -1,6 +1,13 @@\n 'use strict';\n const common = require('../../common');\n const assert = require('assert');\n-const addon = require(`./build/${common.buildType}/binding`);\n+const bindingPath = require.resolve(`./build/${common.buildType}/binding`);\n+const binding = require(bindingPath);\n+assert.strictEqual(binding.hello(), 'world');\n+console.log('binding.hello() =', binding.hello());\n \n-assert.strictEqual(addon.hello(), 'world');\n+// Test multiple loading of the same module.\n+delete require.cache[bindingPath];\n+const rebinding = require(bindingPath);\n+assert.strictEqual(rebinding.hello(), 'world');\n+assert.notStrictEqual(binding.hello, rebinding.hello);"
+        }
+    ],
+    "stats": {
+        "total": 91,
+        "additions": 80,
+        "deletions": 11
+    }
+}

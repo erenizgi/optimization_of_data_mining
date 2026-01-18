@@ -1,0 +1,36 @@
+{
+    "author": "aaugustin",
+    "message": "Fixed #17476 -- Ensure timezone-dependant cache keys only use ASCII characters, especially on Windows.\n\n\ngit-svn-id: http://code.djangoproject.com/svn/django/trunk@17286 bcc190cf-cafb-0310-a4f2-bffc1f526a37",
+    "sha": "3367913c3db97a15b64f03646ac2c4486a77376f",
+    "files": [
+        {
+            "sha": "7ef3680db2ccdc617f64f2d88af0d4b331afbc2f",
+            "filename": "django/utils/cache.py",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 4,
+            "changes": 11,
+            "blob_url": "https://github.com/django/django/blob/3367913c3db97a15b64f03646ac2c4486a77376f/django%2Futils%2Fcache.py",
+            "raw_url": "https://github.com/django/django/raw/3367913c3db97a15b64f03646ac2c4486a77376f/django%2Futils%2Fcache.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Futils%2Fcache.py?ref=3367913c3db97a15b64f03646ac2c4486a77376f",
+            "patch": "@@ -23,7 +23,7 @@\n \n from django.conf import settings\n from django.core.cache import get_cache\n-from django.utils.encoding import smart_str, iri_to_uri\n+from django.utils.encoding import smart_str, iri_to_uri, force_unicode\n from django.utils.http import http_date\n from django.utils.timezone import get_current_timezone_name\n from django.utils.translation import get_language\n@@ -165,9 +165,12 @@ def _i18n_cache_key_suffix(request, cache_key):\n         # which in turn can also fall back to settings.LANGUAGE_CODE\n         cache_key += '.%s' % getattr(request, 'LANGUAGE_CODE', get_language())\n     if settings.USE_TZ:\n-        # Windows uses non-standard timezone names that may include spaces,\n-        # which triggers CacheKeyWarning.\n-        cache_key += '.%s' % get_current_timezone_name().replace(' ', '_')\n+        # The datetime module doesn't restrict the output of tzname().\n+        # Windows is known to use non-standard, locale-dependant names.\n+        # User-defined tzinfo classes may return absolutely anything.\n+        # Hence this paranoid conversion to create a valid cache key.\n+        tz_name = force_unicode(get_current_timezone_name(), errors='ignore')\n+        cache_key += '.%s' % tz_name.encode('ascii', 'ignore').replace(' ', '_')\n     return cache_key\n \n def _generate_cache_key(request, method, headerlist, key_prefix):"
+        },
+        {
+            "sha": "d31a5e0d872134eb13ce14ee6eb6d31e62f9b207",
+            "filename": "tests/regressiontests/cache/tests.py",
+            "status": "modified",
+            "additions": 29,
+            "deletions": 2,
+            "changes": 31,
+            "blob_url": "https://github.com/django/django/blob/3367913c3db97a15b64f03646ac2c4486a77376f/tests%2Fregressiontests%2Fcache%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/3367913c3db97a15b64f03646ac2c4486a77376f/tests%2Fregressiontests%2Fcache%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fcache%2Ftests.py?ref=3367913c3db97a15b64f03646ac2c4486a77376f",
+            "patch": "@@ -28,6 +28,7 @@\n from django.utils import timezone, translation, unittest\n from django.utils.cache import (patch_vary_headers, get_cache_key,\n     learn_cache_key, patch_cache_control, patch_response_headers)\n+from django.utils.encoding import force_unicode\n from django.views.decorators.cache import cache_page\n \n from .models import Poll, expensive_calculation\n@@ -1270,7 +1271,10 @@ def test_cache_key_i18n_formatting(self):\n     @override_settings(USE_I18N=False, USE_L10N=False, USE_TZ=True)\n     def test_cache_key_i18n_timezone(self):\n         request = self._get_request()\n-        tz = timezone.get_current_timezone_name().replace(' ', '_')\n+        # This is tightly coupled to the implementation,\n+        # but it's the most straightforward way to test the key.\n+        tz = force_unicode(timezone.get_current_timezone_name(), errors='ignore')\n+        tz = tz.encode('ascii', 'ignore').replace(' ', '_')\n         response = HttpResponse()\n         key = learn_cache_key(request, response)\n         self.assertIn(tz, key, \"Cache keys should include the time zone name when time zones are active\")\n@@ -1281,12 +1285,35 @@ def test_cache_key_i18n_timezone(self):\n     def test_cache_key_no_i18n (self):\n         request = self._get_request()\n         lang = translation.get_language()\n-        tz = timezone.get_current_timezone_name().replace(' ', '_')\n+        tz = force_unicode(timezone.get_current_timezone_name(), errors='ignore')\n+        tz = tz.encode('ascii', 'ignore').replace(' ', '_')\n         response = HttpResponse()\n         key = learn_cache_key(request, response)\n         self.assertNotIn(lang, key, \"Cache keys shouldn't include the language name when i18n isn't active\")\n         self.assertNotIn(tz, key, \"Cache keys shouldn't include the time zone name when i18n isn't active\")\n \n+    @override_settings(USE_I18N=False, USE_L10N=False, USE_TZ=True)\n+    def test_cache_key_with_non_ascii_tzname(self):\n+        # Regression test for #17476\n+        class CustomTzName(timezone.UTC):\n+            name = ''\n+            def tzname(self, dt):\n+                return self.name\n+\n+        request = self._get_request()\n+        response = HttpResponse()\n+        with timezone.override(CustomTzName()):\n+            CustomTzName.name = 'Hora estándar de Argentina'    # UTF-8 string\n+            sanitized_name = 'Hora_estndar_de_Argentina'\n+            self.assertIn(sanitized_name, learn_cache_key(request, response),\n+                    \"Cache keys should include the time zone name when time zones are active\")\n+\n+            CustomTzName.name = u'Hora estándar de Argentina'    # unicode\n+            sanitized_name = 'Hora_estndar_de_Argentina'\n+            self.assertIn(sanitized_name, learn_cache_key(request, response),\n+                    \"Cache keys should include the time zone name when time zones are active\")\n+\n+\n     @override_settings(\n             CACHE_MIDDLEWARE_KEY_PREFIX=\"test\",\n             CACHE_MIDDLEWARE_SECONDS=60,"
+        }
+    ],
+    "stats": {
+        "total": 42,
+        "additions": 36,
+        "deletions": 6
+    }
+}

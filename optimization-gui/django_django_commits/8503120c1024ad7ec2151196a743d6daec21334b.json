@@ -1,0 +1,36 @@
+{
+    "author": "vdboor",
+    "message": "Fixed #15849 -- Made IfChanged node thread safe.\n\nPreviously, the ifchanged node stored state on `self._last_seen`,\nthereby giving undesired results when the node is reused by another\nthread at the same time (e.g. globally caching a Template object).\n\nThanks to akaihola for the report and Diederik van der Boor and\nBas Peschier for the patch.",
+    "sha": "8503120c1024ad7ec2151196a743d6daec21334b",
+    "files": [
+        {
+            "sha": "7c0772cda847add7025217df9fdc3d36e53d86b2",
+            "filename": "django/template/defaulttags.py",
+            "status": "modified",
+            "additions": 21,
+            "deletions": 9,
+            "changes": 30,
+            "blob_url": "https://github.com/django/django/blob/8503120c1024ad7ec2151196a743d6daec21334b/django%2Ftemplate%2Fdefaulttags.py",
+            "raw_url": "https://github.com/django/django/raw/8503120c1024ad7ec2151196a743d6daec21334b/django%2Ftemplate%2Fdefaulttags.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Ftemplate%2Fdefaulttags.py?ref=8503120c1024ad7ec2151196a743d6daec21334b",
+            "patch": "@@ -215,32 +215,44 @@ class IfChangedNode(Node):\n \n     def __init__(self, nodelist_true, nodelist_false, *varlist):\n         self.nodelist_true, self.nodelist_false = nodelist_true, nodelist_false\n-        self._last_seen = None\n         self._varlist = varlist\n-        self._id = str(id(self))\n \n     def render(self, context):\n-        if 'forloop' in context and self._id not in context['forloop']:\n-            self._last_seen = None\n-            context['forloop'][self._id] = 1\n+        # Init state storage\n+        state_frame = self._get_context_stack_frame(context)\n+        if self not in state_frame:\n+            state_frame[self] = None\n+\n         try:\n             if self._varlist:\n                 # Consider multiple parameters.  This automatically behaves\n                 # like an OR evaluation of the multiple variables.\n                 compare_to = [var.resolve(context, True) for var in self._varlist]\n             else:\n+                # The \"{% ifchanged %}\" syntax (without any variables) compares the rendered output.\n                 compare_to = self.nodelist_true.render(context)\n         except VariableDoesNotExist:\n             compare_to = None\n \n-        if compare_to != self._last_seen:\n-            self._last_seen = compare_to\n-            content = self.nodelist_true.render(context)\n-            return content\n+        if compare_to != state_frame[self]:\n+            state_frame[self] = compare_to\n+            return self.nodelist_true.render(context)\n         elif self.nodelist_false:\n             return self.nodelist_false.render(context)\n         return ''\n \n+    def _get_context_stack_frame(self, context):\n+        # The Context object behaves like a stack where each template tag can create a new scope.\n+        # Find the place where to store the state to detect changes.\n+        if 'forloop' in context:\n+            # Ifchanged is bound to the local for loop.\n+            # When there is a loop-in-loop, the state is bound to the inner loop,\n+            # so it resets when the outer loop continues.\n+            return context['forloop']\n+        else:\n+            # Using ifchanged outside loops. Effectively this is a no-op because the state is associated with 'self'.\n+            return context.render_context\n+\n class IfEqualNode(Node):\n     child_nodelists = ('nodelist_true', 'nodelist_false')\n "
+        },
+        {
+            "sha": "28d85cae9da04025464e307b72cb01a8e60417f2",
+            "filename": "tests/regressiontests/templates/tests.py",
+            "status": "modified",
+            "additions": 21,
+            "deletions": 0,
+            "changes": 21,
+            "blob_url": "https://github.com/django/django/blob/8503120c1024ad7ec2151196a743d6daec21334b/tests%2Fregressiontests%2Ftemplates%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/8503120c1024ad7ec2151196a743d6daec21334b/tests%2Fregressiontests%2Ftemplates%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Ftemplates%2Ftests.py?ref=8503120c1024ad7ec2151196a743d6daec21334b",
+            "patch": "@@ -420,6 +420,27 @@ def test_invalid_block_suggestion(self):\n         except TemplateSyntaxError as e:\n             self.assertEqual(e.args[0], \"Invalid block tag: 'endblock', expected 'elif', 'else' or 'endif'\")\n \n+    def test_ifchanged_concurrency(self):\n+        # Tests for #15849\n+        template = Template('[0{% for x in foo %},{% with var=get_value %}{% ifchanged %}{{ var }}{% endifchanged %}{% endwith %}{% endfor %}]')\n+\n+        # Using generator to mimic concurrency.\n+        # The generator is not passed to the 'for' loop, because it does a list(values)\n+        # instead, call gen.next() in the template to control the generator.\n+        def gen():\n+            yield 1\n+            yield 2\n+            # Simulate that another thread is now rendering.\n+            # When the IfChangeNode stores state at 'self' it stays at '3' and skip the last yielded value below.\n+            iter2 = iter([1, 2, 3])\n+            output2 = template.render(Context({'foo': range(3), 'get_value': lambda: next(iter2)}))\n+            self.assertEqual(output2, '[0,1,2,3]', 'Expected [0,1,2,3] in second parallel template, got {0}'.format(output2))\n+            yield 3\n+\n+        gen1 = gen()\n+        output1 = template.render(Context({'foo': range(3), 'get_value': lambda: next(gen1)}))\n+        self.assertEqual(output1, '[0,1,2,3]', 'Expected [0,1,2,3] in first template, got {0}'.format(output1))\n+\n     def test_templates(self):\n         template_tests = self.get_template_tests()\n         filter_tests = filters.get_filter_tests()"
+        }
+    ],
+    "stats": {
+        "total": 51,
+        "additions": 42,
+        "deletions": 9
+    }
+}

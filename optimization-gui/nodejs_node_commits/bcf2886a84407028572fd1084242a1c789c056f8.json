@@ -1,0 +1,48 @@
+{
+    "author": "albertstill",
+    "message": "http: return HTTP 431 on HPE_HEADER_OVERFLOW error\n\nInstead of returning a generic 400 response when the\nmax header size is reached, return a 431 Request Header\nFields Too Large.\n\nThis is a semver-major because it changes the HTTP\nstatus code for requests that trigger the header\noverflow error.\n\nPR-URL: https://github.com/nodejs/node/pull/25605\nFixes: https://github.com/nodejs/node/issues/25528\nRefs: https://tools.ietf.org/html/rfc6585#section-5\n\nReviewed-By: Matteo Collina <matteo.collina@gmail.com>\nReviewed-By: Sakthipriyan Vairamani <thechargingvolcano@gmail.com>\nReviewed-By: Luigi Pinca <luigipinca@gmail.com>\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "bcf2886a84407028572fd1084242a1c789c056f8",
+    "files": [
+        {
+            "sha": "149fc536687f370bf7df272b51292a2c909bf6c5",
+            "filename": "doc/api/http.md",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 2,
+            "changes": 11,
+            "blob_url": "https://github.com/nodejs/node/blob/bcf2886a84407028572fd1084242a1c789c056f8/doc%2Fapi%2Fhttp.md",
+            "raw_url": "https://github.com/nodejs/node/raw/bcf2886a84407028572fd1084242a1c789c056f8/doc%2Fapi%2Fhttp.md",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/doc%2Fapi%2Fhttp.md?ref=bcf2886a84407028572fd1084242a1c789c056f8",
+            "patch": "@@ -829,6 +829,10 @@ changes:\n     description: The `rawPacket` is the current buffer that just parsed. Adding\n                  this buffer to the error object of `'clientError'` event is to\n                  make it possible that developers can log the broken packet.\n+  - version: REPLACEME\n+    pr-url: https://github.com/nodejs/node/pull/25605\n+    description: The default behavior will return a 431 Request Header\n+                 Fields Too Large if a HPE_HEADER_OVERFLOW error occurs.\n -->\n \n * `exception` {Error}\n@@ -839,8 +843,10 @@ Listener of this event is responsible for closing/destroying the underlying\n socket. For example, one may wish to more gracefully close the socket with a\n custom HTTP response instead of abruptly severing the connection.\n \n-Default behavior is to close the socket with an HTTP '400 Bad Request' response\n-if possible, otherwise the socket is immediately destroyed.\n+Default behavior is to try close the socket with a HTTP '400 Bad Request',\n+or a HTTP '431 Request Header Fields Too Large' in the case of a\n+[`HPE_HEADER_OVERFLOW`][] error. If the socket is not writable it is\n+immediately destroyed.\n \n `socket` is the [`net.Socket`][] object that the error originated from.\n \n@@ -2171,3 +2177,4 @@ not abort the request or do anything besides add a `'timeout'` event.\n [`url.parse()`]: url.html#url_url_parse_urlstring_parsequerystring_slashesdenotehost\n [Readable Stream]: stream.html#stream_class_stream_readable\n [Stream]: stream.html#stream_stream\n+[`HPE_HEADER_OVERFLOW`]: errors.html#errors_hpe_header_overflow"
+        },
+        {
+            "sha": "5a714da6b6c4283cf70b74fe8c6da755233dffe6",
+            "filename": "lib/_http_server.js",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 1,
+            "changes": 7,
+            "blob_url": "https://github.com/nodejs/node/blob/bcf2886a84407028572fd1084242a1c789c056f8/lib%2F_http_server.js",
+            "raw_url": "https://github.com/nodejs/node/raw/bcf2886a84407028572fd1084242a1c789c056f8/lib%2F_http_server.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2F_http_server.js?ref=bcf2886a84407028572fd1084242a1c789c056f8",
+            "patch": "@@ -507,14 +507,19 @@ const noop = () => {};\n const badRequestResponse = Buffer.from(\n   `HTTP/1.1 400 ${STATUS_CODES[400]}${CRLF}${CRLF}`, 'ascii'\n );\n+const requestHeaderFieldsTooLargeResponse = Buffer.from(\n+  `HTTP/1.1 431 ${STATUS_CODES[431]}${CRLF}${CRLF}`, 'ascii'\n+);\n function socketOnError(e) {\n   // Ignore further errors\n   this.removeListener('error', socketOnError);\n   this.on('error', noop);\n \n   if (!this.server.emit('clientError', e, this)) {\n     if (this.writable) {\n-      this.write(badRequestResponse);\n+      const response = e.code === 'HPE_HEADER_OVERFLOW' ?\n+        requestHeaderFieldsTooLargeResponse : badRequestResponse;\n+      this.write(response);\n     }\n     this.destroy(e);\n   }"
+        },
+        {
+            "sha": "a9bf5cbfa086013f159f2ee319febb6e03d7322c",
+            "filename": "test/parallel/test-http-header-overflow.js",
+            "status": "added",
+            "additions": 47,
+            "deletions": 0,
+            "changes": 47,
+            "blob_url": "https://github.com/nodejs/node/blob/bcf2886a84407028572fd1084242a1c789c056f8/test%2Fparallel%2Ftest-http-header-overflow.js",
+            "raw_url": "https://github.com/nodejs/node/raw/bcf2886a84407028572fd1084242a1c789c056f8/test%2Fparallel%2Ftest-http-header-overflow.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-http-header-overflow.js?ref=bcf2886a84407028572fd1084242a1c789c056f8",
+            "patch": "@@ -0,0 +1,47 @@\n+'use strict';\n+const assert = require('assert');\n+const { createServer, maxHeaderSize } = require('http');\n+const { createConnection } = require('net');\n+const { expectsError, mustCall } = require('../common');\n+\n+const CRLF = '\\r\\n';\n+const DUMMY_HEADER_NAME = 'Cookie: ';\n+const DUMMY_HEADER_VALUE = 'a'.repeat(\n+  // plus one is to make it 1 byte too big\n+  maxHeaderSize - DUMMY_HEADER_NAME.length - (2 * CRLF.length) + 1\n+);\n+const PAYLOAD_GET = 'GET /blah HTTP/1.1';\n+const PAYLOAD = PAYLOAD_GET + CRLF +\n+  DUMMY_HEADER_NAME + DUMMY_HEADER_VALUE + CRLF.repeat(2);\n+\n+const server = createServer();\n+\n+server.on('connection', mustCall((socket) => {\n+  socket.on('error', expectsError({\n+    type: Error,\n+    message: 'Parse Error',\n+    code: 'HPE_HEADER_OVERFLOW',\n+    bytesParsed: maxHeaderSize + PAYLOAD_GET.length,\n+    rawPacket: Buffer.from(PAYLOAD)\n+  }));\n+}));\n+\n+server.listen(0, mustCall(() => {\n+  const c = createConnection(server.address().port);\n+  let received = '';\n+\n+  c.on('connect', mustCall(() => {\n+    c.write(PAYLOAD);\n+  }));\n+  c.on('data', mustCall((data) => {\n+    received += data.toString();\n+  }));\n+  c.on('end', mustCall(() => {\n+    assert.strictEqual(\n+      received,\n+      'HTTP/1.1 431 Request Header Fields Too Large\\r\\n\\r\\n'\n+    );\n+    c.end();\n+  }));\n+  c.on('close', mustCall(() => server.close()));\n+}));"
+        }
+    ],
+    "stats": {
+        "total": 65,
+        "additions": 62,
+        "deletions": 3
+    }
+}

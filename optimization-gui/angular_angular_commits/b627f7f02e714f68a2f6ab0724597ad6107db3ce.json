@@ -1,0 +1,84 @@
+{
+    "author": "JoostK",
+    "message": "test(compiler-cli): improve test performance using shared source file cache (#38909)\n\nSome compiler tests take a long time to run, even using multiple\nexecutors. A profiling session revealed that most time is spent in\nparsing source files, especially the default libraries are expensive to\nparse.\n\nThe default library files are constant across all tests, so this commit\nintroduces a shared cache of parsed source files of the default\nlibraries. This achieves a significant improvement for several targets\non my machine:\n\n//packages/compiler-cli/test/compliance: from 23s to 5s.\n//packages/compiler-cli/test/ngtsc: from 115s to 11s.\n\nNote that the number of shards for the compliance tests has been halved,\nas the extra shards no longer provide any speedup.\n\nPR Close #38909",
+    "sha": "b627f7f02e714f68a2f6ab0724597ad6107db3ce",
+    "files": [
+        {
+            "sha": "b37fe372c1692e8c18fb88c7f599265d9ff37183",
+            "filename": "packages/compiler-cli/test/compliance/BUILD.bazel",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/angular/angular/blob/b627f7f02e714f68a2f6ab0724597ad6107db3ce/packages%2Fcompiler-cli%2Ftest%2Fcompliance%2FBUILD.bazel",
+            "raw_url": "https://github.com/angular/angular/raw/b627f7f02e714f68a2f6ab0724597ad6107db3ce/packages%2Fcompiler-cli%2Ftest%2Fcompliance%2FBUILD.bazel",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Ftest%2Fcompliance%2FBUILD.bazel?ref=b627f7f02e714f68a2f6ab0724597ad6107db3ce",
+            "patch": "@@ -22,7 +22,7 @@ jasmine_node_test(\n     data = [\n         \"//packages/compiler-cli/test/ngtsc/fake_core:npm_package\",\n     ],\n-    shard_count = 4,\n+    shard_count = 2,\n     tags = [\n         \"ivy-only\",\n     ],"
+        },
+        {
+            "sha": "5c504e39cf6b26871bed8afdb5fca8f77a10bb26",
+            "filename": "packages/compiler-cli/test/helpers/index.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/angular/angular/blob/b627f7f02e714f68a2f6ab0724597ad6107db3ce/packages%2Fcompiler-cli%2Ftest%2Fhelpers%2Findex.ts",
+            "raw_url": "https://github.com/angular/angular/raw/b627f7f02e714f68a2f6ab0724597ad6107db3ce/packages%2Fcompiler-cli%2Ftest%2Fhelpers%2Findex.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Ftest%2Fhelpers%2Findex.ts?ref=b627f7f02e714f68a2f6ab0724597ad6107db3ce",
+            "patch": "@@ -7,3 +7,4 @@\n  */\n export {getAngularPackagesFromRunfiles, resolveNpmTreeArtifact} from './src/runfile_helpers';\n export * from './src/mock_file_loading';\n+export * from './src/cached_source_files';"
+        },
+        {
+            "sha": "64dbd95529c49b17ebc29e9655bb90133e83876e",
+            "filename": "packages/compiler-cli/test/helpers/src/cached_source_files.ts",
+            "status": "added",
+            "additions": 44,
+            "deletions": 0,
+            "changes": 44,
+            "blob_url": "https://github.com/angular/angular/blob/b627f7f02e714f68a2f6ab0724597ad6107db3ce/packages%2Fcompiler-cli%2Ftest%2Fhelpers%2Fsrc%2Fcached_source_files.ts",
+            "raw_url": "https://github.com/angular/angular/raw/b627f7f02e714f68a2f6ab0724597ad6107db3ce/packages%2Fcompiler-cli%2Ftest%2Fhelpers%2Fsrc%2Fcached_source_files.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Ftest%2Fhelpers%2Fsrc%2Fcached_source_files.ts?ref=b627f7f02e714f68a2f6ab0724597ad6107db3ce",
+            "patch": "@@ -0,0 +1,44 @@\n+/**\n+ * @license\n+ * Copyright Google LLC All Rights Reserved.\n+ *\n+ * Use of this source code is governed by an MIT-style license that can be\n+ * found in the LICENSE file at https://angular.io/license\n+ */\n+\n+import * as ts from 'typescript';\n+import {basename} from '../../../src/ngtsc/file_system';\n+\n+// A cache of source files that are typically used across tests and are expensive to parse.\n+let sourceFileCache = new Map<string, ts.SourceFile>();\n+\n+/**\n+ * If the `fileName` is determined to benefit from caching across tests, a parsed `ts.SourceFile`\n+ * is returned from a shared cache. If caching is not applicable for the requested `fileName`, then\n+ * `null` is returned.\n+ *\n+ * Even if a `ts.SourceFile` already exists for the given `fileName` will the contents be loaded\n+ * from disk, such that it can be verified whether the cached `ts.SourceFile` is identical to the\n+ * disk contents. If there is a difference, a new `ts.SourceFile` is parsed from the loaded contents\n+ * which replaces the prior cache entry.\n+ *\n+ * @param fileName the path of the file to request a source file for.\n+ * @param load a callback to load the contents of the file; this is even called when a cache entry\n+ * is available to verify that the cached `ts.SourceFile` corresponds with the contents on disk.\n+ */\n+export function getCachedSourceFile(\n+    fileName: string, load: () => string | undefined): ts.SourceFile|null {\n+  if (!/^lib\\..+\\.d\\.ts$/.test(basename(fileName))) {\n+    return null;\n+  }\n+\n+  const content = load();\n+  if (content === undefined) {\n+    return null;\n+  }\n+  if (!sourceFileCache.has(fileName) || sourceFileCache.get(fileName)!.text !== content) {\n+    const sf = ts.createSourceFile(fileName, content, ts.ScriptTarget.ES2015);\n+    sourceFileCache.set(fileName, sf);\n+  }\n+  return sourceFileCache.get(fileName)!;\n+}"
+        },
+        {
+            "sha": "869a22e1fca936d4c804a97e01ddabf913e29f1e",
+            "filename": "packages/compiler-cli/test/ngtsc/env.ts",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 1,
+            "changes": 13,
+            "blob_url": "https://github.com/angular/angular/blob/b627f7f02e714f68a2f6ab0724597ad6107db3ce/packages%2Fcompiler-cli%2Ftest%2Fngtsc%2Fenv.ts",
+            "raw_url": "https://github.com/angular/angular/raw/b627f7f02e714f68a2f6ab0724597ad6107db3ce/packages%2Fcompiler-cli%2Ftest%2Fngtsc%2Fenv.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Ftest%2Fngtsc%2Fenv.ts?ref=b627f7f02e714f68a2f6ab0724597ad6107db3ce",
+            "patch": "@@ -18,6 +18,7 @@ import {IndexedComponent} from '../../src/ngtsc/indexer';\n import {NgtscProgram} from '../../src/ngtsc/program';\n import {LazyRoute} from '../../src/ngtsc/routing';\n import {setWrapHostForTest} from '../../src/transformers/compiler_host';\n+import {getCachedSourceFile} from '../helpers';\n \n \n /**\n@@ -266,7 +267,17 @@ export class NgtscTestEnvironment {\n   }\n }\n \n-class AugmentedCompilerHost extends NgtscCompilerHost {\n+class NgtscTestCompilerHost extends NgtscCompilerHost {\n+  getSourceFile(fileName: string, languageVersion: ts.ScriptTarget): ts.SourceFile|undefined {\n+    const cachedSf = getCachedSourceFile(fileName, () => this.readFile(fileName));\n+    if (cachedSf !== null) {\n+      return cachedSf;\n+    }\n+    return super.getSourceFile(fileName, languageVersion);\n+  }\n+}\n+\n+class AugmentedCompilerHost extends NgtscTestCompilerHost {\n   delegate!: ts.CompilerHost;\n }\n "
+        },
+        {
+            "sha": "53444e27382efb31f164a15e0e86459b7709bbc1",
+            "filename": "packages/compiler/test/BUILD.bazel",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/angular/angular/blob/b627f7f02e714f68a2f6ab0724597ad6107db3ce/packages%2Fcompiler%2Ftest%2FBUILD.bazel",
+            "raw_url": "https://github.com/angular/angular/raw/b627f7f02e714f68a2f6ab0724597ad6107db3ce/packages%2Fcompiler%2Ftest%2FBUILD.bazel",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler%2Ftest%2FBUILD.bazel?ref=b627f7f02e714f68a2f6ab0724597ad6107db3ce",
+            "patch": "@@ -29,6 +29,7 @@ ts_library(\n         \"//packages:types\",\n         \"//packages/compiler\",\n         \"//packages/compiler-cli\",\n+        \"//packages/compiler-cli/test/helpers\",\n         \"@npm//typescript\",\n     ],\n )"
+        },
+        {
+            "sha": "006678439a6e2b06c6f52dffbfef6d82cf70695a",
+            "filename": "packages/compiler/test/aot/test_util.ts",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 3,
+            "changes": 15,
+            "blob_url": "https://github.com/angular/angular/blob/b627f7f02e714f68a2f6ab0724597ad6107db3ce/packages%2Fcompiler%2Ftest%2Faot%2Ftest_util.ts",
+            "raw_url": "https://github.com/angular/angular/raw/b627f7f02e714f68a2f6ab0724597ad6107db3ce/packages%2Fcompiler%2Ftest%2Faot%2Ftest_util.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler%2Ftest%2Faot%2Ftest_util.ts?ref=b627f7f02e714f68a2f6ab0724597ad6107db3ce",
+            "patch": "@@ -10,6 +10,7 @@ import {AotCompilerHost, AotCompilerOptions, createAotCompiler, GeneratedFile, t\n import {MetadataBundlerHost} from '@angular/compiler-cli/src/metadata/bundler';\n import {MetadataCollector} from '@angular/compiler-cli/src/metadata/collector';\n import {ModuleMetadata} from '@angular/compiler-cli/src/metadata/index';\n+import {getCachedSourceFile} from '@angular/compiler-cli/test/helpers';\n import {newArray} from '@angular/compiler/src/util';\n import * as fs from 'fs';\n import * as path from 'path';\n@@ -182,6 +183,10 @@ export class EmittingCompilerHost implements ts.CompilerHost {\n       onError?: (message: string) => void): ts.SourceFile {\n     const content = this.readFile(fileName);\n     if (content) {\n+      const cachedSf = getCachedSourceFile(fileName, () => content);\n+      if (cachedSf !== null) {\n+        return cachedSf;\n+      }\n       return ts.createSourceFile(fileName, content, languageVersion, /* setParentNodes */ true);\n     }\n     throw new Error(`File not found '${fileName}'.`);\n@@ -316,16 +321,20 @@ export class MockCompilerHost implements ts.CompilerHost {\n   // ts.CompilerHost\n   getSourceFile(\n       fileName: string, languageVersion: ts.ScriptTarget,\n-      onError?: (message: string) => void): ts.SourceFile {\n+      onError?: (message: string) => void): ts.SourceFile|undefined {\n     let result = this.sourceFiles.get(fileName);\n     if (!result) {\n       const content = this.getFileContent(fileName);\n+      const cachedSf = getCachedSourceFile(fileName, () => content);\n+      if (cachedSf !== null) {\n+        return cachedSf;\n+      }\n       if (content) {\n         result = ts.createSourceFile(fileName, content, languageVersion);\n         this.sourceFiles.set(fileName, result);\n       }\n     }\n-    return result!;\n+    return result;\n   }\n \n   getDefaultLibFileName(options: ts.CompilerOptions): string {\n@@ -424,7 +433,7 @@ export class MockAotCompilerHost implements AotCompilerHost {\n       }\n     } else {\n       const sf = this.tsHost.getSourceFile(modulePath, ts.ScriptTarget.Latest);\n-      const metadata = this.metadataProvider.getMetadata(sf);\n+      const metadata = sf && this.metadataProvider.getMetadata(sf);\n       return metadata ? [metadata] : [];\n     }\n     return undefined;"
+        }
+    ],
+    "stats": {
+        "total": 76,
+        "additions": 71,
+        "deletions": 5
+    }
+}

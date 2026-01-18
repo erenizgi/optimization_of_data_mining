@@ -1,0 +1,72 @@
+{
+    "author": "addaleax",
+    "message": "src: add can_call_into_js flag\n\nThis prevents calls back into JS from the shutdown phase.\n\nMany thanks for Stephen Belanger for reviewing the original version of\nthis commit in the Ayo.js project.\n\nRefs: https://github.com/ayojs/ayo/pull/82\nPR-URL: https://github.com/nodejs/node/pull/19377\nReviewed-By: Ben Noordhuis <info@bnoordhuis.nl>\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "bcb324c3ffd74147041cf892a0b2840aa340c248",
+    "files": [
+        {
+            "sha": "b20e2b746f7f89a1703acb26b4e98466563b244a",
+            "filename": "src/async_wrap.cc",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 2,
+            "changes": 7,
+            "blob_url": "https://github.com/nodejs/node/blob/bcb324c3ffd74147041cf892a0b2840aa340c248/src%2Fasync_wrap.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/bcb324c3ffd74147041cf892a0b2840aa340c248/src%2Fasync_wrap.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fasync_wrap.cc?ref=bcb324c3ffd74147041cf892a0b2840aa340c248",
+            "patch": "@@ -141,6 +141,7 @@ static void DestroyAsyncIdsCallback(Environment* env, void* data) {\n   do {\n     std::vector<double> destroy_async_id_list;\n     destroy_async_id_list.swap(*env->destroy_async_id_list());\n+    if (!env->can_call_into_js()) return;\n     for (auto async_id : destroy_async_id_list) {\n       // Want each callback to be cleaned up after itself, instead of cleaning\n       // them all up after the while() loop completes.\n@@ -166,7 +167,7 @@ void Emit(Environment* env, double async_id, AsyncHooks::Fields type,\n           Local<Function> fn) {\n   AsyncHooks* async_hooks = env->async_hooks();\n \n-  if (async_hooks->fields()[type] == 0)\n+  if (async_hooks->fields()[type] == 0 || !env->can_call_into_js())\n     return;\n \n   v8::HandleScope handle_scope(env->isolate());\n@@ -625,8 +626,10 @@ void AsyncWrap::EmitTraceEventDestroy() {\n }\n \n void AsyncWrap::EmitDestroy(Environment* env, double async_id) {\n-  if (env->async_hooks()->fields()[AsyncHooks::kDestroy] == 0)\n+  if (env->async_hooks()->fields()[AsyncHooks::kDestroy] == 0 ||\n+      !env->can_call_into_js()) {\n     return;\n+  }\n \n   if (env->destroy_async_id_list()->empty()) {\n     env->SetUnrefImmediate(DestroyAsyncIdsCallback, nullptr);"
+        },
+        {
+            "sha": "0268879f5c7823bcc5648068a5b941dd2dce19d6",
+            "filename": "src/env-inl.h",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 0,
+            "changes": 8,
+            "blob_url": "https://github.com/nodejs/node/blob/bcb324c3ffd74147041cf892a0b2840aa340c248/src%2Fenv-inl.h",
+            "raw_url": "https://github.com/nodejs/node/raw/bcb324c3ffd74147041cf892a0b2840aa340c248/src%2Fenv-inl.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv-inl.h?ref=bcb324c3ffd74147041cf892a0b2840aa340c248",
+            "patch": "@@ -559,6 +559,14 @@ void Environment::SetUnrefImmediate(native_immediate_callback cb,\n   CreateImmediate(cb, data, obj, false);\n }\n \n+inline bool Environment::can_call_into_js() const {\n+  return can_call_into_js_;\n+}\n+\n+inline void Environment::set_can_call_into_js(bool can_call_into_js) {\n+  can_call_into_js_ = can_call_into_js;\n+}\n+\n inline performance::performance_state* Environment::performance_state() {\n   return performance_state_.get();\n }"
+        },
+        {
+            "sha": "15d417ba6068608f2ab77715acf5bc9524253a71",
+            "filename": "src/env.h",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/nodejs/node/blob/bcb324c3ffd74147041cf892a0b2840aa340c248/src%2Fenv.h",
+            "raw_url": "https://github.com/nodejs/node/raw/bcb324c3ffd74147041cf892a0b2840aa340c248/src%2Fenv.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv.h?ref=bcb324c3ffd74147041cf892a0b2840aa340c248",
+            "patch": "@@ -679,6 +679,12 @@ class Environment {\n                               const char* path = nullptr,\n                               const char* dest = nullptr);\n \n+  // If this flag is set, calls into JS (if they would be observable\n+  // from userland) must be avoided.  This flag does not indicate whether\n+  // calling into JS is allowed from a VM perspective at this point.\n+  inline bool can_call_into_js() const;\n+  inline void set_can_call_into_js(bool can_call_into_js);\n+\n   inline void ThrowError(const char* errmsg);\n   inline void ThrowTypeError(const char* errmsg);\n   inline void ThrowRangeError(const char* errmsg);\n@@ -821,6 +827,7 @@ class Environment {\n \n   std::unique_ptr<performance::performance_state> performance_state_;\n   std::unordered_map<std::string, uint64_t> performance_marks_;\n+  bool can_call_into_js_ = true;\n \n #if HAVE_INSPECTOR\n   std::unique_ptr<inspector::Agent> inspector_agent_;"
+        },
+        {
+            "sha": "6411eafb8cb61f5a5b8674d290036fdd400bd7a4",
+            "filename": "src/node.cc",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/nodejs/node/blob/bcb324c3ffd74147041cf892a0b2840aa340c248/src%2Fnode.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/bcb324c3ffd74147041cf892a0b2840aa340c248/src%2Fnode.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode.cc?ref=bcb324c3ffd74147041cf892a0b2840aa340c248",
+            "patch": "@@ -954,6 +954,11 @@ InternalCallbackScope::InternalCallbackScope(Environment* env,\n     CHECK(!object.IsEmpty());\n   }\n \n+  if (!env->can_call_into_js()) {\n+    failed_ = true;\n+    return;\n+  }\n+\n   HandleScope handle_scope(env->isolate());\n   // If you hit this assertion, you forgot to enter the v8::Context first.\n   CHECK_EQ(Environment::GetCurrent(env->isolate()), env);\n@@ -997,6 +1002,7 @@ void InternalCallbackScope::Close() {\n \n   Environment::TickInfo* tick_info = env_->tick_info();\n \n+  if (!env_->can_call_into_js()) return;\n   if (!tick_info->has_scheduled()) {\n     env_->isolate()->RunMicrotasks();\n   }\n@@ -1014,6 +1020,8 @@ void InternalCallbackScope::Close() {\n \n   Local<Object> process = env_->process_object();\n \n+  if (!env_->can_call_into_js()) return;\n+\n   if (env_->tick_callback_function()->Call(process, 0, nullptr).IsEmpty()) {\n     env_->tick_info()->set_has_thrown(true);\n     failed_ = true;\n@@ -4552,6 +4560,7 @@ inline int Start(Isolate* isolate, IsolateData* isolate_data,\n \n   WaitForInspectorDisconnect(&env);\n \n+  env.set_can_call_into_js(false);\n   env.RunCleanup();\n   RunAtExit(&env);\n "
+        },
+        {
+            "sha": "23582454cd6f67191f222bf7b57175003c1986cd",
+            "filename": "src/node_contextify.cc",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/bcb324c3ffd74147041cf892a0b2840aa340c248/src%2Fnode_contextify.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/bcb324c3ffd74147041cf892a0b2840aa340c248/src%2Fnode_contextify.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_contextify.cc?ref=bcb324c3ffd74147041cf892a0b2840aa340c248",
+            "patch": "@@ -820,6 +820,8 @@ class ContextifyScript : public BaseObject {\n                           const bool display_errors,\n                           const bool break_on_sigint,\n                           const FunctionCallbackInfo<Value>& args) {\n+    if (!env->can_call_into_js())\n+      return false;\n     if (!ContextifyScript::InstanceOf(env, args.Holder())) {\n       env->ThrowTypeError(\n           \"Script methods can only be called on script instances.\");"
+        }
+    ],
+    "stats": {
+        "total": 33,
+        "additions": 31,
+        "deletions": 2
+    }
+}

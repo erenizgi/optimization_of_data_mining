@@ -1,0 +1,48 @@
+{
+    "author": "addaleax",
+    "message": "src: clean up `req.bytes` tracking\n\nSimply always tell the caller how many bytes were written, rather\nthan letting them track it.\n\nIn the case of writing a string, also keep track of the bytes\nwritten by the earlier `DoTryWrite()`.\n\nRefs: https://github.com/nodejs/node/issues/19562\n\nPR-URL: https://github.com/nodejs/node/pull/19551\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "b7cfd278a53d2b7769340ed800142f6662aa48d2",
+    "files": [
+        {
+            "sha": "392dc2c87c3ca3e811d6993de942b092907fe156",
+            "filename": "src/stream_base-inl.h",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 3,
+            "changes": 8,
+            "blob_url": "https://github.com/nodejs/node/blob/b7cfd278a53d2b7769340ed800142f6662aa48d2/src%2Fstream_base-inl.h",
+            "raw_url": "https://github.com/nodejs/node/raw/b7cfd278a53d2b7769340ed800142f6662aa48d2/src%2Fstream_base-inl.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fstream_base-inl.h?ref=b7cfd278a53d2b7769340ed800142f6662aa48d2",
+            "patch": "@@ -194,13 +194,15 @@ inline StreamWriteResult StreamBase::Write(\n   Environment* env = stream_env();\n   int err;\n \n+  size_t total_bytes = 0;\n   for (size_t i = 0; i < count; ++i)\n-    bytes_written_ += bufs[i].len;\n+    total_bytes += bufs[i].len;\n+  bytes_written_ += total_bytes;\n \n   if (send_handle == nullptr) {\n     err = DoTryWrite(&bufs, &count);\n     if (err != 0 || count == 0) {\n-      return StreamWriteResult { false, err, nullptr };\n+      return StreamWriteResult { false, err, nullptr, total_bytes };\n     }\n   }\n \n@@ -230,7 +232,7 @@ inline StreamWriteResult StreamBase::Write(\n     ClearError();\n   }\n \n-  return StreamWriteResult { async, err, req_wrap };\n+  return StreamWriteResult { async, err, req_wrap, total_bytes };\n }\n \n template <typename OtherBase>"
+        },
+        {
+            "sha": "263943d2b03420a0969050f79fd40640488d9923",
+            "filename": "src/stream_base.cc",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 11,
+            "changes": 23,
+            "blob_url": "https://github.com/nodejs/node/blob/b7cfd278a53d2b7769340ed800142f6662aa48d2/src%2Fstream_base.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/b7cfd278a53d2b7769340ed800142f6662aa48d2/src%2Fstream_base.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fstream_base.cc?ref=b7cfd278a53d2b7769340ed800142f6662aa48d2",
+            "patch": "@@ -60,12 +60,11 @@ int StreamBase::Shutdown(const FunctionCallbackInfo<Value>& args) {\n inline void SetWriteResultPropertiesOnWrapObject(\n     Environment* env,\n     Local<Object> req_wrap_obj,\n-    const StreamWriteResult& res,\n-    size_t bytes) {\n+    const StreamWriteResult& res) {\n   req_wrap_obj->Set(\n       env->context(),\n       env->bytes_string(),\n-      Number::New(env->isolate(), bytes)).FromJust();\n+      Number::New(env->isolate(), res.bytes)).FromJust();\n   req_wrap_obj->Set(\n       env->context(),\n       env->async(),\n@@ -91,7 +90,6 @@ int StreamBase::Writev(const FunctionCallbackInfo<Value>& args) {\n   MaybeStackBuffer<uv_buf_t, 16> bufs(count);\n \n   size_t storage_size = 0;\n-  uint32_t bytes = 0;\n   size_t offset;\n \n   if (!all_buffers) {\n@@ -123,7 +121,6 @@ int StreamBase::Writev(const FunctionCallbackInfo<Value>& args) {\n       Local<Value> chunk = chunks->Get(i);\n       bufs[i].base = Buffer::Data(chunk);\n       bufs[i].len = Buffer::Length(chunk);\n-      bytes += bufs[i].len;\n     }\n   }\n \n@@ -140,7 +137,6 @@ int StreamBase::Writev(const FunctionCallbackInfo<Value>& args) {\n       if (Buffer::HasInstance(chunk)) {\n         bufs[i].base = Buffer::Data(chunk);\n         bufs[i].len = Buffer::Length(chunk);\n-        bytes += bufs[i].len;\n         continue;\n       }\n \n@@ -160,12 +156,11 @@ int StreamBase::Writev(const FunctionCallbackInfo<Value>& args) {\n       bufs[i].base = str_storage;\n       bufs[i].len = str_size;\n       offset += str_size;\n-      bytes += str_size;\n     }\n   }\n \n   StreamWriteResult res = Write(*bufs, count, nullptr, req_wrap_obj);\n-  SetWriteResultPropertiesOnWrapObject(env, req_wrap_obj, res, bytes);\n+  SetWriteResultPropertiesOnWrapObject(env, req_wrap_obj, res);\n   if (res.wrap != nullptr && storage) {\n     res.wrap->SetAllocatedStorage(storage.release(), storage_size);\n   }\n@@ -193,7 +188,7 @@ int StreamBase::WriteBuffer(const FunctionCallbackInfo<Value>& args) {\n \n   if (res.async)\n     req_wrap_obj->Set(env->context(), env->buffer_string(), args[1]).FromJust();\n-  SetWriteResultPropertiesOnWrapObject(env, req_wrap_obj, res, buf.len);\n+  SetWriteResultPropertiesOnWrapObject(env, req_wrap_obj, res);\n \n   return res.err;\n }\n@@ -228,6 +223,7 @@ int StreamBase::WriteString(const FunctionCallbackInfo<Value>& args) {\n   // Try writing immediately if write size isn't too big\n   char stack_storage[16384];  // 16kb\n   size_t data_size;\n+  size_t synchronously_written = 0;\n   uv_buf_t buf;\n \n   bool try_write = storage_size <= sizeof(stack_storage) &&\n@@ -243,7 +239,11 @@ int StreamBase::WriteString(const FunctionCallbackInfo<Value>& args) {\n     uv_buf_t* bufs = &buf;\n     size_t count = 1;\n     err = DoTryWrite(&bufs, &count);\n-    bytes_written_ += data_size;\n+    // Keep track of the bytes written here, because we're taking a shortcut\n+    // by using `DoTryWrite()` directly instead of using the utilities\n+    // provided by `Write()`.\n+    synchronously_written = count == 0 ? data_size : data_size - buf.len;\n+    bytes_written_ += synchronously_written;\n \n     // Immediate failure or success\n     if (err != 0 || count == 0) {\n@@ -299,8 +299,9 @@ int StreamBase::WriteString(const FunctionCallbackInfo<Value>& args) {\n   }\n \n   StreamWriteResult res = Write(&buf, 1, send_handle, req_wrap_obj);\n+  res.bytes += synchronously_written;\n \n-  SetWriteResultPropertiesOnWrapObject(env, req_wrap_obj, res, data_size);\n+  SetWriteResultPropertiesOnWrapObject(env, req_wrap_obj, res);\n   if (res.wrap != nullptr) {\n     res.wrap->SetAllocatedStorage(data.release(), data_size);\n   }"
+        },
+        {
+            "sha": "dfce7df44a5ebf636fe7978e1a87d02d24a8cfa3",
+            "filename": "src/stream_base.h",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/b7cfd278a53d2b7769340ed800142f6662aa48d2/src%2Fstream_base.h",
+            "raw_url": "https://github.com/nodejs/node/raw/b7cfd278a53d2b7769340ed800142f6662aa48d2/src%2Fstream_base.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fstream_base.h?ref=b7cfd278a53d2b7769340ed800142f6662aa48d2",
+            "patch": "@@ -23,6 +23,7 @@ struct StreamWriteResult {\n   bool async;\n   int err;\n   WriteWrap* wrap;\n+  size_t bytes;\n };\n \n "
+        }
+    ],
+    "stats": {
+        "total": 32,
+        "additions": 18,
+        "deletions": 14
+    }
+}

@@ -1,0 +1,36 @@
+{
+    "author": "BridgeAR",
+    "message": "util: fix proxy inspection\n\nThis prevents any proxy traps from being called while inspecting\nproxy objects. That guarantees a side-effect free way of inspecting\nproxies.\n\nPR-URL: https://github.com/nodejs/node/pull/26241\nFixes: https://github.com/nodejs/node/issues/10731\nFixes: https://github.com/nodejs/node/issues/26231\nRefs: https://github.com/nodejs/node/issues/25212\nRefs: https://github.com/nodejs/node/issues/24765\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Matteo Collina <matteo.collina@gmail.com>",
+    "sha": "a32cbe159749c645bf2da6b2af46f9b732b416e0",
+    "files": [
+        {
+            "sha": "40bc76f817b99a98d96ef548266fd006d39e3db5",
+            "filename": "lib/internal/util/inspect.js",
+            "status": "modified",
+            "additions": 14,
+            "deletions": 10,
+            "changes": 24,
+            "blob_url": "https://github.com/nodejs/node/blob/a32cbe159749c645bf2da6b2af46f9b732b416e0/lib%2Finternal%2Futil%2Finspect.js",
+            "raw_url": "https://github.com/nodejs/node/raw/a32cbe159749c645bf2da6b2af46f9b732b416e0/lib%2Finternal%2Futil%2Finspect.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Futil%2Finspect.js?ref=a32cbe159749c645bf2da6b2af46f9b732b416e0",
+            "patch": "@@ -495,18 +495,23 @@ function formatValue(ctx, value, recurseTimes, typedArray) {\n     return ctx.stylize('null', 'null');\n   }\n \n+  // Memorize the context for custom inspection on proxies.\n+  const context = value;\n+  // Always check for proxies to prevent side effects and to prevent triggering\n+  // any proxy handlers.\n+  const proxy = getProxyDetails(value);\n+  if (proxy !== undefined) {\n+    if (ctx.showProxy && ctx.stop === undefined) {\n+      return formatProxy(ctx, proxy, recurseTimes);\n+    }\n+    value = proxy[0];\n+  }\n+\n   if (ctx.stop !== undefined) {\n     const name = getConstructorName(value, ctx) || value[Symbol.toStringTag];\n     return ctx.stylize(`[${name || 'Object'}]`, 'special');\n   }\n \n-  if (ctx.showProxy) {\n-    const proxy = getProxyDetails(value);\n-    if (proxy !== undefined) {\n-      return formatProxy(ctx, proxy, recurseTimes);\n-    }\n-  }\n-\n   // Provide a hook for user-specified inspect functions.\n   // Check that value is an object with an inspect function on it.\n   if (ctx.customInspect) {\n@@ -523,11 +528,10 @@ function formatValue(ctx, value, recurseTimes, typedArray) {\n       // This makes sure the recurseTimes are reported as before while using\n       // a counter internally.\n       const depth = ctx.depth === null ? null : ctx.depth - recurseTimes;\n-      const ret = maybeCustom.call(value, depth, plainCtx);\n-\n+      const ret = maybeCustom.call(context, depth, plainCtx);\n       // If the custom inspection method returned `this`, don't go into\n       // infinite recursion.\n-      if (ret !== value) {\n+      if (ret !== context) {\n         if (typeof ret !== 'string') {\n           return formatValue(ctx, ret, recurseTimes);\n         }"
+        },
+        {
+            "sha": "9aaa8fb13eeb71fb39f0c782f7fec484bc0a5ce9",
+            "filename": "test/parallel/test-util-inspect-proxy.js",
+            "status": "modified",
+            "additions": 48,
+            "deletions": 12,
+            "changes": 60,
+            "blob_url": "https://github.com/nodejs/node/blob/a32cbe159749c645bf2da6b2af46f9b732b416e0/test%2Fparallel%2Ftest-util-inspect-proxy.js",
+            "raw_url": "https://github.com/nodejs/node/raw/a32cbe159749c645bf2da6b2af46f9b732b416e0/test%2Fparallel%2Ftest-util-inspect-proxy.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-util-inspect-proxy.js?ref=a32cbe159749c645bf2da6b2af46f9b732b416e0",
+            "patch": "@@ -8,11 +8,35 @@ const { internalBinding } = require('internal/test/binding');\n const processUtil = internalBinding('util');\n const opts = { showProxy: true };\n \n-const target = {};\n+let proxyObj;\n+let called = false;\n+const target = {\n+  [util.inspect.custom](depth, { showProxy }) {\n+    if (showProxy === false) {\n+      called = true;\n+      if (proxyObj !== this) {\n+        throw new Error('Failed');\n+      }\n+    }\n+    return [1, 2, 3];\n+  }\n+};\n const handler = {\n-  get: function() { throw new Error('Getter should not be called'); }\n+  getPrototypeOf() { throw new Error('getPrototypeOf'); },\n+  setPrototypeOf() { throw new Error('setPrototypeOf'); },\n+  isExtensible() { throw new Error('isExtensible'); },\n+  preventExtensions() { throw new Error('preventExtensions'); },\n+  getOwnPropertyDescriptor() { throw new Error('getOwnPropertyDescriptor'); },\n+  defineProperty() { throw new Error('defineProperty'); },\n+  has() { throw new Error('has'); },\n+  get() { throw new Error('get'); },\n+  set() { throw new Error('set'); },\n+  deleteProperty() { throw new Error('deleteProperty'); },\n+  ownKeys() { throw new Error('ownKeys'); },\n+  apply() { throw new Error('apply'); },\n+  construct() { throw new Error('construct'); }\n };\n-const proxyObj = new Proxy(target, handler);\n+proxyObj = new Proxy(target, handler);\n \n // Inspecting the proxy should not actually walk it's properties\n util.inspect(proxyObj, opts);\n@@ -23,19 +47,31 @@ const details = processUtil.getProxyDetails(proxyObj);\n assert.strictEqual(target, details[0]);\n assert.strictEqual(handler, details[1]);\n \n-assert.strictEqual(util.inspect(proxyObj, opts),\n-                   'Proxy [ {}, { get: [Function: get] } ]');\n+assert.strictEqual(\n+  util.inspect(proxyObj, opts),\n+  'Proxy [ [ 1, 2, 3 ],\\n' +\n+  '  { getPrototypeOf: [Function: getPrototypeOf],\\n' +\n+  '    setPrototypeOf: [Function: setPrototypeOf],\\n' +\n+  '    isExtensible: [Function: isExtensible],\\n' +\n+  '    preventExtensions: [Function: preventExtensions],\\n' +\n+  '    getOwnPropertyDescriptor: [Function: getOwnPropertyDescriptor],\\n' +\n+  '    defineProperty: [Function: defineProperty],\\n' +\n+  '    has: [Function: has],\\n' +\n+  '    get: [Function: get],\\n' +\n+  '    set: [Function: set],\\n' +\n+  '    deleteProperty: [Function: deleteProperty],\\n' +\n+  '    ownKeys: [Function: ownKeys],\\n' +\n+  '    apply: [Function: apply],\\n' +\n+  '    construct: [Function: construct] } ]'\n+);\n \n // Using getProxyDetails with non-proxy returns undefined\n assert.strictEqual(processUtil.getProxyDetails({}), undefined);\n \n-// This will throw because the showProxy option is not used\n-// and the get function on the handler object defined above\n-// is actually invoked.\n-assert.throws(\n-  () => util.inspect(proxyObj),\n-  /^Error: Getter should not be called$/\n-);\n+// Inspecting a proxy without the showProxy option set to true should not\n+// trigger any proxy handlers.\n+assert.strictEqual(util.inspect(proxyObj), '[ 1, 2, 3 ]');\n+assert(called);\n \n // Yo dawg, I heard you liked Proxy so I put a Proxy\n // inside your Proxy that proxies your Proxy's Proxy."
+        }
+    ],
+    "stats": {
+        "total": 84,
+        "additions": 62,
+        "deletions": 22
+    }
+}

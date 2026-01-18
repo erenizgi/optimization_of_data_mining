@@ -1,0 +1,60 @@
+{
+    "author": "addaleax",
+    "message": "net,http2: merge after-write code\n\nPR-URL: https://github.com/nodejs/node/pull/24380\nRefs: https://github.com/nodejs/node/issues/19060\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Daniel Bevenius <daniel.bevenius@gmail.com>",
+    "sha": "8dd8b8fad9689f31673866f1b77c50098dd2c855",
+    "files": [
+        {
+            "sha": "ecf243f845b6d55e7e1f3af76af8af25702e34b4",
+            "filename": "lib/internal/http2/core.js",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 16,
+            "changes": 25,
+            "blob_url": "https://github.com/nodejs/node/blob/8dd8b8fad9689f31673866f1b77c50098dd2c855/lib%2Finternal%2Fhttp2%2Fcore.js",
+            "raw_url": "https://github.com/nodejs/node/raw/8dd8b8fad9689f31673866f1b77c50098dd2c855/lib%2Finternal%2Fhttp2%2Fcore.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fhttp2%2Fcore.js?ref=8dd8b8fad9689f31673866f1b77c50098dd2c855",
+            "patch": "@@ -108,6 +108,7 @@ const {\n   writeGeneric,\n   writevGeneric,\n   onStreamRead,\n+  kAfterAsyncWrite,\n   kMaybeDestroy,\n   kUpdateTimer\n } = require('internal/stream_base_commons');\n@@ -1515,21 +1516,6 @@ function trackWriteState(stream, bytes) {\n   session[kHandle].chunksSentSinceLastWrite = 0;\n }\n \n-function afterDoStreamWrite(status, handle) {\n-  const stream = handle[kOwner];\n-  const session = stream[kSession];\n-\n-  stream[kUpdateTimer]();\n-\n-  const { bytes } = this;\n-  stream[kState].writeQueueSize -= bytes;\n-\n-  if (session !== undefined)\n-    session[kState].writeQueueSize -= bytes;\n-  if (typeof this.callback === 'function')\n-    this.callback(null);\n-}\n-\n function streamOnResume() {\n   if (!this.destroyed)\n     this[kHandle].readStart();\n@@ -1782,6 +1768,13 @@ class Http2Stream extends Duplex {\n                 'bug in Node.js');\n   }\n \n+  [kAfterAsyncWrite]({ bytes }) {\n+    this[kState].writeQueueSize -= bytes;\n+\n+    if (this.session !== undefined)\n+      this.session[kState].writeQueueSize -= bytes;\n+  }\n+\n   [kWriteGeneric](writev, data, encoding, cb) {\n     // When the Http2Stream is first created, it is corked until the\n     // handle and the stream ID is assigned. However, if the user calls\n@@ -1808,7 +1801,7 @@ class Http2Stream extends Duplex {\n     if (!this.headersSent)\n       this[kProceed]();\n \n-    const req = createWriteWrap(this[kHandle], afterDoStreamWrite);\n+    const req = createWriteWrap(this[kHandle]);\n     req.stream = this[kID];\n \n     if (writev)"
+        },
+        {
+            "sha": "31291e751d57a6589a573f8149e69f488a31ab82",
+            "filename": "lib/internal/stream_base_commons.js",
+            "status": "modified",
+            "additions": 26,
+            "deletions": 2,
+            "changes": 28,
+            "blob_url": "https://github.com/nodejs/node/blob/8dd8b8fad9689f31673866f1b77c50098dd2c855/lib%2Finternal%2Fstream_base_commons.js",
+            "raw_url": "https://github.com/nodejs/node/raw/8dd8b8fad9689f31673866f1b77c50098dd2c855/lib%2Finternal%2Fstream_base_commons.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fstream_base_commons.js?ref=8dd8b8fad9689f31673866f1b77c50098dd2c855",
+            "patch": "@@ -16,6 +16,7 @@ const { owner_symbol } = require('internal/async_hooks').symbols;\n \n const kMaybeDestroy = Symbol('kMaybeDestroy');\n const kUpdateTimer = Symbol('kUpdateTimer');\n+const kAfterAsyncWrite = Symbol('kAfterAsyncWrite');\n \n function handleWriteReq(req, data, encoding) {\n   const { handle } = req;\n@@ -52,11 +53,33 @@ function handleWriteReq(req, data, encoding) {\n   }\n }\n \n-function createWriteWrap(handle, oncomplete) {\n+function onWriteComplete(status) {\n+  const stream = this.handle[owner_symbol];\n+\n+  if (stream.destroyed) {\n+    if (typeof this.callback === 'function')\n+      this.callback(null);\n+    return;\n+  }\n+\n+  if (status < 0) {\n+    const ex = errnoException(status, 'write', this.error);\n+    stream.destroy(ex, this.callback);\n+    return;\n+  }\n+\n+  stream[kUpdateTimer]();\n+  stream[kAfterAsyncWrite](this);\n+\n+  if (typeof this.callback === 'function')\n+    this.callback(null);\n+}\n+\n+function createWriteWrap(handle) {\n   var req = new WriteWrap();\n \n   req.handle = handle;\n-  req.oncomplete = oncomplete;\n+  req.oncomplete = onWriteComplete;\n   req.async = false;\n   req.bytes = 0;\n   req.buffer = null;\n@@ -160,6 +183,7 @@ module.exports = {\n   writevGeneric,\n   writeGeneric,\n   onStreamRead,\n+  kAfterAsyncWrite,\n   kMaybeDestroy,\n   kUpdateTimer,\n };"
+        },
+        {
+            "sha": "01cfed98e872a47bc0198c66644f7326d0dd079b",
+            "filename": "lib/net.js",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 34,
+            "changes": 40,
+            "blob_url": "https://github.com/nodejs/node/blob/8dd8b8fad9689f31673866f1b77c50098dd2c855/lib%2Fnet.js",
+            "raw_url": "https://github.com/nodejs/node/raw/8dd8b8fad9689f31673866f1b77c50098dd2c855/lib%2Fnet.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Fnet.js?ref=8dd8b8fad9689f31673866f1b77c50098dd2c855",
+            "patch": "@@ -62,6 +62,7 @@ const {\n   writevGeneric,\n   writeGeneric,\n   onStreamRead,\n+  kAfterAsyncWrite,\n   kUpdateTimer\n } = require('internal/stream_base_commons');\n const {\n@@ -685,6 +686,10 @@ protoGetter('localPort', function localPort() {\n });\n \n \n+Socket.prototype[kAfterAsyncWrite] = function() {\n+  this[kLastWriteQueueSize] = 0;\n+};\n+\n Socket.prototype._writeGeneric = function(writev, data, encoding, cb) {\n   // If we are still connecting, then buffer this for later.\n   // The Writable logic will buffer up any more writes while\n@@ -707,7 +712,7 @@ Socket.prototype._writeGeneric = function(writev, data, encoding, cb) {\n \n   this._unrefTimer();\n \n-  var req = createWriteWrap(this._handle, afterWrite);\n+  var req = createWriteWrap(this._handle);\n   if (writev)\n     writevGeneric(this, req, data, cb);\n   else\n@@ -771,39 +776,6 @@ protoGetter('bytesWritten', function bytesWritten() {\n });\n \n \n-function afterWrite(status, handle, err) {\n-  var self = handle[owner_symbol];\n-  if (self !== process.stderr && self !== process.stdout)\n-    debug('afterWrite', status);\n-\n-  if (this.async)\n-    self[kLastWriteQueueSize] = 0;\n-\n-  // callback may come after call to destroy.\n-  if (self.destroyed) {\n-    debug('afterWrite destroyed');\n-    if (this.callback)\n-      this.callback(null);\n-    return;\n-  }\n-\n-  if (status < 0) {\n-    var ex = errnoException(status, 'write', this.error);\n-    debug('write failure', ex);\n-    self.destroy(ex, this.callback);\n-    return;\n-  }\n-\n-  self._unrefTimer();\n-\n-  if (self !== process.stderr && self !== process.stdout)\n-    debug('afterWrite call cb');\n-\n-  if (this.callback)\n-    this.callback.call(undefined);\n-}\n-\n-\n function checkBindError(err, port, handle) {\n   // EADDRINUSE may not be reported until we call listen() or connect().\n   // To complicate matters, a failed bind() followed by listen() or connect()"
+        },
+        {
+            "sha": "20cfcf3745c81b374d9acf4ab450f65d4699fdb8",
+            "filename": "src/node_http2.cc",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 2,
+            "changes": 8,
+            "blob_url": "https://github.com/nodejs/node/blob/8dd8b8fad9689f31673866f1b77c50098dd2c855/src%2Fnode_http2.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/8dd8b8fad9689f31673866f1b77c50098dd2c855/src%2Fnode_http2.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_http2.cc?ref=8dd8b8fad9689f31673866f1b77c50098dd2c855",
+            "patch": "@@ -1571,8 +1571,12 @@ void Http2Session::ClearOutgoing(int status) {\n     current_outgoing_buffers_.swap(outgoing_buffers_);\n     for (const nghttp2_stream_write& wr : current_outgoing_buffers_) {\n       WriteWrap* wrap = wr.req_wrap;\n-      if (wrap != nullptr)\n-        wrap->Done(status);\n+      if (wrap != nullptr) {\n+        // TODO(addaleax): Pass `status` instead of 0, so that we actually error\n+        // out with the error from the write to the underlying protocol,\n+        // if one occurred.\n+        wrap->Done(0);\n+      }\n     }\n   }\n "
+        }
+    ],
+    "stats": {
+        "total": 101,
+        "additions": 47,
+        "deletions": 54
+    }
+}

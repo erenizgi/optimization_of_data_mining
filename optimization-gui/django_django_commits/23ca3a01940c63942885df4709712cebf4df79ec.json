@@ -1,0 +1,60 @@
+{
+    "author": "akaariai",
+    "message": "Fixed #16759 -- Remove use of __deepcopy__ in qs.clone()\n\nThe original problem was that queryset cloning was really expensive\nwhen filtering with F() clauses. The __deepcopy__ went too deep copying\n_meta attributes of the models used. To fix this the use of\n__deepcopy__ in qs cloning was removed.\n\nThis commit results in some speed improvements across the djangobench\nbenchmark suite. Most query_* tests are 20-30% faster, save() is 50%\nfaster and finally complex filtering situations can see 2x to order\nof magnitude improvments.\n\nThanks to Suor, Alex and lrekucki for valuable feedback.",
+    "sha": "23ca3a01940c63942885df4709712cebf4df79ec",
+    "files": [
+        {
+            "sha": "75a330f22aa63096487a95ef5bde5777ee583c6a",
+            "filename": "django/db/models/sql/aggregates.py",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/django/django/blob/23ca3a01940c63942885df4709712cebf4df79ec/django%2Fdb%2Fmodels%2Fsql%2Faggregates.py",
+            "raw_url": "https://github.com/django/django/raw/23ca3a01940c63942885df4709712cebf4df79ec/django%2Fdb%2Fmodels%2Fsql%2Faggregates.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fmodels%2Fsql%2Faggregates.py?ref=23ca3a01940c63942885df4709712cebf4df79ec",
+            "patch": "@@ -1,6 +1,7 @@\n \"\"\"\n Classes to represent the default SQL aggregate functions\n \"\"\"\n+import copy\n \n from django.db.models.fields import IntegerField, FloatField\n \n@@ -62,6 +63,11 @@ def __init__(self, col, source=None, is_summary=False, **extra):\n \n         self.field = tmp\n \n+    def clone(self):\n+        # Different aggregates have different init methods, so use copy here\n+        # deepcopy is not needed, as self.col is only changing variable.\n+        return copy.copy(self)\n+\n     def relabel_aliases(self, change_map):\n         if isinstance(self.col, (list, tuple)):\n             self.col = (change_map.get(self.col[0], self.col[0]), self.col[1])"
+        },
+        {
+            "sha": "613f4c4cfc780b4e67a2572ab533da4877f624a1",
+            "filename": "django/db/models/sql/query.py",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 6,
+            "changes": 14,
+            "blob_url": "https://github.com/django/django/blob/23ca3a01940c63942885df4709712cebf4df79ec/django%2Fdb%2Fmodels%2Fsql%2Fquery.py",
+            "raw_url": "https://github.com/django/django/raw/23ca3a01940c63942885df4709712cebf4df79ec/django%2Fdb%2Fmodels%2Fsql%2Fquery.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fmodels%2Fsql%2Fquery.py?ref=23ca3a01940c63942885df4709712cebf4df79ec",
+            "patch": "@@ -279,21 +279,23 @@ def clone(self, klass=None, memo=None, **kwargs):\n         obj.select = self.select[:]\n         obj.related_select_cols = []\n         obj.tables = self.tables[:]\n-        obj.where = copy.deepcopy(self.where, memo=memo)\n+        obj.where = self.where.clone()\n         obj.where_class = self.where_class\n         if self.group_by is None:\n             obj.group_by = None\n         else:\n             obj.group_by = self.group_by[:]\n-        obj.having = copy.deepcopy(self.having, memo=memo)\n+        obj.having = self.having.clone()\n         obj.order_by = self.order_by[:]\n         obj.low_mark, obj.high_mark = self.low_mark, self.high_mark\n         obj.distinct = self.distinct\n         obj.distinct_fields = self.distinct_fields[:]\n         obj.select_for_update = self.select_for_update\n         obj.select_for_update_nowait = self.select_for_update_nowait\n         obj.select_related = self.select_related\n-        obj.aggregates = copy.deepcopy(self.aggregates, memo=memo)\n+        obj.related_select_cols = []\n+        obj.aggregates = SortedDict((k, v.clone())\n+                                    for k, v in self.aggregates.items())\n         if self.aggregate_select_mask is None:\n             obj.aggregate_select_mask = None\n         else:\n@@ -316,7 +318,7 @@ def clone(self, klass=None, memo=None, **kwargs):\n             obj._extra_select_cache = self._extra_select_cache.copy()\n         obj.extra_tables = self.extra_tables\n         obj.extra_order_by = self.extra_order_by\n-        obj.deferred_loading = copy.deepcopy(self.deferred_loading, memo=memo)\n+        obj.deferred_loading = copy.copy(self.deferred_loading[0]), self.deferred_loading[1]\n         if self.filter_is_sticky and self.used_aliases:\n             obj.used_aliases = self.used_aliases.copy()\n         else:\n@@ -549,7 +551,7 @@ def combine(self, rhs, connector):\n         # Now relabel a copy of the rhs where-clause and add it to the current\n         # one.\n         if rhs.where:\n-            w = copy.deepcopy(rhs.where)\n+            w = rhs.where.clone()\n             w.relabel_aliases(change_map)\n             if not self.where:\n                 # Since 'self' matches everything, add an explicit \"include\n@@ -571,7 +573,7 @@ def combine(self, rhs, connector):\n                 new_col = change_map.get(col[0], col[0]), col[1]\n                 self.select.append(SelectInfo(new_col, field))\n             else:\n-                item = copy.deepcopy(col)\n+                item = col.clone()\n                 item.relabel_aliases(change_map)\n                 self.select.append(SelectInfo(item, field))\n "
+        },
+        {
+            "sha": "3e4b352f100e7c0408c79679f62f623820185e65",
+            "filename": "django/db/models/sql/where.py",
+            "status": "modified",
+            "additions": 33,
+            "deletions": 1,
+            "changes": 34,
+            "blob_url": "https://github.com/django/django/blob/23ca3a01940c63942885df4709712cebf4df79ec/django%2Fdb%2Fmodels%2Fsql%2Fwhere.py",
+            "raw_url": "https://github.com/django/django/raw/23ca3a01940c63942885df4709712cebf4df79ec/django%2Fdb%2Fmodels%2Fsql%2Fwhere.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fmodels%2Fsql%2Fwhere.py?ref=23ca3a01940c63942885df4709712cebf4df79ec",
+            "patch": "@@ -10,7 +10,7 @@\n \n from django.utils import tree\n from django.db.models.fields import Field\n-from django.db.models.sql.datastructures import EmptyResultSet\n+from django.db.models.sql.datastructures import EmptyResultSet, Empty\n from django.db.models.sql.aggregates import Aggregate\n from django.utils.six.moves import xrange\n \n@@ -272,6 +272,23 @@ def relabel_aliases(self, change_map, node=None):\n                 if hasattr(child[3], 'relabel_aliases'):\n                     child[3].relabel_aliases(change_map)\n \n+    def clone(self):\n+        \"\"\"\n+        Creates a clone of the tree. Must only be called on root nodes (nodes\n+        with empty subtree_parents). Childs must be either (Contraint, lookup,\n+        value) tuples, or objects supporting .clone().\n+        \"\"\"\n+        assert not self.subtree_parents\n+        clone = self.__class__._new_instance(\n+            children=[], connector=self.connector, negated=self.negated)\n+        for child in self.children:\n+            if isinstance(child, tuple):\n+                clone.children.append(\n+                    (child[0].clone(), child[1], child[2], child[3]))\n+            else:\n+                clone.children.append(child.clone())\n+        return clone\n+\n class EmptyWhere(WhereNode):\n \n     def add(self, data, connector):\n@@ -291,6 +308,9 @@ def as_sql(self, qn=None, connection=None):\n     def relabel_aliases(self, change_map, node=None):\n         return\n \n+    def clone(self):\n+        return self\n+\n class NothingNode(object):\n     \"\"\"\n     A node that matches nothing.\n@@ -301,6 +321,9 @@ def as_sql(self, qn=None, connection=None):\n     def relabel_aliases(self, change_map, node=None):\n         return\n \n+    def clone(self):\n+        return self\n+\n class ExtraWhere(object):\n     def __init__(self, sqls, params):\n         self.sqls = sqls\n@@ -310,6 +333,9 @@ def as_sql(self, qn=None, connection=None):\n         sqls = [\"(%s)\" % sql for sql in self.sqls]\n         return \" AND \".join(sqls), tuple(self.params or ())\n \n+    def clone(self):\n+        return self\n+\n class Constraint(object):\n     \"\"\"\n     An object that can be passed to WhereNode.add() and knows how to\n@@ -374,3 +400,9 @@ def process(self, lookup_type, value, connection):\n     def relabel_aliases(self, change_map):\n         if self.alias in change_map:\n             self.alias = change_map[self.alias]\n+\n+    def clone(self):\n+        new = Empty()\n+        new.__class__ = self.__class__\n+        new.alias, new.col, new.field = self.alias, self.col, self.field\n+        return new"
+        },
+        {
+            "sha": "780af5a8b7babad2829caea3b1a342234393db52",
+            "filename": "tests/regressiontests/queries/tests.py",
+            "status": "modified",
+            "additions": 34,
+            "deletions": 0,
+            "changes": 34,
+            "blob_url": "https://github.com/django/django/blob/23ca3a01940c63942885df4709712cebf4df79ec/tests%2Fregressiontests%2Fqueries%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/23ca3a01940c63942885df4709712cebf4df79ec/tests%2Fregressiontests%2Fqueries%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fqueries%2Ftests.py?ref=23ca3a01940c63942885df4709712cebf4df79ec",
+            "patch": "@@ -1919,6 +1919,7 @@ def test_sliced_delete(self):\n \n \n class CloneTests(TestCase):\n+\n     def test_evaluated_queryset_as_argument(self):\n         \"#13227 -- If a queryset is already evaluated, it can still be used as a query arg\"\n         n = Note(note='Test1', misc='misc')\n@@ -1933,6 +1934,39 @@ def test_evaluated_queryset_as_argument(self):\n         # that query in a way that involves cloning.\n         self.assertEqual(ExtraInfo.objects.filter(note__in=n_list)[0].info, 'good')\n \n+    def test_no_model_options_cloning(self):\n+        \"\"\"\n+        Test that cloning a queryset does not get out of hand. While complete\n+        testing is impossible, this is a sanity check against invalid use of\n+        deepcopy. refs #16759.\n+        \"\"\"\n+        opts_class = type(Note._meta)\n+        note_deepcopy = getattr(opts_class, \"__deepcopy__\", None)\n+        opts_class.__deepcopy__ = lambda obj, memo: self.fail(\"Model options shouldn't be cloned.\")\n+        try:\n+            Note.objects.filter(pk__lte=F('pk') + 1).all()\n+        finally:\n+            if note_deepcopy is None:\n+                delattr(opts_class, \"__deepcopy__\")\n+            else:\n+                opts_class.__deepcopy__ = note_deepcopy\n+\n+    def test_no_fields_cloning(self):\n+        \"\"\"\n+        Test that cloning a queryset does not get out of hand. While complete\n+        testing is impossible, this is a sanity check against invalid use of\n+        deepcopy. refs #16759.\n+        \"\"\"\n+        opts_class = type(Note._meta.get_field_by_name(\"misc\")[0])\n+        note_deepcopy = getattr(opts_class, \"__deepcopy__\", None)\n+        opts_class.__deepcopy__ = lambda obj, memo: self.fail(\"Model fields shouldn't be cloned\")\n+        try:\n+            Note.objects.filter(note=F('misc')).all()\n+        finally:\n+            if note_deepcopy is None:\n+                delattr(opts_class, \"__deepcopy__\")\n+            else:\n+                opts_class.__deepcopy__ = note_deepcopy\n \n class EmptyQuerySetTests(TestCase):\n     def test_emptyqueryset_values(self):"
+        }
+    ],
+    "stats": {
+        "total": 88,
+        "additions": 81,
+        "deletions": 7
+    }
+}

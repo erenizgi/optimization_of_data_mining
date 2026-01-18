@@ -1,0 +1,84 @@
+{
+    "author": "addaleax",
+    "message": "src: do proper error checking in `AsyncWrap::MakeCallback`\n\nAt least one method on a native object is added as a getter,\nnamely `MessagePort.prototype.onmessage`. When a MessagePort\nattempts to call this method from C++ in response to receiving\ndata, it will first invoke that getter and then call the function.\n\nSince `worker.terminate()` interrupts execution, this means\nthat the getter may fail (without being faulty code on its own).\nThis means that at least one test exercising these methods in\ncombination has been flaky and could have crashed, because\nwe did not actually check that the getter returns a value\nso far, resulting in dereferencing an empty `Local`.\n\nThe proper fix for this is to use the non-deprecated overload\nof `Get()` and check the result like we should be doing.\nAlso, as a (related) fix, don’t crash if the method\nis not a function but rather something else, like a getter\ncould provide.\n\nExample test failure: https://ci.nodejs.org/job/node-test-commit-linux-containered/4976/nodes=ubuntu1604_sharedlibs_zlib_x64/console\n\n    17:56:56 not ok 1955 parallel/test-worker-dns-terminate\n    17:56:56   ---\n    17:56:56   duration_ms: 1.237\n    17:56:56   severity: crashed\n    17:56:56   exitcode: -11\n    17:56:56   stack: |-\n\nPR-URL: https://github.com/nodejs/node/pull/21189\nReviewed-By: Anatoli Papirovski <apapirovski@mac.com>\nReviewed-By: Benjamin Gruenbaum <benjamingr@gmail.com>\nReviewed-By: Joyee Cheung <joyeec9h3@gmail.com>\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "22c826f5aa3811e758686fd00a8fe15728f6fc37",
+    "files": [
+        {
+            "sha": "4405bb3a9baa520c23dd8f7357cd1d1c760a0f66",
+            "filename": "src/async_wrap-inl.h",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 12,
+            "changes": 20,
+            "blob_url": "https://github.com/nodejs/node/blob/22c826f5aa3811e758686fd00a8fe15728f6fc37/src%2Fasync_wrap-inl.h",
+            "raw_url": "https://github.com/nodejs/node/raw/22c826f5aa3811e758686fd00a8fe15728f6fc37/src%2Fasync_wrap-inl.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fasync_wrap-inl.h?ref=22c826f5aa3811e758686fd00a8fe15728f6fc37",
+            "patch": "@@ -81,18 +81,14 @@ inline v8::MaybeLocal<v8::Value> AsyncWrap::MakeCallback(\n     const v8::Local<v8::Name> symbol,\n     int argc,\n     v8::Local<v8::Value>* argv) {\n-  v8::Local<v8::Value> cb_v = object()->Get(symbol);\n-  CHECK(cb_v->IsFunction());\n-  return MakeCallback(cb_v.As<v8::Function>(), argc, argv);\n-}\n-\n-\n-inline v8::MaybeLocal<v8::Value> AsyncWrap::MakeCallback(\n-    uint32_t index,\n-    int argc,\n-    v8::Local<v8::Value>* argv) {\n-  v8::Local<v8::Value> cb_v = object()->Get(index);\n-  CHECK(cb_v->IsFunction());\n+  v8::Local<v8::Value> cb_v;\n+  if (!object()->Get(env()->context(), symbol).ToLocal(&cb_v))\n+    return v8::MaybeLocal<v8::Value>();\n+  if (!cb_v->IsFunction()) {\n+    // TODO(addaleax): We should throw an error here to fulfill the\n+    // `MaybeLocal<>` API contract.\n+    return v8::MaybeLocal<v8::Value>();\n+  }\n   return MakeCallback(cb_v.As<v8::Function>(), argc, argv);\n }\n "
+        },
+        {
+            "sha": "82c57910925be972766b606be9eb04e969dc0a47",
+            "filename": "src/async_wrap.h",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 3,
+            "changes": 3,
+            "blob_url": "https://github.com/nodejs/node/blob/22c826f5aa3811e758686fd00a8fe15728f6fc37/src%2Fasync_wrap.h",
+            "raw_url": "https://github.com/nodejs/node/raw/22c826f5aa3811e758686fd00a8fe15728f6fc37/src%2Fasync_wrap.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fasync_wrap.h?ref=22c826f5aa3811e758686fd00a8fe15728f6fc37",
+            "patch": "@@ -173,9 +173,6 @@ class AsyncWrap : public BaseObject {\n       const v8::Local<v8::Name> symbol,\n       int argc,\n       v8::Local<v8::Value>* argv);\n-  inline v8::MaybeLocal<v8::Value> MakeCallback(uint32_t index,\n-                                                int argc,\n-                                                v8::Local<v8::Value>* argv);\n \n   virtual size_t self_size() const = 0;\n   virtual std::string diagnostic_name() const;"
+        },
+        {
+            "sha": "bd7ef4000bad6fe8ddbbe175d0209686d4b446b7",
+            "filename": "src/handle_wrap.h",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/nodejs/node/blob/22c826f5aa3811e758686fd00a8fe15728f6fc37/src%2Fhandle_wrap.h",
+            "raw_url": "https://github.com/nodejs/node/raw/22c826f5aa3811e758686fd00a8fe15728f6fc37/src%2Fhandle_wrap.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fhandle_wrap.h?ref=22c826f5aa3811e758686fd00a8fe15728f6fc37",
+            "patch": "@@ -83,6 +83,10 @@ class HandleWrap : public AsyncWrap {\n   void MarkAsInitialized();\n   void MarkAsUninitialized();\n \n+  inline bool IsHandleClosing() const {\n+    return state_ == kClosing || state_ == kClosed;\n+  }\n+\n  private:\n   friend class Environment;\n   friend void GetActiveHandles(const v8::FunctionCallbackInfo<v8::Value>&);"
+        },
+        {
+            "sha": "407557d4f4ae135e085513ad5e4a08e48370820b",
+            "filename": "src/node_messaging.cc",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 1,
+            "changes": 13,
+            "blob_url": "https://github.com/nodejs/node/blob/22c826f5aa3811e758686fd00a8fe15728f6fc37/src%2Fnode_messaging.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/22c826f5aa3811e758686fd00a8fe15728f6fc37/src%2Fnode_messaging.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_messaging.cc?ref=22c826f5aa3811e758686fd00a8fe15728f6fc37",
+            "patch": "@@ -391,9 +391,21 @@ uv_async_t* MessagePort::async() {\n }\n \n void MessagePort::TriggerAsync() {\n+  if (IsHandleClosing()) return;\n   CHECK_EQ(uv_async_send(async()), 0);\n }\n \n+void MessagePort::Close(v8::Local<v8::Value> close_callback) {\n+  if (data_) {\n+    // Wrap this call with accessing the mutex, so that TriggerAsync()\n+    // can check IsHandleClosing() without race conditions.\n+    Mutex::ScopedLock sibling_lock(data_->mutex_);\n+    HandleWrap::Close(close_callback);\n+  } else {\n+    HandleWrap::Close(close_callback);\n+  }\n+}\n+\n void MessagePort::New(const FunctionCallbackInfo<Value>& args) {\n   Environment* env = Environment::GetCurrent(args);\n   if (!args.IsConstructCall()) {\n@@ -476,7 +488,6 @@ void MessagePort::OnMessage() {\n       };\n \n       if (args[0].IsEmpty() ||\n-          !object()->Has(context, env()->onmessage_string()).FromMaybe(false) ||\n           MakeCallback(env()->onmessage_string(), 1, args).IsEmpty()) {\n         // Re-schedule OnMessage() execution in case of failure.\n         if (data_)"
+        },
+        {
+            "sha": "28122c526ccceac87d69f52ced39b266083203ae",
+            "filename": "src/node_messaging.h",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/22c826f5aa3811e758686fd00a8fe15728f6fc37/src%2Fnode_messaging.h",
+            "raw_url": "https://github.com/nodejs/node/raw/22c826f5aa3811e758686fd00a8fe15728f6fc37/src%2Fnode_messaging.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_messaging.h?ref=22c826f5aa3811e758686fd00a8fe15728f6fc37",
+            "patch": "@@ -154,6 +154,8 @@ class MessagePort : public HandleWrap {\n   std::unique_ptr<MessagePortData> Detach();\n \n   bool IsSiblingClosed() const;\n+  void Close(\n+      v8::Local<v8::Value> close_callback = v8::Local<v8::Value>()) override;\n \n   size_t self_size() const override;\n "
+        },
+        {
+            "sha": "72d6d9fdf3fac4737a1c1b7694cd0dc65dc181f8",
+            "filename": "test/parallel/test-async-wrap-missing-method.js",
+            "status": "added",
+            "additions": 49,
+            "deletions": 0,
+            "changes": 49,
+            "blob_url": "https://github.com/nodejs/node/blob/22c826f5aa3811e758686fd00a8fe15728f6fc37/test%2Fparallel%2Ftest-async-wrap-missing-method.js",
+            "raw_url": "https://github.com/nodejs/node/raw/22c826f5aa3811e758686fd00a8fe15728f6fc37/test%2Fparallel%2Ftest-async-wrap-missing-method.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-async-wrap-missing-method.js?ref=22c826f5aa3811e758686fd00a8fe15728f6fc37",
+            "patch": "@@ -0,0 +1,49 @@\n+// Flags: --experimental-worker\n+'use strict';\n+const common = require('../common');\n+const assert = require('assert');\n+\n+const { MessageChannel } = require('worker_threads');\n+\n+{\n+  const { port1, port2 } = new MessageChannel();\n+\n+  // Returning a non-function in the getter should not crash.\n+  Object.defineProperty(port1, 'onmessage', {\n+    get() {\n+      port1.unref();\n+      return 42;\n+    }\n+  });\n+\n+  port2.postMessage({ foo: 'bar' });\n+\n+  // We need to start the port manually because .onmessage assignment tracking\n+  // has been overridden.\n+  port1.start();\n+  port1.ref();\n+}\n+\n+{\n+  const err = new Error('eyecatcher');\n+  process.on('uncaughtException', common.mustCall((exception) => {\n+    port1.unref();\n+    assert.strictEqual(exception, err);\n+  }));\n+\n+  const { port1, port2 } = new MessageChannel();\n+\n+  // Throwing in the getter should not crash.\n+  Object.defineProperty(port1, 'onmessage', {\n+    get() {\n+      throw err;\n+    }\n+  });\n+\n+  port2.postMessage({ foo: 'bar' });\n+\n+  // We need to start the port manually because .onmessage assignment tracking\n+  // has been overridden.\n+  port1.start();\n+  port1.ref();\n+}"
+        }
+    ],
+    "stats": {
+        "total": 91,
+        "additions": 75,
+        "deletions": 16
+    }
+}

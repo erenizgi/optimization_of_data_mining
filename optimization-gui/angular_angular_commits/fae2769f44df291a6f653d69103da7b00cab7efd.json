@@ -1,0 +1,72 @@
+{
+    "author": "atscott",
+    "message": "refactor(compiler-cli): Add additional shim locations to reference and variable symbols (#39715)\n\nBoth `ReferenceSymbol` and `VariableSymbol` have two locations of\ninterest to an external consumer.\n1. The location for the initializers of the local TCB variables allow consumers\nto query the TypeScript Language Service for information about the initialized type of the variable.\n2. The location of the local variable itself (i.e. `_t1`) allows\nconsumers to query the TypeScript LS for references to that variable\nfrom within the template.\n\nPR Close #39715",
+    "sha": "fae2769f44df291a6f653d69103da7b00cab7efd",
+    "files": [
+        {
+            "sha": "af72642041f9894dbacc7ce794272e502a8314fc",
+            "filename": "packages/compiler-cli/src/ngtsc/typecheck/api/symbols.ts",
+            "status": "modified",
+            "additions": 28,
+            "deletions": 4,
+            "changes": 32,
+            "blob_url": "https://github.com/angular/angular/blob/fae2769f44df291a6f653d69103da7b00cab7efd/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Fapi%2Fsymbols.ts",
+            "raw_url": "https://github.com/angular/angular/raw/fae2769f44df291a6f653d69103da7b00cab7efd/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Fapi%2Fsymbols.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Fapi%2Fsymbols.ts?ref=fae2769f44df291a6f653d69103da7b00cab7efd",
+            "patch": "@@ -155,8 +155,24 @@ export interface ReferenceSymbol {\n    */\n   declaration: TmplAstReference;\n \n-  /** The location in the shim file of a variable that holds the type of the local ref. */\n-  shimLocation: ShimLocation;\n+  /**\n+   * The location in the shim file of a variable that holds the type of the local ref.\n+   * For example, a reference declaration like the following:\n+   * ```\n+   * var _t1 = document.createElement('div');\n+   * var _t2 = _t1; // This is the reference declaration\n+   * ```\n+   * This `targetLocation` is `[_t1 variable declaration].getStart()`.\n+   */\n+  targetLocation: ShimLocation;\n+\n+  /**\n+   * The location in the TCB for the identifier node in the reference variable declaration.\n+   * For example, given a variable declaration statement for a template reference:\n+   * `var _t2 = _t1`, this location is `[_t2 node].getStart()`. This location can\n+   * be used to find references to the variable within the template.\n+   */\n+  referenceVarLocation: ShimLocation;\n }\n \n /**\n@@ -185,8 +201,16 @@ export interface VariableSymbol {\n    */\n   declaration: TmplAstVariable;\n \n-  /** The location in the shim file of a variable that holds the type of the template variable. */\n-  shimLocation: ShimLocation;\n+  /**\n+   * The location in the shim file for the identifier that was declared for the template variable.\n+   */\n+  localVarLocation: ShimLocation;\n+\n+  /**\n+   * The location in the shim file for the initializer node of the variable that represents the\n+   * template variable.\n+   */\n+  initializerLocation: ShimLocation;\n }\n \n /**"
+        },
+        {
+            "sha": "df08a4016f525e77cc9a192ea01b8345aae81b83",
+            "filename": "packages/compiler-cli/src/ngtsc/typecheck/src/template_symbol_builder.ts",
+            "status": "modified",
+            "additions": 23,
+            "deletions": 5,
+            "changes": 28,
+            "blob_url": "https://github.com/angular/angular/blob/fae2769f44df291a6f653d69103da7b00cab7efd/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Fsrc%2Ftemplate_symbol_builder.ts",
+            "raw_url": "https://github.com/angular/angular/raw/fae2769f44df291a6f653d69103da7b00cab7efd/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Fsrc%2Ftemplate_symbol_builder.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Fsrc%2Ftemplate_symbol_builder.ts?ref=fae2769f44df291a6f653d69103da7b00cab7efd",
+            "patch": "@@ -13,7 +13,7 @@ import {AbsoluteFsPath} from '../../file_system';\n import {ClassDeclaration} from '../../reflection';\n import {ComponentScopeReader} from '../../scope';\n import {isAssignment} from '../../util/src/typescript';\n-import {DirectiveSymbol, DomBindingSymbol, ElementSymbol, ExpressionSymbol, InputBindingSymbol, OutputBindingSymbol, ReferenceSymbol, Symbol, SymbolKind, TemplateSymbol, TsNodeSymbolInfo, TypeCheckableDirectiveMeta, VariableSymbol} from '../api';\n+import {DirectiveSymbol, DomBindingSymbol, ElementSymbol, ExpressionSymbol, InputBindingSymbol, OutputBindingSymbol, ReferenceSymbol, ShimLocation, Symbol, SymbolKind, TemplateSymbol, TsNodeSymbolInfo, TypeCheckableDirectiveMeta, VariableSymbol} from '../api';\n \n import {ExpressionIdentifier, findAllMatchingNodes, findFirstMatchingNode, hasExpressionIdentifier} from './comments';\n import {TemplateData} from './context';\n@@ -303,7 +303,17 @@ export class SymbolBuilder {\n       return null;\n     }\n \n-    return {...expressionSymbol, kind: SymbolKind.Variable, declaration: variable};\n+    return {\n+      tsType: expressionSymbol.tsType,\n+      tsSymbol: expressionSymbol.tsSymbol,\n+      initializerLocation: expressionSymbol.shimLocation,\n+      kind: SymbolKind.Variable,\n+      declaration: variable,\n+      localVarLocation: {\n+        shimPath: this.shimPath,\n+        positionInShimFile: this.getShimPositionForNode(node.name),\n+      }\n+    };\n   }\n \n   private getSymbolOfReference(ref: TmplAstReference): ReferenceSymbol|null {\n@@ -331,25 +341,33 @@ export class SymbolBuilder {\n       return null;\n     }\n \n+    const referenceVarShimLocation: ShimLocation = {\n+      shimPath: this.shimPath,\n+      positionInShimFile: this.getShimPositionForNode(node),\n+    };\n     if (target instanceof TmplAstTemplate || target instanceof TmplAstElement) {\n       return {\n-        ...symbol,\n-        tsSymbol: symbol.tsSymbol,\n         kind: SymbolKind.Reference,\n+        tsSymbol: symbol.tsSymbol,\n+        tsType: symbol.tsType,\n         target,\n         declaration: ref,\n+        targetLocation: symbol.shimLocation,\n+        referenceVarLocation: referenceVarShimLocation,\n       };\n     } else {\n       if (!ts.isClassDeclaration(target.directive.ref.node)) {\n         return null;\n       }\n \n       return {\n-        ...symbol,\n         kind: SymbolKind.Reference,\n         tsSymbol: symbol.tsSymbol,\n+        tsType: symbol.tsType,\n         declaration: ref,\n         target: target.directive.ref.node,\n+        targetLocation: symbol.shimLocation,\n+        referenceVarLocation: referenceVarShimLocation,\n       };\n     }\n   }"
+        },
+        {
+            "sha": "de0b8ce78afa0a7a41f33f2d9696e17b87958bb1",
+            "filename": "packages/language-service/ivy/definitions.ts",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 2,
+            "changes": 7,
+            "blob_url": "https://github.com/angular/angular/blob/fae2769f44df291a6f653d69103da7b00cab7efd/packages%2Flanguage-service%2Fivy%2Fdefinitions.ts",
+            "raw_url": "https://github.com/angular/angular/raw/fae2769f44df291a6f653d69103da7b00cab7efd/packages%2Flanguage-service%2Fivy%2Fdefinitions.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Flanguage-service%2Fivy%2Fdefinitions.ts?ref=fae2769f44df291a6f653d69103da7b00cab7efd",
+            "patch": "@@ -90,7 +90,8 @@ export class DefinitionBuilder {\n           });\n         }\n         if (symbol.kind === SymbolKind.Variable) {\n-          definitions.push(...this.getDefinitionsForSymbols(symbol));\n+          definitions.push(\n+              ...this.getDefinitionsForSymbols({shimLocation: symbol.initializerLocation}));\n         }\n         return definitions;\n       }\n@@ -135,9 +136,11 @@ export class DefinitionBuilder {\n         return [...bindingDefs, ...directiveDefs];\n       }\n       case SymbolKind.Reference:\n+        return this.getTypeDefinitionsForSymbols({shimLocation: symbol.targetLocation});\n       case SymbolKind.Expression:\n-      case SymbolKind.Variable:\n         return this.getTypeDefinitionsForSymbols(symbol);\n+      case SymbolKind.Variable:\n+        return this.getTypeDefinitionsForSymbols({shimLocation: symbol.initializerLocation});\n     }\n   }\n "
+        },
+        {
+            "sha": "0844fe6a81fa0e37bb574bc8057c5f4e79bece70",
+            "filename": "packages/language-service/ivy/display_parts.ts",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 1,
+            "changes": 4,
+            "blob_url": "https://github.com/angular/angular/blob/fae2769f44df291a6f653d69103da7b00cab7efd/packages%2Flanguage-service%2Fivy%2Fdisplay_parts.ts",
+            "raw_url": "https://github.com/angular/angular/raw/fae2769f44df291a6f653d69103da7b00cab7efd/packages%2Flanguage-service%2Fivy%2Fdisplay_parts.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Flanguage-service%2Fivy%2Fdisplay_parts.ts?ref=fae2769f44df291a6f653d69103da7b00cab7efd",
+            "patch": "@@ -56,7 +56,9 @@ export function getDisplayInfo(\n   const displayParts = createDisplayParts(\n       symbol.declaration.name, kind, /* containerName */ undefined,\n       typeChecker.typeToString(symbol.tsType));\n-  const documentation = getDocumentationFromTypeDefAtLocation(tsLS, symbol.shimLocation);\n+  const documentation = symbol.kind === SymbolKind.Reference ?\n+      getDocumentationFromTypeDefAtLocation(tsLS, symbol.targetLocation) :\n+      getDocumentationFromTypeDefAtLocation(tsLS, symbol.initializerLocation);\n   return {\n     kind,\n     displayParts,"
+        },
+        {
+            "sha": "32d99e65fd5935857bce1ad7e4a712692e0e93e8",
+            "filename": "packages/language-service/ivy/quick_info.ts",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 3,
+            "changes": 6,
+            "blob_url": "https://github.com/angular/angular/blob/fae2769f44df291a6f653d69103da7b00cab7efd/packages%2Flanguage-service%2Fivy%2Fquick_info.ts",
+            "raw_url": "https://github.com/angular/angular/raw/fae2769f44df291a6f653d69103da7b00cab7efd/packages%2Flanguage-service%2Fivy%2Fquick_info.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Flanguage-service%2Fivy%2Fquick_info.ts?ref=fae2769f44df291a6f653d69103da7b00cab7efd",
+            "patch": "@@ -80,14 +80,14 @@ export class QuickInfoBuilder {\n   }\n \n   private getQuickInfoForVariableSymbol(symbol: VariableSymbol): ts.QuickInfo {\n-    const documentation = this.getDocumentationFromTypeDefAtLocation(symbol.shimLocation);\n+    const documentation = this.getDocumentationFromTypeDefAtLocation(symbol.initializerLocation);\n     return createQuickInfo(\n         symbol.declaration.name, DisplayInfoKind.VARIABLE, getTextSpanOfNode(this.node),\n         undefined /* containerName */, this.typeChecker.typeToString(symbol.tsType), documentation);\n   }\n \n   private getQuickInfoForReferenceSymbol(symbol: ReferenceSymbol): ts.QuickInfo {\n-    const documentation = this.getDocumentationFromTypeDefAtLocation(symbol.shimLocation);\n+    const documentation = this.getDocumentationFromTypeDefAtLocation(symbol.targetLocation);\n     return createQuickInfo(\n         symbol.declaration.name, DisplayInfoKind.REFERENCE, getTextSpanOfNode(this.node),\n         undefined /* containerName */, this.typeChecker.typeToString(symbol.tsType), documentation);\n@@ -235,4 +235,4 @@ export function createQuickInfo(\n     displayParts,\n     documentation,\n   };\n-}\n\\ No newline at end of file\n+}"
+        }
+    ],
+    "stats": {
+        "total": 77,
+        "additions": 62,
+        "deletions": 15
+    }
+}

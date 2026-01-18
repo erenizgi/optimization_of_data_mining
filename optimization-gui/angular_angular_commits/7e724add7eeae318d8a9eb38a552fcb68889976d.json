@@ -1,0 +1,60 @@
+{
+    "author": "atscott",
+    "message": "refactor(compiler-cli): Add additional key/value spans to TCB (#39665)\n\nIn order to more accurately map from a node in the TCB to a template position,\nwe need to provide more span information in the TCB. These changes are necessary\nfor the Language Service to map from a TCB node back to a specific\nlocations in the template for actions like \"find references\" and\n\"refactor/rename\". After the TS \"find references\" returns results,\nincluding those in the TCB, we need to map specifically to the matching\nkey/value spans in the template rather than the entire source span.\n\nThis also has the benefit of producing diagnostics which align more\nclosely with what TypeScript produces.\nThe following example shows TS code and the diagnostic produced by an invalid assignment to a property:\n\n```\nlet a: {age: number} = {} as any;\na.age = 'laksjdf';\n^^^^^ <-- Type 'string' is not assignable to type 'number'.\n```\nA corollary to this in a template file would be [age]=\"'someString'\". The diagnostic we currently produce for this is:\n\n```\nType 'number' is not assignable to type 'string'.\n\n1 <app-hello [greeting]=\"1\"></app-hello>\n             ~~~~~~~~~~~~~~\n```\nNotice that the underlined text includes the entire span.\nIf we included the keySpan for the assignment to the property,\nthis diagnostic underline would be more similar to the one produced by TypeScript;\nthat is, it would only underline “greeting”.\n\n[design/discussion doc]\n(https://docs.google.com/document/d/1FtaHdVL805wKe4E6FxVTnVHl38lICoHIjS2nThtRJ6I/edit?usp=sharing)\n\nPR Close #39665",
+    "sha": "7e724add7eeae318d8a9eb38a552fcb68889976d",
+    "files": [
+        {
+            "sha": "0d417fae78068b176f64dc134436c9c68dc378bd",
+            "filename": "packages/compiler-cli/src/ngtsc/typecheck/src/type_check_block.ts",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 3,
+            "changes": 19,
+            "blob_url": "https://github.com/angular/angular/blob/7e724add7eeae318d8a9eb38a552fcb68889976d/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Fsrc%2Ftype_check_block.ts",
+            "raw_url": "https://github.com/angular/angular/raw/7e724add7eeae318d8a9eb38a552fcb68889976d/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Fsrc%2Ftype_check_block.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Fsrc%2Ftype_check_block.ts?ref=7e724add7eeae318d8a9eb38a552fcb68889976d",
+            "patch": "@@ -15,7 +15,7 @@ import {ClassDeclaration} from '../../reflection';\n import {TemplateId, TypeCheckableDirectiveMeta, TypeCheckBlockMetadata} from '../api';\n \n import {addExpressionIdentifier, ExpressionIdentifier, markIgnoreDiagnostics} from './comments';\n-import {addParseSpanInfo, addTemplateId, wrapForDiagnostics} from './diagnostics';\n+import {addParseSpanInfo, addTemplateId, wrapForDiagnostics, wrapForTypeChecker} from './diagnostics';\n import {DomSchemaChecker} from './dom';\n import {Environment} from './environment';\n import {astToTypescript, NULL_AS_ANY} from './expression';\n@@ -176,10 +176,18 @@ class TcbVariableOp extends TcbOp {\n     const initializer = ts.createPropertyAccess(\n         /* expression */ ctx,\n         /* name */ this.variable.value || '$implicit');\n-    addParseSpanInfo(initializer, this.variable.sourceSpan);\n+    addParseSpanInfo(id, this.variable.keySpan);\n \n     // Declare the variable, and return its identifier.\n-    this.scope.addStatement(tsCreateVariable(id, initializer));\n+    let variable: ts.VariableStatement;\n+    if (this.variable.valueSpan !== undefined) {\n+      addParseSpanInfo(initializer, this.variable.valueSpan);\n+      variable = tsCreateVariable(id, wrapForTypeChecker(initializer));\n+    } else {\n+      variable = tsCreateVariable(id, initializer);\n+    }\n+    addParseSpanInfo(variable.declarationList.declarations[0], this.variable.sourceSpan);\n+    this.scope.addStatement(variable);\n     return id;\n   }\n }\n@@ -443,6 +451,7 @@ class TcbReferenceOp extends TcbOp {\n       initializer = ts.createParen(initializer);\n     }\n     addParseSpanInfo(initializer, this.node.sourceSpan);\n+    addParseSpanInfo(id, this.node.keySpan);\n \n     this.scope.addStatement(tsCreateVariable(id, initializer));\n     return id;\n@@ -617,6 +626,9 @@ class TcbDirectiveInputsOp extends TcbOp {\n               ts.createPropertyAccess(dirId, ts.createIdentifier(fieldName));\n         }\n \n+        if (input.attribute.keySpan !== undefined) {\n+          addParseSpanInfo(target, input.attribute.keySpan);\n+        }\n         // Finally the assignment is extended by assigning it into the target expression.\n         assignment = ts.createBinary(target, ts.SyntaxKind.EqualsToken, assignment);\n       }\n@@ -839,6 +851,7 @@ export class TcbDirectiveOutputsOp extends TcbOp {\n           dirId = this.scope.resolve(this.node, this.dir);\n         }\n         const outputField = ts.createElementAccess(dirId, ts.createStringLiteral(field));\n+        addParseSpanInfo(outputField, output.keySpan);\n         const outputHelper =\n             ts.createCall(this.tcb.env.declareOutputHelper(), undefined, [outputField]);\n         const subscribeFn = ts.createPropertyAccess(outputHelper, 'subscribe');"
+        },
+        {
+            "sha": "cd7e820cb6a7c6f8f3c13b39abc4ef5b0a841864",
+            "filename": "packages/compiler-cli/src/ngtsc/typecheck/test/diagnostics_spec.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/angular/angular/blob/7e724add7eeae318d8a9eb38a552fcb68889976d/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Ftest%2Fdiagnostics_spec.ts",
+            "raw_url": "https://github.com/angular/angular/raw/7e724add7eeae318d8a9eb38a552fcb68889976d/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Ftest%2Fdiagnostics_spec.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Ftest%2Fdiagnostics_spec.ts?ref=7e724add7eeae318d8a9eb38a552fcb68889976d",
+            "patch": "@@ -36,7 +36,7 @@ runInEachFileSystem(() => {\n           }]);\n \n       expect(messages).toEqual(\n-          [`TestComponent.html(1, 10): Type 'string' is not assignable to type 'number'.`]);\n+          [`TestComponent.html(1, 11): Type 'string' is not assignable to type 'number'.`]);\n     });\n \n     it('infers type of template variables', () => {"
+        },
+        {
+            "sha": "caa312ce0a0b57ecb3860d7eac7142879a390d85",
+            "filename": "packages/compiler-cli/src/ngtsc/typecheck/test/span_comments_spec.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/angular/angular/blob/7e724add7eeae318d8a9eb38a552fcb68889976d/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Ftest%2Fspan_comments_spec.ts",
+            "raw_url": "https://github.com/angular/angular/raw/7e724add7eeae318d8a9eb38a552fcb68889976d/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Ftest%2Fspan_comments_spec.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Ftypecheck%2Ftest%2Fspan_comments_spec.ts?ref=7e724add7eeae318d8a9eb38a552fcb68889976d",
+            "patch": "@@ -184,7 +184,7 @@ describe('type check blocks diagnostics', () => {\n         }];\n         const TEMPLATE = `<my-cmp [inputA]=\"''\"></my-cmp>`;\n         expect(tcbWithSpans(TEMPLATE, DIRECTIVES))\n-            .toContain('_t1.inputA = (\"\" /*18,20*/) /*8,21*/;');\n+            .toContain('_t1.inputA /*9,15*/ = (\"\" /*18,20*/) /*8,21*/;');\n       });\n     });\n   });"
+        },
+        {
+            "sha": "4e20f958ec353ab98e674f54600fdcdad8a1c345",
+            "filename": "packages/compiler-cli/test/ngtsc/template_typecheck_spec.ts",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 6,
+            "changes": 12,
+            "blob_url": "https://github.com/angular/angular/blob/7e724add7eeae318d8a9eb38a552fcb68889976d/packages%2Fcompiler-cli%2Ftest%2Fngtsc%2Ftemplate_typecheck_spec.ts",
+            "raw_url": "https://github.com/angular/angular/raw/7e724add7eeae318d8a9eb38a552fcb68889976d/packages%2Fcompiler-cli%2Ftest%2Fngtsc%2Ftemplate_typecheck_spec.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Ftest%2Fngtsc%2Ftemplate_typecheck_spec.ts?ref=7e724add7eeae318d8a9eb38a552fcb68889976d",
+            "patch": "@@ -1267,11 +1267,11 @@ export declare class AnimationEvent {\n       const diags = env.driveDiagnostics();\n       expect(diags.length).toBe(3);\n       expect(diags[0].messageText).toBe(`Type 'boolean' is not assignable to type 'number'.`);\n-      expect(getSourceCodeForDiagnostic(diags[0])).toEqual('[fromAbstract]=\"true\"');\n+      expect(getSourceCodeForDiagnostic(diags[0])).toEqual('fromAbstract');\n       expect(diags[1].messageText).toBe(`Type 'number' is not assignable to type 'string'.`);\n-      expect(getSourceCodeForDiagnostic(diags[1])).toEqual('[fromBase]=\"3\"');\n+      expect(getSourceCodeForDiagnostic(diags[1])).toEqual('fromBase');\n       expect(diags[2].messageText).toBe(`Type 'number' is not assignable to type 'boolean'.`);\n-      expect(getSourceCodeForDiagnostic(diags[2])).toEqual('[fromChild]=\"4\"');\n+      expect(getSourceCodeForDiagnostic(diags[2])).toEqual('fromChild');\n     });\n \n     it('should properly type-check inherited directives from external libraries', () => {\n@@ -1324,11 +1324,11 @@ export declare class AnimationEvent {\n       const diags = env.driveDiagnostics();\n       expect(diags.length).toBe(3);\n       expect(diags[0].messageText).toBe(`Type 'boolean' is not assignable to type 'number'.`);\n-      expect(getSourceCodeForDiagnostic(diags[0])).toEqual('[fromAbstract]=\"true\"');\n+      expect(getSourceCodeForDiagnostic(diags[0])).toEqual('fromAbstract');\n       expect(diags[1].messageText).toBe(`Type 'number' is not assignable to type 'string'.`);\n-      expect(getSourceCodeForDiagnostic(diags[1])).toEqual('[fromBase]=\"3\"');\n+      expect(getSourceCodeForDiagnostic(diags[1])).toEqual('fromBase');\n       expect(diags[2].messageText).toBe(`Type 'number' is not assignable to type 'boolean'.`);\n-      expect(getSourceCodeForDiagnostic(diags[2])).toEqual('[fromChild]=\"4\"');\n+      expect(getSourceCodeForDiagnostic(diags[2])).toEqual('fromChild');\n     });\n \n     it('should detect an illegal write to a template variable', () => {"
+        }
+    ],
+    "stats": {
+        "total": 35,
+        "additions": 24,
+        "deletions": 11
+    }
+}

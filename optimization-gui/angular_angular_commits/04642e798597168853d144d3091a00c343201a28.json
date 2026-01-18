@@ -1,0 +1,96 @@
+{
+    "author": "devversion",
+    "message": "feat(dev-infra): add lint rule to enforce no-implicit-override abstract members (#42512)\n\nTypeScript introduced a new flag called `noImplicitOverride` as part\nof TypeScript v4.3. This flag introduces a new keyword called `override`\nthat can be applied to members which override declarations from a base\nclass. This helps with code health as TS will report an error if e.g.\nthe base class changes the method name but the override would still\nhave the old method name. Similarly, if the base class removes the method\ncompletely, TS would complain that the memeber with `override` no longer\noverrides any method.\n\nA similar concept applies to abstract methods, with the exception that\nTypeScript's builtin `noImplicitOverride` option does not flag members\nwhich are implemented as part of an abstract class. We want to enforce\nthis as a best-practice in the repository as adding `override` to such\nimplemented members will cause TS to complain if an abstract member is\nremoved, but still implemented by derived classes.\n\nMore details: https://github.com/microsoft/TypeScript/issues/44457.\n\nPR Close #42512",
+    "sha": "04642e798597168853d144d3091a00c343201a28",
+    "files": [
+        {
+            "sha": "f2ca982a5c960ee480e34052a60ded2693e08b53",
+            "filename": "dev-infra/BUILD.bazel",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/angular/angular/blob/04642e798597168853d144d3091a00c343201a28/dev-infra%2FBUILD.bazel",
+            "raw_url": "https://github.com/angular/angular/raw/04642e798597168853d144d3091a00c343201a28/dev-infra%2FBUILD.bazel",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/dev-infra%2FBUILD.bazel?ref=04642e798597168853d144d3091a00c343201a28",
+            "patch": "@@ -78,6 +78,7 @@ pkg_npm(\n         \"//dev-infra/benchmark/driver-utilities\",\n         \"//dev-infra/commit-message\",\n         \"//dev-infra/ts-circular-dependencies\",\n+        \"//dev-infra/tslint-rules\",\n     ],\n )\n "
+        },
+        {
+            "sha": "7d7baf8d33e7a6b29e51a42315c56668643cfaa9",
+            "filename": "dev-infra/tslint-rules/BUILD.bazel",
+            "status": "added",
+            "additions": 13,
+            "deletions": 0,
+            "changes": 13,
+            "blob_url": "https://github.com/angular/angular/blob/04642e798597168853d144d3091a00c343201a28/dev-infra%2Ftslint-rules%2FBUILD.bazel",
+            "raw_url": "https://github.com/angular/angular/raw/04642e798597168853d144d3091a00c343201a28/dev-infra%2Ftslint-rules%2FBUILD.bazel",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/dev-infra%2Ftslint-rules%2FBUILD.bazel?ref=04642e798597168853d144d3091a00c343201a28",
+            "patch": "@@ -0,0 +1,13 @@\n+load(\"@npm//@bazel/typescript:index.bzl\", \"ts_library\")\n+\n+ts_library(\n+    name = \"tslint-rules\",\n+    srcs = glob([\"*.ts\"]),\n+    module_name = \"@angular/dev-infra-private/tslint-rules\",\n+    visibility = [\"//dev-infra:__subpackages__\"],\n+    deps = [\n+        \"@npm//tslib\",\n+        \"@npm//tslint\",\n+        \"@npm//typescript\",\n+    ],\n+)"
+        },
+        {
+            "sha": "73ad2f9fc6dd9d9ed2d821d6c97f773c7f01a4c3",
+            "filename": "dev-infra/tslint-rules/noImplicitOverrideAbstractRule.ts",
+            "status": "added",
+            "additions": 145,
+            "deletions": 0,
+            "changes": 145,
+            "blob_url": "https://github.com/angular/angular/blob/04642e798597168853d144d3091a00c343201a28/dev-infra%2Ftslint-rules%2FnoImplicitOverrideAbstractRule.ts",
+            "raw_url": "https://github.com/angular/angular/raw/04642e798597168853d144d3091a00c343201a28/dev-infra%2Ftslint-rules%2FnoImplicitOverrideAbstractRule.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/dev-infra%2Ftslint-rules%2FnoImplicitOverrideAbstractRule.ts?ref=04642e798597168853d144d3091a00c343201a28",
+            "patch": "@@ -0,0 +1,145 @@\n+/**\n+ * @license\n+ * Copyright Google LLC All Rights Reserved.\n+ *\n+ * Use of this source code is governed by an MIT-style license that can be\n+ * found in the LICENSE file at https://angular.io/license\n+ */\n+\n+import {Replacement, RuleFailure, WalkContext} from 'tslint/lib';\n+import {TypedRule} from 'tslint/lib/rules';\n+import * as ts from 'typescript';\n+\n+const FAILURE_MESSAGE = 'Missing override modifier. Members implemented as part of ' +\n+    'abstract classes must explicitly set the \"override\" modifier. ' +\n+    'More details: https://github.com/microsoft/TypeScript/issues/44457#issuecomment-856202843.';\n+\n+/**\n+ * Rule which enforces that class members implementing abstract members\n+ * from base classes explicitly specify the `override` modifier.\n+ *\n+ * This ensures we follow the best-practice of applying `override` for abstract-implemented\n+ * members so that TypeScript creates diagnostics in both scenarios where either the abstract\n+ * class member is removed, or renamed.\n+ *\n+ * More details can be found here: https://github.com/microsoft/TypeScript/issues/44457.\n+ */\n+export class Rule extends TypedRule {\n+  override applyWithProgram(sourceFile: ts.SourceFile, program: ts.Program): RuleFailure[] {\n+    return this.applyWithFunction(sourceFile, ctx => visitNode(sourceFile, ctx, program));\n+  }\n+}\n+\n+/**\n+ * For a TypeScript AST node and each of its child nodes, check whether the node is a class\n+ * element which implements an abstract member but does not have the `override` keyword.\n+ */\n+function visitNode(node: ts.Node, ctx: WalkContext, program: ts.Program) {\n+  // If a class element implements an abstract member but does not have the\n+  // `override` keyword, create a lint failure.\n+  if (ts.isClassElement(node) && !hasOverrideModifier(node) &&\n+      matchesParentAbstractElement(node, program)) {\n+    ctx.addFailureAtNode(\n+        node, FAILURE_MESSAGE, Replacement.appendText(node.getStart(), `override `));\n+  }\n+\n+  ts.forEachChild(node, node => visitNode(node, ctx, program));\n+}\n+\n+/**\n+ * Checks if the specified class element matches a parent abstract class element. i.e.\n+ * whether the specified member \"implements\" an abstract member from a base class.\n+ */\n+function matchesParentAbstractElement(node: ts.ClassElement, program: ts.Program): boolean {\n+  const containingClass = node.parent as ts.ClassDeclaration;\n+\n+  // If the property we check does not have a property name, we cannot look for similarly-named\n+  // members in parent classes and therefore return early.\n+  if (node.name === undefined) {\n+    return false;\n+  }\n+\n+  const propertyName = getPropertyNameText(node.name);\n+  const typeChecker = program.getTypeChecker();\n+\n+  // If the property we check does not have a statically-analyzable property name,\n+  // we cannot look for similarly-named members in parent classes and return early.\n+  if (propertyName === null) {\n+    return false;\n+  }\n+\n+  return checkClassForInheritedMatchingAbstractMember(containingClass, typeChecker, propertyName);\n+}\n+\n+/** Checks if the given class inherits an abstract member with the specified name. */\n+function checkClassForInheritedMatchingAbstractMember(\n+    clazz: ts.ClassDeclaration, typeChecker: ts.TypeChecker, searchMemberName: string): boolean {\n+  const baseClass = getBaseClass(clazz, typeChecker);\n+\n+  // If the class is not `abstract`, then all parent abstract methods would need to\n+  // be implemented, and there is never an abstract member within the class.\n+  if (baseClass === null || !hasAbstractModifier(baseClass)) {\n+    return false;\n+  }\n+\n+  const matchingMember = baseClass.members.find(\n+      m => m.name !== undefined && getPropertyNameText(m.name) === searchMemberName);\n+\n+  if (matchingMember !== undefined) {\n+    return hasAbstractModifier(matchingMember);\n+  }\n+\n+  return checkClassForInheritedMatchingAbstractMember(baseClass, typeChecker, searchMemberName);\n+}\n+\n+/** Gets the base class for the given class declaration. */\n+function getBaseClass(node: ts.ClassDeclaration, typeChecker: ts.TypeChecker): ts.ClassDeclaration|\n+    null {\n+  const baseTypes = getExtendsHeritageExpressions(node);\n+\n+  if (baseTypes.length > 1) {\n+    throw Error('Class unexpectedly extends from multiple types.');\n+  }\n+\n+  const baseClass = typeChecker.getTypeAtLocation(baseTypes[0]).getSymbol();\n+  const baseClassDecl = baseClass?.valueDeclaration ?? baseClass?.declarations?.[0];\n+\n+  if (baseClassDecl !== undefined && ts.isClassDeclaration(baseClassDecl)) {\n+    return baseClassDecl;\n+  }\n+\n+  return null;\n+}\n+\n+/** Gets the `extends` base type expressions of the specified class. */\n+function getExtendsHeritageExpressions(classDecl: ts.ClassDeclaration):\n+    ts.ExpressionWithTypeArguments[] {\n+  if (classDecl.heritageClauses === undefined) {\n+    return [];\n+  }\n+  const result: ts.ExpressionWithTypeArguments[] = [];\n+  for (const clause of classDecl.heritageClauses) {\n+    if (clause.token === ts.SyntaxKind.ExtendsKeyword) {\n+      result.push(...clause.types);\n+    }\n+  }\n+  return result;\n+}\n+\n+/** Gets whether the specified node has the `abstract` modifier applied. */\n+function hasAbstractModifier(node: ts.Node): boolean {\n+  return !!node.modifiers?.some(s => s.kind === ts.SyntaxKind.AbstractKeyword);\n+}\n+\n+/** Gets whether the specified node has the `override` modifier applied. */\n+function hasOverrideModifier(node: ts.Node): boolean {\n+  return !!node.modifiers?.some(s => s.kind === ts.SyntaxKind.OverrideKeyword);\n+}\n+\n+/** Gets the property name text of the specified property name. */\n+function getPropertyNameText(name: ts.PropertyName): string|null {\n+  if (ts.isComputedPropertyName(name)) {\n+    return null;\n+  }\n+  return name.text;\n+}"
+        },
+        {
+            "sha": "dc9627a4ad27777f06de361029777ae4b041b3d9",
+            "filename": "package.json",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/angular/angular/blob/04642e798597168853d144d3091a00c343201a28/package.json",
+            "raw_url": "https://github.com/angular/angular/raw/04642e798597168853d144d3091a00c343201a28/package.json",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/package.json?ref=04642e798597168853d144d3091a00c343201a28",
+            "patch": "@@ -29,7 +29,7 @@\n     \"test-fixme-ivy-aot\": \"bazelisk test --config=ivy --build_tag_filters=-no-ivy-aot --test_tag_filters=-no-ivy-aot\",\n     \"list-fixme-ivy-targets\": \"bazelisk query --output=label 'attr(\\\"tags\\\", \\\"\\\\[.*fixme-ivy.*\\\\]\\\", //...) except kind(\\\"sh_binary\\\", //...) except kind(\\\"devmode_js_sources\\\", //...)' | sort\",\n     \"lint\": \"yarn -s tslint && yarn -s ng-dev format changed --check\",\n-    \"tslint\": \"tsc -p tools/tsconfig.json && tslint -c tslint.json \\\"+(dev-infra|packages|modules|scripts|tools)/**/*.+(js|ts)\\\"\",\n+    \"tslint\": \"tslint -c tslint.json --project tsconfig-tslint.json\",\n     \"public-api:check\": \"node goldens/public-api/manage.js test\",\n     \"public-api:update\": \"node goldens/public-api/manage.js accept\",\n     \"symbol-extractor:check\": \"node tools/symbol-extractor/run_all_symbols_extractor_tests.js test\","
+        },
+        {
+            "sha": "091cc3dda8424e876579fe7fb4fe45ea862c5de9",
+            "filename": "tools/tslint/tsNodeLoaderRule.js",
+            "status": "added",
+            "additions": 19,
+            "deletions": 0,
+            "changes": 19,
+            "blob_url": "https://github.com/angular/angular/blob/04642e798597168853d144d3091a00c343201a28/tools%2Ftslint%2FtsNodeLoaderRule.js",
+            "raw_url": "https://github.com/angular/angular/raw/04642e798597168853d144d3091a00c343201a28/tools%2Ftslint%2FtsNodeLoaderRule.js",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/tools%2Ftslint%2FtsNodeLoaderRule.js?ref=04642e798597168853d144d3091a00c343201a28",
+            "patch": "@@ -0,0 +1,19 @@\n+/**\n+ * @license\n+ * Copyright Google LLC All Rights Reserved.\n+ *\n+ * Use of this source code is governed by an MIT-style license that can be\n+ * found in the LICENSE file at https://angular.io/license\n+ */\n+\n+const path = require('path');\n+const Lint = require('tslint');\n+\n+// Custom rule that registers all of the custom rules, written in TypeScript, with ts-node.\n+// This is necessary, because `tslint` and IDEs won't execute any rules that aren't in a .js file.\n+require('ts-node').register();\n+\n+// Add a noop rule so tslint doesn't complain.\n+exports.Rule = class Rule extends Lint.Rules.AbstractRule {\n+  apply() {}\n+};"
+        },
+        {
+            "sha": "e5a235c7c904f454a90d6b32c65a2fa0b1ae9819",
+            "filename": "tsconfig-tslint.json",
+            "status": "added",
+            "additions": 12,
+            "deletions": 0,
+            "changes": 12,
+            "blob_url": "https://github.com/angular/angular/blob/04642e798597168853d144d3091a00c343201a28/tsconfig-tslint.json",
+            "raw_url": "https://github.com/angular/angular/raw/04642e798597168853d144d3091a00c343201a28/tsconfig-tslint.json",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/tsconfig-tslint.json?ref=04642e798597168853d144d3091a00c343201a28",
+            "patch": "@@ -0,0 +1,12 @@\n+{\n+  \"compilerOptions\": {\n+    \"allowJs\": true\n+  },\n+  \"include\": [\n+    \"dev-infra/**/*\",\n+    \"packages/**/*\",\n+    \"modules/**/*\",\n+    \"tools/**/*\",\n+    \"scripts/**/*\"\n+  ]\n+}"
+        },
+        {
+            "sha": "a08ecf0e5d58d2ca7b97aa8609fe632fda9e36f0",
+            "filename": "tslint.json",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 3,
+            "changes": 18,
+            "blob_url": "https://github.com/angular/angular/blob/04642e798597168853d144d3091a00c343201a28/tslint.json",
+            "raw_url": "https://github.com/angular/angular/raw/04642e798597168853d144d3091a00c343201a28/tslint.json",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/tslint.json?ref=04642e798597168853d144d3091a00c343201a28",
+            "patch": "@@ -1,11 +1,19 @@\n {\n   \"rulesDirectory\": [\n-    \"dist/tools/tslint\",\n+    \"tools/tslint\",\n+    \"dev-infra/tslint-rules\",\n     \"node_modules/vrsource-tslint-rules/rules\",\n     \"node_modules/tslint-eslint-rules/dist/rules\",\n     \"node_modules/tslint-no-toplevel-property-access/rules\"\n   ],\n   \"rules\": {\n+    // The first rule needs to be `ts-node-loader` which sets up `ts-node` within TSLint so\n+    // that rules written in TypeScript can be loaded without needing to be transpiled.\n+    \"ts-node-loader\": true,\n+    // Custom rules written in TypeScript.\n+    \"require-internal-with-underscore\": true,\n+    \"no-implicit-override-abstract\": true,\n+\n     \"eofline\": true,\n     \"file-header\": [\n       true,\n@@ -26,7 +34,6 @@\n       true,\n       \"object\"\n     ],\n-    \"require-internal-with-underscore\": true,\n     \"no-toplevel-property-access\": [\n       true,\n       \"packages/animations/src/\",\n@@ -57,6 +64,12 @@\n     ]\n   },\n   \"jsRules\": {\n+    // The first rule needs to be `ts-node-loader` which sets up `ts-node` within TSLint so\n+    // that rules written in TypeScript can be loaded without needing to be transpiled.\n+    \"ts-node-loader\": true,\n+    // Custom rules written in TypeScript.\n+    \"require-internal-with-underscore\": true,\n+\n     \"eofline\": true,\n     \"file-header\": [\n       true,\n@@ -71,7 +84,6 @@\n     ],\n     \"no-duplicate-imports\": true,\n     \"no-duplicate-variable\": true,\n-    \"require-internal-with-underscore\": true,\n     \"semicolon\": [\n       true\n     ],"
+        }
+    ],
+    "stats": {
+        "total": 210,
+        "additions": 206,
+        "deletions": 4
+    }
+}

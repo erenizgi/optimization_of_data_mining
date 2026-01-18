@@ -1,0 +1,60 @@
+{
+    "author": "alex",
+    "message": "Introduce `ContentType.objects.get_for_models(*models)` and use it in the the auth permissions code.  This is a solid performance gain on the test suite.  Thanks to ptone for the profiling to find this hotspot, and carl for the review.\n\ngit-svn-id: http://code.djangoproject.com/svn/django/trunk@16963 bcc190cf-cafb-0310-a4f2-bffc1f526a37",
+    "sha": "f04af7080b12744c8f06fb8228ef683d556690d0",
+    "files": [
+        {
+            "sha": "78a51cf443e7254366a478b7119f9be818f1a9a7",
+            "filename": "django/contrib/auth/management/__init__.py",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/django/django/blob/f04af7080b12744c8f06fb8228ef683d556690d0/django%2Fcontrib%2Fauth%2Fmanagement%2F__init__.py",
+            "raw_url": "https://github.com/django/django/raw/f04af7080b12744c8f06fb8228ef683d556690d0/django%2Fcontrib%2Fauth%2Fmanagement%2F__init__.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fcontrib%2Fauth%2Fmanagement%2F__init__.py?ref=f04af7080b12744c8f06fb8228ef683d556690d0",
+            "patch": "@@ -31,8 +31,8 @@ def create_permissions(app, created_models, verbosity, **kwargs):\n     searched_perms = list()\n     # The codenames and ctypes that should exist.\n     ctypes = set()\n-    for klass in app_models:\n-        ctype = ContentType.objects.get_for_model(klass)\n+    ctypes_for_models = ContentType.objects.get_for_models(*app_models)\n+    for klass, ctype in ctypes_for_models.iteritems():\n         ctypes.add(ctype)\n         for perm in _get_all_permissions(klass._meta):\n             searched_perms.append((ctype, perm))"
+        },
+        {
+            "sha": "1bb07e0d529bba5dc5be8f6a0ccb0578158d69f4",
+            "filename": "django/contrib/contenttypes/models.py",
+            "status": "modified",
+            "additions": 55,
+            "deletions": 6,
+            "changes": 61,
+            "blob_url": "https://github.com/django/django/blob/f04af7080b12744c8f06fb8228ef683d556690d0/django%2Fcontrib%2Fcontenttypes%2Fmodels.py",
+            "raw_url": "https://github.com/django/django/raw/f04af7080b12744c8f06fb8228ef683d556690d0/django%2Fcontrib%2Fcontenttypes%2Fmodels.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fcontrib%2Fcontenttypes%2Fmodels.py?ref=f04af7080b12744c8f06fb8228ef683d556690d0",
+            "patch": "@@ -15,19 +15,26 @@ def get_by_natural_key(self, app_label, model):\n             ct = self.get(app_label=app_label, model=model)\n         return ct\n \n+    def _get_opts(self, model):\n+        opts = model._meta\n+        while opts.proxy:\n+            model = opts.proxy_for_model\n+            opts = model._meta\n+        return opts\n+\n+    def _get_from_cache(self, opts):\n+        key = (opts.app_label, opts.object_name.lower())\n+        return self.__class__._cache[self.db][key]\n+\n     def get_for_model(self, model):\n         \"\"\"\n         Returns the ContentType object for a given model, creating the\n         ContentType if necessary. Lookups are cached so that subsequent lookups\n         for the same model don't hit the database.\n         \"\"\"\n-        opts = model._meta\n-        while opts.proxy:\n-            model = opts.proxy_for_model\n-            opts = model._meta\n-        key = (opts.app_label, opts.object_name.lower())\n+        opts = self._get_opts(model)\n         try:\n-            ct = self.__class__._cache[self.db][key]\n+            ct = self._get_from_cache(opts)\n         except KeyError:\n             # Load or create the ContentType entry. The smart_unicode() is\n             # needed around opts.verbose_name_raw because name_raw might be a\n@@ -41,6 +48,48 @@ def get_for_model(self, model):\n \n         return ct\n \n+    def get_for_models(self, *models):\n+        \"\"\"\n+        Given *models, returns a dictionary mapping {model: content_type}.\n+        \"\"\"\n+        # Final results\n+        results = {}\n+        # models that aren't already in the cache\n+        needed_app_labels = set()\n+        needed_models = set()\n+        needed_opts = set()\n+        for model in models:\n+            opts = self._get_opts(model)\n+            try:\n+                ct = self._get_from_cache(opts)\n+            except KeyError:\n+                needed_app_labels.add(opts.app_label)\n+                needed_models.add(opts.object_name.lower())\n+                needed_opts.add(opts)\n+            else:\n+                results[model] = ct\n+        if needed_opts:\n+            cts = self.filter(\n+                app_label__in=needed_app_labels,\n+                model__in=needed_models\n+            )\n+            for ct in cts:\n+                model = ct.model_class()\n+                if model._meta in needed_opts:\n+                    results[model] = ct\n+                    needed_opts.remove(model._meta)\n+                self._add_to_cache(self.db, ct)\n+        for opts in needed_opts:\n+            # These weren't in the cache, or the DB, create them.\n+            ct = self.create(\n+                app_label=opts.app_label,\n+                model=opts.object_name.lower(),\n+                name=smart_unicode(opts.verbose_name_raw),\n+            )\n+            self._add_to_cache(self.db, ct)\n+            results[ct.model_class()] = ct\n+        return results\n+\n     def get_for_id(self, id):\n         \"\"\"\n         Lookup a ContentType by ID. Uses the same shared cache as get_for_model"
+        },
+        {
+            "sha": "18546647558bb8887a08970eaa923f7b40c6c7c4",
+            "filename": "django/contrib/contenttypes/tests.py",
+            "status": "modified",
+            "additions": 30,
+            "deletions": 0,
+            "changes": 30,
+            "blob_url": "https://github.com/django/django/blob/f04af7080b12744c8f06fb8228ef683d556690d0/django%2Fcontrib%2Fcontenttypes%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/f04af7080b12744c8f06fb8228ef683d556690d0/django%2Fcontrib%2Fcontenttypes%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fcontrib%2Fcontenttypes%2Ftests.py?ref=f04af7080b12744c8f06fb8228ef683d556690d0",
+            "patch": "@@ -63,6 +63,36 @@ def test_lookup_cache(self):\n         with self.assertNumQueries(1):\n             ContentType.objects.get_for_model(ContentType)\n \n+    def test_get_for_models_empty_cache(self):\n+        # Empty cache.\n+        with self.assertNumQueries(1):\n+            cts = ContentType.objects.get_for_models(ContentType, FooWithUrl)\n+        self.assertEqual(cts, {\n+            ContentType: ContentType.objects.get_for_model(ContentType),\n+            FooWithUrl: ContentType.objects.get_for_model(FooWithUrl),\n+        })\n+\n+    def test_get_for_models_partial_cache(self):\n+        # Partial cache\n+        ContentType.objects.get_for_model(ContentType)\n+        with self.assertNumQueries(1):\n+            cts = ContentType.objects.get_for_models(ContentType, FooWithUrl)\n+        self.assertEqual(cts, {\n+            ContentType: ContentType.objects.get_for_model(ContentType),\n+            FooWithUrl: ContentType.objects.get_for_model(FooWithUrl),\n+        })\n+\n+    def test_get_for_models_full_cache(self):\n+        # Full cache\n+        ContentType.objects.get_for_model(ContentType)\n+        ContentType.objects.get_for_model(FooWithUrl)\n+        with self.assertNumQueries(0):\n+            cts = ContentType.objects.get_for_models(ContentType, FooWithUrl)\n+        self.assertEqual(cts, {\n+            ContentType: ContentType.objects.get_for_model(ContentType),\n+            FooWithUrl: ContentType.objects.get_for_model(FooWithUrl),\n+        })\n+\n     def test_shortcut_view(self):\n         \"\"\"\n         Check that the shortcut view (used for the admin \"view on site\""
+        },
+        {
+            "sha": "fc685c8cd6f6b5631a02fd6556575a0d4d6fcde8",
+            "filename": "docs/ref/contrib/contenttypes.txt",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 2,
+            "changes": 11,
+            "blob_url": "https://github.com/django/django/blob/f04af7080b12744c8f06fb8228ef683d556690d0/docs%2Fref%2Fcontrib%2Fcontenttypes.txt",
+            "raw_url": "https://github.com/django/django/raw/f04af7080b12744c8f06fb8228ef683d556690d0/docs%2Fref%2Fcontrib%2Fcontenttypes.txt",
+            "contents_url": "https://api.github.com/repos/django/django/contents/docs%2Fref%2Fcontrib%2Fcontenttypes.txt?ref=f04af7080b12744c8f06fb8228ef683d556690d0",
+            "patch": "@@ -193,6 +193,13 @@ The ``ContentTypeManager``\n         :class:`~django.contrib.contenttypes.models.ContentType` instance\n         representing that model.\n \n+    .. method:: get_for_models(*models)\n+\n+        Takes a variadic number of model classes, and returns a dictionary\n+        mapping the model classes to the\n+        :class:`~django.contrib.contenttypes.models.ContentType` instances\n+        representing them.\n+\n     .. method:: get_by_natural_key(app_label, model)\n \n         Returns the :class:`~django.contrib.contenttypes.models.ContentType`\n@@ -319,8 +326,8 @@ creating a ``TaggedItem``::\n \n Due to the way :class:`~django.contrib.contenttypes.generic.GenericForeignKey`\n is implemented, you cannot use such fields directly with filters (``filter()``\n-and ``exclude()``, for example) via the database API. Because a \n-:class:`~django.contrib.contenttypes.generic.GenericForeignKey` isn't a \n+and ``exclude()``, for example) via the database API. Because a\n+:class:`~django.contrib.contenttypes.generic.GenericForeignKey` isn't a\n normal field objects, these examples will *not* work::\n \n     # This will fail"
+        }
+    ],
+    "stats": {
+        "total": 106,
+        "additions": 96,
+        "deletions": 10
+    }
+}

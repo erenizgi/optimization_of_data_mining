@@ -1,0 +1,108 @@
+{
+    "author": "devversion",
+    "message": "refactor(compiler-cli): remove dynamic require in ngcc to allow for bundling (#43431)\n\nngcc currently dynamially loads the `Transformer` code. It does this\nto avoid unnecessary parsing and loading of transformer-related code\nif there is nothing to process (so-called noop case). Unfortunately\nthis dynamic require is not recognized by ESBuild. The import needs\nto be discovered as otheriwse the transformer code would not be included\nin the bundled package output of the CLI.\n\nThe ngcc code needs to use an async runtime import as it would work\nin ES modules. This introduces async code into to the compililation\npipeline, breaking the `ngccMain` synchronous invocation feature.\n\nTo avoid this, we just move the dynamic require/async import to\nthe file top-level so that we do not break synchronous processing\nwhich the CLI relies on. This has the downside of slowing-down\nthe noop case a little but I believe that should be mitigated\nthrough bundling of ngcc anyway. In the future with full-ESM\nwe won't be able to get around this anyway (unless we remove the\nsync variant of ngcc processing).\n\nPR Close #43431",
+    "sha": "11a81898be7de96f5d6f976cd2c87aa8cec5886c",
+    "files": [
+        {
+            "sha": "149c9f577909082c5acf1eb607662247b92ef8c7",
+            "filename": "packages/compiler-cli/BUILD.bazel",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/angular/angular/blob/11a81898be7de96f5d6f976cd2c87aa8cec5886c/packages%2Fcompiler-cli%2FBUILD.bazel",
+            "raw_url": "https://github.com/angular/angular/raw/11a81898be7de96f5d6f976cd2c87aa8cec5886c/packages%2Fcompiler-cli%2FBUILD.bazel",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2FBUILD.bazel?ref=11a81898be7de96f5d6f976cd2c87aa8cec5886c",
+            "patch": "@@ -34,6 +34,8 @@ esbuild(\n         \"//packages/compiler-cli/private:bazel.ts\",\n         \"//packages/compiler-cli/private:localize.ts\",\n         \"//packages/compiler-cli/private:migrations.ts\",\n+        \"//packages/compiler-cli/ngcc:src/locking/lock_file_with_child_process/ngcc_lock_unlocker.ts\",\n+        \"//packages/compiler-cli/ngcc:src/execution/cluster/ngcc_cluster_worker.ts\",\n     ],\n     external = [\n         \"@angular/compiler\","
+        },
+        {
+            "sha": "f8d8929757db071f4e990c54ad34dc0794b6295c",
+            "filename": "packages/compiler-cli/ngcc/src/execution/cluster/master.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/angular/angular/blob/11a81898be7de96f5d6f976cd2c87aa8cec5886c/packages%2Fcompiler-cli%2Fngcc%2Fsrc%2Fexecution%2Fcluster%2Fmaster.ts",
+            "raw_url": "https://github.com/angular/angular/raw/11a81898be7de96f5d6f976cd2c87aa8cec5886c/packages%2Fcompiler-cli%2Fngcc%2Fsrc%2Fexecution%2Fcluster%2Fmaster.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fngcc%2Fsrc%2Fexecution%2Fcluster%2Fmaster.ts?ref=11a81898be7de96f5d6f976cd2c87aa8cec5886c",
+            "patch": "@@ -44,7 +44,7 @@ export class ClusterMaster {\n     }\n \n     // Set the worker entry-point\n-    cluster.setupMaster({exec: this.fileSystem.resolve(__dirname, 'worker.js')});\n+    cluster.setupMaster({exec: this.fileSystem.resolve(__dirname, 'ngcc_cluster_worker.js')});\n \n     this.taskQueue = analyzeEntryPoints();\n     this.onTaskCompleted = createTaskCompletedCallback(this.taskQueue);"
+        },
+        {
+            "sha": "a7072fecaa8a0c013fbc26642c9e16281c7607ee",
+            "filename": "packages/compiler-cli/ngcc/src/execution/cluster/ngcc_cluster_worker.ts",
+            "status": "added",
+            "additions": 46,
+            "deletions": 0,
+            "changes": 46,
+            "blob_url": "https://github.com/angular/angular/blob/11a81898be7de96f5d6f976cd2c87aa8cec5886c/packages%2Fcompiler-cli%2Fngcc%2Fsrc%2Fexecution%2Fcluster%2Fngcc_cluster_worker.ts",
+            "raw_url": "https://github.com/angular/angular/raw/11a81898be7de96f5d6f976cd2c87aa8cec5886c/packages%2Fcompiler-cli%2Fngcc%2Fsrc%2Fexecution%2Fcluster%2Fngcc_cluster_worker.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fngcc%2Fsrc%2Fexecution%2Fcluster%2Fngcc_cluster_worker.ts?ref=11a81898be7de96f5d6f976cd2c87aa8cec5886c",
+            "patch": "@@ -0,0 +1,46 @@\n+/**\n+ * @license\n+ * Copyright Google LLC All Rights Reserved.\n+ *\n+ * Use of this source code is governed by an MIT-style license that can be\n+ * found in the LICENSE file at https://angular.io/license\n+ */\n+\n+import {parseCommandLineOptions} from '../../command_line_options';\n+import {getSharedSetup} from '../../ngcc_options';\n+import {getCreateCompileFn} from '../create_compile_function';\n+\n+import {ClusterWorkerPackageJsonUpdater} from './package_json_updater';\n+import {startWorker} from './worker';\n+\n+// Cluster worker entry point\n+(async () => {\n+  process.title = 'ngcc (worker)';\n+\n+  try {\n+    const {\n+      logger,\n+      pathMappings,\n+      enableI18nLegacyMessageIdFormat,\n+      fileSystem,\n+      tsConfig,\n+      getFileWriter,\n+    } = getSharedSetup(parseCommandLineOptions(process.argv.slice(2)));\n+\n+    // NOTE: To avoid file corruption, `ngcc` invocation only creates _one_ instance of\n+    // `PackageJsonUpdater` that actually writes to disk (across all processes).\n+    // In cluster workers we use a `PackageJsonUpdater` that delegates to the cluster master.\n+    const pkgJsonUpdater = new ClusterWorkerPackageJsonUpdater();\n+    const fileWriter = getFileWriter(pkgJsonUpdater);\n+\n+    // The function for creating the `compile()` function.\n+    const createCompileFn = getCreateCompileFn(\n+        fileSystem, logger, fileWriter, enableI18nLegacyMessageIdFormat, tsConfig, pathMappings);\n+\n+    await startWorker(logger, createCompileFn);\n+    process.exitCode = 0;\n+  } catch (e) {\n+    console.error(e.stack || e.message);\n+    process.exit(1);\n+  }\n+})();"
+        },
+        {
+            "sha": "32b984b2ecdb3b0303b6f01666e4ff15161d8034",
+            "filename": "packages/compiler-cli/ngcc/src/execution/cluster/worker.ts",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 38,
+            "changes": 38,
+            "blob_url": "https://github.com/angular/angular/blob/11a81898be7de96f5d6f976cd2c87aa8cec5886c/packages%2Fcompiler-cli%2Fngcc%2Fsrc%2Fexecution%2Fcluster%2Fworker.ts",
+            "raw_url": "https://github.com/angular/angular/raw/11a81898be7de96f5d6f976cd2c87aa8cec5886c/packages%2Fcompiler-cli%2Fngcc%2Fsrc%2Fexecution%2Fcluster%2Fworker.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fngcc%2Fsrc%2Fexecution%2Fcluster%2Fworker.ts?ref=11a81898be7de96f5d6f976cd2c87aa8cec5886c",
+            "patch": "@@ -10,50 +10,12 @@\n import * as cluster from 'cluster';\n \n import {Logger} from '../../../../src/ngtsc/logging';\n-import {parseCommandLineOptions} from '../../command_line_options';\n-import {getSharedSetup} from '../../ngcc_options';\n import {CreateCompileFn} from '../api';\n-import {getCreateCompileFn} from '../create_compile_function';\n import {stringifyTask} from '../tasks/utils';\n \n import {MessageToWorker} from './api';\n-import {ClusterWorkerPackageJsonUpdater} from './package_json_updater';\n import {sendMessageToMaster} from './utils';\n \n-// Cluster worker entry point\n-if (require.main === module) {\n-  (async () => {\n-    process.title = 'ngcc (worker)';\n-\n-    try {\n-      const {\n-        logger,\n-        pathMappings,\n-        enableI18nLegacyMessageIdFormat,\n-        fileSystem,\n-        tsConfig,\n-        getFileWriter,\n-      } = getSharedSetup(parseCommandLineOptions(process.argv.slice(2)));\n-\n-      // NOTE: To avoid file corruption, `ngcc` invocation only creates _one_ instance of\n-      // `PackageJsonUpdater` that actually writes to disk (across all processes).\n-      // In cluster workers we use a `PackageJsonUpdater` that delegates to the cluster master.\n-      const pkgJsonUpdater = new ClusterWorkerPackageJsonUpdater();\n-      const fileWriter = getFileWriter(pkgJsonUpdater);\n-\n-      // The function for creating the `compile()` function.\n-      const createCompileFn = getCreateCompileFn(\n-          fileSystem, logger, fileWriter, enableI18nLegacyMessageIdFormat, tsConfig, pathMappings);\n-\n-      await startWorker(logger, createCompileFn);\n-      process.exitCode = 0;\n-    } catch (e) {\n-      console.error(e.stack || e.message);\n-      process.exit(1);\n-    }\n-  })();\n-}\n-\n export async function startWorker(logger: Logger, createCompileFn: CreateCompileFn): Promise<void> {\n   if (cluster.isMaster) {\n     throw new Error('Tried to run cluster worker on the master process.');"
+        },
+        {
+            "sha": "fb528a8ea025f311d366fe60705166a4b3b314ff",
+            "filename": "packages/compiler-cli/ngcc/src/execution/create_compile_function.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/angular/angular/blob/11a81898be7de96f5d6f976cd2c87aa8cec5886c/packages%2Fcompiler-cli%2Fngcc%2Fsrc%2Fexecution%2Fcreate_compile_function.ts",
+            "raw_url": "https://github.com/angular/angular/raw/11a81898be7de96f5d6f976cd2c87aa8cec5886c/packages%2Fcompiler-cli%2Fngcc%2Fsrc%2Fexecution%2Fcreate_compile_function.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fngcc%2Fsrc%2Fexecution%2Fcreate_compile_function.ts?ref=11a81898be7de96f5d6f976cd2c87aa8cec5886c",
+            "patch": "@@ -15,6 +15,7 @@ import {ParsedConfiguration} from '../../../src/perform_compile';\n import {getEntryPointFormat} from '../packages/entry_point';\n import {makeEntryPointBundle} from '../packages/entry_point_bundle';\n import {createModuleResolutionCache, SharedFileCache} from '../packages/source_file_cache';\n+import {Transformer} from '../packages/transformer';\n import {PathMappings} from '../path_mappings';\n import {FileWriter} from '../writing/file_writer';\n \n@@ -29,7 +30,6 @@ export function getCreateCompileFn(\n     enableI18nLegacyMessageIdFormat: boolean, tsConfig: ParsedConfiguration|null,\n     pathMappings: PathMappings|undefined): CreateCompileFn {\n   return (beforeWritingFiles, onTaskCompleted) => {\n-    const {Transformer} = require('../packages/transformer');\n     const transformer = new Transformer(fileSystem, logger, tsConfig);\n     const sharedFileCache = new SharedFileCache(fileSystem);\n     const moduleResolutionCache = createModuleResolutionCache(fileSystem);"
+        },
+        {
+            "sha": "8a0c59a8a589ef5ea10ff1e50235f4ae146e1c75",
+            "filename": "packages/compiler-cli/ngcc/src/locking/lock_file_with_child_process/index.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/angular/angular/blob/11a81898be7de96f5d6f976cd2c87aa8cec5886c/packages%2Fcompiler-cli%2Fngcc%2Fsrc%2Flocking%2Flock_file_with_child_process%2Findex.ts",
+            "raw_url": "https://github.com/angular/angular/raw/11a81898be7de96f5d6f976cd2c87aa8cec5886c/packages%2Fcompiler-cli%2Fngcc%2Fsrc%2Flocking%2Flock_file_with_child_process%2Findex.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fngcc%2Fsrc%2Flocking%2Flock_file_with_child_process%2Findex.ts?ref=11a81898be7de96f5d6f976cd2c87aa8cec5886c",
+            "patch": "@@ -78,7 +78,7 @@ export class LockFileWithChildProcess implements LockFile {\n         this.logger.level !== undefined ? this.logger.level.toString() : LogLevel.info.toString();\n     const isWindows = process.platform === 'win32';\n     const unlocker = fork(\n-        __dirname + '/unlocker.js', [path, logLevel],\n+        __dirname + '/ngcc_lock_unlocker.js', [path, logLevel],\n         {detached: true, stdio: isWindows ? 'pipe' : 'inherit'});\n     if (isWindows) {\n       unlocker.stdout?.on('data', process.stdout.write.bind(process.stdout));"
+        },
+        {
+            "sha": "4e732ab7cfcc90897bfc163db2d86588845e4bd1",
+            "filename": "packages/compiler-cli/ngcc/src/locking/lock_file_with_child_process/ngcc_lock_unlocker.ts",
+            "status": "renamed",
+            "additions": 0,
+            "deletions": 0,
+            "changes": 0,
+            "blob_url": "https://github.com/angular/angular/blob/11a81898be7de96f5d6f976cd2c87aa8cec5886c/packages%2Fcompiler-cli%2Fngcc%2Fsrc%2Flocking%2Flock_file_with_child_process%2Fngcc_lock_unlocker.ts",
+            "raw_url": "https://github.com/angular/angular/raw/11a81898be7de96f5d6f976cd2c87aa8cec5886c/packages%2Fcompiler-cli%2Fngcc%2Fsrc%2Flocking%2Flock_file_with_child_process%2Fngcc_lock_unlocker.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fngcc%2Fsrc%2Flocking%2Flock_file_with_child_process%2Fngcc_lock_unlocker.ts?ref=11a81898be7de96f5d6f976cd2c87aa8cec5886c",
+            "previous_filename": "packages/compiler-cli/ngcc/src/locking/lock_file_with_child_process/unlocker.ts"
+        },
+        {
+            "sha": "83b9bc5b4e4eece8f79c97a87563c657c15531b1",
+            "filename": "packages/compiler-cli/ngcc/test/locking/lockfile_with_child_process/unlocker_spec.ts",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/angular/angular/blob/11a81898be7de96f5d6f976cd2c87aa8cec5886c/packages%2Fcompiler-cli%2Fngcc%2Ftest%2Flocking%2Flockfile_with_child_process%2Funlocker_spec.ts",
+            "raw_url": "https://github.com/angular/angular/raw/11a81898be7de96f5d6f976cd2c87aa8cec5886c/packages%2Fcompiler-cli%2Fngcc%2Ftest%2Flocking%2Flockfile_with_child_process%2Funlocker_spec.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fngcc%2Ftest%2Flocking%2Flockfile_with_child_process%2Funlocker_spec.ts?ref=11a81898be7de96f5d6f976cd2c87aa8cec5886c",
+            "patch": "@@ -11,7 +11,7 @@\n describe('unlocker', () => {\n   it('should attach a handler to the `disconnect` event', () => {\n     spyOn(process, 'on');\n-    require('../../../src/locking/lock_file_with_child_process/unlocker');\n+    require('../../../src/locking/lock_file_with_child_process/ngcc_lock_unlocker');\n     // TODO: @JiaLiPassion, need to wait for @types/jasmine to handle the override case\n     // https://github.com/DefinitelyTyped/DefinitelyTyped/issues/42455\n     expect(process.on).toHaveBeenCalledWith('disconnect' as any, jasmine.any(Function));"
+        }
+    ],
+    "stats": {
+        "total": 94,
+        "additions": 52,
+        "deletions": 42
+    }
+}

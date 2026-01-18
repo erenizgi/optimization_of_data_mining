@@ -1,0 +1,120 @@
+{
+    "author": "freakboy3742",
+    "message": "Fixed #15012 -- Added post-rendering callbacks to TemplateResponse so that decorators (in particular, the cache decorator) can defer processing until after rendering has occurred. Thanks to Joshua Ginsberg for the draft patch.\n\ngit-svn-id: http://code.djangoproject.com/svn/django/trunk@15295 bcc190cf-cafb-0310-a4f2-bffc1f526a37",
+    "sha": "3f528e10d50ff7ba19a8a9e6cb2f9417a1e7f270",
+    "files": [
+        {
+            "sha": "ab72db3c18ff225777ff3b5b85140ebf34912ea1",
+            "filename": "django/middleware/cache.py",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 1,
+            "changes": 8,
+            "blob_url": "https://github.com/django/django/blob/3f528e10d50ff7ba19a8a9e6cb2f9417a1e7f270/django%2Fmiddleware%2Fcache.py",
+            "raw_url": "https://github.com/django/django/raw/3f528e10d50ff7ba19a8a9e6cb2f9417a1e7f270/django%2Fmiddleware%2Fcache.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fmiddleware%2Fcache.py?ref=3f528e10d50ff7ba19a8a9e6cb2f9417a1e7f270",
+            "patch": "@@ -52,6 +52,7 @@\n from django.core.cache import get_cache, DEFAULT_CACHE_ALIAS\n from django.utils.cache import get_cache_key, learn_cache_key, patch_response_headers, get_max_age\n \n+\n class UpdateCacheMiddleware(object):\n     \"\"\"\n     Response-phase cache middleware that updates the cache if the response is\n@@ -87,7 +88,12 @@ def process_response(self, request, response):\n         patch_response_headers(response, timeout)\n         if timeout:\n             cache_key = learn_cache_key(request, response, timeout, self.key_prefix, cache=self.cache)\n-            self.cache.set(cache_key, response, timeout)\n+            if hasattr(response, 'render') and callable(response.render):\n+                response.add_post_render_callback(\n+                    lambda r: self.cache.set(cache_key, r, timeout)\n+                )\n+            else:\n+                self.cache.set(cache_key, response, timeout)\n         return response\n \n class FetchFromCacheMiddleware(object):"
+        },
+        {
+            "sha": "a6ef893520786f9082515102972b1426e7c77795",
+            "filename": "django/template/response.py",
+            "status": "modified",
+            "additions": 47,
+            "deletions": 1,
+            "changes": 48,
+            "blob_url": "https://github.com/django/django/blob/3f528e10d50ff7ba19a8a9e6cb2f9417a1e7f270/django%2Ftemplate%2Fresponse.py",
+            "raw_url": "https://github.com/django/django/raw/3f528e10d50ff7ba19a8a9e6cb2f9417a1e7f270/django%2Ftemplate%2Fresponse.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Ftemplate%2Fresponse.py?ref=3f528e10d50ff7ba19a8a9e6cb2f9417a1e7f270",
+            "patch": "@@ -19,12 +19,30 @@ def __init__(self, template, context=None, mimetype=None, status=None,\n         # a final response.\n         self._is_rendered = False\n \n+        self._post_render_callbacks = []\n+\n         # content argument doesn't make sense here because it will be replaced\n         # with rendered template so we always pass empty string in order to\n         # prevent errors and provide shorter signature.\n         super(SimpleTemplateResponse, self).__init__('', mimetype, status,\n                                                      content_type)\n \n+    def __getstate__(self):\n+        \"\"\"Pickling support function.\n+\n+        Ensures that the object can't be pickled before it has been\n+        rendered, and that the pickled state only includes rendered\n+        data, not the data used to construct the response.\n+        \"\"\"\n+        obj_dict = self.__dict__.copy()\n+        if not self._is_rendered:\n+            raise ContentNotRenderedError('The response content must be rendered before it can be pickled.')\n+        del obj_dict['template_name']\n+        del obj_dict['context_data']\n+        del obj_dict['_post_render_callbacks']\n+\n+        return obj_dict\n+\n     def resolve_template(self, template):\n         \"Accepts a template object, path-to-template or list of paths\"\n         if isinstance(template, (list, tuple)):\n@@ -57,6 +75,16 @@ def rendered_content(self):\n         content = template.render(context)\n         return content\n \n+    def add_post_render_callback(self, callback):\n+        \"\"\"Add a new post-rendering callback.\n+\n+        If the response has already been rendered, invoke the callback immediately.\n+        \"\"\"\n+        if self._is_rendered:\n+            callback(self)\n+        else:\n+            self._post_render_callbacks.append(callback)\n+\n     def render(self):\n         \"\"\"Render (thereby finalizing) the content of the response.\n \n@@ -66,6 +94,8 @@ def render(self):\n         \"\"\"\n         if not self._is_rendered:\n             self._set_content(self.rendered_content)\n+            for post_callback in self._post_render_callbacks:\n+                post_callback(self)\n         return self\n \n     is_rendered = property(lambda self: self._is_rendered)\n@@ -81,7 +111,7 @@ def _get_content(self):\n         return super(SimpleTemplateResponse, self)._get_content()\n \n     def _set_content(self, value):\n-        \"Overrides rendered content, unless you later call render()\"\n+        \"Sets the content for the response\"\n         super(SimpleTemplateResponse, self)._set_content(value)\n         self._is_rendered = True\n \n@@ -101,6 +131,20 @@ def __init__(self, request, template, context=None, mimetype=None,\n         super(TemplateResponse, self).__init__(\n             template, context, mimetype, status, content_type)\n \n+    def __getstate__(self):\n+        \"\"\"Pickling support function.\n+\n+        Ensures that the object can't be pickled before it has been\n+        rendered, and that the pickled state only includes rendered\n+        data, not the data used to construct the response.\n+        \"\"\"\n+        obj_dict = super(TemplateResponse, self).__getstate__()\n+\n+        del obj_dict['_request']\n+        del obj_dict['_current_app']\n+\n+        return obj_dict\n+\n     def resolve_context(self, context):\n         \"\"\"Convert context data into a full RequestContext object\n         (assuming it isn't already a Context object).\n@@ -109,3 +153,5 @@ def resolve_context(self, context):\n             return context\n         else:\n             return RequestContext(self._request, context, current_app=self._current_app)\n+\n+"
+        },
+        {
+            "sha": "90da00220e15b065d2916bd222ac5dc5bf63667c",
+            "filename": "docs/ref/template-response.txt",
+            "status": "modified",
+            "additions": 58,
+            "deletions": 1,
+            "changes": 59,
+            "blob_url": "https://github.com/django/django/blob/3f528e10d50ff7ba19a8a9e6cb2f9417a1e7f270/docs%2Fref%2Ftemplate-response.txt",
+            "raw_url": "https://github.com/django/django/raw/3f528e10d50ff7ba19a8a9e6cb2f9417a1e7f270/docs%2Fref%2Ftemplate-response.txt",
+            "contents_url": "https://api.github.com/repos/django/django/contents/docs%2Fref%2Ftemplate-response.txt?ref=3f528e10d50ff7ba19a8a9e6cb2f9417a1e7f270",
+            "patch": "@@ -55,7 +55,6 @@ Attributes\n \n     A boolean indicating whether the response content has been rendered.\n \n-\n Methods\n -------\n \n@@ -106,6 +105,20 @@ Methods\n \n     Override this method in order to customize template rendering.\n \n+.. method:: SimpleTemplateResponse.add_post_rendering_callback\n+\n+    Add a callback that will be invoked after rendering has taken\n+    place. This hook can be used to defer certain processing\n+    operations (such as caching) until after rendering has occurred.\n+\n+    If the :class:`~django.template.response.SimpleTemplateResponse`\n+    has already been rendered, the callback will be invoked\n+    immediately.\n+\n+    When called, callbacks will be passed a single argument -- the\n+    rendered :class:`~django.template.response.SimpleTemplateResponse`\n+    instance.\n+\n .. method:: SimpleTemplateResponse.render():\n \n     Sets :attr:`response.content` to the result obtained by\n@@ -211,6 +224,50 @@ the content of the response manually::\n     >>> print t.content\n     New content\n \n+Post-render callbacks\n+---------------------\n+\n+Some operations -- such as caching -- cannot be performed on an\n+unrendered template. They must be performed on a fully complete and\n+rendered response.\n+\n+If you're using middleware, the solution is easy. Middleware provides\n+multiple opportunities to process a response on exit from a view. If\n+you put behavior in the Response middleware is guaranteed to execute\n+after template rendering has taken place.\n+\n+However, if you're using a decorator, the same opportunities do not\n+exist. Any behavior defined in a decorator is handled immediately.\n+\n+To compensate for this (and any other analogous use cases),\n+:class:`TemplateResponse` allows you to register callbacks that will\n+be invoked when rendering has completed. Using this callback, you can\n+defer critical processing until a point where you can guarantee that\n+rendered content will be available.\n+\n+To define a post-render callback, just define a function that takes\n+a single argument -- response -- and register that function with\n+the template response::\n+\n+    def my_render_callback(response):\n+        # Do content-sensitive processing\n+        do_post_processing()\n+\n+    def my_view(request):\n+        # Create a response\n+        response = TemplateResponse(request, 'mytemplate.html', {})\n+        # Register the callback\n+        response.add_post_render_callback(my_render_callback)\n+        # Return the response\n+        return response\n+\n+``my_render_callback()`` will be invoked after the ``mytemplate.html``\n+has been rendered, and will be provided the fully rendered\n+:class:`TemplateResponse` instance as an argument.\n+\n+If the template has already been rendered, the callback will be\n+invoked immediately.\n+\n Using TemplateResponse and SimpleTemplateResponse\n =================================================\n "
+        },
+        {
+            "sha": "c378315b62b2cb0f891d598a6f7bde4beeb79abb",
+            "filename": "tests/regressiontests/generic_views/base.py",
+            "status": "modified",
+            "additions": 24,
+            "deletions": 1,
+            "changes": 25,
+            "blob_url": "https://github.com/django/django/blob/3f528e10d50ff7ba19a8a9e6cb2f9417a1e7f270/tests%2Fregressiontests%2Fgeneric_views%2Fbase.py",
+            "raw_url": "https://github.com/django/django/raw/3f528e10d50ff7ba19a8a9e6cb2f9417a1e7f270/tests%2Fregressiontests%2Fgeneric_views%2Fbase.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fgeneric_views%2Fbase.py?ref=3f528e10d50ff7ba19a8a9e6cb2f9417a1e7f270",
+            "patch": "@@ -1,3 +1,4 @@\n+import time\n import unittest\n \n from django.core.exceptions import ImproperlyConfigured\n@@ -158,7 +159,7 @@ class TemplateViewTest(TestCase):\n     def _assert_about(self, response):\n         response.render()\n         self.assertEqual(response.status_code, 200)\n-        self.assertEqual(response.content, '<h1>About</h1>')\n+        self.assertContains(response, '<h1>About</h1>')\n \n     def test_get(self):\n         \"\"\"\n@@ -197,6 +198,28 @@ def test_extra_template_params(self):\n         self.assertEqual(response.context['params'], {'foo': 'bar'})\n         self.assertEqual(response.context['key'], 'value')\n \n+    def test_cached_views(self):\n+        \"\"\"\n+        A template view can be cached\n+        \"\"\"\n+        response = self.client.get('/template/cached/bar/')\n+        self.assertEqual(response.status_code, 200)\n+\n+        time.sleep(1.0)\n+\n+        response2 = self.client.get('/template/cached/bar/')\n+        self.assertEqual(response2.status_code, 200)\n+\n+        self.assertEqual(response.content, response2.content)\n+\n+        time.sleep(2.0)\n+\n+        # Let the cache expire and test again\n+        response2 = self.client.get('/template/cached/bar/')\n+        self.assertEqual(response2.status_code, 200)\n+\n+        self.assertNotEqual(response.content, response2.content)\n+\n class RedirectViewTest(unittest.TestCase):\n     rf = RequestFactory()\n "
+        },
+        {
+            "sha": "f946f630cf2e3b10830d818ffe1fcc2a98f7b182",
+            "filename": "tests/regressiontests/generic_views/templates/generic_views/about.html",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/django/django/blob/3f528e10d50ff7ba19a8a9e6cb2f9417a1e7f270/tests%2Fregressiontests%2Fgeneric_views%2Ftemplates%2Fgeneric_views%2Fabout.html",
+            "raw_url": "https://github.com/django/django/raw/3f528e10d50ff7ba19a8a9e6cb2f9417a1e7f270/tests%2Fregressiontests%2Fgeneric_views%2Ftemplates%2Fgeneric_views%2Fabout.html",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fgeneric_views%2Ftemplates%2Fgeneric_views%2Fabout.html?ref=3f528e10d50ff7ba19a8a9e6cb2f9417a1e7f270",
+            "patch": "@@ -1 +1,2 @@\n-<h1>About</h1>\n\\ No newline at end of file\n+<h1>About</h1>\n+{% now \"U.u\" %}"
+        },
+        {
+            "sha": "4c847ac78d635c7a1b0c4d42a6a2b02fc4bb80c6",
+            "filename": "tests/regressiontests/generic_views/urls.py",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/django/django/blob/3f528e10d50ff7ba19a8a9e6cb2f9417a1e7f270/tests%2Fregressiontests%2Fgeneric_views%2Furls.py",
+            "raw_url": "https://github.com/django/django/raw/3f528e10d50ff7ba19a8a9e6cb2f9417a1e7f270/tests%2Fregressiontests%2Fgeneric_views%2Furls.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fgeneric_views%2Furls.py?ref=3f528e10d50ff7ba19a8a9e6cb2f9417a1e7f270",
+            "patch": "@@ -1,5 +1,6 @@\n from django.conf.urls.defaults import *\n from django.views.generic import TemplateView\n+from django.views.decorators.cache import cache_page\n \n import views\n \n@@ -15,6 +16,9 @@\n     (r'^template/custom/(?P<foo>\\w+)/$',\n         views.CustomTemplateView.as_view(template_name='generic_views/about.html')),\n \n+    (r'^template/cached/(?P<foo>\\w+)/$',\n+        cache_page(2.0)(TemplateView.as_view(template_name='generic_views/about.html'))),\n+\n     # DetailView\n     (r'^detail/obj/$',\n         views.ObjectDetail.as_view()),"
+        },
+        {
+            "sha": "e68f1c5875c5e6831063f544f67c3dae4d3523ed",
+            "filename": "tests/regressiontests/templates/alternate_urls.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 1,
+            "changes": 4,
+            "blob_url": "https://github.com/django/django/blob/3f528e10d50ff7ba19a8a9e6cb2f9417a1e7f270/tests%2Fregressiontests%2Ftemplates%2Falternate_urls.py",
+            "raw_url": "https://github.com/django/django/raw/3f528e10d50ff7ba19a8a9e6cb2f9417a1e7f270/tests%2Fregressiontests%2Ftemplates%2Falternate_urls.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Ftemplates%2Falternate_urls.py?ref=3f528e10d50ff7ba19a8a9e6cb2f9417a1e7f270",
+            "patch": "@@ -1,10 +1,12 @@\n # coding: utf-8\n from django.conf.urls.defaults import *\n+\n from regressiontests.templates import views\n \n+\n urlpatterns = patterns('',\n     # View returning a template response\n-    (r'^template_response_view/', views.template_response_view),\n+    (r'^template_response_view/$', views.template_response_view),\n \n     # A view that can be hard to find...\n     url(r'^snark/', views.snark, name='snark'),"
+        },
+        {
+            "sha": "1e42d666636953123b5a726eef65306799d379f2",
+            "filename": "tests/regressiontests/templates/response.py",
+            "status": "modified",
+            "additions": 109,
+            "deletions": 1,
+            "changes": 110,
+            "blob_url": "https://github.com/django/django/blob/3f528e10d50ff7ba19a8a9e6cb2f9417a1e7f270/tests%2Fregressiontests%2Ftemplates%2Fresponse.py",
+            "raw_url": "https://github.com/django/django/raw/3f528e10d50ff7ba19a8a9e6cb2f9417a1e7f270/tests%2Fregressiontests%2Ftemplates%2Fresponse.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Ftemplates%2Fresponse.py?ref=3f528e10d50ff7ba19a8a9e6cb2f9417a1e7f270",
+            "patch": "@@ -1,4 +1,7 @@\n+from datetime import datetime\n import os\n+import pickle\n+import time\n from django.utils import unittest\n from django.test import RequestFactory, TestCase\n from django.conf import settings\n@@ -147,6 +150,49 @@ def test_args(self):\n         self.assertEqual(response['content-type'], 'application/json')\n         self.assertEqual(response.status_code, 504)\n \n+    def test_post_callbacks(self):\n+        \"Rendering a template response triggers the post-render callbacks\"\n+        post = []\n+\n+        def post1(obj):\n+            post.append('post1')\n+        def post2(obj):\n+            post.append('post2')\n+\n+        response = SimpleTemplateResponse('first/test.html', {})\n+        response.add_post_render_callback(post1)\n+        response.add_post_render_callback(post2)\n+\n+        # When the content is rendered, all the callbacks are invoked, too.\n+        response.render()\n+        self.assertEqual('First template\\n', response.content)\n+        self.assertEquals(post, ['post1','post2'])\n+\n+\n+    def test_pickling(self):\n+        # Create a template response. The context is\n+        # known to be unpickleable (e.g., a function).\n+        response = SimpleTemplateResponse('first/test.html', {\n+                'value': 123,\n+                'fn': datetime.now,\n+            })\n+        self.assertRaises(ContentNotRenderedError,\n+                          pickle.dumps, response)\n+\n+        # But if we render the response, we can pickle it.\n+        response.render()\n+        pickled_response = pickle.dumps(response)\n+        unpickled_response = pickle.loads(pickled_response)\n+\n+        self.assertEquals(unpickled_response.content, response.content)\n+        self.assertEquals(unpickled_response['content-type'], response['content-type'])\n+        self.assertEquals(unpickled_response.status_code, response.status_code)\n+\n+        # ...and the unpickled reponse doesn't have the\n+        # template-related attributes, so it can't be re-rendered\n+        self.assertFalse(hasattr(unpickled_response, 'template_name'))\n+        self.assertFalse(hasattr(unpickled_response, 'context_data'))\n+        self.assertFalse(hasattr(unpickled_response, '_post_render_callbacks'))\n \n class TemplateResponseTest(BaseTemplateResponseTest):\n \n@@ -187,6 +233,33 @@ def test_custom_app(self):\n \n         self.assertEqual(rc.current_app, 'foobar')\n \n+    def test_pickling(self):\n+        # Create a template response. The context is\n+        # known to be unpickleable (e.g., a function).\n+        response = TemplateResponse(self.factory.get('/'),\n+            'first/test.html', {\n+                'value': 123,\n+                'fn': datetime.now,\n+            })\n+        self.assertRaises(ContentNotRenderedError,\n+                          pickle.dumps, response)\n+\n+        # But if we render the response, we can pickle it.\n+        response.render()\n+        pickled_response = pickle.dumps(response)\n+        unpickled_response = pickle.loads(pickled_response)\n+\n+        self.assertEquals(unpickled_response.content, response.content)\n+        self.assertEquals(unpickled_response['content-type'], response['content-type'])\n+        self.assertEquals(unpickled_response.status_code, response.status_code)\n+\n+        # ...and the unpickled reponse doesn't have the\n+        # template-related attributes, so it can't be re-rendered\n+        self.assertFalse(hasattr(unpickled_response, '_request'))\n+        self.assertFalse(hasattr(unpickled_response, 'template_name'))\n+        self.assertFalse(hasattr(unpickled_response, 'context_data'))\n+        self.assertFalse(hasattr(unpickled_response, '_post_render_callbacks'))\n+\n \n class CustomURLConfTest(TestCase):\n     urls = 'regressiontests.templates.urls'\n@@ -203,6 +276,41 @@ def tearDown(self):\n     def test_custom_urlconf(self):\n         response = self.client.get('/template_response_view/')\n         self.assertEqual(response.status_code, 200)\n-        self.assertEqual(response.content, 'This is where you can find the snark: /snark/')\n+        self.assertContains(response, 'This is where you can find the snark: /snark/')\n+\n+\n+class CacheMiddlewareTest(TestCase):\n+    urls = 'regressiontests.templates.alternate_urls'\n+\n+    def setUp(self):\n+        self.old_MIDDLEWARE_CLASSES = settings.MIDDLEWARE_CLASSES\n+        self.CACHE_MIDDLEWARE_SECONDS = settings.CACHE_MIDDLEWARE_SECONDS\n+\n+        settings.CACHE_MIDDLEWARE_SECONDS = 2.0\n+        settings.MIDDLEWARE_CLASSES = list(settings.MIDDLEWARE_CLASSES) + [\n+            'django.middleware.cache.FetchFromCacheMiddleware',\n+            'django.middleware.cache.UpdateCacheMiddleware',\n+        ]\n+\n+    def tearDown(self):\n+        settings.MIDDLEWARE_CLASSES = self.old_MIDDLEWARE_CLASSES\n+        settings.CACHE_MIDDLEWARE_SECONDS = self.CACHE_MIDDLEWARE_SECONDS\n+\n+    def test_middleware_caching(self):\n+        response = self.client.get('/template_response_view/')\n+        self.assertEqual(response.status_code, 200)\n+\n+        time.sleep(1.0)\n+\n+        response2 = self.client.get('/template_response_view/')\n+        self.assertEqual(response2.status_code, 200)\n+\n+        self.assertEqual(response.content, response2.content)\n+\n+        time.sleep(2.0)\n \n+        # Let the cache expire and test again\n+        response2 = self.client.get('/template_response_view/')\n+        self.assertEqual(response2.status_code, 200)\n \n+        self.assertNotEqual(response.content, response2.content)"
+        },
+        {
+            "sha": "7535fa76060c95d07fe569cad156466124ca6c81",
+            "filename": "tests/regressiontests/templates/templates/response.html",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/django/django/blob/3f528e10d50ff7ba19a8a9e6cb2f9417a1e7f270/tests%2Fregressiontests%2Ftemplates%2Ftemplates%2Fresponse.html",
+            "raw_url": "https://github.com/django/django/raw/3f528e10d50ff7ba19a8a9e6cb2f9417a1e7f270/tests%2Fregressiontests%2Ftemplates%2Ftemplates%2Fresponse.html",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Ftemplates%2Ftemplates%2Fresponse.html?ref=3f528e10d50ff7ba19a8a9e6cb2f9417a1e7f270",
+            "patch": "@@ -1 +1,2 @@\n-{% load url from future %}This is where you can find the snark: {% url \"snark\" %}\n\\ No newline at end of file\n+{% load url from future %}This is where you can find the snark: {% url \"snark\" %}\n+{% now \"U.u\" %}\n\\ No newline at end of file"
+        }
+    ],
+    "stats": {
+        "total": 264,
+        "additions": 256,
+        "deletions": 8
+    }
+}

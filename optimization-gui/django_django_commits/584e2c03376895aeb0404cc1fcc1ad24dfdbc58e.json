@@ -1,0 +1,84 @@
+{
+    "author": "akaariai",
+    "message": "Prevent Oracle from changing field.null to True\n\nFixed #17957 -- when using Oracle and character fields, the fields\nwere set null = True to ease the handling of empty strings. This\ncaused problems when using multiple databases from different vendors,\nor when the character field happened to be also a primary key.\n\nThe handling was changed so that NOT NULL is not emitted on Oracle\neven if field.null = False, and field.null is not touched otherwise.\n\nThanks to bhuztez for the report, ramiro for triaging & comments,\nikelly for the patch and alex for reviewing.",
+    "sha": "584e2c03376895aeb0404cc1fcc1ad24dfdbc58e",
+    "files": [
+        {
+            "sha": "75afe926fabb2be460a0a689cbb6569c127dee88",
+            "filename": "django/db/backends/creation.py",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 1,
+            "changes": 8,
+            "blob_url": "https://github.com/django/django/blob/584e2c03376895aeb0404cc1fcc1ad24dfdbc58e/django%2Fdb%2Fbackends%2Fcreation.py",
+            "raw_url": "https://github.com/django/django/raw/584e2c03376895aeb0404cc1fcc1ad24dfdbc58e/django%2Fdb%2Fbackends%2Fcreation.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fbackends%2Fcreation.py?ref=584e2c03376895aeb0404cc1fcc1ad24dfdbc58e",
+            "patch": "@@ -50,7 +50,13 @@ def sql_create_model(self, model, style, known_models=set()):\n             # Make the definition (e.g. 'foo VARCHAR(30)') for this field.\n             field_output = [style.SQL_FIELD(qn(f.column)),\n                 style.SQL_COLTYPE(col_type)]\n-            if not f.null:\n+            # Oracle treats the empty string ('') as null, so coerce the null\n+            # option whenever '' is a possible value.\n+            null = f.null\n+            if (f.empty_strings_allowed and not f.primary_key and\n+                    self.connection.features.interprets_empty_strings_as_nulls):\n+                null = True\n+            if not null:\n                 field_output.append(style.SQL_KEYWORD('NOT NULL'))\n             if f.primary_key:\n                 field_output.append(style.SQL_KEYWORD('PRIMARY KEY'))"
+        },
+        {
+            "sha": "5a5e6cc8c3d82ac3deab06b1c90c293c8d253771",
+            "filename": "django/db/models/fields/__init__.py",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 5,
+            "changes": 5,
+            "blob_url": "https://github.com/django/django/blob/584e2c03376895aeb0404cc1fcc1ad24dfdbc58e/django%2Fdb%2Fmodels%2Ffields%2F__init__.py",
+            "raw_url": "https://github.com/django/django/raw/584e2c03376895aeb0404cc1fcc1ad24dfdbc58e/django%2Fdb%2Fmodels%2Ffields%2F__init__.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fmodels%2Ffields%2F__init__.py?ref=584e2c03376895aeb0404cc1fcc1ad24dfdbc58e",
+            "patch": "@@ -85,11 +85,6 @@ def __init__(self, verbose_name=None, name=None, primary_key=False,\n         self.primary_key = primary_key\n         self.max_length, self._unique = max_length, unique\n         self.blank, self.null = blank, null\n-        # Oracle treats the empty string ('') as null, so coerce the null\n-        # option whenever '' is a possible value.\n-        if (self.empty_strings_allowed and\n-            connection.features.interprets_empty_strings_as_nulls):\n-            self.null = True\n         self.rel = rel\n         self.default = default\n         self.editable = editable"
+        },
+        {
+            "sha": "6111a881186ceb5a031b714f5cf5652d47af84b0",
+            "filename": "django/db/models/sql/query.py",
+            "status": "modified",
+            "additions": 21,
+            "deletions": 2,
+            "changes": 23,
+            "blob_url": "https://github.com/django/django/blob/584e2c03376895aeb0404cc1fcc1ad24dfdbc58e/django%2Fdb%2Fmodels%2Fsql%2Fquery.py",
+            "raw_url": "https://github.com/django/django/raw/584e2c03376895aeb0404cc1fcc1ad24dfdbc58e/django%2Fdb%2Fmodels%2Fsql%2Fquery.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fmodels%2Fsql%2Fquery.py?ref=584e2c03376895aeb0404cc1fcc1ad24dfdbc58e",
+            "patch": "@@ -1193,7 +1193,7 @@ def add_filter(self, filter_expr, connector=AND, negate=False, trim=False,\n                             entry.negate()\n                             self.where.add(entry, AND)\n                             break\n-                if field.null:\n+                if self.is_nullable(field):\n                     # In SQL NULL = anyvalue returns unknown, and NOT unknown\n                     # is still unknown. However, in Python None = anyvalue is False\n                     # (and not False is True...), and we want to return this Python's\n@@ -1396,7 +1396,8 @@ def setup_joins(self, names, opts, alias, dupe_multis, allow_many=True,\n                                 opts, target)\n \n                     alias = self.join((alias, table, from_col, to_col),\n-                            exclusions=exclusions, nullable=field.null)\n+                                      exclusions=exclusions,\n+                                      nullable=self.is_nullable(field))\n                     joins.append(alias)\n                 else:\n                     # Non-relation fields.\n@@ -1946,6 +1947,24 @@ def set_start(self, start):\n         self.select = [(select_alias, select_col)]\n         self.remove_inherited_models()\n \n+    def is_nullable(self, field):\n+        \"\"\"\n+        A helper to check if the given field should be treated as nullable.\n+\n+        Some backends treat '' as null and Django treats such fields as\n+        nullable for those backends. In such situations field.null can be\n+        False even if we should treat the field as nullable.\n+        \"\"\"\n+        # We need to use DEFAULT_DB_ALIAS here, as QuerySet does not have\n+        # (nor should it have) knowledge of which connection is going to be\n+        # used. The proper fix would be to defer all decisions where\n+        # is_nullable() is needed to the compiler stage, but that is not easy\n+        # to do currently.\n+        if ((connections[DEFAULT_DB_ALIAS].features.interprets_empty_strings_as_nulls)\n+            and field.empty_strings_allowed):\n+            return True\n+        else:\n+            return field.null\n \n def get_order_dir(field, default='ASC'):\n     \"\"\""
+        },
+        {
+            "sha": "2dea337d2bc74f5a16786dd11e8879e13612858a",
+            "filename": "docs/ref/databases.txt",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 5,
+            "changes": 10,
+            "blob_url": "https://github.com/django/django/blob/584e2c03376895aeb0404cc1fcc1ad24dfdbc58e/docs%2Fref%2Fdatabases.txt",
+            "raw_url": "https://github.com/django/django/raw/584e2c03376895aeb0404cc1fcc1ad24dfdbc58e/docs%2Fref%2Fdatabases.txt",
+            "contents_url": "https://api.github.com/repos/django/django/contents/docs%2Fref%2Fdatabases.txt?ref=584e2c03376895aeb0404cc1fcc1ad24dfdbc58e",
+            "patch": "@@ -685,11 +685,11 @@ NULL and empty strings\n \n Django generally prefers to use the empty string ('') rather than\n NULL, but Oracle treats both identically. To get around this, the\n-Oracle backend coerces the ``null=True`` option on fields that have\n-the empty string as a possible value. When fetching from the database,\n-it is assumed that a NULL value in one of these fields really means\n-the empty string, and the data is silently converted to reflect this\n-assumption.\n+Oracle backend ignores an explicit ``null`` option on fields that\n+have the empty string as a possible value and generates DDL as if\n+``null=True``. When fetching from the database, it is assumed that\n+a ``NULL`` value in one of these fields really means the empty\n+string, and the data is silently converted to reflect this assumption.\n \n ``TextField`` limitations\n -------------------------"
+        },
+        {
+            "sha": "eab7ad91e1448f58bff3dbf8e763882dfc828c8b",
+            "filename": "docs/ref/models/fields.txt",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 3,
+            "changes": 5,
+            "blob_url": "https://github.com/django/django/blob/584e2c03376895aeb0404cc1fcc1ad24dfdbc58e/docs%2Fref%2Fmodels%2Ffields.txt",
+            "raw_url": "https://github.com/django/django/raw/584e2c03376895aeb0404cc1fcc1ad24dfdbc58e/docs%2Fref%2Fmodels%2Ffields.txt",
+            "contents_url": "https://api.github.com/repos/django/django/contents/docs%2Fref%2Fmodels%2Ffields.txt?ref=584e2c03376895aeb0404cc1fcc1ad24dfdbc58e",
+            "patch": "@@ -55,9 +55,8 @@ string, not ``NULL``.\n \n .. note::\n \n-    When using the Oracle database backend, the ``null=True`` option will be\n-    coerced for string-based fields that have the empty string as a possible\n-    value, and the value ``NULL`` will be stored to denote the empty string.\n+    When using the Oracle database backend, the value ``NULL`` will be stored to\n+    denote the empty string regardless of this attribute.\n \n If you want to accept :attr:`~Field.null` values with :class:`BooleanField`,\n use :class:`NullBooleanField` instead."
+        },
+        {
+            "sha": "416970d4936a674354acc74b0c929f3581dfa70b",
+            "filename": "tests/regressiontests/queries/tests.py",
+            "status": "modified",
+            "additions": 22,
+            "deletions": 0,
+            "changes": 22,
+            "blob_url": "https://github.com/django/django/blob/584e2c03376895aeb0404cc1fcc1ad24dfdbc58e/tests%2Fregressiontests%2Fqueries%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/584e2c03376895aeb0404cc1fcc1ad24dfdbc58e/tests%2Fregressiontests%2Fqueries%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fqueries%2Ftests.py?ref=584e2c03376895aeb0404cc1fcc1ad24dfdbc58e",
+            "patch": "@@ -1930,3 +1930,25 @@ def test_col_not_in_list_containing_null(self):\n         self.assertQuerysetEqual(\n             NullableName.objects.exclude(name__in=[None]),\n             ['i1'], attrgetter('name'))\n+\n+class EmptyStringsAsNullTest(TestCase):\n+    \"\"\"\n+    Test that filtering on non-null character fields works as expected.\n+    The reason for these tests is that Oracle treats '' as NULL, and this\n+    can cause problems in query construction. Refs #17957.\n+    \"\"\"\n+\n+    def setUp(self):\n+        self.nc = NamedCategory.objects.create(name='')\n+\n+    def test_direct_exclude(self):\n+        self.assertQuerysetEqual(\n+            NamedCategory.objects.exclude(name__in=['nonexisting']),\n+            [self.nc.pk], attrgetter('pk')\n+        )\n+\n+    def test_joined_exclude(self):\n+        self.assertQuerysetEqual(\n+            DumbCategory.objects.exclude(namedcategory__name__in=['nonexisting']),\n+            [self.nc.pk], attrgetter('pk')\n+        )"
+        }
+    ],
+    "stats": {
+        "total": 73,
+        "additions": 57,
+        "deletions": 16
+    }
+}

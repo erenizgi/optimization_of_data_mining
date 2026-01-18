@@ -1,0 +1,192 @@
+{
+    "author": "joyeecheung",
+    "message": "inspector: split the HostPort being used and the one parsed from CLI\n\nInstead of using a shared pointer of the entire debug option set,\npass the parsed debug option to inspector classes by value because\nthey are set once the CLI argument parsing is done. Add another shared\npointer to HostPort being used by the inspector server, which is copied\nfrom the one in the debug options initially. The port of the shared\nHostPort is 9229 by default and can be specified as 0 initially but\nwill be set to the actual port of the server once it starts listening.\n\nThis makes the shared state clearer and makes it possible to use\n`require('internal/options')` in JS land to query the CLI options\ninstead of using `process._breakFirstLine` and other underscored\nproperties of `process` since we are now certain that these\nvalues should not be altered once the parsing is done and can be\npassed around in copies without locks.\n\nPR-URL: https://github.com/nodejs/node/pull/24772\nReviewed-By: Anna Henningsen <anna@addaleax.net>",
+    "sha": "61a89630ee5664b1f909b310a016b522a6285521",
+    "files": [
+        {
+            "sha": "f28701c70f14d224196f22d1005f98285e176e31",
+            "filename": "src/env-inl.h",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/nodejs/node/blob/61a89630ee5664b1f909b310a016b522a6285521/src%2Fenv-inl.h",
+            "raw_url": "https://github.com/nodejs/node/raw/61a89630ee5664b1f909b310a016b522a6285521/src%2Fenv-inl.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv-inl.h?ref=61a89630ee5664b1f909b310a016b522a6285521",
+            "patch": "@@ -585,6 +585,10 @@ inline std::shared_ptr<EnvironmentOptions> Environment::options() {\n   return options_;\n }\n \n+inline std::shared_ptr<HostPort> Environment::inspector_host_port() {\n+  return inspector_host_port_;\n+}\n+\n inline std::shared_ptr<PerIsolateOptions> IsolateData::options() {\n   return options_;\n }"
+        },
+        {
+            "sha": "6d69339b585e30693cfc27c1dc728644ec1a3231",
+            "filename": "src/env.cc",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/nodejs/node/blob/61a89630ee5664b1f909b310a016b522a6285521/src%2Fenv.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/61a89630ee5664b1f909b310a016b522a6285521/src%2Fenv.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv.cc?ref=61a89630ee5664b1f909b310a016b522a6285521",
+            "patch": "@@ -5,6 +5,7 @@\n #include \"node_file.h\"\n #include \"node_internals.h\"\n #include \"node_native_module.h\"\n+#include \"node_options-inl.h\"\n #include \"node_platform.h\"\n #include \"node_worker.h\"\n #include \"tracing/agent.h\"\n@@ -192,7 +193,7 @@ Environment::Environment(IsolateData* isolate_data,\n   // part of the per-Isolate option set, for which in turn the defaults are\n   // part of the per-process option set.\n   options_.reset(new EnvironmentOptions(*isolate_data->options()->per_env));\n-  options_->debug_options.reset(new DebugOptions(*options_->debug_options));\n+  inspector_host_port_.reset(new HostPort(options_->debug_options().host_port));\n \n #if HAVE_INSPECTOR\n   // We can only create the inspector agent after having cloned the options."
+        },
+        {
+            "sha": "ec0368e040a6082ef44ad77f85a61f2d3547e2ec",
+            "filename": "src/env.h",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9,
+            "blob_url": "https://github.com/nodejs/node/blob/61a89630ee5664b1f909b310a016b522a6285521/src%2Fenv.h",
+            "raw_url": "https://github.com/nodejs/node/raw/61a89630ee5664b1f909b310a016b522a6285521/src%2Fenv.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv.h?ref=61a89630ee5664b1f909b310a016b522a6285521",
+            "patch": "@@ -911,6 +911,7 @@ class Environment {\n                                  void* data);\n \n   inline std::shared_ptr<EnvironmentOptions> options();\n+  inline std::shared_ptr<HostPort> inspector_host_port();\n \n  private:\n   inline void CreateImmediate(native_immediate_callback cb,\n@@ -942,6 +943,14 @@ class Environment {\n   std::vector<double> destroy_async_id_list_;\n \n   std::shared_ptr<EnvironmentOptions> options_;\n+  // options_ contains debug options parsed from CLI arguments,\n+  // while inspector_host_port_ stores the actual inspector host\n+  // and port being used. For example the port is -1 by default\n+  // and can be specified as 0 (meaning any port allocated when the\n+  // server starts listening), but when the inspector server starts\n+  // the inspector_host_port_->port() will be the actual port being\n+  // used.\n+  std::shared_ptr<HostPort> inspector_host_port_;\n \n   uint32_t module_id_counter_ = 0;\n   uint32_t script_id_counter_ = 0;"
+        },
+        {
+            "sha": "8949dfe2a7192c4f62c1c6d264600a7dd4777537",
+            "filename": "src/inspector_agent.cc",
+            "status": "modified",
+            "additions": 17,
+            "deletions": 12,
+            "changes": 29,
+            "blob_url": "https://github.com/nodejs/node/blob/61a89630ee5664b1f909b310a016b522a6285521/src%2Finspector_agent.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/61a89630ee5664b1f909b310a016b522a6285521/src%2Finspector_agent.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Finspector_agent.cc?ref=61a89630ee5664b1f909b310a016b522a6285521",
+            "patch": "@@ -669,8 +669,9 @@ class NodeInspectorClient : public V8InspectorClient {\n };\n \n Agent::Agent(Environment* env)\n-  : parent_env_(env),\n-    debug_options_(env->options()->debug_options) {}\n+    : parent_env_(env),\n+      debug_options_(env->options()->debug_options()),\n+      host_port_(env->inspector_host_port()) {}\n \n Agent::~Agent() {\n   if (start_io_thread_async.data == this) {\n@@ -681,13 +682,14 @@ Agent::~Agent() {\n }\n \n bool Agent::Start(const std::string& path,\n-                  std::shared_ptr<DebugOptions> options,\n+                  const DebugOptions& options,\n+                  std::shared_ptr<HostPort> host_port,\n                   bool is_main) {\n-  if (options == nullptr) {\n-    options = std::make_shared<DebugOptions>();\n-  }\n   path_ = path;\n   debug_options_ = options;\n+  CHECK_NE(host_port, nullptr);\n+  host_port_ = host_port;\n+\n   client_ = std::make_shared<NodeInspectorClient>(parent_env_, is_main);\n   if (parent_env_->is_main_thread()) {\n     CHECK_EQ(0, uv_async_init(parent_env_->event_loop(),\n@@ -699,13 +701,18 @@ bool Agent::Start(const std::string& path,\n     StartDebugSignalHandler();\n   }\n \n-  bool wait_for_connect = options->wait_for_connect();\n+  bool wait_for_connect = options.wait_for_connect();\n   if (parent_handle_) {\n     wait_for_connect = parent_handle_->WaitForConnect();\n     parent_handle_->WorkerStarted(client_->getThreadHandle(), wait_for_connect);\n-  } else if (!options->inspector_enabled || !StartIoThread()) {\n+  } else if (!options.inspector_enabled || !StartIoThread()) {\n     return false;\n   }\n+\n+  // TODO(joyeecheung): we should not be using process as a global object\n+  // to transport --inspect-brk. Instead, the JS land can get this through\n+  // require('internal/options') since it should be set once CLI parsing\n+  // is done.\n   if (wait_for_connect) {\n     HandleScope scope(parent_env_->isolate());\n     parent_env_->process_object()->DefineOwnProperty(\n@@ -725,8 +732,7 @@ bool Agent::StartIoThread() {\n \n   CHECK_NOT_NULL(client_);\n \n-  io_ = InspectorIo::Start(\n-      client_->getThreadHandle(), path_, debug_options_);\n+  io_ = InspectorIo::Start(client_->getThreadHandle(), path_, host_port_);\n   if (io_ == nullptr) {\n     return false;\n   }\n@@ -867,8 +873,7 @@ void Agent::ContextCreated(Local<Context> context, const ContextInfo& info) {\n }\n \n bool Agent::WillWaitForConnect() {\n-  if (debug_options_->wait_for_connect())\n-    return true;\n+  if (debug_options_.wait_for_connect()) return true;\n   if (parent_handle_)\n     return parent_handle_->WaitForConnect();\n   return false;"
+        },
+        {
+            "sha": "5e599a6339e90334023c134da54a8bf9b3ab7bda",
+            "filename": "src/inspector_agent.h",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 5,
+            "changes": 18,
+            "blob_url": "https://github.com/nodejs/node/blob/61a89630ee5664b1f909b310a016b522a6285521/src%2Finspector_agent.h",
+            "raw_url": "https://github.com/nodejs/node/raw/61a89630ee5664b1f909b310a016b522a6285521/src%2Finspector_agent.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Finspector_agent.h?ref=61a89630ee5664b1f909b310a016b522a6285521",
+            "patch": "@@ -11,7 +11,7 @@\n #error(\"This header can only be used when inspector is enabled\")\n #endif\n \n-#include \"node_options.h\"\n+#include \"node_options-inl.h\"\n #include \"node_persistent.h\"\n #include \"v8.h\"\n \n@@ -50,8 +50,9 @@ class Agent {\n \n   // Create client_, may create io_ if option enabled\n   bool Start(const std::string& path,\n-             std::shared_ptr<DebugOptions> options,\n-             bool is_worker);\n+             const DebugOptions& options,\n+             std::shared_ptr<HostPort> host_port,\n+             bool is_main);\n   // Stop and destroy io_\n   void Stop();\n \n@@ -104,7 +105,8 @@ class Agent {\n   // Calls StartIoThread() from off the main thread.\n   void RequestIoThreadStart();\n \n-  std::shared_ptr<DebugOptions> options() { return debug_options_; }\n+  const DebugOptions& options() { return debug_options_; }\n+  std::shared_ptr<HostPort> host_port() { return host_port_; }\n   void ContextCreated(v8::Local<v8::Context> context, const ContextInfo& info);\n \n   // Interface for interacting with inspectors in worker threads\n@@ -121,7 +123,13 @@ class Agent {\n   std::unique_ptr<InspectorIo> io_;\n   std::unique_ptr<ParentInspectorHandle> parent_handle_;\n   std::string path_;\n-  std::shared_ptr<DebugOptions> debug_options_;\n+\n+  // This is a copy of the debug options parsed from CLI in the Environment.\n+  // Do not use the host_port in that, instead manipulate the shared host_port_\n+  // pointer which is meant to store the actual host and port of the inspector\n+  // server.\n+  DebugOptions debug_options_;\n+  std::shared_ptr<HostPort> host_port_;\n \n   bool pending_enable_async_hook_ = false;\n   bool pending_disable_async_hook_ = false;"
+        },
+        {
+            "sha": "7686294b2e28421390b923eacd4e5169dfed0417",
+            "filename": "src/inspector_io.cc",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 9,
+            "changes": 22,
+            "blob_url": "https://github.com/nodejs/node/blob/61a89630ee5664b1f909b310a016b522a6285521/src%2Finspector_io.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/61a89630ee5664b1f909b310a016b522a6285521/src%2Finspector_io.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Finspector_io.cc?ref=61a89630ee5664b1f909b310a016b522a6285521",
+            "patch": "@@ -242,9 +242,9 @@ class InspectorIoDelegate: public node::inspector::SocketServerDelegate {\n std::unique_ptr<InspectorIo> InspectorIo::Start(\n     std::shared_ptr<MainThreadHandle> main_thread,\n     const std::string& path,\n-    std::shared_ptr<DebugOptions> options) {\n+    std::shared_ptr<HostPort> host_port) {\n   auto io = std::unique_ptr<InspectorIo>(\n-      new InspectorIo(main_thread, path, options));\n+      new InspectorIo(main_thread, path, host_port));\n   if (io->request_queue_->Expired()) {  // Thread is not running\n     return nullptr;\n   }\n@@ -253,9 +253,12 @@ std::unique_ptr<InspectorIo> InspectorIo::Start(\n \n InspectorIo::InspectorIo(std::shared_ptr<MainThreadHandle> main_thread,\n                          const std::string& path,\n-                         std::shared_ptr<DebugOptions> options)\n-                         : main_thread_(main_thread), options_(options),\n-                           thread_(), script_name_(path), id_(GenerateID()) {\n+                         std::shared_ptr<HostPort> host_port)\n+    : main_thread_(main_thread),\n+      host_port_(host_port),\n+      thread_(),\n+      script_name_(path),\n+      id_(GenerateID()) {\n   Mutex::ScopedLock scoped_lock(thread_start_lock_);\n   CHECK_EQ(uv_thread_create(&thread_, InspectorIo::ThreadMain, this), 0);\n   thread_start_condition_.Wait(scoped_lock);\n@@ -287,16 +290,17 @@ void InspectorIo::ThreadMain() {\n   std::unique_ptr<InspectorIoDelegate> delegate(\n       new InspectorIoDelegate(queue, main_thread_, id_,\n                               script_path, script_name_));\n-  InspectorSocketServer server(std::move(delegate), &loop,\n-                               options_->host().c_str(),\n-                               options_->port());\n+  InspectorSocketServer server(std::move(delegate),\n+                               &loop,\n+                               host_port_->host().c_str(),\n+                               host_port_->port());\n   request_queue_ = queue->handle();\n   // Its lifetime is now that of the server delegate\n   queue.reset();\n   {\n     Mutex::ScopedLock scoped_lock(thread_start_lock_);\n     if (server.Start()) {\n-      port_ = server.Port();\n+      host_port_->set_port(server.Port());\n     }\n     thread_start_condition_.Broadcast(scoped_lock);\n   }"
+        },
+        {
+            "sha": "bc09afdd3df54ef36f4a91b4caf988b38cf6e774",
+            "filename": "src/inspector_io.h",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 7,
+            "changes": 14,
+            "blob_url": "https://github.com/nodejs/node/blob/61a89630ee5664b1f909b310a016b522a6285521/src%2Finspector_io.h",
+            "raw_url": "https://github.com/nodejs/node/raw/61a89630ee5664b1f909b310a016b522a6285521/src%2Finspector_io.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Finspector_io.h?ref=61a89630ee5664b1f909b310a016b522a6285521",
+            "patch": "@@ -46,21 +46,22 @@ class InspectorIo {\n   // bool Start();\n   // Returns empty pointer if thread was not started\n   static std::unique_ptr<InspectorIo> Start(\n-      std::shared_ptr<MainThreadHandle> main_thread, const std::string& path,\n-      std::shared_ptr<DebugOptions> options);\n+      std::shared_ptr<MainThreadHandle> main_thread,\n+      const std::string& path,\n+      std::shared_ptr<HostPort> host_port);\n \n   // Will block till the transport thread shuts down\n   ~InspectorIo();\n \n   void StopAcceptingNewConnections();\n-  const std::string& host() const { return options_->host(); }\n-  int port() const { return port_; }\n+  const std::string& host() const { return host_port_->host(); }\n+  int port() const { return host_port_->port(); }\n   std::vector<std::string> GetTargetIds() const;\n \n  private:\n   InspectorIo(std::shared_ptr<MainThreadHandle> handle,\n               const std::string& path,\n-              std::shared_ptr<DebugOptions> options);\n+              std::shared_ptr<HostPort> host_port);\n \n   // Wrapper for agent->ThreadMain()\n   static void ThreadMain(void* agent);\n@@ -74,7 +75,7 @@ class InspectorIo {\n   // Used to post on a frontend interface thread, lives while the server is\n   // running\n   std::shared_ptr<RequestQueue> request_queue_;\n-  std::shared_ptr<DebugOptions> options_;\n+  std::shared_ptr<HostPort> host_port_;\n \n   // The IO thread runs its own uv_loop to implement the TCP server off\n   // the main thread.\n@@ -84,7 +85,6 @@ class InspectorIo {\n   Mutex thread_start_lock_;\n   ConditionVariable thread_start_condition_;\n   std::string script_name_;\n-  int port_ = -1;\n   // May be accessed from any thread\n   const std::string id_;\n };"
+        },
+        {
+            "sha": "1cb51b51ec09d3fc4ea9ed4c1440010235aace10",
+            "filename": "src/inspector_js_api.cc",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/nodejs/node/blob/61a89630ee5664b1f909b310a016b522a6285521/src%2Finspector_js_api.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/61a89630ee5664b1f909b310a016b522a6285521/src%2Finspector_js_api.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Finspector_js_api.cc?ref=61a89630ee5664b1f909b310a016b522a6285521",
+            "patch": "@@ -243,12 +243,12 @@ void Open(const FunctionCallbackInfo<Value>& args) {\n \n   if (args.Length() > 0 && args[0]->IsUint32()) {\n     uint32_t port = args[0].As<Uint32>()->Value();\n-    agent->options()->host_port.port = port;\n+    agent->host_port()->set_port(static_cast<int>(port));\n   }\n \n   if (args.Length() > 1 && args[1]->IsString()) {\n     Utf8Value host(env->isolate(), args[1].As<String>());\n-    agent->options()->host_port.host_name = *host;\n+    agent->host_port()->set_host(*host);\n   }\n \n   if (args.Length() > 2 && args[2]->IsBoolean()) {"
+        },
+        {
+            "sha": "f24ba12a8118741159dee046e0317b927f7fb3b8",
+            "filename": "src/node.cc",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 16,
+            "changes": 32,
+            "blob_url": "https://github.com/nodejs/node/blob/61a89630ee5664b1f909b310a016b522a6285521/src%2Fnode.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/61a89630ee5664b1f909b310a016b522a6285521/src%2Fnode.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode.cc?ref=61a89630ee5664b1f909b310a016b522a6285521",
+            "patch": "@@ -27,6 +27,7 @@\n #include \"node_internals.h\"\n #include \"node_metadata.h\"\n #include \"node_native_module.h\"\n+#include \"node_options-inl.h\"\n #include \"node_perf.h\"\n #include \"node_platform.h\"\n #include \"node_revert.h\"\n@@ -257,13 +258,15 @@ static struct {\n   }\n \n #if HAVE_INSPECTOR\n-  bool StartInspector(Environment* env, const char* script_path,\n-                      std::shared_ptr<DebugOptions> options) {\n+  bool StartInspector(Environment* env, const char* script_path) {\n     // Inspector agent can't fail to start, but if it was configured to listen\n     // right away on the websocket port and fails to bind/etc, this will return\n     // false.\n     return env->inspector_agent()->Start(\n-        script_path == nullptr ? \"\" : script_path, options, true);\n+        script_path == nullptr ? \"\" : script_path,\n+        env->options()->debug_options(),\n+        env->inspector_host_port(),\n+        true);\n   }\n \n   bool InspectorStarted(Environment* env) {\n@@ -304,8 +307,7 @@ static struct {\n   void Dispose() {}\n   void DrainVMTasks(Isolate* isolate) {}\n   void CancelVMTasks(Isolate* isolate) {}\n-  bool StartInspector(Environment* env, const char* script_path,\n-                      const DebugOptions& options) {\n+  bool StartInspector(Environment* env, const char* script_path) {\n     env->ThrowError(\"Node compiled with NODE_USE_V8_PLATFORM=0\");\n     return true;\n   }\n@@ -1090,24 +1092,24 @@ void SetupProcessObject(Environment* env,\n \n   // TODO(refack): move the following 4 to `node_config`\n   // --inspect-brk\n-  if (env->options()->debug_options->wait_for_connect()) {\n+  if (env->options()->debug_options().wait_for_connect()) {\n     READONLY_DONT_ENUM_PROPERTY(process,\n                                 \"_breakFirstLine\", True(env->isolate()));\n   }\n \n-  if (env->options()->debug_options->break_node_first_line) {\n+  if (env->options()->debug_options().break_node_first_line) {\n     READONLY_DONT_ENUM_PROPERTY(process,\n                                 \"_breakNodeFirstLine\", True(env->isolate()));\n   }\n \n   // --inspect --debug-brk\n-  if (env->options()->debug_options->deprecated_invocation()) {\n+  if (env->options()->debug_options().deprecated_invocation()) {\n     READONLY_DONT_ENUM_PROPERTY(process,\n                                 \"_deprecatedDebugBrk\", True(env->isolate()));\n   }\n \n   // --debug or, --debug-brk without --inspect\n-  if (env->options()->debug_options->invalid_invocation()) {\n+  if (env->options()->debug_options().invalid_invocation()) {\n     READONLY_DONT_ENUM_PROPERTY(process,\n                                 \"_invalidDebug\", True(env->isolate()));\n   }\n@@ -1255,7 +1257,7 @@ void LoadEnvironment(Environment* env) {\n           ->GetFunction(context)\n           .ToLocalChecked(),\n       Boolean::New(isolate,\n-                   env->options()->debug_options->break_node_first_line)};\n+                   env->options()->debug_options().break_node_first_line)};\n \n   MaybeLocal<Value> loader_exports;\n   // Bootstrap internal loaders\n@@ -1290,12 +1292,10 @@ void LoadEnvironment(Environment* env) {\n   }\n }\n \n-\n-static void StartInspector(Environment* env, const char* path,\n-                           std::shared_ptr<DebugOptions> debug_options) {\n+static void StartInspector(Environment* env, const char* path) {\n #if HAVE_INSPECTOR\n   CHECK(!env->inspector_agent()->IsListening());\n-  v8_platform.StartInspector(env, path, debug_options);\n+  v8_platform.StartInspector(env, path);\n #endif  // HAVE_INSPECTOR\n }\n \n@@ -1938,9 +1938,9 @@ inline int Start(Isolate* isolate, IsolateData* isolate_data,\n   env.Start(args, exec_args, v8_is_profiling);\n \n   const char* path = args.size() > 1 ? args[1].c_str() : nullptr;\n-  StartInspector(&env, path, env.options()->debug_options);\n+  StartInspector(&env, path);\n \n-  if (env.options()->debug_options->inspector_enabled &&\n+  if (env.options()->debug_options().inspector_enabled &&\n       !v8_platform.InspectorStarted(&env)) {\n     return 12;  // Signal internal error.\n   }"
+        },
+        {
+            "sha": "27ec44b8d305389305f252635bf7f9f587fc0b48",
+            "filename": "src/node_config.cc",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 9,
+            "changes": 17,
+            "blob_url": "https://github.com/nodejs/node/blob/61a89630ee5664b1f909b310a016b522a6285521/src%2Fnode_config.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/61a89630ee5664b1f909b310a016b522a6285521/src%2Fnode_config.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_config.cc?ref=61a89630ee5664b1f909b310a016b522a6285521",
+            "patch": "@@ -1,5 +1,6 @@\n #include \"node.h\"\n #include \"node_i18n.h\"\n+#include \"node_options-inl.h\"\n #include \"env-inl.h\"\n #include \"util-inl.h\"\n \n@@ -94,20 +95,18 @@ static void Initialize(Local<Object> target,\n     READONLY_STRING_PROPERTY(target, \"warningFile\", warning_file);\n   }\n \n-  std::shared_ptr<DebugOptions> debug_options = env->options()->debug_options;\n   Local<Object> debug_options_obj = Object::New(isolate);\n   READONLY_PROPERTY(target, \"debugOptions\", debug_options_obj);\n \n-  READONLY_STRING_PROPERTY(debug_options_obj, \"host\",\n-                           debug_options->host());\n-\n-  READONLY_PROPERTY(debug_options_obj,\n-                    \"port\",\n-                    Integer::New(isolate, debug_options->port()));\n-\n+  const DebugOptions& debug_options = env->options()->debug_options();\n   READONLY_PROPERTY(debug_options_obj,\n                     \"inspectorEnabled\",\n-                    Boolean::New(isolate, debug_options->inspector_enabled));\n+                    Boolean::New(isolate, debug_options.inspector_enabled));\n+  READONLY_STRING_PROPERTY(\n+      debug_options_obj, \"host\", debug_options.host_port.host());\n+  READONLY_PROPERTY(debug_options_obj,\n+                    \"port\",\n+                    Integer::New(isolate, debug_options.host_port.port()));\n }  // InitConfig\n \n }  // namespace node"
+        },
+        {
+            "sha": "8aaa62524b8ee674dbe2fedf15b67aa31ad0dc83",
+            "filename": "src/node_options-inl.h",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 1,
+            "changes": 6,
+            "blob_url": "https://github.com/nodejs/node/blob/61a89630ee5664b1f909b310a016b522a6285521/src%2Fnode_options-inl.h",
+            "raw_url": "https://github.com/nodejs/node/raw/61a89630ee5664b1f909b310a016b522a6285521/src%2Fnode_options-inl.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_options-inl.h?ref=61a89630ee5664b1f909b310a016b522a6285521",
+            "patch": "@@ -14,7 +14,11 @@ PerIsolateOptions* PerProcessOptions::get_per_isolate_options() {\n }\n \n DebugOptions* EnvironmentOptions::get_debug_options() {\n-  return debug_options.get();\n+  return &debug_options_;\n+}\n+\n+const DebugOptions& EnvironmentOptions::debug_options() const {\n+  return debug_options_;\n }\n \n EnvironmentOptions* PerIsolateOptions::get_per_env_options() {"
+        },
+        {
+            "sha": "3f9e066f2875856fceff1a111f839f4f651ab80b",
+            "filename": "src/node_options.cc",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 7,
+            "changes": 18,
+            "blob_url": "https://github.com/nodejs/node/blob/61a89630ee5664b1f909b310a016b522a6285521/src%2Fnode_options.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/61a89630ee5664b1f909b310a016b522a6285521/src%2Fnode_options.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_options.cc?ref=61a89630ee5664b1f909b310a016b522a6285521",
+            "patch": "@@ -44,7 +44,9 @@ void EnvironmentOptions::CheckOptions(std::vector<std::string>* errors) {\n     errors->push_back(\"invalid value for --http-parser\");\n   }\n \n-  debug_options->CheckOptions(errors);\n+#if HAVE_INSPECTOR\n+  debug_options_.CheckOptions(errors);\n+#endif  // HAVE_INSPECTOR\n }\n \n namespace options_parser {\n@@ -54,7 +56,6 @@ namespace options_parser {\n // TODO(addaleax): Make that unnecessary.\n \n DebugOptionsParser::DebugOptionsParser() {\n-#if HAVE_INSPECTOR\n   AddOption(\"--inspect-port\",\n             \"set host:port for inspector\",\n             &DebugOptions::host_port,\n@@ -84,10 +85,11 @@ DebugOptionsParser::DebugOptionsParser() {\n   AddOption(\"--debug-brk\", \"\", &DebugOptions::break_first_line);\n   Implies(\"--debug-brk\", \"--debug\");\n   AddAlias(\"--debug-brk=\", { \"--inspect-port\", \"--debug-brk\" });\n-#endif\n }\n \n+#if HAVE_INSPECTOR\n DebugOptionsParser DebugOptionsParser::instance;\n+#endif  // HAVE_INSPECTOR\n \n EnvironmentOptionsParser::EnvironmentOptionsParser() {\n   AddOption(\"--experimental-modules\",\n@@ -214,8 +216,10 @@ EnvironmentOptionsParser::EnvironmentOptionsParser() {\n             kAllowedInEnvironment);\n #endif\n \n+#if HAVE_INSPECTOR\n   Insert(&DebugOptionsParser::instance,\n          &EnvironmentOptions::get_debug_options);\n+#endif  // HAVE_INSPECTOR\n }\n \n EnvironmentOptionsParser EnvironmentOptionsParser::instance;\n@@ -372,15 +376,15 @@ HostPort SplitHostPort(const std::string& arg,\n   // so if it has an effect only an IPv6 address was specified.\n   std::string host = RemoveBrackets(arg);\n   if (host.length() < arg.length())\n-    return HostPort { host, -1 };\n+    return HostPort{host, DebugOptions::kDefaultInspectorPort};\n \n   size_t colon = arg.rfind(':');\n   if (colon == std::string::npos) {\n     // Either a port number or a host name.  Assume that\n     // if it's not all decimal digits, it's a host name.\n     for (char c : arg) {\n       if (c < '0' || c > '9') {\n-        return HostPort { arg, -1 };\n+        return HostPort{arg, DebugOptions::kDefaultInspectorPort};\n       }\n     }\n     return HostPort { \"\", ParseAndValidatePort(arg, errors) };\n@@ -446,11 +450,11 @@ void GetOptions(const FunctionCallbackInfo<Value>& args) {\n         const HostPort& host_port = *parser.Lookup<HostPort>(field, opts);\n         Local<Object> obj = Object::New(isolate);\n         Local<Value> host;\n-        if (!ToV8Value(context, host_port.host_name).ToLocal(&host) ||\n+        if (!ToV8Value(context, host_port.host()).ToLocal(&host) ||\n             obj->Set(context, env->host_string(), host).IsNothing() ||\n             obj->Set(context,\n                      env->port_string(),\n-                     Integer::New(isolate, host_port.port))\n+                     Integer::New(isolate, host_port.port()))\n                 .IsNothing()) {\n           return;\n         }"
+        },
+        {
+            "sha": "17dc7084638fcc3a9576d95ab085560e7c076b00",
+            "filename": "src/node_options.h",
+            "status": "modified",
+            "additions": 46,
+            "deletions": 17,
+            "changes": 63,
+            "blob_url": "https://github.com/nodejs/node/blob/61a89630ee5664b1f909b310a016b522a6285521/src%2Fnode_options.h",
+            "raw_url": "https://github.com/nodejs/node/raw/61a89630ee5664b1f909b310a016b522a6285521/src%2Fnode_options.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_options.h?ref=61a89630ee5664b1f909b310a016b522a6285521",
+            "patch": "@@ -3,22 +3,44 @@\n \n #if defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS\n \n+#include <memory>\n #include <string>\n-#include <vector>\n #include <unordered_map>\n-#include <memory>\n+#include <vector>\n #include \"node_constants.h\"\n+#include \"util.h\"\n \n namespace node {\n \n-struct HostPort {\n-  std::string host_name;\n-  int port;\n+class HostPort {\n+ public:\n+  HostPort(const std::string& host_name, int port)\n+      : host_name_(host_name), port_(port) {}\n+  HostPort(const HostPort&) = default;\n+  HostPort& operator=(const HostPort&) = default;\n+  HostPort(HostPort&&) = default;\n+  HostPort& operator=(HostPort&&) = default;\n+\n+  void set_host(const std::string& host) { host_name_ = host; }\n+\n+  void set_port(int port) { port_ = port; }\n+\n+  const std::string& host() const { return host_name_; }\n+\n+  int port() const {\n+    // TODO(joyeecheung): make port a uint16_t\n+    CHECK_GE(port_, 0);\n+    return port_;\n+  }\n \n   void Update(const HostPort& other) {\n-    if (!other.host_name.empty()) host_name = other.host_name;\n-    if (other.port >= 0) port = other.port;\n+    if (!other.host_name_.empty()) host_name_ = other.host_name_;\n+    if (other.port_ >= 0) port_ = other.port_;\n   }\n+\n+ private:\n+  std::string host_name_;\n+  int port_;\n };\n \n class Options {\n@@ -33,13 +55,25 @@ class Options {\n // per-Isolate, rather than per-Environment.\n class DebugOptions : public Options {\n  public:\n+  DebugOptions() = default;\n+  DebugOptions(const DebugOptions&) = default;\n+  DebugOptions& operator=(const DebugOptions&) = default;\n+  DebugOptions(DebugOptions&&) = default;\n+  DebugOptions& operator=(DebugOptions&&) = default;\n+\n+  // --inspect\n   bool inspector_enabled = false;\n+  // --debug\n   bool deprecated_debug = false;\n+  // --inspect-brk\n   bool break_first_line = false;\n+  // --inspect-brk-node\n   bool break_node_first_line = false;\n-  HostPort host_port = {\"127.0.0.1\", -1};\n+\n   enum { kDefaultInspectorPort = 9229 };\n \n+  HostPort host_port{\"127.0.0.1\", kDefaultInspectorPort};\n+\n   bool deprecated_invocation() const {\n     return deprecated_debug &&\n       inspector_enabled &&\n@@ -53,19 +87,10 @@ class DebugOptions : public Options {\n   bool wait_for_connect() const {\n     return break_first_line || break_node_first_line;\n   }\n-\n-  const std::string& host() {\n-    return host_port.host_name;\n-  }\n-\n-  int port() {\n-    return host_port.port < 0 ? kDefaultInspectorPort : host_port.port;\n-  }\n };\n \n class EnvironmentOptions : public Options {\n  public:\n-  std::shared_ptr<DebugOptions> debug_options { new DebugOptions() };\n   bool abort_on_uncaught_exception = false;\n   bool experimental_modules = false;\n   bool experimental_repl_await = false;\n@@ -108,7 +133,11 @@ class EnvironmentOptions : public Options {\n   std::vector<std::string> user_argv;\n \n   inline DebugOptions* get_debug_options();\n+  inline const DebugOptions& debug_options() const;\n   void CheckOptions(std::vector<std::string>* errors);\n+\n+ private:\n+  DebugOptions debug_options_;\n };\n \n class PerIsolateOptions : public Options {"
+        },
+        {
+            "sha": "792cc510924b4e60d476e2060d0f337d5204d44f",
+            "filename": "src/node_process.cc",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 11,
+            "changes": 14,
+            "blob_url": "https://github.com/nodejs/node/blob/61a89630ee5664b1f909b310a016b522a6285521/src%2Fnode_process.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/61a89630ee5664b1f909b310a016b522a6285521/src%2Fnode_process.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_process.cc?ref=61a89630ee5664b1f909b310a016b522a6285521",
+            "patch": "@@ -825,14 +825,7 @@ void GetActiveHandles(const FunctionCallbackInfo<Value>& args) {\n void DebugPortGetter(Local<Name> property,\n                      const PropertyCallbackInfo<Value>& info) {\n   Environment* env = Environment::GetCurrent(info);\n-  Mutex::ScopedLock lock(process_mutex);\n-  int port = env->options()->debug_options->port();\n-#if HAVE_INSPECTOR\n-  if (port == 0) {\n-    if (auto io = env->inspector_agent()->io())\n-      port = io->port();\n-  }\n-#endif  // HAVE_INSPECTOR\n+  int port = env->inspector_host_port()->port();\n   info.GetReturnValue().Set(port);\n }\n \n@@ -841,9 +834,8 @@ void DebugPortSetter(Local<Name> property,\n                      Local<Value> value,\n                      const PropertyCallbackInfo<void>& info) {\n   Environment* env = Environment::GetCurrent(info);\n-  Mutex::ScopedLock lock(process_mutex);\n-  env->options()->debug_options->host_port.port =\n-      value->Int32Value(env->context()).FromMaybe(0);\n+  int32_t port = value->Int32Value(env->context()).FromMaybe(0);\n+  env->inspector_host_port()->set_port(static_cast<int>(port));\n }\n \n "
+        },
+        {
+            "sha": "65d3b7297cc65b4fc095f6c905883fafd9a69ecf",
+            "filename": "src/node_worker.cc",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 1,
+            "changes": 5,
+            "blob_url": "https://github.com/nodejs/node/blob/61a89630ee5664b1f909b310a016b522a6285521/src%2Fnode_worker.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/61a89630ee5664b1f909b310a016b522a6285521/src%2Fnode_worker.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_worker.cc?ref=61a89630ee5664b1f909b310a016b522a6285521",
+            "patch": "@@ -37,7 +37,10 @@ Mutex next_thread_id_mutex;\n \n #if NODE_USE_V8_PLATFORM && HAVE_INSPECTOR\n void StartWorkerInspector(Environment* child, const std::string& url) {\n-  child->inspector_agent()->Start(url, nullptr, false);\n+  child->inspector_agent()->Start(url,\n+                                  child->options()->debug_options(),\n+                                  child->inspector_host_port(),\n+                                  false);\n }\n \n void AddWorkerInspector(Environment* parent,"
+        }
+    ],
+    "stats": {
+        "total": 258,
+        "additions": 160,
+        "deletions": 98
+    }
+}

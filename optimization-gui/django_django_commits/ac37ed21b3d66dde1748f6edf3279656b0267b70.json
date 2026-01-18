@@ -1,0 +1,156 @@
+{
+    "author": "aaugustin",
+    "message": "Deprecated TransactionMiddleware and TRANSACTIONS_MANAGED.\n\nReplaced them with per-database options, for proper multi-db support.\n\nAlso toned down the recommendation to tie transactions to HTTP requests.\nThanks Jeremy for sharing his experience.",
+    "sha": "ac37ed21b3d66dde1748f6edf3279656b0267b70",
+    "files": [
+        {
+            "sha": "5327ce58911c9369f561be19c16e3e7f82d805df",
+            "filename": "django/core/handlers/base.py",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 2,
+            "changes": 12,
+            "blob_url": "https://github.com/django/django/blob/ac37ed21b3d66dde1748f6edf3279656b0267b70/django%2Fcore%2Fhandlers%2Fbase.py",
+            "raw_url": "https://github.com/django/django/raw/ac37ed21b3d66dde1748f6edf3279656b0267b70/django%2Fcore%2Fhandlers%2Fbase.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fcore%2Fhandlers%2Fbase.py?ref=ac37ed21b3d66dde1748f6edf3279656b0267b70",
+            "patch": "@@ -6,10 +6,10 @@\n \n from django import http\n from django.conf import settings\n-from django.core import exceptions\n from django.core import urlresolvers\n from django.core import signals\n from django.core.exceptions import MiddlewareNotUsed, PermissionDenied\n+from django.db import connections, transaction\n from django.utils.encoding import force_text\n from django.utils.module_loading import import_by_path\n from django.utils import six\n@@ -65,6 +65,13 @@ def load_middleware(self):\n         # as a flag for initialization being complete.\n         self._request_middleware = request_middleware\n \n+    def make_view_atomic(self, view):\n+        if getattr(view, 'transactions_per_request', True):\n+            for db in connections.all():\n+                if db.settings_dict['ATOMIC_REQUESTS']:\n+                    view = transaction.atomic(using=db.alias)(view)\n+        return view\n+\n     def get_response(self, request):\n         \"Returns an HttpResponse object for the given HttpRequest\"\n         try:\n@@ -101,8 +108,9 @@ def get_response(self, request):\n                             break\n \n                 if response is None:\n+                    wrapped_callback = self.make_view_atomic(callback)\n                     try:\n-                        response = callback(request, *callback_args, **callback_kwargs)\n+                        response = wrapped_callback(request, *callback_args, **callback_kwargs)\n                     except Exception as e:\n                         # If the view raised an exception, run it through exception\n                         # middleware, and if the exception middleware returns a"
+        },
+        {
+            "sha": "2cf75bd5285aa6c2077f423fd0db349bfba5d443",
+            "filename": "django/db/backends/__init__.py",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/django/django/blob/ac37ed21b3d66dde1748f6edf3279656b0267b70/django%2Fdb%2Fbackends%2F__init__.py",
+            "raw_url": "https://github.com/django/django/raw/ac37ed21b3d66dde1748f6edf3279656b0267b70/django%2Fdb%2Fbackends%2F__init__.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fbackends%2F__init__.py?ref=ac37ed21b3d66dde1748f6edf3279656b0267b70",
+            "patch": "@@ -104,7 +104,7 @@ def connect(self):\n         conn_params = self.get_connection_params()\n         self.connection = self.get_new_connection(conn_params)\n         self.init_connection_state()\n-        if not settings.TRANSACTIONS_MANAGED:\n+        if self.settings_dict['AUTOCOMMIT']:\n             self.set_autocommit()\n         connection_created.send(sender=self.__class__, connection=self)\n \n@@ -299,7 +299,7 @@ def leave_transaction_management(self):\n         if self.transaction_state:\n             managed = self.transaction_state[-1]\n         else:\n-            managed = settings.TRANSACTIONS_MANAGED\n+            managed = not self.settings_dict['AUTOCOMMIT']\n \n         if self._dirty:\n             self.rollback()"
+        },
+        {
+            "sha": "936b42039d5079bc3e6a5f54f9247fa5aeaba66e",
+            "filename": "django/db/utils.py",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 0,
+            "changes": 8,
+            "blob_url": "https://github.com/django/django/blob/ac37ed21b3d66dde1748f6edf3279656b0267b70/django%2Fdb%2Futils.py",
+            "raw_url": "https://github.com/django/django/raw/ac37ed21b3d66dde1748f6edf3279656b0267b70/django%2Fdb%2Futils.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Futils.py?ref=ac37ed21b3d66dde1748f6edf3279656b0267b70",
+            "patch": "@@ -2,6 +2,7 @@\n import os\n import pkgutil\n from threading import local\n+import warnings\n \n from django.conf import settings\n from django.core.exceptions import ImproperlyConfigured\n@@ -158,6 +159,13 @@ def ensure_defaults(self, alias):\n         except KeyError:\n             raise ConnectionDoesNotExist(\"The connection %s doesn't exist\" % alias)\n \n+        conn.setdefault('ATOMIC_REQUESTS', False)\n+        if settings.TRANSACTIONS_MANAGED:\n+            warnings.warn(\n+                \"TRANSACTIONS_MANAGED is deprecated. Use AUTOCOMMIT instead.\",\n+                PendingDeprecationWarning, stacklevel=2)\n+            conn.setdefault('AUTOCOMMIT', False)\n+        conn.setdefault('AUTOCOMMIT', True)\n         conn.setdefault('ENGINE', 'django.db.backends.dummy')\n         if conn['ENGINE'] == 'django.db.backends.' or not conn['ENGINE']:\n             conn['ENGINE'] = 'django.db.backends.dummy'"
+        },
+        {
+            "sha": "95cc9a21f3bcc71bec6d110804437596cc7a4d00",
+            "filename": "django/middleware/transaction.py",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 1,
+            "changes": 13,
+            "blob_url": "https://github.com/django/django/blob/ac37ed21b3d66dde1748f6edf3279656b0267b70/django%2Fmiddleware%2Ftransaction.py",
+            "raw_url": "https://github.com/django/django/raw/ac37ed21b3d66dde1748f6edf3279656b0267b70/django%2Fmiddleware%2Ftransaction.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fmiddleware%2Ftransaction.py?ref=ac37ed21b3d66dde1748f6edf3279656b0267b70",
+            "patch": "@@ -1,4 +1,7 @@\n-from django.db import transaction\n+import warnings\n+\n+from django.core.exceptions import MiddlewareNotUsed\n+from django.db import connection, transaction\n \n class TransactionMiddleware(object):\n     \"\"\"\n@@ -7,6 +10,14 @@ class TransactionMiddleware(object):\n     commit, the commit is done when a successful response is created. If an\n     exception happens, the database is rolled back.\n     \"\"\"\n+\n+    def __init__(self):\n+        warnings.warn(\n+            \"TransactionMiddleware is deprecated in favor of ATOMIC_REQUESTS.\",\n+            PendingDeprecationWarning, stacklevel=2)\n+        if connection.settings_dict['ATOMIC_REQUESTS']:\n+            raise MiddlewareNotUsed\n+\n     def process_request(self, request):\n         \"\"\"Enters transaction management\"\"\"\n         transaction.enter_transaction_management()"
+        },
+        {
+            "sha": "19675801e43c6b6486bd37e5c197fab15b08f845",
+            "filename": "docs/internals/deprecation.txt",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 3,
+            "changes": 11,
+            "blob_url": "https://github.com/django/django/blob/ac37ed21b3d66dde1748f6edf3279656b0267b70/docs%2Finternals%2Fdeprecation.txt",
+            "raw_url": "https://github.com/django/django/raw/ac37ed21b3d66dde1748f6edf3279656b0267b70/docs%2Finternals%2Fdeprecation.txt",
+            "contents_url": "https://api.github.com/repos/django/django/contents/docs%2Finternals%2Fdeprecation.txt?ref=ac37ed21b3d66dde1748f6edf3279656b0267b70",
+            "patch": "@@ -329,9 +329,14 @@ these changes.\n 1.8\n ---\n \n-* The decorators and context managers ``django.db.transaction.autocommit``,\n-  ``commit_on_success`` and ``commit_manually`` will be removed. See\n-  :ref:`transactions-upgrading-from-1.5`.\n+* The following transaction management APIs will be removed:\n+\n+  - ``TransactionMiddleware``,\n+  - the decorators and context managers ``autocommit``, ``commit_on_success``,\n+    and ``commit_manually``,\n+  - the ``TRANSACTIONS_MANAGED`` setting.\n+\n+  Upgrade paths are described in :ref:`transactions-upgrading-from-1.5`.\n \n * The :ttag:`cycle` and :ttag:`firstof` template tags will auto-escape their\n   arguments. In 1.6 and 1.7, this behavior is provided by the version of these"
+        },
+        {
+            "sha": "20bb2fb751bc8440ffd1bebd7956c87e447c2d79",
+            "filename": "docs/ref/middleware.txt",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4,
+            "blob_url": "https://github.com/django/django/blob/ac37ed21b3d66dde1748f6edf3279656b0267b70/docs%2Fref%2Fmiddleware.txt",
+            "raw_url": "https://github.com/django/django/raw/ac37ed21b3d66dde1748f6edf3279656b0267b70/docs%2Fref%2Fmiddleware.txt",
+            "contents_url": "https://api.github.com/repos/django/django/contents/docs%2Fref%2Fmiddleware.txt?ref=ac37ed21b3d66dde1748f6edf3279656b0267b70",
+            "patch": "@@ -205,6 +205,10 @@ Transaction middleware\n \n .. class:: TransactionMiddleware\n \n+.. versionchanged:: 1.6\n+    ``TransactionMiddleware`` is deprecated. The documentation of transactions\n+    contains :ref:`upgrade instructions <transactions-upgrading-from-1.5>`.\n+\n Binds commit and rollback of the default database to the request/response\n phase. If a view function runs successfully, a commit is done. If it fails with\n an exception, a rollback is done."
+        },
+        {
+            "sha": "2b80527d8b0eb11203433b46bc4462dfe5302bca",
+            "filename": "docs/ref/settings.txt",
+            "status": "modified",
+            "additions": 30,
+            "deletions": 0,
+            "changes": 30,
+            "blob_url": "https://github.com/django/django/blob/ac37ed21b3d66dde1748f6edf3279656b0267b70/docs%2Fref%2Fsettings.txt",
+            "raw_url": "https://github.com/django/django/raw/ac37ed21b3d66dde1748f6edf3279656b0267b70/docs%2Fref%2Fsettings.txt",
+            "contents_url": "https://api.github.com/repos/django/django/contents/docs%2Fref%2Fsettings.txt?ref=ac37ed21b3d66dde1748f6edf3279656b0267b70",
+            "patch": "@@ -408,6 +408,30 @@ SQLite. This can be configured using the following::\n For other database backends, or more complex SQLite configurations, other options\n will be required. The following inner options are available.\n \n+.. setting:: DATABASE-ATOMIC_REQUESTS\n+\n+ATOMIC_REQUESTS\n+~~~~~~~~~~~~~~~\n+\n+.. versionadded:: 1.6\n+\n+Default: ``False``\n+\n+Set this to ``True`` to wrap each HTTP request in a transaction on this\n+database. See :ref:`tying-transactions-to-http-requests`.\n+\n+.. setting:: DATABASE-AUTOCOMMIT\n+\n+AUTOCOMMIT\n+~~~~~~~~~~\n+\n+.. versionadded:: 1.6\n+\n+Default: ``True``\n+\n+Set this to ``False`` if you want to :ref:`disable Django's transaction\n+management <deactivate-transaction-management>` and implement your own.\n+\n .. setting:: DATABASE-ENGINE\n \n ENGINE\n@@ -1807,6 +1831,12 @@ to ensure your processes are running in the correct environment.\n TRANSACTIONS_MANAGED\n --------------------\n \n+.. deprecated:: 1.6\n+\n+    This setting was deprecated because its name is very misleading. Use the\n+    :setting:`AUTOCOMMIT <DATABASE-AUTOCOMMIT>` key in :setting:`DATABASES`\n+    entries instead.\n+\n Default: ``False``\n \n Set this to ``True`` if you want to :ref:`disable Django's transaction"
+        },
+        {
+            "sha": "a1fe69229c0712772bb0463dfe6f92d51aea0e20",
+            "filename": "docs/releases/1.6.txt",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 3,
+            "changes": 8,
+            "blob_url": "https://github.com/django/django/blob/ac37ed21b3d66dde1748f6edf3279656b0267b70/docs%2Freleases%2F1.6.txt",
+            "raw_url": "https://github.com/django/django/raw/ac37ed21b3d66dde1748f6edf3279656b0267b70/docs%2Freleases%2F1.6.txt",
+            "contents_url": "https://api.github.com/repos/django/django/contents/docs%2Freleases%2F1.6.txt?ref=ac37ed21b3d66dde1748f6edf3279656b0267b70",
+            "patch": "@@ -262,9 +262,11 @@ Transaction management APIs\n Transaction management was completely overhauled in Django 1.6, and the\n current APIs are deprecated:\n \n-- :func:`django.db.transaction.autocommit`\n-- :func:`django.db.transaction.commit_on_success`\n-- :func:`django.db.transaction.commit_manually`\n+- ``django.middleware.transaction.TransactionMiddleware``\n+- ``django.db.transaction.autocommit``\n+- ``django.db.transaction.commit_on_success``\n+- ``django.db.transaction.commit_manually``\n+- the ``TRANSACTIONS_MANAGED`` setting\n \n The reasons for this change and the upgrade path are described in the\n :ref:`transactions documentation <transactions-upgrading-from-1.5>`."
+        },
+        {
+            "sha": "37a369a02f85e097e3f99143e7a07f34415634d7",
+            "filename": "docs/topics/db/transactions.txt",
+            "status": "modified",
+            "additions": 94,
+            "deletions": 40,
+            "changes": 134,
+            "blob_url": "https://github.com/django/django/blob/ac37ed21b3d66dde1748f6edf3279656b0267b70/docs%2Ftopics%2Fdb%2Ftransactions.txt",
+            "raw_url": "https://github.com/django/django/raw/ac37ed21b3d66dde1748f6edf3279656b0267b70/docs%2Ftopics%2Fdb%2Ftransactions.txt",
+            "contents_url": "https://api.github.com/repos/django/django/contents/docs%2Ftopics%2Fdb%2Ftransactions.txt?ref=ac37ed21b3d66dde1748f6edf3279656b0267b70",
+            "patch": "@@ -26,45 +26,61 @@ immediately committed to the database. :ref:`See below for details\n     Previous version of Django featured :ref:`a more complicated default\n     behavior <transactions-upgrading-from-1.5>`.\n \n+.. _tying-transactions-to-http-requests:\n+\n Tying transactions to HTTP requests\n -----------------------------------\n \n-The recommended way to handle transactions in Web requests is to tie them to\n-the request and response phases via Django's ``TransactionMiddleware``.\n+A common way to handle transactions on the web is to wrap each request in a\n+transaction. Set :setting:`ATOMIC_REQUESTS <DATABASE-ATOMIC_REQUESTS>` to\n+``True`` in the configuration of each database for which you want to enable\n+this behavior.\n \n It works like this. When a request starts, Django starts a transaction. If the\n-response is produced without problems, Django commits any pending transactions.\n-If the view function produces an exception, Django rolls back any pending\n-transactions.\n-\n-To activate this feature, just add the ``TransactionMiddleware`` middleware to\n-your :setting:`MIDDLEWARE_CLASSES` setting::\n-\n-    MIDDLEWARE_CLASSES = (\n-        'django.middleware.cache.UpdateCacheMiddleware',\n-        'django.contrib.sessions.middleware.SessionMiddleware',\n-        'django.middleware.common.CommonMiddleware',\n-        'django.middleware.transaction.TransactionMiddleware',\n-        'django.middleware.cache.FetchFromCacheMiddleware',\n-    )\n-\n-The order is quite important. The transaction middleware applies not only to\n-view functions, but also for all middleware modules that come after it. So if\n-you use the session middleware after the transaction middleware, session\n-creation will be part of the transaction.\n-\n-The various cache middlewares are an exception: ``CacheMiddleware``,\n-:class:`~django.middleware.cache.UpdateCacheMiddleware`, and\n-:class:`~django.middleware.cache.FetchFromCacheMiddleware` are never affected.\n-Even when using database caching, Django's cache backend uses its own database\n-connection internally.\n-\n-.. note::\n-\n-    The ``TransactionMiddleware`` only affects the database aliased\n-    as \"default\" within your :setting:`DATABASES` setting.  If you are using\n-    multiple databases and want transaction control over databases other than\n-    \"default\", you will need to write your own transaction middleware.\n+response is produced without problems, Django commits the transaction. If the\n+view function produces an exception, Django rolls back the transaction.\n+Middleware always runs outside of this transaction.\n+\n+You may perfom partial commits and rollbacks in your view code, typically with\n+the :func:`atomic` context manager. However, at the end of the view, either\n+all the changes will be committed, or none of them.\n+\n+To disable this behavior for a specific view, you must set the\n+``transactions_per_request`` attribute of the view function itself to\n+``False``, like this::\n+\n+    def my_view(request):\n+        do_stuff()\n+    my_view.transactions_per_request = False\n+\n+.. warning::\n+\n+    While the simplicity of this transaction model is appealing, it also makes it\n+    inefficient when traffic increases. Opening a transaction for every view has\n+    some overhead. The impact on performance depends on the query patterns of your\n+    application and on how well your database handles locking.\n+\n+.. admonition:: Per-request transactions and streaming responses\n+\n+    When a view returns a :class:`~django.http.StreamingHttpResponse`, reading\n+    the contents of the response will often execute code to generate the\n+    content. Since the view has already returned, such code runs outside of\n+    the transaction.\n+\n+    Generally speaking, it isn't advisable to write to the database while\n+    generating a streaming response, since there's no sensible way to handle\n+    errors after starting to send the response.\n+\n+In practice, this feature simply wraps every view function in the :func:`atomic`\n+decorator described below.\n+\n+Note that only the execution of your view in enclosed in the transactions.\n+Middleware run outside of the transaction, and so does the rendering of\n+template responses.\n+\n+.. versionchanged:: 1.6\n+    Django used to provide this feature via ``TransactionMiddleware``, which is\n+    now deprecated.\n \n Controlling transactions explicitly\n -----------------------------------\n@@ -283,18 +299,20 @@ if autocommit is off. Django will also refuse to turn autocommit off when an\n Deactivating transaction management\n -----------------------------------\n \n-Control freaks can totally disable all transaction management by setting\n-:setting:`TRANSACTIONS_MANAGED` to ``True`` in the Django settings file. If\n-you do this, Django won't enable autocommit. You'll get the regular behavior\n-of the underlying database library.\n+You can totally disable Django's transaction management for a given database\n+by setting :setting:`AUTOCOMMIT <DATABASE-AUTOCOMMIT>` to ``False`` in its\n+configuration. If you do this, Django won't enable autocommit, and won't\n+perform any commits. You'll get the regular behavior of the underlying\n+database library.\n \n This requires you to commit explicitly every transaction, even those started\n by Django or by third-party libraries. Thus, this is best used in situations\n where you want to run your own transaction-controlling middleware or do\n something really strange.\n \n-In almost all situations, you'll be better off using the default behavior, or\n-the transaction middleware, and only modify selected functions as needed.\n+.. versionchanged:: 1.6\n+    This used to be controlled by the ``TRANSACTIONS_MANAGED`` setting.\n+\n \n Database-specific notes\n =======================\n@@ -459,6 +477,35 @@ atomicity of the outer block.\n API changes\n -----------\n \n+Transaction middleware\n+~~~~~~~~~~~~~~~~~~~~~~\n+\n+In Django 1.6, ``TransactionMiddleware`` is deprecated and replaced\n+:setting:`ATOMIC_REQUESTS <DATABASE-ATOMIC_REQUESTS>`. While the general\n+behavior is the same, there are a few differences.\n+\n+With the transaction middleware, it was still possible to switch to autocommit\n+or to commit explicitly in a view. Since :func:`atomic` guarantees atomicity,\n+this isn't allowed any longer.\n+\n+To avoid wrapping a particular view in a transaction, instead of::\n+\n+    @transaction.autocommit\n+    def my_view(request):\n+        do_stuff()\n+\n+you must now use this pattern::\n+\n+    def my_view(request):\n+        do_stuff()\n+    my_view.transactions_per_request = False\n+\n+The transaction middleware applied not only to view functions, but also to\n+middleware modules that come after it. For instance, if you used the session\n+middleware after the transaction middleware, session creation was part of the\n+transaction. :setting:`ATOMIC_REQUESTS <DATABASE-ATOMIC_REQUESTS>` only\n+applies to the view itself.\n+\n Managing transactions\n ~~~~~~~~~~~~~~~~~~~~~\n \n@@ -508,6 +555,13 @@ you should now use::\n     finally:\n         transaction.set_autocommit(autocommit=False)\n \n+Disabling transaction management\n+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n+\n+Instead of setting ``TRANSACTIONS_MANAGED = True``, set the ``AUTOCOMMIT`` key\n+to ``False`` in the configuration of each database, as explained in :ref\n+:`deactivate-transaction-management`.\n+\n Backwards incompatibilities\n ---------------------------\n "
+        },
+        {
+            "sha": "3680eecdd2f599fe4c7c1a7ac36a46feda5d1e84",
+            "filename": "tests/handlers/tests.py",
+            "status": "modified",
+            "additions": 27,
+            "deletions": 3,
+            "changes": 30,
+            "blob_url": "https://github.com/django/django/blob/ac37ed21b3d66dde1748f6edf3279656b0267b70/tests%2Fhandlers%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/ac37ed21b3d66dde1748f6edf3279656b0267b70/tests%2Fhandlers%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fhandlers%2Ftests.py?ref=ac37ed21b3d66dde1748f6edf3279656b0267b70",
+            "patch": "@@ -1,9 +1,8 @@\n from django.core.handlers.wsgi import WSGIHandler\n from django.core.signals import request_started, request_finished\n-from django.db import close_old_connections\n-from django.test import RequestFactory, TestCase\n+from django.db import close_old_connections, connection\n+from django.test import RequestFactory, TestCase, TransactionTestCase\n from django.test.utils import override_settings\n-from django.utils import six\n \n \n class HandlerTests(TestCase):\n@@ -37,6 +36,31 @@ def test_bad_path_info(self):\n         self.assertEqual(response.status_code, 400)\n \n \n+class TransactionsPerRequestTests(TransactionTestCase):\n+    urls = 'handlers.urls'\n+\n+    def test_no_transaction(self):\n+        response = self.client.get('/in_transaction/')\n+        self.assertContains(response, 'False')\n+\n+    def test_auto_transaction(self):\n+        old_atomic_requests = connection.settings_dict['ATOMIC_REQUESTS']\n+        try:\n+            connection.settings_dict['ATOMIC_REQUESTS'] = True\n+            response = self.client.get('/in_transaction/')\n+        finally:\n+            connection.settings_dict['ATOMIC_REQUESTS'] = old_atomic_requests\n+        self.assertContains(response, 'True')\n+\n+    def test_no_auto_transaction(self):\n+        old_atomic_requests = connection.settings_dict['ATOMIC_REQUESTS']\n+        try:\n+            connection.settings_dict['ATOMIC_REQUESTS'] = True\n+            response = self.client.get('/not_in_transaction/')\n+        finally:\n+            connection.settings_dict['ATOMIC_REQUESTS'] = old_atomic_requests\n+        self.assertContains(response, 'False')\n+\n class SignalsTests(TestCase):\n     urls = 'handlers.urls'\n "
+        },
+        {
+            "sha": "29858055abd4a82e0033a428e81a380d7e99a4cd",
+            "filename": "tests/handlers/urls.py",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 3,
+            "changes": 9,
+            "blob_url": "https://github.com/django/django/blob/ac37ed21b3d66dde1748f6edf3279656b0267b70/tests%2Fhandlers%2Furls.py",
+            "raw_url": "https://github.com/django/django/raw/ac37ed21b3d66dde1748f6edf3279656b0267b70/tests%2Fhandlers%2Furls.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fhandlers%2Furls.py?ref=ac37ed21b3d66dde1748f6edf3279656b0267b70",
+            "patch": "@@ -1,9 +1,12 @@\n from __future__ import unicode_literals\n \n from django.conf.urls import patterns, url\n-from django.http import HttpResponse, StreamingHttpResponse\n+\n+from . import views\n \n urlpatterns = patterns('',\n-    url(r'^regular/$', lambda request: HttpResponse(b\"regular content\")),\n-    url(r'^streaming/$', lambda request: StreamingHttpResponse([b\"streaming\", b\" \", b\"content\"])),\n+    url(r'^regular/$', views.regular),\n+    url(r'^streaming/$', views.streaming),\n+    url(r'^in_transaction/$', views.in_transaction),\n+    url(r'^not_in_transaction/$', views.not_in_transaction),\n )"
+        },
+        {
+            "sha": "22d9ea4c7d8207b449f1e506af248d6ee33484ac",
+            "filename": "tests/handlers/views.py",
+            "status": "added",
+            "additions": 17,
+            "deletions": 0,
+            "changes": 17,
+            "blob_url": "https://github.com/django/django/blob/ac37ed21b3d66dde1748f6edf3279656b0267b70/tests%2Fhandlers%2Fviews.py",
+            "raw_url": "https://github.com/django/django/raw/ac37ed21b3d66dde1748f6edf3279656b0267b70/tests%2Fhandlers%2Fviews.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fhandlers%2Fviews.py?ref=ac37ed21b3d66dde1748f6edf3279656b0267b70",
+            "patch": "@@ -0,0 +1,17 @@\n+from __future__ import unicode_literals\n+\n+from django.db import connection\n+from django.http import HttpResponse, StreamingHttpResponse\n+\n+def regular(request):\n+    return HttpResponse(b\"regular content\")\n+\n+def streaming(request):\n+    return StreamingHttpResponse([b\"streaming\", b\" \", b\"content\"])\n+\n+def in_transaction(request):\n+    return HttpResponse(str(connection.in_atomic_block))\n+\n+def not_in_transaction(request):\n+    return HttpResponse(str(connection.in_atomic_block))\n+not_in_transaction.transactions_per_request = False"
+        }
+    ],
+    "stats": {
+        "total": 280,
+        "additions": 223,
+        "deletions": 57
+    }
+}

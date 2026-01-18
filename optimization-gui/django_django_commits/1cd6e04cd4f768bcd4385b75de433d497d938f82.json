@@ -1,0 +1,168 @@
+{
+    "author": "akaariai",
+    "message": "Fixed #18676 -- Allow fast-path deletion of objects\n\nObjects can be fast-path deleted if there are no signals, and there are\nno further cascades. If fast-path is taken, the objects do not need to\nbe loaded into memory before deletion.\n\nThanks to Jeremy Dunck, Simon Charette and Alex Gaynor for reviewing\nthe patch.",
+    "sha": "1cd6e04cd4f768bcd4385b75de433d497d938f82",
+    "files": [
+        {
+            "sha": "a85045c515fca2596640d973552897ecab2d0083",
+            "filename": "django/contrib/admin/util.py",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 0,
+            "changes": 7,
+            "blob_url": "https://github.com/django/django/blob/1cd6e04cd4f768bcd4385b75de433d497d938f82/django%2Fcontrib%2Fadmin%2Futil.py",
+            "raw_url": "https://github.com/django/django/raw/1cd6e04cd4f768bcd4385b75de433d497d938f82/django%2Fcontrib%2Fadmin%2Futil.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fcontrib%2Fadmin%2Futil.py?ref=1cd6e04cd4f768bcd4385b75de433d497d938f82",
+            "patch": "@@ -191,6 +191,13 @@ def nested(self, format_callback=None):\n             roots.extend(self._nested(root, seen, format_callback))\n         return roots\n \n+    def can_fast_delete(self, *args, **kwargs):\n+        \"\"\"\n+        We always want to load the objects into memory so that we can display\n+        them to the user in confirm page.\n+        \"\"\"\n+        return False\n+\n \n def model_format_dict(obj):\n     \"\"\""
+        },
+        {
+            "sha": "6dff4a288207fe19b343574143ccaf21ccf7b100",
+            "filename": "django/db/models/deletion.py",
+            "status": "modified",
+            "additions": 57,
+            "deletions": 6,
+            "changes": 63,
+            "blob_url": "https://github.com/django/django/blob/1cd6e04cd4f768bcd4385b75de433d497d938f82/django%2Fdb%2Fmodels%2Fdeletion.py",
+            "raw_url": "https://github.com/django/django/raw/1cd6e04cd4f768bcd4385b75de433d497d938f82/django%2Fdb%2Fmodels%2Fdeletion.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fmodels%2Fdeletion.py?ref=1cd6e04cd4f768bcd4385b75de433d497d938f82",
+            "patch": "@@ -77,6 +77,9 @@ def __init__(self, using):\n         self.data = {}\n         self.batches = {} # {model: {field: set([instances])}}\n         self.field_updates = {} # {model: {(field, value): set([instances])}}\n+        # fast_deletes is a list of queryset-likes that can be deleted without\n+        # fetching the objects into memory.\n+        self.fast_deletes = [] \n \n         # Tracks deletion-order dependency for databases without transactions\n         # or ability to defer constraint checks. Only concrete model classes\n@@ -131,6 +134,43 @@ def add_field_update(self, field, value, objs):\n             model, {}).setdefault(\n             (field, value), set()).update(objs)\n \n+    def can_fast_delete(self, objs, from_field=None):\n+        \"\"\"\n+        Determines if the objects in the given queryset-like can be\n+        fast-deleted. This can be done if there are no cascades, no\n+        parents and no signal listeners for the object class.\n+\n+        The 'from_field' tells where we are coming from - we need this to\n+        determine if the objects are in fact to be deleted. Allows also\n+        skipping parent -> child -> parent chain preventing fast delete of\n+        the child.\n+        \"\"\"\n+        if from_field and from_field.rel.on_delete is not CASCADE:\n+            return False\n+        if not (hasattr(objs, 'model') and hasattr(objs, '_raw_delete')):\n+            return False\n+        model = objs.model\n+        if (signals.pre_delete.has_listeners(model)\n+                or signals.post_delete.has_listeners(model)\n+                or signals.m2m_changed.has_listeners(model)):\n+            return False\n+        # The use of from_field comes from the need to avoid cascade back to\n+        # parent when parent delete is cascading to child.\n+        opts = model._meta\n+        if any(link != from_field for link in opts.concrete_model._meta.parents.values()):\n+            return False\n+        # Foreign keys pointing to this model, both from m2m and other\n+        # models.\n+        for related in opts.get_all_related_objects(\n+            include_hidden=True, include_proxy_eq=True):\n+            if related.field.rel.on_delete is not DO_NOTHING:\n+                return False\n+        # GFK deletes\n+        for relation in opts.many_to_many:\n+            if not relation.rel.through:\n+                return False\n+        return True\n+\n     def collect(self, objs, source=None, nullable=False, collect_related=True,\n         source_attr=None, reverse_dependency=False):\n         \"\"\"\n@@ -148,6 +188,9 @@ def collect(self, objs, source=None, nullable=False, collect_related=True,\n         models, the one case in which the cascade follows the forwards\n         direction of an FK rather than the reverse direction.)\n         \"\"\"\n+        if self.can_fast_delete(objs):\n+            self.fast_deletes.append(objs)\n+            return\n         new_objs = self.add(objs, source, nullable,\n                             reverse_dependency=reverse_dependency)\n         if not new_objs:\n@@ -160,6 +203,10 @@ def collect(self, objs, source=None, nullable=False, collect_related=True,\n         concrete_model = model._meta.concrete_model\n         for ptr in six.itervalues(concrete_model._meta.parents):\n             if ptr:\n+                # FIXME: This seems to be buggy and execute a query for each\n+                # parent object fetch. We have the parent data in the obj,\n+                # but we don't have a nice way to turn that data into parent\n+                # object instance.\n                 parent_objs = [getattr(obj, ptr.name) for obj in new_objs]\n                 self.collect(parent_objs, source=model,\n                              source_attr=ptr.rel.related_name,\n@@ -170,12 +217,12 @@ def collect(self, objs, source=None, nullable=False, collect_related=True,\n             for related in model._meta.get_all_related_objects(\n                     include_hidden=True, include_proxy_eq=True):\n                 field = related.field\n-                if related.model._meta.auto_created:\n-                    self.add_batch(related.model, field, new_objs)\n-                else:\n-                    sub_objs = self.related_objects(related, new_objs)\n-                    if not sub_objs:\n-                        continue\n+                if field.rel.on_delete == DO_NOTHING:\n+                    continue\n+                sub_objs = self.related_objects(related, new_objs)\n+                if self.can_fast_delete(sub_objs, from_field=field):\n+                    self.fast_deletes.append(sub_objs)\n+                elif sub_objs:\n                     field.rel.on_delete(self, field, sub_objs, self.using)\n \n             # TODO This entire block is only needed as a special case to\n@@ -241,6 +288,10 @@ def delete(self):\n                     sender=model, instance=obj, using=self.using\n                 )\n \n+        # fast deletes\n+        for qs in self.fast_deletes:\n+            qs._raw_delete(using=self.using)\n+\n         # update fields\n         for model, instances_for_fieldvalues in six.iteritems(self.field_updates):\n             query = sql.UpdateQuery(model)"
+        },
+        {
+            "sha": "0210a7914dcbcc7e46ae285406cb7b51ef49bde2",
+            "filename": "django/db/models/query.py",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 0,
+            "changes": 8,
+            "blob_url": "https://github.com/django/django/blob/1cd6e04cd4f768bcd4385b75de433d497d938f82/django%2Fdb%2Fmodels%2Fquery.py",
+            "raw_url": "https://github.com/django/django/raw/1cd6e04cd4f768bcd4385b75de433d497d938f82/django%2Fdb%2Fmodels%2Fquery.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fmodels%2Fquery.py?ref=1cd6e04cd4f768bcd4385b75de433d497d938f82",
+            "patch": "@@ -529,6 +529,14 @@ def delete(self):\n         self._result_cache = None\n     delete.alters_data = True\n \n+    def _raw_delete(self, using):\n+        \"\"\"\n+        Deletes objects found from the given queryset in single direct SQL\n+        query. No signals are sent, and there is no protection for cascades.\n+        \"\"\"\n+        sql.DeleteQuery(self.model).delete_qs(self, using)\n+    _raw_delete.alters_data = True\n+\n     def update(self, **kwargs):\n         \"\"\"\n         Updates all elements in the current QuerySet, setting all the given"
+        },
+        {
+            "sha": "f6b6bba1d98004d1d4a7baacf5bf51fd5f9dc691",
+            "filename": "django/db/models/sql/compiler.py",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/django/django/blob/1cd6e04cd4f768bcd4385b75de433d497d938f82/django%2Fdb%2Fmodels%2Fsql%2Fcompiler.py",
+            "raw_url": "https://github.com/django/django/raw/1cd6e04cd4f768bcd4385b75de433d497d938f82/django%2Fdb%2Fmodels%2Fsql%2Fcompiler.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fmodels%2Fsql%2Fcompiler.py?ref=1cd6e04cd4f768bcd4385b75de433d497d938f82",
+            "patch": "@@ -934,7 +934,8 @@ def as_sql(self):\n         qn = self.quote_name_unless_alias\n         result = ['DELETE FROM %s' % qn(self.query.tables[0])]\n         where, params = self.query.where.as_sql(qn=qn, connection=self.connection)\n-        result.append('WHERE %s' % where)\n+        if where:\n+            result.append('WHERE %s' % where)\n         return ' '.join(result), tuple(params)\n \n class SQLUpdateCompiler(SQLCompiler):"
+        },
+        {
+            "sha": "9f3fb8ac229271fdcf0022f6cd9851bf6de8ed9e",
+            "filename": "django/db/models/sql/subqueries.py",
+            "status": "modified",
+            "additions": 32,
+            "deletions": 0,
+            "changes": 32,
+            "blob_url": "https://github.com/django/django/blob/1cd6e04cd4f768bcd4385b75de433d497d938f82/django%2Fdb%2Fmodels%2Fsql%2Fsubqueries.py",
+            "raw_url": "https://github.com/django/django/raw/1cd6e04cd4f768bcd4385b75de433d497d938f82/django%2Fdb%2Fmodels%2Fsql%2Fsubqueries.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fmodels%2Fsql%2Fsubqueries.py?ref=1cd6e04cd4f768bcd4385b75de433d497d938f82",
+            "patch": "@@ -3,6 +3,7 @@\n \"\"\"\n \n from django.core.exceptions import FieldError\n+from django.db import connections\n from django.db.models.constants import LOOKUP_SEP\n from django.db.models.fields import DateField, FieldDoesNotExist\n from django.db.models.sql.constants import *\n@@ -46,6 +47,37 @@ def delete_batch(self, pk_list, using, field=None):\n                     pk_list[offset:offset + GET_ITERATOR_CHUNK_SIZE]), AND)\n             self.do_query(self.model._meta.db_table, where, using=using)\n \n+    def delete_qs(self, query, using):\n+        innerq = query.query\n+        # Make sure the inner query has at least one table in use.\n+        innerq.get_initial_alias()\n+        # The same for our new query.\n+        self.get_initial_alias()\n+        innerq_used_tables = [t for t in innerq.tables\n+                              if innerq.alias_refcount[t]]\n+        if ((not innerq_used_tables or innerq_used_tables == self.tables)\n+            and not len(innerq.having)):\n+            # There is only the base table in use in the query, and there are\n+            # no aggregate filtering going on.\n+            self.where = innerq.where\n+        else:\n+            pk = query.model._meta.pk\n+            if not connections[using].features.update_can_self_select:\n+                # We can't do the delete using subquery.\n+                values = list(query.values_list('pk', flat=True))\n+                if not values:\n+                    return\n+                self.delete_batch(values, using)\n+                return\n+            else:\n+                values = innerq\n+                innerq.select = [(self.get_initial_alias(), pk.column)]\n+            where = self.where_class()\n+            where.add((Constraint(None, pk.column, pk), 'in', values), AND)\n+            self.where = where\n+        self.get_compiler(using).execute_sql(None)\n+\n+\n class UpdateQuery(Query):\n     \"\"\"\n     Represents an \"update\" SQL query."
+        },
+        {
+            "sha": "d17d8691647bfb16db616d823f1deceb6e932f87",
+            "filename": "docs/ref/models/querysets.txt",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 0,
+            "changes": 15,
+            "blob_url": "https://github.com/django/django/blob/1cd6e04cd4f768bcd4385b75de433d497d938f82/docs%2Fref%2Fmodels%2Fquerysets.txt",
+            "raw_url": "https://github.com/django/django/raw/1cd6e04cd4f768bcd4385b75de433d497d938f82/docs%2Fref%2Fmodels%2Fquerysets.txt",
+            "contents_url": "https://api.github.com/repos/django/django/contents/docs%2Fref%2Fmodels%2Fquerysets.txt?ref=1cd6e04cd4f768bcd4385b75de433d497d938f82",
+            "patch": "@@ -1667,6 +1667,21 @@ methods on your models. It does, however, emit the\n :data:`~django.db.models.signals.post_delete` signals for all deleted objects\n (including cascaded deletions).\n \n+.. versionadded:: 1.5\n+    Allow fast-path deletion of objects\n+\n+Django needs to fetch objects into memory to send signals and handle cascades.\n+However, if there are no cascades and no signals, then Django may take a\n+fast-path and delete objects without fetching into memory. For large\n+deletes this can result in significantly reduced memory usage. The amount of\n+executed queries can be reduced, too.\n+\n+ForeignKeys which are set to :attr:`~django.db.models.ForeignKey.on_delete`\n+DO_NOTHING do not prevent taking the fast-path in deletion.\n+\n+Note that the queries generated in object deletion is an implementation\n+detail subject to change.\n+\n .. _field-lookups:\n \n Field lookups"
+        },
+        {
+            "sha": "5636a2b34b65afe2c4097ea87e883a8030ab58d2",
+            "filename": "docs/releases/1.5.txt",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6,
+            "blob_url": "https://github.com/django/django/blob/1cd6e04cd4f768bcd4385b75de433d497d938f82/docs%2Freleases%2F1.5.txt",
+            "raw_url": "https://github.com/django/django/raw/1cd6e04cd4f768bcd4385b75de433d497d938f82/docs%2Freleases%2F1.5.txt",
+            "contents_url": "https://api.github.com/repos/django/django/contents/docs%2Freleases%2F1.5.txt?ref=1cd6e04cd4f768bcd4385b75de433d497d938f82",
+            "patch": "@@ -149,6 +149,12 @@ Django 1.5 also includes several smaller improvements worth noting:\n * Django now provides a mod_wsgi :doc:`auth handler\n   </howto/deployment/wsgi/apache-auth>`\n \n+* The :meth:`QuerySet.delete() <django.db.models.query.QuerySet.delete>`\n+  and :meth:`Model.delete() <django.db.models.Model.delete()>` can now take\n+  fast-path in some cases. The fast-path allows for less queries and less\n+  objects fetched into memory. See :meth:`QuerySet.delete()\n+  <django.db.models.query.QuerySet.delete>` for details.\n+\n Backwards incompatible changes in 1.5\n =====================================\n "
+        },
+        {
+            "sha": "65d4e6f725fa55fb98c453ff025940f587a563e0",
+            "filename": "tests/modeltests/delete/models.py",
+            "status": "modified",
+            "additions": 19,
+            "deletions": 1,
+            "changes": 20,
+            "blob_url": "https://github.com/django/django/blob/1cd6e04cd4f768bcd4385b75de433d497d938f82/tests%2Fmodeltests%2Fdelete%2Fmodels.py",
+            "raw_url": "https://github.com/django/django/raw/1cd6e04cd4f768bcd4385b75de433d497d938f82/tests%2Fmodeltests%2Fdelete%2Fmodels.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fmodeltests%2Fdelete%2Fmodels.py?ref=1cd6e04cd4f768bcd4385b75de433d497d938f82",
+            "patch": "@@ -95,7 +95,7 @@ class MRNull(models.Model):\n \n \n class Avatar(models.Model):\n-    pass\n+    desc = models.TextField(null=True)\n \n \n class User(models.Model):\n@@ -108,3 +108,21 @@ class HiddenUser(models.Model):\n \n class HiddenUserProfile(models.Model):\n     user = models.ForeignKey(HiddenUser)\n+\n+class M2MTo(models.Model):\n+    pass\n+\n+class M2MFrom(models.Model):\n+    m2m = models.ManyToManyField(M2MTo)\n+\n+class Parent(models.Model):\n+    pass\n+\n+class Child(Parent):\n+    pass\n+\n+class Base(models.Model):\n+    pass\n+\n+class RelToBase(models.Model):\n+    base = models.ForeignKey(Base, on_delete=models.DO_NOTHING)"
+        },
+        {
+            "sha": "2610cb4b3936195d095c92238337c8ef76a7a553",
+            "filename": "tests/modeltests/delete/tests.py",
+            "status": "modified",
+            "additions": 99,
+            "deletions": 2,
+            "changes": 101,
+            "blob_url": "https://github.com/django/django/blob/1cd6e04cd4f768bcd4385b75de433d497d938f82/tests%2Fmodeltests%2Fdelete%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/1cd6e04cd4f768bcd4385b75de433d497d938f82/tests%2Fmodeltests%2Fdelete%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fmodeltests%2Fdelete%2Ftests.py?ref=1cd6e04cd4f768bcd4385b75de433d497d938f82",
+            "patch": "@@ -1,11 +1,12 @@\n from __future__ import absolute_import\n \n-from django.db import models, IntegrityError\n+from django.db import models, IntegrityError, connection\n from django.test import TestCase, skipUnlessDBFeature, skipIfDBFeature\n from django.utils.six.moves import xrange\n \n from .models import (R, RChild, S, T, U, A, M, MR, MRNull,\n-    create_a, get_default_r, User, Avatar, HiddenUser, HiddenUserProfile)\n+    create_a, get_default_r, User, Avatar, HiddenUser, HiddenUserProfile,\n+    M2MTo, M2MFrom, Parent, Child, Base)\n \n \n class OnDeleteTests(TestCase):\n@@ -74,6 +75,16 @@ def check_do_nothing(sender, **kwargs):\n         self.assertEqual(replacement_r, a.donothing)\n         models.signals.pre_delete.disconnect(check_do_nothing)\n \n+    def test_do_nothing_qscount(self):\n+        \"\"\"\n+        Test that a models.DO_NOTHING relation doesn't trigger a query.\n+        \"\"\"\n+        b = Base.objects.create()\n+        with self.assertNumQueries(1):\n+            # RelToBase should not be queried.\n+            b.delete()\n+        self.assertEqual(Base.objects.count(), 0)\n+\n     def test_inheritance_cascade_up(self):\n         child = RChild.objects.create()\n         child.delete()\n@@ -229,23 +240,43 @@ def test_can_defer_constraint_checks(self):\n         # 1 query to delete the avatar\n         # The important thing is that when we can defer constraint checks there\n         # is no need to do an UPDATE on User.avatar to null it out.\n+\n+        # Attach a signal to make sure we will not do fast_deletes.\n+        calls = []\n+        def noop(*args, **kwargs):\n+            calls.append('')\n+        models.signals.post_delete.connect(noop, sender=User)\n+\n         self.assertNumQueries(3, a.delete)\n         self.assertFalse(User.objects.exists())\n         self.assertFalse(Avatar.objects.exists())\n+        self.assertEquals(len(calls), 1)\n+        models.signals.post_delete.disconnect(noop, sender=User)\n \n     @skipIfDBFeature(\"can_defer_constraint_checks\")\n     def test_cannot_defer_constraint_checks(self):\n         u = User.objects.create(\n             avatar=Avatar.objects.create()\n         )\n+        # Attach a signal to make sure we will not do fast_deletes.\n+        calls = []\n+        def noop(*args, **kwargs):\n+            calls.append('')\n+        models.signals.post_delete.connect(noop, sender=User)\n+\n         a = Avatar.objects.get(pk=u.avatar_id)\n+        # The below doesn't make sense... Why do we need to null out\n+        # user.avatar if we are going to delete the user immediately after it,\n+        # and there are no more cascades.\n         # 1 query to find the users for the avatar.\n         # 1 query to delete the user\n         # 1 query to null out user.avatar, because we can't defer the constraint\n         # 1 query to delete the avatar\n         self.assertNumQueries(4, a.delete)\n         self.assertFalse(User.objects.exists())\n         self.assertFalse(Avatar.objects.exists())\n+        self.assertEquals(len(calls), 1)\n+        models.signals.post_delete.disconnect(noop, sender=User)\n \n     def test_hidden_related(self):\n         r = R.objects.create()\n@@ -254,3 +285,69 @@ def test_hidden_related(self):\n \n         r.delete()\n         self.assertEqual(HiddenUserProfile.objects.count(), 0)\n+\n+class FastDeleteTests(TestCase):\n+\n+    def test_fast_delete_fk(self):\n+        u = User.objects.create(\n+            avatar=Avatar.objects.create()\n+        )\n+        a = Avatar.objects.get(pk=u.avatar_id)\n+        # 1 query to fast-delete the user\n+        # 1 query to delete the avatar\n+        self.assertNumQueries(2, a.delete)\n+        self.assertFalse(User.objects.exists())\n+        self.assertFalse(Avatar.objects.exists())\n+\n+    def test_fast_delete_m2m(self):\n+        t = M2MTo.objects.create()\n+        f = M2MFrom.objects.create()\n+        f.m2m.add(t)\n+        # 1 to delete f, 1 to fast-delete m2m for f\n+        self.assertNumQueries(2, f.delete)\n+\n+    def test_fast_delete_revm2m(self):\n+        t = M2MTo.objects.create()\n+        f = M2MFrom.objects.create()\n+        f.m2m.add(t)\n+        # 1 to delete t, 1 to fast-delete t's m_set\n+        self.assertNumQueries(2, f.delete)\n+\n+    def test_fast_delete_qs(self):\n+        u1 = User.objects.create()\n+        u2 = User.objects.create()\n+        self.assertNumQueries(1, User.objects.filter(pk=u1.pk).delete)\n+        self.assertEquals(User.objects.count(), 1)\n+        self.assertTrue(User.objects.filter(pk=u2.pk).exists())\n+\n+    def test_fast_delete_joined_qs(self):\n+        a = Avatar.objects.create(desc='a')\n+        User.objects.create(avatar=a)\n+        u2 = User.objects.create()\n+        expected_queries = 1 if connection.features.update_can_self_select else 2\n+        self.assertNumQueries(expected_queries,\n+                              User.objects.filter(avatar__desc='a').delete)\n+        self.assertEquals(User.objects.count(), 1)\n+        self.assertTrue(User.objects.filter(pk=u2.pk).exists())\n+\n+    def test_fast_delete_inheritance(self):\n+        c = Child.objects.create()\n+        p = Parent.objects.create()\n+        # 1 for self, 1 for parent\n+        # However, this doesn't work as child.parent access creates a query,\n+        # and this means we will be generating extra queries (a lot for large\n+        # querysets). This is not a fast-delete problem.\n+        # self.assertNumQueries(2, c.delete)\n+        c.delete()\n+        self.assertFalse(Child.objects.exists())\n+        self.assertEquals(Parent.objects.count(), 1)\n+        self.assertEquals(Parent.objects.filter(pk=p.pk).count(), 1)\n+        # 1 for self delete, 1 for fast delete of empty \"child\" qs.\n+        self.assertNumQueries(2, p.delete)\n+        self.assertFalse(Parent.objects.exists())\n+        # 1 for self delete, 1 for fast delete of empty \"child\" qs.\n+        c = Child.objects.create()\n+        p = c.parent_ptr\n+        self.assertNumQueries(2, p.delete)\n+        self.assertFalse(Parent.objects.exists())\n+        self.assertFalse(Child.objects.exists())"
+        },
+        {
+            "sha": "32a6cd62916344763b4c03b89eec7333144dde6a",
+            "filename": "tests/regressiontests/admin_util/models.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3,
+            "blob_url": "https://github.com/django/django/blob/1cd6e04cd4f768bcd4385b75de433d497d938f82/tests%2Fregressiontests%2Fadmin_util%2Fmodels.py",
+            "raw_url": "https://github.com/django/django/raw/1cd6e04cd4f768bcd4385b75de433d497d938f82/tests%2Fregressiontests%2Fadmin_util%2Fmodels.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fadmin_util%2Fmodels.py?ref=1cd6e04cd4f768bcd4385b75de433d497d938f82",
+            "patch": "@@ -39,3 +39,6 @@ class Guest(models.Model):\n \n     class Meta:\n         verbose_name = \"awesome guest\"\n+\n+class EventGuide(models.Model):\n+    event = models.ForeignKey(Event, on_delete=models.DO_NOTHING)"
+        },
+        {
+            "sha": "ef8a91d1db3a63e9989dc3e8187fca2a11370b29",
+            "filename": "tests/regressiontests/admin_util/tests.py",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 1,
+            "changes": 13,
+            "blob_url": "https://github.com/django/django/blob/1cd6e04cd4f768bcd4385b75de433d497d938f82/tests%2Fregressiontests%2Fadmin_util%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/1cd6e04cd4f768bcd4385b75de433d497d938f82/tests%2Fregressiontests%2Fadmin_util%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fadmin_util%2Ftests.py?ref=1cd6e04cd4f768bcd4385b75de433d497d938f82",
+            "patch": "@@ -17,7 +17,7 @@\n from django.utils.safestring import mark_safe\n from django.utils import six\n \n-from .models import Article, Count, Event, Location\n+from .models import Article, Count, Event, Location, EventGuide\n \n \n class NestedObjectsTests(TestCase):\n@@ -71,6 +71,17 @@ def test_queries(self):\n         # Should not require additional queries to populate the nested graph.\n         self.assertNumQueries(2, self._collect, 0)\n \n+    def test_on_delete_do_nothing(self):\n+        \"\"\"\n+        Check that the nested collector doesn't query for DO_NOTHING objects.\n+        \"\"\"\n+        n = NestedObjects(using=DEFAULT_DB_ALIAS)\n+        objs = [Event.objects.create()]\n+        EventGuide.objects.create(event=objs[0])\n+        with self.assertNumQueries(2):\n+            # One for Location, one for Guest, and no query for EventGuide\n+            n.collect(objs)\n+\n class UtilTests(unittest.TestCase):\n     def test_values_from_lookup_field(self):\n         \"\"\""
+        },
+        {
+            "sha": "ebe59bffd740dfa5955ec19db3a00bb4ab9f91cc",
+            "filename": "tests/regressiontests/delete_regress/tests.py",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 2,
+            "changes": 11,
+            "blob_url": "https://github.com/django/django/blob/1cd6e04cd4f768bcd4385b75de433d497d938f82/tests%2Fregressiontests%2Fdelete_regress%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/1cd6e04cd4f768bcd4385b75de433d497d938f82/tests%2Fregressiontests%2Fdelete_regress%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fdelete_regress%2Ftests.py?ref=1cd6e04cd4f768bcd4385b75de433d497d938f82",
+            "patch": "@@ -3,7 +3,7 @@\n import datetime\n \n from django.conf import settings\n-from django.db import backend, transaction, DEFAULT_DB_ALIAS\n+from django.db import backend, transaction, DEFAULT_DB_ALIAS, models\n from django.test import TestCase, TransactionTestCase, skipUnlessDBFeature\n \n from .models import (Book, Award, AwardNote, Person, Child, Toy, PlayedWith,\n@@ -139,17 +139,24 @@ def test_to_field(self):\n         eaten = Eaten.objects.create(food=apple, meal=\"lunch\")\n \n         apple.delete()\n+        self.assertFalse(Food.objects.exists())\n+        self.assertFalse(Eaten.objects.exists())\n+\n \n class LargeDeleteTests(TestCase):\n     def test_large_deletes(self):\n         \"Regression for #13309 -- if the number of objects > chunk size, deletion still occurs\"\n         for x in range(300):\n             track = Book.objects.create(pagecount=x+100)\n+        # attach a signal to make sure we will not fast-delete\n+        def noop(*args, **kwargs):\n+            pass\n+        models.signals.post_delete.connect(noop, sender=Book)\n         Book.objects.all().delete()\n+        models.signals.post_delete.disconnect(noop, sender=Book)\n         self.assertEqual(Book.objects.count(), 0)\n \n \n-\n class ProxyDeleteTest(TestCase):\n     \"\"\"\n     Tests on_delete behavior for proxy models."
+        },
+        {
+            "sha": "5f8f92acaf7f823f1d05a0ebef59212e1b966920",
+            "filename": "tests/regressiontests/dispatch/tests/test_dispatcher.py",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 6,
+            "changes": 12,
+            "blob_url": "https://github.com/django/django/blob/1cd6e04cd4f768bcd4385b75de433d497d938f82/tests%2Fregressiontests%2Fdispatch%2Ftests%2Ftest_dispatcher.py",
+            "raw_url": "https://github.com/django/django/raw/1cd6e04cd4f768bcd4385b75de433d497d938f82/tests%2Fregressiontests%2Fdispatch%2Ftests%2Ftest_dispatcher.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fdispatch%2Ftests%2Ftest_dispatcher.py?ref=1cd6e04cd4f768bcd4385b75de433d497d938f82",
+            "patch": "@@ -127,15 +127,15 @@ def testDisconnection(self):\n         self._testIsClean(a_signal)\n \n     def test_has_listeners(self):\n-        self.assertIs(a_signal.has_listeners(), False)\n-        self.assertIs(a_signal.has_listeners(sender=object()), False)\n+        self.assertFalse(a_signal.has_listeners())\n+        self.assertFalse(a_signal.has_listeners(sender=object()))\n         receiver_1 = Callable()\n         a_signal.connect(receiver_1)\n-        self.assertIs(a_signal.has_listeners(), True)\n-        self.assertIs(a_signal.has_listeners(sender=object()), True)\n+        self.assertTrue(a_signal.has_listeners())\n+        self.assertTrue(a_signal.has_listeners(sender=object()))\n         a_signal.disconnect(receiver_1)\n-        self.assertIs(a_signal.has_listeners(), False)\n-        self.assertIs(a_signal.has_listeners(sender=object()), False)\n+        self.assertFalse(a_signal.has_listeners())\n+        self.assertFalse(a_signal.has_listeners(sender=object()))\n \n \n class ReceiverTestCase(unittest.TestCase):"
+        }
+    ],
+    "stats": {
+        "total": 294,
+        "additions": 275,
+        "deletions": 19
+    }
+}

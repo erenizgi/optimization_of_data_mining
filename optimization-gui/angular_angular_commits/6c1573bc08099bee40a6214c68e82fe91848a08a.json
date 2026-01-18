@@ -1,0 +1,36 @@
+{
+    "author": "devversion",
+    "message": "fix(compiler-cli): downlevel transform incorrectly extracting constructor parameters for nested classes (#44281)\n\nThe downlevel decorator transform (commonly used in the CLI and other\ntooling of the ecosystem for enabling JIT ES2015+), is currently\nincorrectly dealing with nested classes.\n\nThe transform will accidentally visit nested classes (in a constructor)\nmultiple times and generate duplicated instances of the `ctorParameters`\nfields. This does not sound like an issue at first, but the duplicated\n`ctorParameters` fields will miss significant type information that has\nbeen elided by the first visit, resulting in generated code like the\nfollowing:\n\n```js\n      let MyClass = /* @__PURE__ */ __name(class MyClass extends UpgradeNg1ComponentAdapter {\n        constructor(scope, injector3, elementRef) {\n        }\n      }, \"MyClass\");\n      MyClass.ctorParameters = () => [\n        { type: void 0, decorators: [{ type: Inject, args: [$SCOPE] }] },\n        { type: Injector },\n        { type: ElementRef }\n      ];\n      MyClass.ctorParameters = () => [\n        { type: void 0 }, // <---- NOTE!\n        { type: Injector },\n        { type: ElementRef }\n      ];\n```\n\nPR Close #44281",
+    "sha": "6c1573bc08099bee40a6214c68e82fe91848a08a",
+    "files": [
+        {
+            "sha": "469e8b9b70e8cd0514ef5c2bbf5855503bfabcb8",
+            "filename": "packages/compiler-cli/src/transformers/downlevel_decorators_transform/downlevel_decorators_transform.ts",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 5,
+            "changes": 11,
+            "blob_url": "https://github.com/angular/angular/blob/6c1573bc08099bee40a6214c68e82fe91848a08a/packages%2Fcompiler-cli%2Fsrc%2Ftransformers%2Fdownlevel_decorators_transform%2Fdownlevel_decorators_transform.ts",
+            "raw_url": "https://github.com/angular/angular/raw/6c1573bc08099bee40a6214c68e82fe91848a08a/packages%2Fcompiler-cli%2Fsrc%2Ftransformers%2Fdownlevel_decorators_transform%2Fdownlevel_decorators_transform.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Ftransformers%2Fdownlevel_decorators_transform%2Fdownlevel_decorators_transform.ts?ref=6c1573bc08099bee40a6214c68e82fe91848a08a",
+            "patch": "@@ -7,7 +7,9 @@\n  */\n \n import ts from 'typescript';\n+\n import {Decorator, ReflectionHost} from '../../ngtsc/reflection';\n+\n import {isAliasImportDeclaration, loadIsReferencedAliasDeclarationPatch} from './patch_alias_reference_resolution';\n \n /**\n@@ -432,9 +434,9 @@ export function getDownlevelDecoratorsTransform(\n       ctor = ts.visitEachChild(ctor, decoratorDownlevelVisitor, context);\n \n       const newParameters: ts.ParameterDeclaration[] = [];\n-      const oldParameters =\n-          ts.visitParameterList(ctor.parameters, decoratorDownlevelVisitor, context);\n+      const oldParameters = ctor.parameters;\n       const parametersInfo: ParameterDecorationInfo[] = [];\n+\n       for (const param of oldParameters) {\n         const decoratorsToKeep: ts.Decorator[] = [];\n         const paramInfo: ParameterDecorationInfo = {decorators: [], type: null};\n@@ -465,9 +467,8 @@ export function getDownlevelDecoratorsTransform(\n             param.dotDotDotToken, param.name, param.questionToken, param.type, param.initializer);\n         newParameters.push(newParam);\n       }\n-      const updated = ts.updateConstructor(\n-          ctor, ctor.decorators, ctor.modifiers, newParameters,\n-          ts.visitFunctionBody(ctor.body, decoratorDownlevelVisitor, context));\n+      const updated =\n+          ts.updateConstructor(ctor, ctor.decorators, ctor.modifiers, newParameters, ctor.body);\n       return [updated, parametersInfo];\n     }\n "
+        },
+        {
+            "sha": "ef06052ee7c0188dd4526d89eb9b5b92fb0a1f8e",
+            "filename": "packages/compiler-cli/test/downlevel_decorators_transform_spec.ts",
+            "status": "modified",
+            "additions": 42,
+            "deletions": 0,
+            "changes": 42,
+            "blob_url": "https://github.com/angular/angular/blob/6c1573bc08099bee40a6214c68e82fe91848a08a/packages%2Fcompiler-cli%2Ftest%2Fdownlevel_decorators_transform_spec.ts",
+            "raw_url": "https://github.com/angular/angular/raw/6c1573bc08099bee40a6214c68e82fe91848a08a/packages%2Fcompiler-cli%2Ftest%2Fdownlevel_decorators_transform_spec.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Ftest%2Fdownlevel_decorators_transform_spec.ts?ref=6c1573bc08099bee40a6214c68e82fe91848a08a",
+            "patch": "@@ -239,6 +239,48 @@ describe('downlevel decorator transform', () => {\n     expect(output).not.toContain('MyClass.propDecorators');\n   });\n \n+  // Regression test for a scenario where previously the class within a constructor body\n+  // would be processed twice, where the downleveled class is revisited accidentally and\n+  // caused invalid generation of the `ctorParameters` static class member.\n+  it('should not duplicate constructor parameters for classes part of constructor body', () => {\n+    // The bug with duplicated/invalid generation only surfaces when the actual class\n+    // decorators are preserved and emitted by TypeScript itself. This setting is also\n+    // disabled within the CLI.\n+    skipClassDecorators = true;\n+\n+    const {output} = transform(`\n+       import {Injectable} from '@angular/core';\n+\n+       export class ZoneToken {}\n+\n+       @Injectable()\n+       export class Wrapper {\n+         constructor(y: ZoneToken) {\n+           @Injectable()\n+           class ShouldBeProcessed {\n+             constructor(x: ZoneToken) {}\n+           }\n+         }\n+       }\n+     `);\n+\n+    expect(diagnostics.length).toBe(0);\n+    expect(output).toContain(dedent`\n+      let Wrapper = class Wrapper {\n+        constructor(y) {\n+          let ShouldBeProcessed = class ShouldBeProcessed {\n+            constructor(x) { }\n+          };\n+          ShouldBeProcessed.ctorParameters = () => [\n+            { type: ZoneToken }\n+          ];\n+          ShouldBeProcessed = (0, tslib_1.__decorate)([\n+            (0, core_1.Injectable)()\n+          ], ShouldBeProcessed);\n+        }\n+      };`);\n+  });\n+\n   // Angular is not concerned with type information for decorated class members. Instead,\n   // the type is omitted. This also helps with server side rendering as DOM globals which\n   // are used as types, do not load at runtime. https://github.com/angular/angular/issues/30586."
+        }
+    ],
+    "stats": {
+        "total": 53,
+        "additions": 48,
+        "deletions": 5
+    }
+}

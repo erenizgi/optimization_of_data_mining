@@ -1,0 +1,60 @@
+{
+    "author": "SmileyChris",
+    "message": "Fixes #15778 -- createsuperuser fails on international characters in system user names. Thanks for the patch, Hynek Cernoch.\n\ngit-svn-id: http://code.djangoproject.com/svn/django/trunk@16182 bcc190cf-cafb-0310-a4f2-bffc1f526a37",
+    "sha": "161b94ef7bbdba2f8106871be796f5d703727a3f",
+    "files": [
+        {
+            "sha": "9966849ca9ae82294ab41ad09a3e3abbd09b3895",
+            "filename": "django/contrib/auth/management/__init__.py",
+            "status": "modified",
+            "additions": 54,
+            "deletions": 1,
+            "changes": 55,
+            "blob_url": "https://github.com/django/django/blob/161b94ef7bbdba2f8106871be796f5d703727a3f/django%2Fcontrib%2Fauth%2Fmanagement%2F__init__.py",
+            "raw_url": "https://github.com/django/django/raw/161b94ef7bbdba2f8106871be796f5d703727a3f/django%2Fcontrib%2Fauth%2Fmanagement%2F__init__.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fcontrib%2Fauth%2Fmanagement%2F__init__.py?ref=161b94ef7bbdba2f8106871be796f5d703727a3f",
+            "patch": "@@ -1,21 +1,26 @@\n \"\"\"\n Creates permissions for all installed apps that need permissions.\n \"\"\"\n-\n+import getpass\n+import locale\n+import unicodedata\n from django.contrib.auth import models as auth_app\n from django.db.models import get_models, signals\n+from django.contrib.auth.models import User\n \n \n def _get_permission_codename(action, opts):\n     return u'%s_%s' % (action, opts.object_name.lower())\n \n+\n def _get_all_permissions(opts):\n     \"Returns (codename, name) for all permissions in the given opts.\"\n     perms = []\n     for action in ('add', 'change', 'delete'):\n         perms.append((_get_permission_codename(action, opts), u'Can %s %s' % (action, opts.verbose_name_raw)))\n     return perms + list(opts.permissions)\n \n+\n def create_permissions(app, created_models, verbosity, **kwargs):\n     from django.contrib.contenttypes.models import ContentType\n \n@@ -70,6 +75,54 @@ def create_superuser(app, created_models, verbosity, **kwargs):\n                 call_command(\"createsuperuser\", interactive=True)\n             break\n \n+\n+def get_system_username():\n+    \"\"\"\n+    Try to determine the current system user's username.\n+\n+    :returns: The username as a unicode string, or an empty string if the\n+        username could not be determined.\n+    \"\"\"\n+    try:\n+        return getpass.getuser().decode(locale.getdefaultlocale()[1])\n+    except (ImportError, KeyError, UnicodeDecodeError):\n+        # KeyError will be raised by os.getpwuid() (called by getuser())\n+        # if there is no corresponding entry in the /etc/passwd file\n+        # (a very restricted chroot environment, for example).\n+        # UnicodeDecodeError - preventive treatment for non-latin Windows.\n+        return u''\n+\n+\n+def get_default_username(check_db=True):\n+    \"\"\"\n+    Try to determine the current system user's username to use as a default.\n+\n+    :param check_db: If ``True``, requires that the username does not match an\n+        existing ``auth.User`` (otherwise returns an empty string).\n+    :returns: The username, or an empty string if no username can be\n+        determined.\n+    \"\"\"\n+    from django.contrib.auth.management.commands.createsuperuser import \\\n+        RE_VALID_USERNAME\n+    default_username = get_system_username()\n+    try:\n+        default_username = unicodedata.normalize('NFKD', default_username)\\\n+            .encode('ascii', 'ignore').replace(' ', '').lower()\n+    except UnicodeDecodeError:\n+        return ''\n+    if not RE_VALID_USERNAME.match(default_username):\n+        return ''\n+    # Don't return the default username if it is already taken.\n+    if check_db and default_username:\n+        try:\n+            User.objects.get(username=default_username)\n+        except User.DoesNotExist:\n+            pass\n+        else:\n+            return ''\n+    return default_username\n+\n+\n signals.post_syncdb.connect(create_permissions,\n     dispatch_uid = \"django.contrib.auth.management.create_permissions\")\n signals.post_syncdb.connect(create_superuser,"
+        },
+        {
+            "sha": "b3a3479c289f0e9ae5bc68b5264243a1bcfee7bb",
+            "filename": "django/contrib/auth/management/commands/createsuperuser.py",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 19,
+            "changes": 21,
+            "blob_url": "https://github.com/django/django/blob/161b94ef7bbdba2f8106871be796f5d703727a3f/django%2Fcontrib%2Fauth%2Fmanagement%2Fcommands%2Fcreatesuperuser.py",
+            "raw_url": "https://github.com/django/django/raw/161b94ef7bbdba2f8106871be796f5d703727a3f/django%2Fcontrib%2Fauth%2Fmanagement%2Fcommands%2Fcreatesuperuser.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fcontrib%2Fauth%2Fmanagement%2Fcommands%2Fcreatesuperuser.py?ref=161b94ef7bbdba2f8106871be796f5d703727a3f",
+            "patch": "@@ -7,6 +7,7 @@\n import sys\n from optparse import make_option\n from django.contrib.auth.models import User\n+from django.contrib.auth.management import get_default_username\n from django.core import exceptions\n from django.core.management.base import BaseCommand, CommandError\n from django.utils.translation import ugettext as _\n@@ -56,28 +57,10 @@ def handle(self, *args, **options):\n         # If not provided, create the user with an unusable password\n         password = None\n \n-        # Try to determine the current system user's username to use as a default.\n-        try:\n-            default_username = getpass.getuser().replace(' ', '').lower()\n-        except (ImportError, KeyError):\n-            # KeyError will be raised by os.getpwuid() (called by getuser())\n-            # if there is no corresponding entry in the /etc/passwd file\n-            # (a very restricted chroot environment, for example).\n-            default_username = ''\n-\n-        # Determine whether the default username is taken, so we don't display\n-        # it as an option.\n-        if default_username:\n-            try:\n-                User.objects.get(username=default_username)\n-            except User.DoesNotExist:\n-                pass\n-            else:\n-                default_username = ''\n-\n         # Prompt for username/email/password. Enclose this whole thing in a\n         # try/except to trap for a keyboard interrupt and exit gracefully.\n         if interactive:\n+            default_username = get_default_username()\n             try:\n \n                 # Get a username"
+        },
+        {
+            "sha": "2d7d0fa1a1220a3e8a2a7547e9ef64295c0665f8",
+            "filename": "django/contrib/auth/tests/__init__.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/django/django/blob/161b94ef7bbdba2f8106871be796f5d703727a3f/django%2Fcontrib%2Fauth%2Ftests%2F__init__.py",
+            "raw_url": "https://github.com/django/django/raw/161b94ef7bbdba2f8106871be796f5d703727a3f/django%2Fcontrib%2Fauth%2Ftests%2F__init__.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fcontrib%2Fauth%2Ftests%2F__init__.py?ref=161b94ef7bbdba2f8106871be796f5d703727a3f",
+            "patch": "@@ -8,6 +8,7 @@\n     UserChangeFormTest, PasswordResetFormTest)\n from django.contrib.auth.tests.remote_user import (RemoteUserTest,\n     RemoteUserNoCreateTest, RemoteUserCustomTest)\n+from django.contrib.auth.tests.management import GetDefaultUsernameTestCase\n from django.contrib.auth.tests.models import ProfileTestCase\n from django.contrib.auth.tests.signals import SignalTestCase\n from django.contrib.auth.tests.tokens import TokenGeneratorTest"
+        },
+        {
+            "sha": "0af68736ffc8dacf7cf5f496c0db092b95792179",
+            "filename": "django/contrib/auth/tests/management.py",
+            "status": "added",
+            "additions": 27,
+            "deletions": 0,
+            "changes": 27,
+            "blob_url": "https://github.com/django/django/blob/161b94ef7bbdba2f8106871be796f5d703727a3f/django%2Fcontrib%2Fauth%2Ftests%2Fmanagement.py",
+            "raw_url": "https://github.com/django/django/raw/161b94ef7bbdba2f8106871be796f5d703727a3f/django%2Fcontrib%2Fauth%2Ftests%2Fmanagement.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fcontrib%2Fauth%2Ftests%2Fmanagement.py?ref=161b94ef7bbdba2f8106871be796f5d703727a3f",
+            "patch": "@@ -0,0 +1,27 @@\n+from django.test import TestCase\n+from django.contrib.auth import models, management\n+\n+\n+class GetDefaultUsernameTestCase(TestCase):\n+\n+    def setUp(self):\n+        self._getpass_getuser = management.get_system_username\n+\n+    def tearDown(self):\n+        management.get_system_username = self._getpass_getuser\n+\n+    def test_simple(self):\n+        management.get_system_username = lambda: u'joe'\n+        self.assertEqual(management.get_default_username(), 'joe')\n+\n+    def test_existing(self):\n+        models.User.objects.create(username='joe')\n+        management.get_system_username = lambda: u'joe'\n+        self.assertEqual(management.get_default_username(), '')\n+        self.assertEqual(\n+            management.get_default_username(check_db=False), 'joe')\n+\n+    def test_i18n(self):\n+        # 'Julia' with accented 'u':\n+        management.get_system_username = lambda: u'J\\xfalia'\n+        self.assertEqual(management.get_default_username(), 'julia')"
+        }
+    ],
+    "stats": {
+        "total": 104,
+        "additions": 84,
+        "deletions": 20
+    }
+}

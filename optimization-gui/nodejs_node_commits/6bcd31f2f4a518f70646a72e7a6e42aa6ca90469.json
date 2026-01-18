@@ -1,0 +1,48 @@
+{
+    "author": "jasnell",
+    "message": "perf_hooks: add warning when too many entries in the timeline\n\nPR-URL: https://github.com/nodejs/node/pull/18087\nReviewed-By: Matteo Collina <matteo.collina@gmail.com>",
+    "sha": "6bcd31f2f4a518f70646a72e7a6e42aa6ca90469",
+    "files": [
+        {
+            "sha": "62b035f6789921de5c3e0c11f16d7f1dd3037d38",
+            "filename": "doc/api/perf_hooks.md",
+            "status": "modified",
+            "additions": 14,
+            "deletions": 0,
+            "changes": 14,
+            "blob_url": "https://github.com/nodejs/node/blob/6bcd31f2f4a518f70646a72e7a6e42aa6ca90469/doc%2Fapi%2Fperf_hooks.md",
+            "raw_url": "https://github.com/nodejs/node/raw/6bcd31f2f4a518f70646a72e7a6e42aa6ca90469/doc%2Fapi%2Fperf_hooks.md",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/doc%2Fapi%2Fperf_hooks.md?ref=6bcd31f2f4a518f70646a72e7a6e42aa6ca90469",
+            "patch": "@@ -125,6 +125,20 @@ Creates a new `PerformanceMark` entry in the Performance Timeline. A\n `performanceEntry.duration` is always `0`. Performance marks are used\n to mark specific significant moments in the Performance Timeline.\n \n+### performance.maxEntries\n+<!-- YAML\n+added: REPLACEME\n+-->\n+\n+Value: {number}\n+\n+The maximum number of Performance Entry items that should be added to the\n+Performance Timeline. This limit is not strictly enforced, but a process\n+warning will be emitted if the number of entries in the timeline exceeds\n+this limit.\n+\n+Defaults to 150.\n+\n ### performance.measure(name, startMark, endMark)\n <!-- YAML\n added: v8.5.0"
+        },
+        {
+            "sha": "6fd6e4a6b768ce3a8d7f3aab64383dabb7c3a926",
+            "filename": "lib/perf_hooks.js",
+            "status": "modified",
+            "additions": 45,
+            "deletions": 4,
+            "changes": 49,
+            "blob_url": "https://github.com/nodejs/node/blob/6bcd31f2f4a518f70646a72e7a6e42aa6ca90469/lib%2Fperf_hooks.js",
+            "raw_url": "https://github.com/nodejs/node/raw/6bcd31f2f4a518f70646a72e7a6e42aa6ca90469/lib%2Fperf_hooks.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Fperf_hooks.js?ref=6bcd31f2f4a518f70646a72e7a6e42aa6ca90469",
+            "patch": "@@ -53,6 +53,9 @@ const kClearEntry = Symbol('clear-entry');\n const kGetEntries = Symbol('get-entries');\n const kIndex = Symbol('index');\n const kMarks = Symbol('marks');\n+const kCount = Symbol('count');\n+const kMaxCount = Symbol('max-count');\n+const kDefaultMaxCount = 150;\n \n observerCounts[NODE_PERFORMANCE_ENTRY_TYPE_MARK] = 1;\n observerCounts[NODE_PERFORMANCE_ENTRY_TYPE_MEASURE] = 1;\n@@ -250,20 +253,32 @@ const nodeTiming = new PerformanceNodeTiming();\n // Maintains a list of entries as a linked list stored in insertion order.\n class PerformanceObserverEntryList {\n   constructor() {\n-    Object.defineProperty(this, kEntries, {\n-      writable: true,\n-      enumerable: false,\n-      value: {}\n+    Object.defineProperties(this, {\n+      [kEntries]: {\n+        writable: true,\n+        enumerable: false,\n+        value: {}\n+      },\n+      [kCount]: {\n+        writable: true,\n+        enumerable: false,\n+        value: 0\n+      }\n     });\n     L.init(this[kEntries]);\n   }\n \n   [kInsertEntry](entry) {\n     const item = { entry };\n     L.append(this[kEntries], item);\n+    this[kCount]++;\n     this[kIndexEntry](item);\n   }\n \n+  get length() {\n+    return this[kCount];\n+  }\n+\n   [kIndexEntry](entry) {\n     // Default implementation does nothing\n   }\n@@ -384,9 +399,22 @@ class Performance extends PerformanceObserverEntryList {\n     this[kIndex] = {\n       [kMarks]: new Set()\n     };\n+    this[kMaxCount] = kDefaultMaxCount;\n     this[kInsertEntry](nodeTiming);\n   }\n \n+  set maxEntries(val) {\n+    if (typeof val !== 'number' || val >>> 0 !== val) {\n+      const errors = lazyErrors();\n+      throw new errors.TypeError('ERR_INVALID_ARG_TYPE', 'val', 'number');\n+    }\n+    this[kMaxCount] = Math.max(1, val >>> 0);\n+  }\n+\n+  get maxEntries() {\n+    return this[kMaxCount];\n+  }\n+\n   [kIndexEntry](item) {\n     const index = this[kIndex];\n     const type = item.entry.entryType;\n@@ -397,6 +425,17 @@ class Performance extends PerformanceObserverEntryList {\n     }\n     const entry = item.entry;\n     L.append(items, { entry, item });\n+    const count = this[kCount];\n+    if (count > this[kMaxCount]) {\n+      const text = count === 1 ? 'is 1 entry' : `are ${count} entries`;\n+      process.emitWarning('Possible perf_hooks memory leak detected. ' +\n+                          `There ${text} in the ` +\n+                          'Performance Timeline. Use the clear methods ' +\n+                          'to remove entries that are no longer needed or ' +\n+                          'set performance.maxEntries equal to a higher ' +\n+                          'value (currently the maxEntries is ' +\n+                          `${this[kMaxCount]}).`);\n+    }\n   }\n \n   [kClearEntry](type, name) {\n@@ -411,10 +450,12 @@ class Performance extends PerformanceObserverEntryList {\n         if (entry.name === `${name}`) {\n           L.remove(item); // remove from the index\n           L.remove(item.item); // remove from the master\n+          this[kCount]--;\n         }\n       } else {\n         L.remove(item); // remove from the index\n         L.remove(item.item); // remove from the master\n+        this[kCount]--;\n       }\n       item = next;\n     }"
+        },
+        {
+            "sha": "f3104677a7c649d42a2e5f886c123c1bc1b68d2b",
+            "filename": "test/parallel/test-performance-warning.js",
+            "status": "added",
+            "additions": 29,
+            "deletions": 0,
+            "changes": 29,
+            "blob_url": "https://github.com/nodejs/node/blob/6bcd31f2f4a518f70646a72e7a6e42aa6ca90469/test%2Fparallel%2Ftest-performance-warning.js",
+            "raw_url": "https://github.com/nodejs/node/raw/6bcd31f2f4a518f70646a72e7a6e42aa6ca90469/test%2Fparallel%2Ftest-performance-warning.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-performance-warning.js?ref=6bcd31f2f4a518f70646a72e7a6e42aa6ca90469",
+            "patch": "@@ -0,0 +1,29 @@\n+// Flags: --no-warnings\n+'use strict';\n+\n+const common = require('../common');\n+const { performance } = require('perf_hooks');\n+const assert = require('assert');\n+\n+assert.strictEqual(performance.length, 1);\n+assert.strictEqual(performance.maxEntries, 150);\n+\n+performance.maxEntries = 1;\n+\n+[-1, 0xffffffff + 1, '', null, undefined, Infinity].forEach((i) => {\n+  common.expectsError(\n+    () => performance.maxEntries = i,\n+    {\n+      code: 'ERR_INVALID_ARG_TYPE',\n+      type: TypeError\n+    }\n+  );\n+});\n+\n+common.expectWarning('Warning', [\n+  'Possible perf_hooks memory leak detected. There are 2 entries in the ' +\n+  'Performance Timeline. Use the clear methods to remove entries that are no ' +\n+  'longer needed or set performance.maxEntries equal to a higher value ' +\n+  '(currently the maxEntries is 1).']);\n+\n+performance.mark('test');"
+        }
+    ],
+    "stats": {
+        "total": 92,
+        "additions": 88,
+        "deletions": 4
+    }
+}

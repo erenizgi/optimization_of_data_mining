@@ -1,0 +1,169 @@
+{
+    "author": "joyeecheung",
+    "message": "src: move process.nextTick and promise setup into node_task_queue.cc\n\nThis patch:\n\n- Moves the process.nextTick and promise setup C++ code into\n  node_task_queue.cc which is exposed as\n  `internalBinding('task_queue')`\n- Makes `lib/internal/process/promises.js` and\n  `lib/internal/process/next_tick.js` as side-effect-free\n  as possible\n- Removes the bootstrapper object being passed into\n  `bootstrap/node.js`, let `next_tick.js` and `promises.js`\n  load whatever they need from `internalBinding('task_queue')`\n  instead.\n- Rename `process._tickCallback` to `runNextTicks` internally\n  for clarity but still expose it as `process._tickCallback`.\n\nPR-URL: https://github.com/nodejs/node/pull/25163\nRefs: https://github.com/nodejs/node/issues/24961\nReviewed-By: Ruben Bridgewater <ruben@bridgewater.de>\nReviewed-By: Anatoli Papirovski <apapirovski@mac.com>",
+    "sha": "457603e96194b4858ad715f9faacb3ad7fec7f35",
+    "files": [
+        {
+            "sha": "870a54746b041bd5089d814acf4f3c50657c7457",
+            "filename": "lib/internal/bootstrap/node.js",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 7,
+            "changes": 20,
+            "blob_url": "https://github.com/nodejs/node/blob/457603e96194b4858ad715f9faacb3ad7fec7f35/lib%2Finternal%2Fbootstrap%2Fnode.js",
+            "raw_url": "https://github.com/nodejs/node/raw/457603e96194b4858ad715f9faacb3ad7fec7f35/lib%2Finternal%2Fbootstrap%2Fnode.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fbootstrap%2Fnode.js?ref=457603e96194b4858ad715f9faacb3ad7fec7f35",
+            "patch": "@@ -14,13 +14,9 @@\n \n // This file is compiled as if it's wrapped in a function with arguments\n // passed by node::LoadEnvironment()\n-/* global process, bootstrappers, loaderExports, triggerFatalException */\n+/* global process, loaderExports, triggerFatalException */\n /* global isMainThread */\n \n-const {\n-  _setupNextTick,\n-  _setupPromises\n-} = bootstrappers;\n const { internalBinding, NativeModule } = loaderExports;\n \n const exceptionHandlerState = { captureFn: null };\n@@ -105,8 +101,18 @@ function startup() {\n   }\n \n   NativeModule.require('internal/process/warning').setup();\n-  NativeModule.require('internal/process/next_tick').setup(_setupNextTick,\n-                                                           _setupPromises);\n+  const {\n+    nextTick,\n+    runNextTicks\n+  } = NativeModule.require('internal/process/next_tick').setup();\n+\n+  process.nextTick = nextTick;\n+  // Used to emulate a tick manually in the JS land.\n+  // A better name for this function would be `runNextTicks` but\n+  // it has been exposed to the process object so we keep this legacy name\n+  // TODO(joyeecheung): either remove it or make it public\n+  process._tickCallback = runNextTicks;\n+\n   const credentials = internalBinding('credentials');\n   if (credentials.implementsPosixCredentials) {\n     process.getuid = credentials.getuid;"
+        },
+        {
+            "sha": "00bba254718684937948818044cf8dd29946210a",
+            "filename": "lib/internal/process/next_tick.js",
+            "status": "modified",
+            "additions": 129,
+            "deletions": 119,
+            "changes": 248,
+            "blob_url": "https://github.com/nodejs/node/blob/457603e96194b4858ad715f9faacb3ad7fec7f35/lib%2Finternal%2Fprocess%2Fnext_tick.js",
+            "raw_url": "https://github.com/nodejs/node/raw/457603e96194b4858ad715f9faacb3ad7fec7f35/lib%2Finternal%2Fprocess%2Fnext_tick.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fprocess%2Fnext_tick.js?ref=457603e96194b4858ad715f9faacb3ad7fec7f35",
+            "patch": "@@ -1,128 +1,138 @@\n 'use strict';\n \n-exports.setup = setupNextTick;\n-\n-function setupNextTick(_setupNextTick, _setupPromises) {\n-  const {\n-    getDefaultTriggerAsyncId,\n-    newAsyncId,\n-    initHooksExist,\n-    destroyHooksExist,\n-    emitInit,\n-    emitBefore,\n-    emitAfter,\n-    emitDestroy,\n-    symbols: { async_id_symbol, trigger_async_id_symbol }\n-  } = require('internal/async_hooks');\n-  const emitPromiseRejectionWarnings =\n-    require('internal/process/promises').setup(_setupPromises);\n-  const { ERR_INVALID_CALLBACK } = require('internal/errors').codes;\n-  const FixedQueue = require('internal/fixed_queue');\n-\n-  // tickInfo is used so that the C++ code in src/node.cc can\n-  // have easy access to our nextTick state, and avoid unnecessary\n-  // calls into JS land.\n-  // runMicrotasks is used to run V8's micro task queue.\n-  const [\n-    tickInfo,\n-    runMicrotasks\n-  ] = _setupNextTick(internalTickCallback);\n-\n-  // *Must* match Environment::TickInfo::Fields in src/env.h.\n-  const kHasScheduled = 0;\n-  const kHasPromiseRejections = 1;\n-\n-  const queue = new FixedQueue();\n-\n-  process.nextTick = nextTick;\n-  // Needs to be accessible from beyond this scope.\n-  process._tickCallback = _tickCallback;\n-\n-  function _tickCallback() {\n-    if (tickInfo[kHasScheduled] === 0 && tickInfo[kHasPromiseRejections] === 0)\n-      runMicrotasks();\n-    if (tickInfo[kHasScheduled] === 0 && tickInfo[kHasPromiseRejections] === 0)\n-      return;\n-\n-    internalTickCallback();\n-  }\n-\n-  function internalTickCallback() {\n-    let tock;\n-    do {\n-      while (tock = queue.shift()) {\n-        const asyncId = tock[async_id_symbol];\n-        emitBefore(asyncId, tock[trigger_async_id_symbol]);\n-        // emitDestroy() places the async_id_symbol into an asynchronous queue\n-        // that calls the destroy callback in the future. It's called before\n-        // calling tock.callback so destroy will be called even if the callback\n-        // throws an exception that is handled by 'uncaughtException' or a\n-        // domain.\n-        // TODO(trevnorris): This is a bit of a hack. It relies on the fact\n-        // that nextTick() doesn't allow the event loop to proceed, but if\n-        // any async hooks are enabled during the callback's execution then\n-        // this tock's after hook will be called, but not its destroy hook.\n-        if (destroyHooksExist())\n-          emitDestroy(asyncId);\n-\n-        const callback = tock.callback;\n-        if (tock.args === undefined)\n-          callback();\n-        else\n-          Reflect.apply(callback, undefined, tock.args);\n-\n-        emitAfter(asyncId);\n-      }\n-      tickInfo[kHasScheduled] = 0;\n-      runMicrotasks();\n-    } while (!queue.isEmpty() || emitPromiseRejectionWarnings());\n-    tickInfo[kHasPromiseRejections] = 0;\n-  }\n+const {\n+  // For easy access to the nextTick state in the C++ land,\n+  // and to avoid unnecessary calls into JS land.\n+  tickInfo,\n+  // Used to run V8's micro task queue.\n+  runMicrotasks,\n+  setTickCallback,\n+  initializePromiseRejectCallback\n+} = internalBinding('task_queue');\n+\n+const {\n+  promiseRejectHandler,\n+  emitPromiseRejectionWarnings\n+} = require('internal/process/promises');\n+\n+const {\n+  getDefaultTriggerAsyncId,\n+  newAsyncId,\n+  initHooksExist,\n+  destroyHooksExist,\n+  emitInit,\n+  emitBefore,\n+  emitAfter,\n+  emitDestroy,\n+  symbols: { async_id_symbol, trigger_async_id_symbol }\n+} = require('internal/async_hooks');\n+const { ERR_INVALID_CALLBACK } = require('internal/errors').codes;\n+const FixedQueue = require('internal/fixed_queue');\n+\n+// *Must* match Environment::TickInfo::Fields in src/env.h.\n+const kHasScheduled = 0;\n+const kHasPromiseRejections = 1;\n+\n+const queue = new FixedQueue();\n+\n+function runNextTicks() {\n+  if (tickInfo[kHasScheduled] === 0 && tickInfo[kHasPromiseRejections] === 0)\n+    runMicrotasks();\n+  if (tickInfo[kHasScheduled] === 0 && tickInfo[kHasPromiseRejections] === 0)\n+    return;\n+\n+  internalTickCallback();\n+}\n \n-  class TickObject {\n-    constructor(callback, args, triggerAsyncId) {\n-      // This must be set to null first to avoid function tracking\n-      // on the hidden class, revisit in V8 versions after 6.2\n-      this.callback = null;\n-      this.callback = callback;\n-      this.args = args;\n-\n-      const asyncId = newAsyncId();\n-      this[async_id_symbol] = asyncId;\n-      this[trigger_async_id_symbol] = triggerAsyncId;\n-\n-      if (initHooksExist()) {\n-        emitInit(asyncId,\n-                 'TickObject',\n-                 triggerAsyncId,\n-                 this);\n-      }\n+function internalTickCallback() {\n+  let tock;\n+  do {\n+    while (tock = queue.shift()) {\n+      const asyncId = tock[async_id_symbol];\n+      emitBefore(asyncId, tock[trigger_async_id_symbol]);\n+      // emitDestroy() places the async_id_symbol into an asynchronous queue\n+      // that calls the destroy callback in the future. It's called before\n+      // calling tock.callback so destroy will be called even if the callback\n+      // throws an exception that is handled by 'uncaughtException' or a\n+      // domain.\n+      // TODO(trevnorris): This is a bit of a hack. It relies on the fact\n+      // that nextTick() doesn't allow the event loop to proceed, but if\n+      // any async hooks are enabled during the callback's execution then\n+      // this tock's after hook will be called, but not its destroy hook.\n+      if (destroyHooksExist())\n+        emitDestroy(asyncId);\n+\n+      const callback = tock.callback;\n+      if (tock.args === undefined)\n+        callback();\n+      else\n+        Reflect.apply(callback, undefined, tock.args);\n+\n+      emitAfter(asyncId);\n     }\n-  }\n+    tickInfo[kHasScheduled] = 0;\n+    runMicrotasks();\n+  } while (!queue.isEmpty() || emitPromiseRejectionWarnings());\n+  tickInfo[kHasPromiseRejections] = 0;\n+}\n \n-  // `nextTick()` will not enqueue any callback when the process is about to\n-  // exit since the callback would not have a chance to be executed.\n-  function nextTick(callback) {\n-    if (typeof callback !== 'function')\n-      throw new ERR_INVALID_CALLBACK();\n-\n-    if (process._exiting)\n-      return;\n-\n-    var args;\n-    switch (arguments.length) {\n-      case 1: break;\n-      case 2: args = [arguments[1]]; break;\n-      case 3: args = [arguments[1], arguments[2]]; break;\n-      case 4: args = [arguments[1], arguments[2], arguments[3]]; break;\n-      default:\n-        args = new Array(arguments.length - 1);\n-        for (var i = 1; i < arguments.length; i++)\n-          args[i - 1] = arguments[i];\n+class TickObject {\n+  constructor(callback, args, triggerAsyncId) {\n+    // This must be set to null first to avoid function tracking\n+    // on the hidden class, revisit in V8 versions after 6.2\n+    this.callback = null;\n+    this.callback = callback;\n+    this.args = args;\n+\n+    const asyncId = newAsyncId();\n+    this[async_id_symbol] = asyncId;\n+    this[trigger_async_id_symbol] = triggerAsyncId;\n+\n+    if (initHooksExist()) {\n+      emitInit(asyncId,\n+               'TickObject',\n+               triggerAsyncId,\n+               this);\n     }\n+  }\n+}\n \n-    if (queue.isEmpty())\n-      tickInfo[kHasScheduled] = 1;\n-    queue.push(new TickObject(callback, args, getDefaultTriggerAsyncId()));\n+// `nextTick()` will not enqueue any callback when the process is about to\n+// exit since the callback would not have a chance to be executed.\n+function nextTick(callback) {\n+  if (typeof callback !== 'function')\n+    throw new ERR_INVALID_CALLBACK();\n+\n+  if (process._exiting)\n+    return;\n+\n+  var args;\n+  switch (arguments.length) {\n+    case 1: break;\n+    case 2: args = [arguments[1]]; break;\n+    case 3: args = [arguments[1], arguments[2]]; break;\n+    case 4: args = [arguments[1], arguments[2], arguments[3]]; break;\n+    default:\n+      args = new Array(arguments.length - 1);\n+      for (var i = 1; i < arguments.length; i++)\n+        args[i - 1] = arguments[i];\n   }\n+\n+  if (queue.isEmpty())\n+    tickInfo[kHasScheduled] = 1;\n+  queue.push(new TickObject(callback, args, getDefaultTriggerAsyncId()));\n }\n+\n+// TODO(joyeecheung): make this a factory class so that node.js can\n+// control the side effects caused by the initializers.\n+exports.setup = function() {\n+  // Initializes the per-isolate promise rejection callback which\n+  // will call the handler being passed into this function.\n+  initializePromiseRejectCallback(promiseRejectHandler);\n+  // Sets the callback to be run in every tick.\n+  setTickCallback(internalTickCallback);\n+  return {\n+    nextTick,\n+    runNextTicks\n+  };\n+};"
+        },
+        {
+            "sha": "df4e8188fe92b4abfec17f568ba515d04797d714",
+            "filename": "lib/internal/process/promises.js",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 9,
+            "changes": 18,
+            "blob_url": "https://github.com/nodejs/node/blob/457603e96194b4858ad715f9faacb3ad7fec7f35/lib%2Finternal%2Fprocess%2Fpromises.js",
+            "raw_url": "https://github.com/nodejs/node/raw/457603e96194b4858ad715f9faacb3ad7fec7f35/lib%2Finternal%2Fprocess%2Fpromises.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fprocess%2Fpromises.js?ref=457603e96194b4858ad715f9faacb3ad7fec7f35",
+            "patch": "@@ -1,21 +1,16 @@\n 'use strict';\n \n const { safeToString } = internalBinding('util');\n+const {\n+  promiseRejectEvents\n+} = internalBinding('task_queue');\n \n const maybeUnhandledPromises = new WeakMap();\n const pendingUnhandledRejections = [];\n const asyncHandledRejections = [];\n-const promiseRejectEvents = {};\n let lastPromiseId = 0;\n \n-exports.setup = setupPromises;\n-\n-function setupPromises(_setupPromises) {\n-  _setupPromises(handler, promiseRejectEvents);\n-  return emitPromiseRejectionWarnings;\n-}\n-\n-function handler(type, promise, reason) {\n+function promiseRejectHandler(type, promise, reason) {\n   switch (type) {\n     case promiseRejectEvents.kPromiseRejectWithNoHandler:\n       return unhandledRejection(promise, reason);\n@@ -124,3 +119,8 @@ function emitPromiseRejectionWarnings() {\n   }\n   return maybeScheduledTicks || pendingUnhandledRejections.length !== 0;\n }\n+\n+module.exports = {\n+  promiseRejectHandler,\n+  emitPromiseRejectionWarnings\n+};"
+        },
+        {
+            "sha": "8560c1d512ca1461f81a74f07ba00568cab03fe1",
+            "filename": "node.gyp",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/457603e96194b4858ad715f9faacb3ad7fec7f35/node.gyp",
+            "raw_url": "https://github.com/nodejs/node/raw/457603e96194b4858ad715f9faacb3ad7fec7f35/node.gyp",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/node.gyp?ref=457603e96194b4858ad715f9faacb3ad7fec7f35",
+            "patch": "@@ -325,7 +325,6 @@\n \n       'sources': [\n         'src/async_wrap.cc',\n-        'src/bootstrapper.cc',\n         'src/callback_scope.cc',\n         'src/cares_wrap.cc',\n         'src/connect_wrap.cc',\n@@ -372,6 +371,7 @@\n         'src/node_serdes.cc',\n         'src/node_stat_watcher.cc',\n         'src/node_symbols.cc',\n+        'src/node_task_queue.cc',\n         'src/node_trace_events.cc',\n         'src/node_types.cc',\n         'src/node_url.cc',"
+        },
+        {
+            "sha": "c999b258c5cafcc5c5995d030b06c7a7fc5eb2ab",
+            "filename": "src/env.h",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/nodejs/node/blob/457603e96194b4858ad715f9faacb3ad7fec7f35/src%2Fenv.h",
+            "raw_url": "https://github.com/nodejs/node/raw/457603e96194b4858ad715f9faacb3ad7fec7f35/src%2Fenv.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fenv.h?ref=457603e96194b4858ad715f9faacb3ad7fec7f35",
+            "patch": "@@ -358,7 +358,7 @@ constexpr size_t kFsStatsBufferLength = kFsStatsFieldsNumber * 2;\n   V(performance_entry_template, v8::Function)                                  \\\n   V(pipe_constructor_template, v8::FunctionTemplate)                           \\\n   V(process_object, v8::Object)                                                \\\n-  V(promise_handler_function, v8::Function)                                    \\\n+  V(promise_reject_callback, v8::Function)                                     \\\n   V(promise_wrap_template, v8::ObjectTemplate)                                 \\\n   V(sab_lifetimepartner_constructor_template, v8::FunctionTemplate)            \\\n   V(script_context_constructor_template, v8::FunctionTemplate)                 \\\n@@ -373,7 +373,7 @@ constexpr size_t kFsStatsBufferLength = kFsStatsFieldsNumber * 2;\n   V(tty_constructor_template, v8::FunctionTemplate)                            \\\n   V(udp_constructor_function, v8::Function)                                    \\\n   V(url_constructor_function, v8::Function)                                    \\\n-  V(write_wrap_template, v8::ObjectTemplate)                                   \\\n+  V(write_wrap_template, v8::ObjectTemplate)\n \n class Environment;\n "
+        },
+        {
+            "sha": "8f554363c0fb1a7197b4f1cbd09824014c932526",
+            "filename": "src/node.cc",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 6,
+            "changes": 6,
+            "blob_url": "https://github.com/nodejs/node/blob/457603e96194b4858ad715f9faacb3ad7fec7f35/src%2Fnode.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/457603e96194b4858ad715f9faacb3ad7fec7f35/src%2Fnode.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode.cc?ref=457603e96194b4858ad715f9faacb3ad7fec7f35",
+            "patch": "@@ -1200,20 +1200,14 @@ void LoadEnvironment(Environment* env) {\n     return;\n   }\n \n-  // Bootstrap Node.js\n-  Local<Object> bootstrapper = Object::New(env->isolate());\n-  SetupBootstrapObject(env, bootstrapper);\n-\n   // process, bootstrappers, loaderExports, triggerFatalException\n   std::vector<Local<String>> node_params = {\n       env->process_string(),\n-      FIXED_ONE_BYTE_STRING(isolate, \"bootstrappers\"),\n       FIXED_ONE_BYTE_STRING(isolate, \"loaderExports\"),\n       FIXED_ONE_BYTE_STRING(isolate, \"triggerFatalException\"),\n       FIXED_ONE_BYTE_STRING(isolate, \"isMainThread\")};\n   std::vector<Local<Value>> node_args = {\n       process,\n-      bootstrapper,\n       loader_exports.ToLocalChecked(),\n       env->NewFunctionTemplate(FatalException)\n           ->GetFunction(context)"
+        },
+        {
+            "sha": "cf47b3058de53872f33acc5a42df7560001743e2",
+            "filename": "src/node_binding.cc",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/457603e96194b4858ad715f9faacb3ad7fec7f35/src%2Fnode_binding.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/457603e96194b4858ad715f9faacb3ad7fec7f35/src%2Fnode_binding.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_binding.cc?ref=457603e96194b4858ad715f9faacb3ad7fec7f35",
+            "patch": "@@ -52,6 +52,7 @@\n   V(stream_wrap)                                                               \\\n   V(string_decoder)                                                            \\\n   V(symbols)                                                                   \\\n+  V(task_queue)                                                                \\\n   V(tcp_wrap)                                                                  \\\n   V(timers)                                                                    \\\n   V(trace_events)                                                              \\"
+        },
+        {
+            "sha": "897905b5a76a69673edf56446d062bc77a61c9a5",
+            "filename": "src/node_internals.h",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 2,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/457603e96194b4858ad715f9faacb3ad7fec7f35/src%2Fnode_internals.h",
+            "raw_url": "https://github.com/nodejs/node/raw/457603e96194b4858ad715f9faacb3ad7fec7f35/src%2Fnode_internals.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_internals.h?ref=457603e96194b4858ad715f9faacb3ad7fec7f35",
+            "patch": "@@ -185,8 +185,6 @@ v8::Maybe<bool> ProcessEmitDeprecationWarning(Environment* env,\n                                               const char* warning,\n                                               const char* deprecation_code);\n \n-void SetupBootstrapObject(Environment* env,\n-                          v8::Local<v8::Object> bootstrapper);\n void SetupProcessObject(Environment* env,\n                         const std::vector<std::string>& args,\n                         const std::vector<std::string>& exec_args);"
+        },
+        {
+            "sha": "f65f420081d6e88b54983a9fff0852566394596a",
+            "filename": "src/node_task_queue.cc",
+            "status": "renamed",
+            "additions": 40,
+            "deletions": 42,
+            "changes": 82,
+            "blob_url": "https://github.com/nodejs/node/blob/457603e96194b4858ad715f9faacb3ad7fec7f35/src%2Fnode_task_queue.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/457603e96194b4858ad715f9faacb3ad7fec7f35/src%2Fnode_task_queue.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_task_queue.cc?ref=457603e96194b4858ad715f9faacb3ad7fec7f35",
+            "patch": "@@ -1,5 +1,5 @@\n-#include \"node.h\"\n #include \"env-inl.h\"\n+#include \"node.h\"\n #include \"node_internals.h\"\n #include \"v8.h\"\n \n@@ -23,36 +23,21 @@ using v8::Object;\n using v8::Promise;\n using v8::PromiseRejectEvent;\n using v8::PromiseRejectMessage;\n-using v8::String;\n using v8::Value;\n \n-void RunMicrotasks(const FunctionCallbackInfo<Value>& args) {\n+namespace task_queue {\n+\n+static void RunMicrotasks(const FunctionCallbackInfo<Value>& args) {\n   args.GetIsolate()->RunMicrotasks();\n }\n \n-void SetupNextTick(const FunctionCallbackInfo<Value>& args) {\n+static void SetTickCallback(const FunctionCallbackInfo<Value>& args) {\n   Environment* env = Environment::GetCurrent(args);\n-  Isolate* isolate = env->isolate();\n-  Local<Context> context = env->context();\n-\n   CHECK(args[0]->IsFunction());\n-\n   env->set_tick_callback_function(args[0].As<Function>());\n-\n-  Local<Function> run_microtasks_fn =\n-      env->NewFunctionTemplate(RunMicrotasks)->GetFunction(context)\n-          .ToLocalChecked();\n-  run_microtasks_fn->SetName(FIXED_ONE_BYTE_STRING(isolate, \"runMicrotasks\"));\n-\n-  Local<Value> ret[] = {\n-    env->tick_info()->fields().GetJSArray(),\n-    run_microtasks_fn\n-  };\n-\n-  args.GetReturnValue().Set(Array::New(isolate, ret, arraysize(ret)));\n }\n \n-void PromiseRejectCallback(PromiseRejectMessage message) {\n+static void PromiseRejectCallback(PromiseRejectMessage message) {\n   static std::atomic<uint64_t> unhandledRejections{0};\n   static std::atomic<uint64_t> rejectionsHandledAfter{0};\n \n@@ -64,7 +49,7 @@ void PromiseRejectCallback(PromiseRejectMessage message) {\n \n   if (env == nullptr) return;\n \n-  Local<Function> callback = env->promise_handler_function();\n+  Local<Function> callback = env->promise_reject_callback();\n   Local<Value> value;\n   Local<Value> type = Number::New(env->isolate(), event);\n \n@@ -104,35 +89,48 @@ void PromiseRejectCallback(PromiseRejectMessage message) {\n     env->tick_info()->promise_rejections_toggle_on();\n }\n \n-void SetupPromises(const FunctionCallbackInfo<Value>& args) {\n+static void InitializePromiseRejectCallback(\n+    const FunctionCallbackInfo<Value>& args) {\n   Environment* env = Environment::GetCurrent(args);\n   Isolate* isolate = env->isolate();\n \n   CHECK(args[0]->IsFunction());\n-  CHECK(args[1]->IsObject());\n-\n-  Local<Object> constants = args[1].As<Object>();\n-\n-  NODE_DEFINE_CONSTANT(constants, kPromiseRejectWithNoHandler);\n-  NODE_DEFINE_CONSTANT(constants, kPromiseHandlerAddedAfterReject);\n-  NODE_DEFINE_CONSTANT(constants, kPromiseResolveAfterResolved);\n-  NODE_DEFINE_CONSTANT(constants, kPromiseRejectAfterResolved);\n \n+  // TODO(joyeecheung): this may be moved to somewhere earlier in the bootstrap\n+  // to make sure it's only called once\n   isolate->SetPromiseRejectCallback(PromiseRejectCallback);\n-  env->set_promise_handler_function(args[0].As<Function>());\n+\n+  env->set_promise_reject_callback(args[0].As<Function>());\n }\n \n-#define BOOTSTRAP_METHOD(name, fn) env->SetMethod(bootstrapper, #name, fn)\n+static void Initialize(Local<Object> target,\n+                       Local<Value> unused,\n+                       Local<Context> context,\n+                       void* priv) {\n+  Environment* env = Environment::GetCurrent(context);\n+  Isolate* isolate = env->isolate();\n \n-// The Bootstrapper object is an ephemeral object that is used only during\n-// the bootstrap process of the Node.js environment. A reference to the\n-// bootstrap object must not be kept around after the bootstrap process\n-// completes so that it can be gc'd as soon as possible.\n-void SetupBootstrapObject(Environment* env,\n-                          Local<Object> bootstrapper) {\n-  BOOTSTRAP_METHOD(_setupNextTick, SetupNextTick);\n-  BOOTSTRAP_METHOD(_setupPromises, SetupPromises);\n+  env->SetMethod(target, \"setTickCallback\", SetTickCallback);\n+  env->SetMethod(target, \"runMicrotasks\", RunMicrotasks);\n+  target->Set(env->context(),\n+              FIXED_ONE_BYTE_STRING(isolate, \"tickInfo\"),\n+              env->tick_info()->fields().GetJSArray()).FromJust();\n+\n+  Local<Object> events = Object::New(isolate);\n+  NODE_DEFINE_CONSTANT(events, kPromiseRejectWithNoHandler);\n+  NODE_DEFINE_CONSTANT(events, kPromiseHandlerAddedAfterReject);\n+  NODE_DEFINE_CONSTANT(events, kPromiseResolveAfterResolved);\n+  NODE_DEFINE_CONSTANT(events, kPromiseRejectAfterResolved);\n+\n+  target->Set(env->context(),\n+              FIXED_ONE_BYTE_STRING(isolate, \"promiseRejectEvents\"),\n+              events).FromJust();\n+  env->SetMethod(target,\n+                 \"initializePromiseRejectCallback\",\n+                 InitializePromiseRejectCallback);\n }\n-#undef BOOTSTRAP_METHOD\n \n+}  // namespace task_queue\n }  // namespace node\n+\n+NODE_MODULE_CONTEXT_AWARE_INTERNAL(task_queue, node::task_queue::Initialize)",
+            "previous_filename": "src/bootstrapper.cc"
+        },
+        {
+            "sha": "aa52367ba0949971cddd743ff972d584b807dbac",
+            "filename": "test/message/events_unhandled_error_nexttick.out",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/457603e96194b4858ad715f9faacb3ad7fec7f35/test%2Fmessage%2Fevents_unhandled_error_nexttick.out",
+            "raw_url": "https://github.com/nodejs/node/raw/457603e96194b4858ad715f9faacb3ad7fec7f35/test%2Fmessage%2Fevents_unhandled_error_nexttick.out",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fmessage%2Fevents_unhandled_error_nexttick.out?ref=457603e96194b4858ad715f9faacb3ad7fec7f35",
+            "patch": "@@ -16,7 +16,7 @@ Error\n Emitted 'error' event at:\n     at process.nextTick (*events_unhandled_error_nexttick.js:*:*)\n     at internalTickCallback (internal/process/next_tick.js:*:*)\n-    at process._tickCallback (internal/process/next_tick.js:*:*)\n+    at process.runNextTicks [as _tickCallback] (internal/process/next_tick.js:*:*)\n     at Function.Module.runMain (internal/modules/cjs/loader.js:*:*)\n     at executeUserCode (internal/bootstrap/node.js:*:*)\n     at startExecution (internal/bootstrap/node.js:*:*)"
+        },
+        {
+            "sha": "1fee9075fe5078fbe146d1a694ee31a91ae4cb2e",
+            "filename": "test/message/nexttick_throw.out",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/457603e96194b4858ad715f9faacb3ad7fec7f35/test%2Fmessage%2Fnexttick_throw.out",
+            "raw_url": "https://github.com/nodejs/node/raw/457603e96194b4858ad715f9faacb3ad7fec7f35/test%2Fmessage%2Fnexttick_throw.out",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fmessage%2Fnexttick_throw.out?ref=457603e96194b4858ad715f9faacb3ad7fec7f35",
+            "patch": "@@ -5,7 +5,7 @@\n ReferenceError: undefined_reference_error_maker is not defined\n     at *test*message*nexttick_throw.js:*:*\n     at internalTickCallback (internal/process/next_tick.js:*:*)\n-    at process._tickCallback (internal/process/next_tick.js:*:*)\n+    at process.runNextTicks [as _tickCallback] (internal/process/next_tick.js:*:*)\n     at Function.Module.runMain (internal/modules/cjs/loader.js:*:*)\n     at executeUserCode (internal/bootstrap/node.js:*:*)\n     at startExecution (internal/bootstrap/node.js:*:*)"
+        },
+        {
+            "sha": "0b2ef999414a3f641be5f053fba28ab609387680",
+            "filename": "test/message/unhandled_promise_trace_warnings.out",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/457603e96194b4858ad715f9faacb3ad7fec7f35/test%2Fmessage%2Funhandled_promise_trace_warnings.out",
+            "raw_url": "https://github.com/nodejs/node/raw/457603e96194b4858ad715f9faacb3ad7fec7f35/test%2Fmessage%2Funhandled_promise_trace_warnings.out",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fmessage%2Funhandled_promise_trace_warnings.out?ref=457603e96194b4858ad715f9faacb3ad7fec7f35",
+            "patch": "@@ -42,7 +42,7 @@\n     at *\n (node:*) PromiseRejectionHandledWarning: Promise rejection was handled asynchronously (rejection id: 1)\n     at handledRejection (internal/process/promises.js:*)\n-    at handler (internal/process/promises.js:*)\n+    at promiseRejectHandler (internal/process/promises.js:*)\n     at Promise.then *\n     at Promise.catch *\n     at Immediate.setImmediate (*test*message*unhandled_promise_trace_warnings.js:*)"
+        },
+        {
+            "sha": "ee4864e09ba1d5c4dae8df6d365c425e2a340c5c",
+            "filename": "test/parallel/test-bootstrap-modules.js",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/457603e96194b4858ad715f9faacb3ad7fec7f35/test%2Fparallel%2Ftest-bootstrap-modules.js",
+            "raw_url": "https://github.com/nodejs/node/raw/457603e96194b4858ad715f9faacb3ad7fec7f35/test%2Fparallel%2Ftest-bootstrap-modules.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-bootstrap-modules.js?ref=457603e96194b4858ad715f9faacb3ad7fec7f35",
+            "patch": "@@ -9,7 +9,7 @@ const common = require('../common');\n const assert = require('assert');\n \n const isMainThread = common.isMainThread;\n-const kMaxModuleCount = isMainThread ? 61 : 83;\n+const kMaxModuleCount = isMainThread ? 62 : 84;\n \n assert(list.length <= kMaxModuleCount,\n        `Total length: ${list.length}\\n` + list.join('\\n')"
+        }
+    ],
+    "stats": {
+        "total": 391,
+        "additions": 199,
+        "deletions": 192
+    }
+}

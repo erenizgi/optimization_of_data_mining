@@ -1,0 +1,36 @@
+{
+    "author": "alxhub",
+    "message": "perf(compiler-cli): fix memory leak in retained incremental state (#37835)\n\nIncremental compilation allows for the output state of one compilation to be\nreused as input to the next compilation. This involves retaining references\nto instances from prior compilations, which must be done carefully to avoid\nmemory leaks.\n\nThis commit fixes such a leak with a complicated retention chain:\n\n* `TrackedIncrementalBuildStrategy` unnecessarily hangs on to the previous\n  `IncrementalDriver` (state of the previous compilation) once the current\n  compilation completes.\n\n  In general this is unnecessary, but should be safe as long as the chain\n  only goes back one level - if the `IncrementalDriver` doesn't retain any\n  previous `TrackedIncrementalBuildStrategy` instances. However, this does\n  happen:\n\n* `NgCompiler` indirectly causes retention of previous `NgCompiler`\n  instances (and thus previous `TrackedIncrementalBuildStrategy` instances)\n  through accidental capture of the `this` context in a closure created in\n  its constructor. This closure is wrapped in a `ts.ModuleResolutionCache`\n  used to create a `ModuleResolver` class, which is passed to the program's\n  `TraitCompiler` on construction.\n\n* The `IncrementalDriver` retains a reference to the `TraitCompiler` of the\n  previous compilation, completing the reference chain.\n\nThe final retention chain thus looks like:\n\n* `TrackedIncrementalBuildStrategy` of current program\n* `.previous`: `IncrementalDriver` of previous program\n* `.lastGood.traitCompiler`: `TraitCompiler`\n* `.handlers[..].moduleResolver.moduleResolutionCache`: cache\n* (via `getCanonicalFileName` closure): `NgCompiler`\n* `.incrementalStrategy`: `TrackedIncrementalBuildStrategy` of previous\n  program.\n\nThe closure link is the \"real\" leak here. `NgCompiler` is creating a closure\nfor `getCanonicalFileName`, delegating to its\n`this.adapter.getCanonicalFileName`, for the purposes of creating a\n`ts.ModuleResolutionCache`. The fact that the closure references\n`NgCompiler` thus eventually causes previous `NgCompiler` iterations to be\nretained. This is also potentially problematic due to the shared nature of\n`ts.ModuleResolutionCache`, which is potentially retained across multiple\ncompilations intentionally.\n\nThis commit fixes the first two links in the retention chain: the build\nstrategy is patched to not retain a `previous` pointer, and the `NgCompiler`\nis patched to not create a closure in the first place, but instead pass a\nbound function. This ensures that the `NgCompiler` does not retain previous\ninstances of itself in the first place, even if the build strategy does\nend up retaining the previous incremental state unnecessarily.\n\nThe third link (`IncrementalDriver` unnecessarily retaining the whole\n`TraitCompiler`) is not addressed in this commit as it's a more\narchitectural problem that will require some refactoring. However, the leak\npotential of this retention is eliminated thanks to fixing the first two\nissues.\n\nPR Close #37835",
+    "sha": "71956250ddc7faee2a813c293f4ebf91a1509afa",
+    "files": [
+        {
+            "sha": "c5077cb3fa6b9240ebc1528d253f1757d7d11029",
+            "filename": "packages/compiler-cli/src/ngtsc/core/src/compiler.ts",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 1,
+            "changes": 8,
+            "blob_url": "https://github.com/angular/angular/blob/71956250ddc7faee2a813c293f4ebf91a1509afa/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fcore%2Fsrc%2Fcompiler.ts",
+            "raw_url": "https://github.com/angular/angular/raw/71956250ddc7faee2a813c293f4ebf91a1509afa/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fcore%2Fsrc%2Fcompiler.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fcore%2Fsrc%2Fcompiler.ts?ref=71956250ddc7faee2a813c293f4ebf91a1509afa",
+            "patch": "@@ -116,7 +116,13 @@ export class NgCompiler {\n \n     const moduleResolutionCache = ts.createModuleResolutionCache(\n         this.adapter.getCurrentDirectory(),\n-        fileName => this.adapter.getCanonicalFileName(fileName));\n+        // Note: this used to be an arrow-function closure. However, JS engines like v8 have some\n+        // strange behaviors with retaining the lexical scope of the closure. Even if this function\n+        // doesn't retain a reference to `this`, if other closures in the constructor here reference\n+        // `this` internally then a closure created here would retain them. This can cause major\n+        // memory leak issues since the `moduleResolutionCache` is a long-lived object and finds its\n+        // way into all kinds of places inside TS internal objects.\n+        this.adapter.getCanonicalFileName.bind(this.adapter));\n     this.moduleResolver =\n         new ModuleResolver(tsProgram, this.options, this.adapter, moduleResolutionCache);\n     this.resourceManager = new AdapterResourceLoader(adapter, this.options);"
+        },
+        {
+            "sha": "b7d60b98568ac1f466eed9e879b83efe21323786",
+            "filename": "packages/compiler-cli/src/ngtsc/incremental/src/strategy.ts",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 5,
+            "changes": 12,
+            "blob_url": "https://github.com/angular/angular/blob/71956250ddc7faee2a813c293f4ebf91a1509afa/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fincremental%2Fsrc%2Fstrategy.ts",
+            "raw_url": "https://github.com/angular/angular/raw/71956250ddc7faee2a813c293f4ebf91a1509afa/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fincremental%2Fsrc%2Fstrategy.ts",
+            "contents_url": "https://api.github.com/repos/angular/angular/contents/packages%2Fcompiler-cli%2Fsrc%2Fngtsc%2Fincremental%2Fsrc%2Fstrategy.ts?ref=71956250ddc7faee2a813c293f4ebf91a1509afa",
+            "patch": "@@ -42,20 +42,22 @@ export class NoopIncrementalBuildStrategy implements IncrementalBuildStrategy {\n  * Tracks an `IncrementalDriver` within the strategy itself.\n  */\n export class TrackedIncrementalBuildStrategy implements IncrementalBuildStrategy {\n-  private previous: IncrementalDriver|null = null;\n-  private next: IncrementalDriver|null = null;\n+  private driver: IncrementalDriver|null = null;\n+  private isSet: boolean = false;\n \n   getIncrementalDriver(): IncrementalDriver|null {\n-    return this.next !== null ? this.next : this.previous;\n+    return this.driver;\n   }\n \n   setIncrementalDriver(driver: IncrementalDriver): void {\n-    this.next = driver;\n+    this.driver = driver;\n+    this.isSet = true;\n   }\n \n   toNextBuildStrategy(): TrackedIncrementalBuildStrategy {\n     const strategy = new TrackedIncrementalBuildStrategy();\n-    strategy.previous = this.next;\n+    // Only reuse a driver that was explicitly set via `setIncrementalDriver`.\n+    strategy.driver = this.isSet ? this.driver : null;\n     return strategy;\n   }\n }"
+        }
+    ],
+    "stats": {
+        "total": 20,
+        "additions": 14,
+        "deletions": 6
+    }
+}

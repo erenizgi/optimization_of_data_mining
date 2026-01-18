@@ -1,0 +1,120 @@
+{
+    "author": "joyeecheung",
+    "message": "src: simplify NativeModule caching and remove redundant data\n\n- Remove `NativeModule._source` - the compilation is now entirely\n  done in C++ and `process.binding('natives')` is implemented\n  directly in the binding loader so there is no need to store\n  additional source code strings.\n- Instead of using an object as `NativeModule._cached` and insert\n  into it after compilation of each native module, simply prebuild\n  a JS map filled with all the native modules and infer the\n  state of compilation through `mod.loading`/`mod.loaded`.\n- Rename `NativeModule.nonInternalExists` to\n  `NativeModule.canBeRequiredByUsers` and precompute that\n  property for all the native modules during bootstrap instead\n  of branching in every require call during runtime. This also fixes\n  the bug where `worker_threads` can be made available with\n  `--expose-internals`.\n- Rename `NativeModule.requireForDeps` to\n  `NativeModule.requireWithFallbackInDeps`.\n- Add a test to make sure we do not accidentally leak any module\n  to the global namespace.\n\nPR-URL: https://github.com/nodejs/node/pull/25352\nReviewed-By: Anna Henningsen <anna@addaleax.net>",
+    "sha": "92e95f17b64838d4cf77343c1a814d4ebd795217",
+    "files": [
+        {
+            "sha": "c89286ce0fd9101eaa0f5cff923b26ddc6db030e",
+            "filename": "lib/internal/bootstrap/cache.js",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 10,
+            "changes": 23,
+            "blob_url": "https://github.com/nodejs/node/blob/92e95f17b64838d4cf77343c1a814d4ebd795217/lib%2Finternal%2Fbootstrap%2Fcache.js",
+            "raw_url": "https://github.com/nodejs/node/raw/92e95f17b64838d4cf77343c1a814d4ebd795217/lib%2Finternal%2Fbootstrap%2Fcache.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fbootstrap%2Fcache.js?ref=92e95f17b64838d4cf77343c1a814d4ebd795217",
+            "patch": "@@ -7,14 +7,10 @@\n \n const { NativeModule } = require('internal/bootstrap/loaders');\n const {\n-  source, getCodeCache, compileFunction\n+  getCodeCache, compileFunction\n } = internalBinding('native_module');\n const { hasTracing, hasInspector } = process.binding('config');\n \n-const depsModule = Object.keys(source).filter(\n-  (key) => NativeModule.isDepsModule(key) || key.startsWith('internal/deps')\n-);\n-\n // Modules with source code compiled in js2c that\n // cannot be compiled with the code cache.\n const cannotUseCache = [\n@@ -29,7 +25,7 @@ const cannotUseCache = [\n   // the code cache is also used when compiling these two files.\n   'internal/bootstrap/loaders',\n   'internal/bootstrap/node'\n-].concat(depsModule);\n+];\n \n // Skip modules that cannot be required when they are not\n // built into the binary.\n@@ -67,11 +63,18 @@ if (!process.versions.openssl) {\n   );\n }\n \n+const cachableBuiltins = [];\n+for (const id of NativeModule.map.keys()) {\n+  if (id.startsWith('internal/deps')) {\n+    cannotUseCache.push(id);\n+  }\n+  if (!cannotUseCache.includes(id)) {\n+    cachableBuiltins.push(id);\n+  }\n+}\n+\n module.exports = {\n-  cachableBuiltins: Object.keys(source).filter(\n-    (key) => !cannotUseCache.includes(key)\n-  ),\n-  getSource(id) { return source[id]; },\n+  cachableBuiltins,\n   getCodeCache,\n   compileFunction,\n   cannotUseCache"
+        },
+        {
+            "sha": "300a362abb5f5647a4636973daade6c89648302c",
+            "filename": "lib/internal/bootstrap/loaders.js",
+            "status": "modified",
+            "additions": 42,
+            "deletions": 68,
+            "changes": 110,
+            "blob_url": "https://github.com/nodejs/node/blob/92e95f17b64838d4cf77343c1a814d4ebd795217/lib%2Finternal%2Fbootstrap%2Floaders.js",
+            "raw_url": "https://github.com/nodejs/node/raw/92e95f17b64838d4cf77343c1a814d4ebd795217/lib%2Finternal%2Fbootstrap%2Floaders.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fbootstrap%2Floaders.js?ref=92e95f17b64838d4cf77343c1a814d4ebd795217",
+            "patch": "@@ -158,6 +158,12 @@ let internalBinding;\n // Create this WeakMap in js-land because V8 has no C++ API for WeakMap.\n internalBinding('module_wrap').callbackMap = new WeakMap();\n \n+// Think of this as module.exports in this file even though it is not\n+// written in CommonJS style.\n+const loaderExports = { internalBinding, NativeModule };\n+const loaderId = 'internal/bootstrap/loaders';\n+const config = internalBinding('config');\n+\n // Set up NativeModule.\n function NativeModule(id) {\n   this.filename = `${id}.js`;\n@@ -167,34 +173,35 @@ function NativeModule(id) {\n   this.exportKeys = undefined;\n   this.loaded = false;\n   this.loading = false;\n+  if (id === loaderId) {\n+    // Do not expose this to user land even with --expose-internals.\n+    this.canBeRequiredByUsers = false;\n+  } else if (id.startsWith('internal/')) {\n+    this.canBeRequiredByUsers = config.exposeInternals;\n+  } else {\n+    this.canBeRequiredByUsers = true;\n+  }\n }\n \n const {\n-  source,\n+  moduleIds,\n   compileFunction\n } = internalBinding('native_module');\n \n-NativeModule._source = source;\n-NativeModule._cache = {};\n-\n-const config = internalBinding('config');\n-\n-// Think of this as module.exports in this file even though it is not\n-// written in CommonJS style.\n-const loaderExports = { internalBinding, NativeModule };\n-const loaderId = 'internal/bootstrap/loaders';\n+NativeModule.map = new Map();\n+for (var i = 0; i < moduleIds.length; ++i) {\n+  const id = moduleIds[i];\n+  const mod = new NativeModule(id);\n+  NativeModule.map.set(id, mod);\n+}\n \n NativeModule.require = function(id) {\n   if (id === loaderId) {\n     return loaderExports;\n   }\n \n-  const cached = NativeModule.getCached(id);\n-  if (cached && (cached.loaded || cached.loading)) {\n-    return cached.exports;\n-  }\n-\n-  if (!NativeModule.exists(id)) {\n+  const mod = NativeModule.map.get(id);\n+  if (!mod) {\n     // Model the error off the internal/errors.js model, but\n     // do not use that module given that it could actually be\n     // the one causing the error if there's a bug in Node.js.\n@@ -205,60 +212,31 @@ NativeModule.require = function(id) {\n     throw err;\n   }\n \n-  moduleLoadList.push(`NativeModule ${id}`);\n-\n-  const nativeModule = new NativeModule(id);\n-\n-  nativeModule.cache();\n-  nativeModule.compile();\n-\n-  return nativeModule.exports;\n-};\n-\n-NativeModule.isDepsModule = function(id) {\n-  return id.startsWith('node-inspect/') || id.startsWith('v8/');\n-};\n-\n-NativeModule.requireForDeps = function(id) {\n-  if (!NativeModule.exists(id)) {\n-    id = `internal/deps/${id}`;\n+  if (mod.loaded || mod.loading) {\n+    return mod.exports;\n   }\n-  return NativeModule.require(id);\n-};\n \n-NativeModule.getCached = function(id) {\n-  return NativeModule._cache[id];\n+  moduleLoadList.push(`NativeModule ${id}`);\n+  mod.compile();\n+  return mod.exports;\n };\n \n NativeModule.exists = function(id) {\n-  return NativeModule._source.hasOwnProperty(id);\n+  return NativeModule.map.has(id);\n };\n \n-if (config.exposeInternals) {\n-  NativeModule.nonInternalExists = function(id) {\n-    // Do not expose this to user land even with --expose-internals.\n-    if (id === loaderId) {\n-      return false;\n-    }\n-    return NativeModule.exists(id);\n-  };\n-\n-  NativeModule.isInternal = function(id) {\n-    // Do not expose this to user land even with --expose-internals.\n-    return id === loaderId;\n-  };\n-} else {\n-  NativeModule.nonInternalExists = function(id) {\n-    return NativeModule.exists(id) && !NativeModule.isInternal(id);\n-  };\n-\n-  NativeModule.isInternal = function(id) {\n-    return id.startsWith('internal/');\n-  };\n-}\n+NativeModule.canBeRequiredByUsers = function(id) {\n+  const mod = NativeModule.map.get(id);\n+  return mod && mod.canBeRequiredByUsers;\n+};\n \n-NativeModule.getSource = function(id) {\n-  return NativeModule._source[id];\n+// Allow internal modules from dependencies to require\n+// other modules from dependencies by providing fallbacks.\n+NativeModule.requireWithFallbackInDeps = function(request) {\n+  if (!NativeModule.map.has(request)) {\n+    request = `internal/deps/${request}`;\n+  }\n+  return NativeModule.require(request);\n };\n \n const getOwn = (target, property, receiver) => {\n@@ -332,13 +310,13 @@ NativeModule.prototype.compile = function() {\n \n   try {\n     const requireFn = this.id.startsWith('internal/deps/') ?\n-      NativeModule.requireForDeps :\n+      NativeModule.requireWithFallbackInDeps :\n       NativeModule.require;\n \n     const fn = compileFunction(id);\n     fn(this.exports, requireFn, this, process, internalBinding);\n \n-    if (config.experimentalModules && !NativeModule.isInternal(this.id)) {\n+    if (config.experimentalModules && this.canBeRequiredByUsers) {\n       this.proxifyExports();\n     }\n \n@@ -348,10 +326,6 @@ NativeModule.prototype.compile = function() {\n   }\n };\n \n-NativeModule.prototype.cache = function() {\n-  NativeModule._cache[this.id] = this;\n-};\n-\n // Coverage must be turned on early, so that we can collect\n // it for Node.js' own internal libraries.\n if (process.env.NODE_V8_COVERAGE) {"
+        },
+        {
+            "sha": "f4551b7d47b546da36d173c7d0752d759ef438a6",
+            "filename": "lib/internal/modules/cjs/loader.js",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 5,
+            "changes": 14,
+            "blob_url": "https://github.com/nodejs/node/blob/92e95f17b64838d4cf77343c1a814d4ebd795217/lib%2Finternal%2Fmodules%2Fcjs%2Floader.js",
+            "raw_url": "https://github.com/nodejs/node/raw/92e95f17b64838d4cf77343c1a814d4ebd795217/lib%2Finternal%2Fmodules%2Fcjs%2Floader.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fmodules%2Fcjs%2Floader.js?ref=92e95f17b64838d4cf77343c1a814d4ebd795217",
+            "patch": "@@ -112,8 +112,12 @@ function Module(id, parent) {\n   this.children = [];\n }\n \n-const builtinModules = Object.keys(NativeModule._source)\n-  .filter(NativeModule.nonInternalExists);\n+const builtinModules = [];\n+for (const [id, mod] of NativeModule.map) {\n+  if (mod.canBeRequiredByUsers) {\n+    builtinModules.push(id);\n+  }\n+}\n \n Object.freeze(builtinModules);\n Module.builtinModules = builtinModules;\n@@ -417,7 +421,7 @@ if (isWindows) {\n var indexChars = [ 105, 110, 100, 101, 120, 46 ];\n var indexLen = indexChars.length;\n Module._resolveLookupPaths = function(request, parent, newReturn) {\n-  if (NativeModule.nonInternalExists(request)) {\n+  if (NativeModule.canBeRequiredByUsers(request)) {\n     debug('looking for %j in []', request);\n     return (newReturn ? null : [request, []]);\n   }\n@@ -534,7 +538,7 @@ Module._load = function(request, parent, isMain) {\n     return cachedModule.exports;\n   }\n \n-  if (NativeModule.nonInternalExists(filename)) {\n+  if (NativeModule.canBeRequiredByUsers(filename)) {\n     debug('load native module %s', request);\n     return NativeModule.require(filename);\n   }\n@@ -567,7 +571,7 @@ function tryModuleLoad(module, filename) {\n }\n \n Module._resolveFilename = function(request, parent, isMain, options) {\n-  if (NativeModule.nonInternalExists(request)) {\n+  if (NativeModule.canBeRequiredByUsers(request)) {\n     return request;\n   }\n "
+        },
+        {
+            "sha": "2cf9014a672ce0bd57d4947066958cb919220dca",
+            "filename": "lib/internal/modules/esm/default_resolve.js",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/92e95f17b64838d4cf77343c1a814d4ebd795217/lib%2Finternal%2Fmodules%2Fesm%2Fdefault_resolve.js",
+            "raw_url": "https://github.com/nodejs/node/raw/92e95f17b64838d4cf77343c1a814d4ebd795217/lib%2Finternal%2Fmodules%2Fesm%2Fdefault_resolve.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fmodules%2Fesm%2Fdefault_resolve.js?ref=92e95f17b64838d4cf77343c1a814d4ebd795217",
+            "patch": "@@ -53,7 +53,7 @@ const extensionFormatMap = {\n };\n \n function resolve(specifier, parentURL) {\n-  if (NativeModule.nonInternalExists(specifier)) {\n+  if (NativeModule.canBeRequiredByUsers(specifier)) {\n     return {\n       url: specifier,\n       format: 'builtin'"
+        },
+        {
+            "sha": "776b8d584df21f560baafa1b37f7832ba20851ff",
+            "filename": "lib/internal/modules/esm/translators.js",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/92e95f17b64838d4cf77343c1a814d4ebd795217/lib%2Finternal%2Fmodules%2Fesm%2Ftranslators.js",
+            "raw_url": "https://github.com/nodejs/node/raw/92e95f17b64838d4cf77343c1a814d4ebd795217/lib%2Finternal%2Fmodules%2Fesm%2Ftranslators.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fmodules%2Fesm%2Ftranslators.js?ref=92e95f17b64838d4cf77343c1a814d4ebd795217",
+            "patch": "@@ -81,7 +81,7 @@ translators.set('builtin', async (url) => {\n   // slice 'node:' scheme\n   const id = url.slice(5);\n   NativeModule.require(id);\n-  const module = NativeModule.getCached(id);\n+  const module = NativeModule.map.get(id);\n   return createDynamicModule(\n     [...module.exportKeys, 'default'], url, (reflect) => {\n       debug(`Loading BuiltinModule ${url}`);"
+        },
+        {
+            "sha": "1b1a5e8ec1d860c37d7fba4bb99cd052c5841d9b",
+            "filename": "src/node_native_module.cc",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 5,
+            "changes": 20,
+            "blob_url": "https://github.com/nodejs/node/blob/92e95f17b64838d4cf77343c1a814d4ebd795217/src%2Fnode_native_module.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/92e95f17b64838d4cf77343c1a814d4ebd795217/src%2Fnode_native_module.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_native_module.cc?ref=92e95f17b64838d4cf77343c1a814d4ebd795217",
+            "patch": "@@ -80,11 +80,21 @@ void NativeModuleLoader::GetCacheUsage(\n   args.GetReturnValue().Set(result);\n }\n \n-void NativeModuleLoader::SourceObjectGetter(\n+void NativeModuleLoader::ModuleIdsGetter(\n     Local<Name> property, const PropertyCallbackInfo<Value>& info) {\n   Local<Context> context = info.GetIsolate()->GetCurrentContext();\n-  info.GetReturnValue().Set(\n-      per_process::native_module_loader.GetSourceObject(context));\n+  Isolate* isolate = info.GetIsolate();\n+\n+  const NativeModuleRecordMap& source_ =\n+      per_process::native_module_loader.source_;\n+  std::vector<Local<Value>> ids;\n+  ids.reserve(source_.size());\n+\n+  for (auto const& x : source_) {\n+    ids.push_back(OneByteString(isolate, x.first.c_str(), x.first.size()));\n+  }\n+\n+  info.GetReturnValue().Set(Array::New(isolate, ids.data(), ids.size()));\n }\n \n void NativeModuleLoader::ConfigStringGetter(\n@@ -303,8 +313,8 @@ void NativeModuleLoader::Initialize(Local<Object> target,\n             .FromJust());\n   CHECK(target\n             ->SetAccessor(env->context(),\n-                          env->source_string(),\n-                          SourceObjectGetter,\n+                          FIXED_ONE_BYTE_STRING(env->isolate(), \"moduleIds\"),\n+                          ModuleIdsGetter,\n                           nullptr,\n                           MaybeLocal<Value>(),\n                           DEFAULT,"
+        },
+        {
+            "sha": "9a0afcc0b9622940fc6bf101a6251ed85ea9f9bd",
+            "filename": "src/node_native_module.h",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 5,
+            "changes": 9,
+            "blob_url": "https://github.com/nodejs/node/blob/92e95f17b64838d4cf77343c1a814d4ebd795217/src%2Fnode_native_module.h",
+            "raw_url": "https://github.com/nodejs/node/raw/92e95f17b64838d4cf77343c1a814d4ebd795217/src%2Fnode_native_module.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_native_module.h?ref=92e95f17b64838d4cf77343c1a814d4ebd795217",
+            "patch": "@@ -56,11 +56,10 @@ class NativeModuleLoader {\n \n  private:\n   static void GetCacheUsage(const v8::FunctionCallbackInfo<v8::Value>& args);\n-  // Passing map of builtin module source code into JS land as\n-  // internalBinding('native_module').source\n-  static void SourceObjectGetter(\n-      v8::Local<v8::Name> property,\n-      const v8::PropertyCallbackInfo<v8::Value>& info);\n+  // Passing ids of builtin module source code into JS land as\n+  // internalBinding('native_module').moduleIds\n+  static void ModuleIdsGetter(v8::Local<v8::Name> property,\n+                              const v8::PropertyCallbackInfo<v8::Value>& info);\n   // Passing config.gypi into JS land as internalBinding('native_module').config\n   static void ConfigStringGetter(\n       v8::Local<v8::Name> property,"
+        },
+        {
+            "sha": "54bd0b0e2a66beefc11ac875cf36de1801ecba41",
+            "filename": "test/code-cache/test-code-cache.js",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 4,
+            "changes": 5,
+            "blob_url": "https://github.com/nodejs/node/blob/92e95f17b64838d4cf77343c1a814d4ebd795217/test%2Fcode-cache%2Ftest-code-cache.js",
+            "raw_url": "https://github.com/nodejs/node/raw/92e95f17b64838d4cf77343c1a814d4ebd795217/test%2Fcode-cache%2Ftest-code-cache.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fcode-cache%2Ftest-code-cache.js?ref=92e95f17b64838d4cf77343c1a814d4ebd795217",
+            "patch": "@@ -5,15 +5,12 @@\n // and the cache is used when built in modules are compiled.\n // Otherwise, verifies that no cache is used when compiling builtins.\n \n-require('../common');\n+const { isMainThread } = require('../common');\n const assert = require('assert');\n const {\n   cachableBuiltins,\n   cannotUseCache\n } = require('internal/bootstrap/cache');\n-const {\n-  isMainThread\n-} = require('worker_threads');\n \n const {\n   internalBinding"
+        },
+        {
+            "sha": "17559d228774f7bcf49c6d3ece5ea359031308c4",
+            "filename": "test/parallel/test-internal-module-require.js",
+            "status": "added",
+            "additions": 112,
+            "deletions": 0,
+            "changes": 112,
+            "blob_url": "https://github.com/nodejs/node/blob/92e95f17b64838d4cf77343c1a814d4ebd795217/test%2Fparallel%2Ftest-internal-module-require.js",
+            "raw_url": "https://github.com/nodejs/node/raw/92e95f17b64838d4cf77343c1a814d4ebd795217/test%2Fparallel%2Ftest-internal-module-require.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-internal-module-require.js?ref=92e95f17b64838d4cf77343c1a814d4ebd795217",
+            "patch": "@@ -0,0 +1,112 @@\n+'use strict';\n+\n+// Flags: --expose-internals\n+// This verifies that\n+// 1. We do not leak internal modules unless the --require-internals option\n+//    is on.\n+// 2. We do not accidentally leak any modules to the public global scope.\n+// 3. Deprecated modules are properly deprecated.\n+\n+const common = require('../common');\n+\n+if (!common.isMainThread) {\n+  common.skip('Cannot test the existence of --expose-internals from worker');\n+}\n+\n+const assert = require('assert');\n+const fork = require('child_process').fork;\n+\n+const expectedPublicModules = new Set([\n+  '_http_agent',\n+  '_http_client',\n+  '_http_common',\n+  '_http_incoming',\n+  '_http_outgoing',\n+  '_http_server',\n+  '_stream_duplex',\n+  '_stream_passthrough',\n+  '_stream_readable',\n+  '_stream_transform',\n+  '_stream_wrap',\n+  '_stream_writable',\n+  '_tls_common',\n+  '_tls_wrap',\n+  'assert',\n+  'async_hooks',\n+  'buffer',\n+  'child_process',\n+  'cluster',\n+  'console',\n+  'constants',\n+  'crypto',\n+  'dgram',\n+  'dns',\n+  'domain',\n+  'events',\n+  'fs',\n+  'http',\n+  'http2',\n+  'https',\n+  'inspector',\n+  'module',\n+  'net',\n+  'os',\n+  'path',\n+  'perf_hooks',\n+  'process',\n+  'punycode',\n+  'querystring',\n+  'readline',\n+  'repl',\n+  'stream',\n+  'string_decoder',\n+  'sys',\n+  'timers',\n+  'tls',\n+  'trace_events',\n+  'tty',\n+  'url',\n+  'util',\n+  'v8',\n+  'vm',\n+  'worker_threads',\n+  'zlib'\n+]);\n+\n+if (process.argv[2] === 'child') {\n+  assert(!process.execArgv.includes('--expose-internals'));\n+  process.once('message', ({ allBuiltins }) => {\n+    const publicModules = new Set();\n+    for (const id of allBuiltins) {\n+      if (id.startsWith('internal/')) {\n+        common.expectsError(() => {\n+          require(id);\n+        }, {\n+          code: 'MODULE_NOT_FOUND',\n+          message: `Cannot find module '${id}'`\n+        });\n+      } else {\n+        require(id);\n+        publicModules.add(id);\n+      }\n+    }\n+    assert(allBuiltins.length > publicModules.size);\n+    // Make sure all the public modules are available through\n+    // require('module').builtinModules\n+    assert.deepStrictEqual(\n+      publicModules,\n+      new Set(require('module').builtinModules)\n+    );\n+    assert.deepStrictEqual(publicModules, expectedPublicModules);\n+  });\n+} else {\n+  assert(process.execArgv.includes('--expose-internals'));\n+  const child = fork(__filename, ['child'], {\n+    execArgv: []\n+  });\n+  const { builtinModules } = require('module');\n+  // When --expose-internals is on, require('module').builtinModules\n+  // contains internal modules.\n+  const message = { allBuiltins: builtinModules };\n+  child.send(message);\n+}"
+        }
+    ],
+    "stats": {
+        "total": 297,
+        "additions": 198,
+        "deletions": 99
+    }
+}

@@ -1,0 +1,72 @@
+{
+    "author": "punteek",
+    "message": "vm: add support for import.meta to Module\n\nFixes: https://github.com/nodejs/node/issues/18570\n\nPR-URL: https://github.com/nodejs/node/pull/19277\nReviewed-By: Gus Caplan <me@gus.host>\nReviewed-By: Tiancheng \"Timothy\" Gu <timothygu99@gmail.com>",
+    "sha": "07ba9141e475ec63f6ef56b67ec5f98077cd3446",
+    "files": [
+        {
+            "sha": "ed7be8177686038d251271a5bc09d736db2108fe",
+            "filename": "doc/api/vm.md",
+            "status": "modified",
+            "additions": 40,
+            "deletions": 0,
+            "changes": 40,
+            "blob_url": "https://github.com/nodejs/node/blob/07ba9141e475ec63f6ef56b67ec5f98077cd3446/doc%2Fapi%2Fvm.md",
+            "raw_url": "https://github.com/nodejs/node/raw/07ba9141e475ec63f6ef56b67ec5f98077cd3446/doc%2Fapi%2Fvm.md",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/doc%2Fapi%2Fvm.md?ref=07ba9141e475ec63f6ef56b67ec5f98077cd3446",
+            "patch": "@@ -167,9 +167,49 @@ const contextifiedSandbox = vm.createContext({ secret: 42 });\n     in stack traces produced by this Module.\n   * `columnOffset` {integer} Spcifies the column number offset that is displayed\n     in stack traces produced by this Module.\n+  * `initalizeImportMeta` {Function} Called during evaluation of this Module to\n+    initialize the `import.meta`. This function has the signature `(meta,\n+    module)`, where `meta` is the `import.meta` object in the Module, and\n+    `module` is this `vm.Module` object.\n \n Creates a new ES `Module` object.\n \n+*Note*: Properties assigned to the `import.meta` object that are objects may\n+allow the Module to access information outside the specified `context`, if the\n+object is created in the top level context. Use `vm.runInContext()` to create\n+objects in a specific context.\n+\n+```js\n+const vm = require('vm');\n+\n+const contextifiedSandbox = vm.createContext({ secret: 42 });\n+\n+(async () => {\n+  const module = new vm.Module(\n+    'Object.getPrototypeOf(import.meta.prop).secret = secret;',\n+    {\n+      initializeImportMeta(meta) {\n+        // Note: this object is created in the top context. As such,\n+        // Object.getPrototypeOf(import.meta.prop) points to the\n+        // Object.prototype in the top context rather than that in\n+        // the sandbox.\n+        meta.prop = {};\n+      }\n+    });\n+  // Since module has no dependencies, the linker function will never be called.\n+  await module.link(() => {});\n+  module.initialize();\n+  await module.evaluate();\n+\n+  // Now, Object.prototype.secret will be equal to 42.\n+  //\n+  // To fix this problem, replace\n+  //     meta.prop = {};\n+  // above with\n+  //     meta.prop = vm.runInContext('{}', contextifiedSandbox);\n+})();\n+```\n+\n ### module.dependencySpecifiers\n \n * {string[]}"
+        },
+        {
+            "sha": "99bf00a6d6e4ac538bf966624d7327c69ecf32ef",
+            "filename": "lib/internal/bootstrap/node.js",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 4,
+            "changes": 11,
+            "blob_url": "https://github.com/nodejs/node/blob/07ba9141e475ec63f6ef56b67ec5f98077cd3446/lib%2Finternal%2Fbootstrap%2Fnode.js",
+            "raw_url": "https://github.com/nodejs/node/raw/07ba9141e475ec63f6ef56b67ec5f98077cd3446/lib%2Finternal%2Fbootstrap%2Fnode.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fbootstrap%2Fnode.js?ref=07ba9141e475ec63f6ef56b67ec5f98077cd3446",
+            "patch": "@@ -108,10 +108,13 @@\n         'DeprecationWarning', 'DEP0062', startup, true);\n     }\n \n-    if (process.binding('config').experimentalModules) {\n-      process.emitWarning(\n-        'The ESM module loader is experimental.',\n-        'ExperimentalWarning', undefined);\n+    if (process.binding('config').experimentalModules ||\n+        process.binding('config').experimentalVMModules) {\n+      if (process.binding('config').experimentalModules) {\n+        process.emitWarning(\n+          'The ESM module loader is experimental.',\n+          'ExperimentalWarning', undefined);\n+      }\n       NativeModule.require('internal/process/esm_loader').setup();\n     }\n "
+        },
+        {
+            "sha": "db28ca04b16cdc80febd988207b60e66c6910983",
+            "filename": "lib/internal/process/esm_loader.js",
+            "status": "modified",
+            "additions": 16,
+            "deletions": 1,
+            "changes": 17,
+            "blob_url": "https://github.com/nodejs/node/blob/07ba9141e475ec63f6ef56b67ec5f98077cd3446/lib%2Finternal%2Fprocess%2Fesm_loader.js",
+            "raw_url": "https://github.com/nodejs/node/raw/07ba9141e475ec63f6ef56b67ec5f98077cd3446/lib%2Finternal%2Fprocess%2Fesm_loader.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fprocess%2Fesm_loader.js?ref=07ba9141e475ec63f6ef56b67ec5f98077cd3446",
+            "patch": "@@ -10,6 +10,10 @@ const { getURLFromFilePath } = require('internal/url');\n const Loader = require('internal/modules/esm/loader');\n const path = require('path');\n const { URL } = require('url');\n+const {\n+  initImportMetaMap,\n+  wrapToModuleMap\n+} = require('internal/vm/module');\n \n function normalizeReferrerURL(referrer) {\n   if (typeof referrer === 'string' && path.isAbsolute(referrer)) {\n@@ -19,7 +23,18 @@ function normalizeReferrerURL(referrer) {\n }\n \n function initializeImportMetaObject(wrap, meta) {\n-  meta.url = wrap.url;\n+  const vmModule = wrapToModuleMap.get(wrap);\n+  if (vmModule === undefined) {\n+    // This ModuleWrap belongs to the Loader.\n+    meta.url = wrap.url;\n+  } else {\n+    const initializeImportMeta = initImportMetaMap.get(vmModule);\n+    if (initializeImportMeta !== undefined) {\n+      // This ModuleWrap belongs to vm.Module, initializer callback was\n+      // provided.\n+      initializeImportMeta(meta, vmModule);\n+    }\n+  }\n }\n \n let loaderResolve;"
+        },
+        {
+            "sha": "9af071ce28cecaa29d883047f3d3cb609dad79c3",
+            "filename": "lib/internal/vm/module.js",
+            "status": "modified",
+            "additions": 18,
+            "deletions": 1,
+            "changes": 19,
+            "blob_url": "https://github.com/nodejs/node/blob/07ba9141e475ec63f6ef56b67ec5f98077cd3446/lib%2Finternal%2Fvm%2Fmodule.js",
+            "raw_url": "https://github.com/nodejs/node/raw/07ba9141e475ec63f6ef56b67ec5f98077cd3446/lib%2Finternal%2Fvm%2Fmodule.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fvm%2Fmodule.js?ref=07ba9141e475ec63f6ef56b67ec5f98077cd3446",
+            "patch": "@@ -43,6 +43,10 @@ const perContextModuleId = new WeakMap();\n const wrapMap = new WeakMap();\n const dependencyCacheMap = new WeakMap();\n const linkingStatusMap = new WeakMap();\n+// vm.Module -> function\n+const initImportMetaMap = new WeakMap();\n+// ModuleWrap -> vm.Module\n+const wrapToModuleMap = new WeakMap();\n \n class Module {\n   constructor(src, options = {}) {\n@@ -80,6 +84,16 @@ class Module {\n       perContextModuleId.set(context, 1);\n     }\n \n+    if (options.initializeImportMeta !== undefined) {\n+      if (typeof options.initializeImportMeta === 'function') {\n+        initImportMetaMap.set(this, options.initializeImportMeta);\n+      } else {\n+        throw new ERR_INVALID_ARG_TYPE(\n+          'options.initializeImportMeta', 'function',\n+          options.initializeImportMeta);\n+      }\n+    }\n+\n     const wrap = new ModuleWrap(src, url, {\n       [kParsingContext]: context,\n       lineOffset: options.lineOffset,\n@@ -88,6 +102,7 @@ class Module {\n \n     wrapMap.set(this, wrap);\n     linkingStatusMap.set(this, 'unlinked');\n+    wrapToModuleMap.set(wrap, this);\n \n     Object.defineProperties(this, {\n       url: { value: url, enumerable: true },\n@@ -206,5 +221,7 @@ class Module {\n }\n \n module.exports = {\n-  Module\n+  Module,\n+  initImportMetaMap,\n+  wrapToModuleMap\n };"
+        },
+        {
+            "sha": "835ef5b6eb5de07c29165045f1e3169bce6c23c7",
+            "filename": "test/parallel/test-vm-module-import-meta.js",
+            "status": "added",
+            "additions": 45,
+            "deletions": 0,
+            "changes": 45,
+            "blob_url": "https://github.com/nodejs/node/blob/07ba9141e475ec63f6ef56b67ec5f98077cd3446/test%2Fparallel%2Ftest-vm-module-import-meta.js",
+            "raw_url": "https://github.com/nodejs/node/raw/07ba9141e475ec63f6ef56b67ec5f98077cd3446/test%2Fparallel%2Ftest-vm-module-import-meta.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-vm-module-import-meta.js?ref=07ba9141e475ec63f6ef56b67ec5f98077cd3446",
+            "patch": "@@ -0,0 +1,45 @@\n+'use strict';\n+\n+// Flags: --experimental-vm-modules --harmony-import-meta\n+\n+const common = require('../common');\n+const assert = require('assert');\n+const { Module } = require('vm');\n+\n+common.crashOnUnhandledRejection();\n+\n+async function testBasic() {\n+  const m = new Module('import.meta;', {\n+    initializeImportMeta: common.mustCall((meta, module) => {\n+      assert.strictEqual(module, m);\n+      meta.prop = 42;\n+    })\n+  });\n+  await m.link(common.mustNotCall());\n+  m.instantiate();\n+  const { result } = await m.evaluate();\n+  assert.strictEqual(typeof result, 'object');\n+  assert.strictEqual(Object.getPrototypeOf(result), null);\n+  assert.strictEqual(result.prop, 42);\n+  assert.deepStrictEqual(Reflect.ownKeys(result), ['prop']);\n+}\n+\n+async function testInvalid() {\n+  for (const invalidValue of [\n+    null, {}, 0, Symbol.iterator, [], 'string', false\n+  ]) {\n+    common.expectsError(() => {\n+      new Module('', {\n+        initializeImportMeta: invalidValue\n+      });\n+    }, {\n+      code: 'ERR_INVALID_ARG_TYPE',\n+      type: TypeError\n+    });\n+  }\n+}\n+\n+(async () => {\n+  await testBasic();\n+  await testInvalid();\n+})();"
+        }
+    ],
+    "stats": {
+        "total": 132,
+        "additions": 126,
+        "deletions": 6
+    }
+}

@@ -1,0 +1,48 @@
+{
+    "author": "mscdex",
+    "message": "os: improve networkInterfaces() performance\n\nPR-URL: https://github.com/nodejs/node/pull/25410\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Ruben Bridgewater <ruben@bridgewater.de>",
+    "sha": "5021b259ed2029dd7c84c7c652268dcad13d1183",
+    "files": [
+        {
+            "sha": "3fa6073ae5c69e5da5c946a80f5cbeaa30574f66",
+            "filename": "benchmark/os/networkInterfaces.js",
+            "status": "added",
+            "additions": 15,
+            "deletions": 0,
+            "changes": 15,
+            "blob_url": "https://github.com/nodejs/node/blob/5021b259ed2029dd7c84c7c652268dcad13d1183/benchmark%2Fos%2FnetworkInterfaces.js",
+            "raw_url": "https://github.com/nodejs/node/raw/5021b259ed2029dd7c84c7c652268dcad13d1183/benchmark%2Fos%2FnetworkInterfaces.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/benchmark%2Fos%2FnetworkInterfaces.js?ref=5021b259ed2029dd7c84c7c652268dcad13d1183",
+            "patch": "@@ -0,0 +1,15 @@\n+'use strict';\n+\n+const common = require('../common.js');\n+const networkInterfaces = require('os').networkInterfaces;\n+\n+const bench = common.createBenchmark(main, {\n+  n: [1e4]\n+});\n+\n+function main({ n }) {\n+  bench.start();\n+  for (var i = 0; i < n; ++i)\n+    networkInterfaces();\n+  bench.end(n);\n+}"
+        },
+        {
+            "sha": "cc86010f7d0ffbe1e3888f54bbbbda37909446b3",
+            "filename": "lib/os.js",
+            "status": "modified",
+            "additions": 29,
+            "deletions": 18,
+            "changes": 47,
+            "blob_url": "https://github.com/nodejs/node/blob/5021b259ed2029dd7c84c7c652268dcad13d1183/lib%2Fos.js",
+            "raw_url": "https://github.com/nodejs/node/raw/5021b259ed2029dd7c84c7c652268dcad13d1183/lib%2Fos.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Fos.js?ref=5021b259ed2029dd7c84c7c652268dcad13d1183",
+            "patch": "@@ -143,18 +143,13 @@ endianness[Symbol.toPrimitive] = () => kEndianness;\n // Returns the number of ones in the binary representation of the decimal\n // number.\n function countBinaryOnes(n) {\n-  let count = 0;\n-  // Remove one \"1\" bit from n until n is the power of 2. This iterates k times\n-  // while k is the number of \"1\" in the binary representation.\n-  // For more check https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Operators/Bitwise_Operators\n-  while (n !== 0) {\n-    n = n & (n - 1);\n-    count++;\n-  }\n-  return count;\n+  // Count the number of bits set in parallel, which is faster than looping\n+  n = n - ((n >>> 1) & 0x55555555);\n+  n = (n & 0x33333333) + ((n >>> 2) & 0x33333333);\n+  return ((n + (n >>> 4) & 0xF0F0F0F) * 0x1010101) >>> 24;\n }\n \n-function getCIDR({ address, netmask, family }) {\n+function getCIDR(address, netmask, family) {\n   let ones = 0;\n   let split = '.';\n   let range = 10;\n@@ -190,17 +185,33 @@ function getCIDR({ address, netmask, family }) {\n }\n \n function networkInterfaces() {\n-  const interfaceAddresses = getInterfaceAddresses();\n+  const data = getInterfaceAddresses();\n+  const result = {};\n \n-  const keys = Object.keys(interfaceAddresses);\n-  for (var i = 0; i < keys.length; i++) {\n-    const arr = interfaceAddresses[keys[i]];\n-    for (var j = 0; j < arr.length; j++) {\n-      arr[j].cidr = getCIDR(arr[j]);\n-    }\n+  if (data === undefined)\n+    return result;\n+  for (var i = 0; i < data.length; i += 7) {\n+    const name = data[i];\n+    const entry = {\n+      address: data[i + 1],\n+      netmask: data[i + 2],\n+      family: data[i + 3],\n+      mac: data[i + 4],\n+      internal: data[i + 5],\n+      cidr: getCIDR(data[i + 1], data[i + 2], data[i + 3])\n+    };\n+    const scopeid = data[i + 6];\n+    if (scopeid !== -1)\n+      entry.scopeid = scopeid;\n+\n+    const existing = result[name];\n+    if (existing !== undefined)\n+      existing.push(entry);\n+    else\n+      result[name] = [entry];\n   }\n \n-  return interfaceAddresses;\n+  return result;\n }\n \n function setPriority(pid, priority) {"
+        },
+        {
+            "sha": "505f42daf67fe47d4e9e2403ccac62e93c7a4594",
+            "filename": "src/node_os.cc",
+            "status": "modified",
+            "additions": 18,
+            "deletions": 37,
+            "changes": 55,
+            "blob_url": "https://github.com/nodejs/node/blob/5021b259ed2029dd7c84c7c652268dcad13d1183/src%2Fnode_os.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/5021b259ed2029dd7c84c7c652268dcad13d1183/src%2Fnode_os.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_os.cc?ref=5021b259ed2029dd7c84c7c652268dcad13d1183",
+            "patch": "@@ -213,28 +213,28 @@ static void GetLoadAvg(const FunctionCallbackInfo<Value>& args) {\n \n static void GetInterfaceAddresses(const FunctionCallbackInfo<Value>& args) {\n   Environment* env = Environment::GetCurrent(args);\n+  Isolate* isolate = env->isolate();\n   uv_interface_address_t* interfaces;\n   int count, i;\n   char ip[INET6_ADDRSTRLEN];\n   char netmask[INET6_ADDRSTRLEN];\n   std::array<char, 18> mac;\n-  Local<Object> ret, o;\n   Local<String> name, family;\n-  Local<Array> ifarr;\n \n   int err = uv_interface_addresses(&interfaces, &count);\n \n-  ret = Object::New(env->isolate());\n+  if (err == UV_ENOSYS)\n+    return args.GetReturnValue().SetUndefined();\n \n-  if (err == UV_ENOSYS) {\n-    return args.GetReturnValue().Set(ret);\n-  } else if (err) {\n+  if (err) {\n     CHECK_GE(args.Length(), 1);\n     env->CollectUVExceptionInfo(args[args.Length() - 1], errno,\n                                 \"uv_interface_addresses\");\n     return args.GetReturnValue().SetUndefined();\n   }\n \n+  Local<Value> no_scope_id = Integer::New(isolate, -1);\n+  std::vector<Local<Value>> result(count * 7);\n   for (i = 0; i < count; i++) {\n     const char* const raw_name = interfaces[i].name;\n \n@@ -243,17 +243,9 @@ static void GetInterfaceAddresses(const FunctionCallbackInfo<Value>& args) {\n     // to assume UTF8 as the default as well. It’s what people will expect if\n     // they name the interface from any input that uses UTF-8, which should be\n     // the most frequent case by far these days.)\n-    name = String::NewFromUtf8(env->isolate(), raw_name,\n+    name = String::NewFromUtf8(isolate, raw_name,\n         v8::NewStringType::kNormal).ToLocalChecked();\n \n-    if (ret->Has(env->context(), name).FromJust()) {\n-      ifarr = Local<Array>::Cast(ret->Get(env->context(),\n-                                          name).ToLocalChecked());\n-    } else {\n-      ifarr = Array::New(env->isolate());\n-      ret->Set(env->context(), name, ifarr).FromJust();\n-    }\n-\n     snprintf(mac.data(),\n              mac.size(),\n              \"%02x:%02x:%02x:%02x:%02x:%02x\",\n@@ -277,34 +269,23 @@ static void GetInterfaceAddresses(const FunctionCallbackInfo<Value>& args) {\n       family = env->unknown_string();\n     }\n \n-    o = Object::New(env->isolate());\n-    o->Set(env->context(),\n-           env->address_string(),\n-           OneByteString(env->isolate(), ip)).FromJust();\n-    o->Set(env->context(),\n-           env->netmask_string(),\n-           OneByteString(env->isolate(), netmask)).FromJust();\n-    o->Set(env->context(),\n-           env->family_string(), family).FromJust();\n-    o->Set(env->context(),\n-           env->mac_string(),\n-           FIXED_ONE_BYTE_STRING(env->isolate(), mac)).FromJust();\n-\n+    result[i * 7] = name;\n+    result[i * 7 + 1] = OneByteString(isolate, ip);\n+    result[i * 7 + 2] = OneByteString(isolate, netmask);\n+    result[i * 7 + 3] = family;\n+    result[i * 7 + 4] = FIXED_ONE_BYTE_STRING(isolate, mac);\n+    result[i * 7 + 5] =\n+      interfaces[i].is_internal ? True(isolate) : False(isolate);\n     if (interfaces[i].address.address4.sin_family == AF_INET6) {\n       uint32_t scopeid = interfaces[i].address.address6.sin6_scope_id;\n-      o->Set(env->context(), env->scopeid_string(),\n-             Integer::NewFromUnsigned(env->isolate(), scopeid)).FromJust();\n+      result[i * 7 + 6] = Integer::NewFromUnsigned(isolate, scopeid);\n+    } else {\n+      result[i * 7 + 6] = no_scope_id;\n     }\n-\n-    const bool internal = interfaces[i].is_internal;\n-    o->Set(env->context(), env->internal_string(),\n-           internal ? True(env->isolate()) : False(env->isolate())).FromJust();\n-\n-    ifarr->Set(env->context(), ifarr->Length(), o).FromJust();\n   }\n \n   uv_free_interface_addresses(interfaces, count);\n-  args.GetReturnValue().Set(ret);\n+  args.GetReturnValue().Set(Array::New(isolate, result.data(), result.size()));\n }\n \n "
+        }
+    ],
+    "stats": {
+        "total": 117,
+        "additions": 62,
+        "deletions": 55
+    }
+}

@@ -1,0 +1,36 @@
+{
+    "author": "addaleax",
+    "message": "tls_wrap: use DoTryWrite()\n\nUse `DoTryWrite()` to write data to the underlying socket.\nThis does probably not make any difference in performance\nbecause the callback is still deferred (for now), but\nbrings TLSWrap in line with other things that write to\nstreams.\n\nPR-URL: https://github.com/nodejs/node/pull/18676\nReviewed-By: Ben Noordhuis <info@bnoordhuis.nl>\nReviewed-By: Anatoli Papirovski <apapirovski@mac.com>\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "82c43aed16cf9b69e2fd44f2e9797a8c56f6fb6d",
+    "files": [
+        {
+            "sha": "ee6e120ca0bf736aa7396e0ff0cb76a46540da07",
+            "filename": "src/tls_wrap.cc",
+            "status": "modified",
+            "additions": 19,
+            "deletions": 7,
+            "changes": 26,
+            "blob_url": "https://github.com/nodejs/node/blob/82c43aed16cf9b69e2fd44f2e9797a8c56f6fb6d/src%2Ftls_wrap.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/82c43aed16cf9b69e2fd44f2e9797a8c56f6fb6d/src%2Ftls_wrap.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Ftls_wrap.cc?ref=82c43aed16cf9b69e2fd44f2e9797a8c56f6fb6d",
+            "patch": "@@ -280,17 +280,30 @@ void TLSWrap::EncOut() {\n                                                                  &count);\n   CHECK(write_size_ != 0 && count != 0);\n \n+  uv_buf_t buf[arraysize(data)];\n+  uv_buf_t* bufs = buf;\n+  for (size_t i = 0; i < count; i++)\n+    buf[i] = uv_buf_init(data[i], size[i]);\n+\n+  int err = stream_->DoTryWrite(&bufs, &count);\n+  if (err != 0) {\n+    InvokeQueued(err);\n+  } else if (count == 0) {\n+    env()->SetImmediate([](Environment* env, void* data) {\n+      NODE_COUNT_NET_BYTES_SENT(write_size_);\n+      static_cast<TLSWrap*>(data)->OnStreamAfterWrite(nullptr, 0);\n+    }, this, object());\n+    return;\n+  }\n+\n   Local<Object> req_wrap_obj =\n       env()->write_wrap_constructor_function()\n           ->NewInstance(env()->context()).ToLocalChecked();\n   WriteWrap* write_req = WriteWrap::New(env(),\n                                         req_wrap_obj,\n                                         static_cast<StreamBase*>(stream_));\n \n-  uv_buf_t buf[arraysize(data)];\n-  for (size_t i = 0; i < count; i++)\n-    buf[i] = uv_buf_init(data[i], size[i]);\n-  int err = stream_->DoWrite(write_req, buf, count, nullptr);\n+  err = stream_->DoWrite(write_req, buf, count, nullptr);\n \n   // Ignore errors, this should be already handled in js\n   if (err) {\n@@ -303,9 +316,8 @@ void TLSWrap::EncOut() {\n \n \n void TLSWrap::OnStreamAfterWrite(WriteWrap* req_wrap, int status) {\n-  // We should not be getting here after `DestroySSL`, because all queued writes\n-  // must be invoked with UV_ECANCELED\n-  CHECK_NE(ssl_, nullptr);\n+  if (ssl_ == nullptr)\n+    status = UV_ECANCELED;\n \n   // Handle error\n   if (status) {"
+        },
+        {
+            "sha": "ed17887684c9c2726c9ece232dcb6152e924f1fc",
+            "filename": "test/async-hooks/test-writewrap.js",
+            "status": "modified",
+            "additions": 23,
+            "deletions": 24,
+            "changes": 47,
+            "blob_url": "https://github.com/nodejs/node/blob/82c43aed16cf9b69e2fd44f2e9797a8c56f6fb6d/test%2Fasync-hooks%2Ftest-writewrap.js",
+            "raw_url": "https://github.com/nodejs/node/raw/82c43aed16cf9b69e2fd44f2e9797a8c56f6fb6d/test%2Fasync-hooks%2Ftest-writewrap.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fasync-hooks%2Ftest-writewrap.js?ref=82c43aed16cf9b69e2fd44f2e9797a8c56f6fb6d",
+            "patch": "@@ -1,28 +1,20 @@\n 'use strict';\n \n const common = require('../common');\n-if (!common.hasCrypto)\n-  common.skip('missing crypto');\n-\n const assert = require('assert');\n const initHooks = require('./init-hooks');\n-const fixtures = require('../common/fixtures');\n const { checkInvocations } = require('./hook-checks');\n-const tls = require('tls');\n+const net = require('net');\n \n const hooks = initHooks();\n hooks.enable();\n \n //\n // Creating server and listening on port\n //\n-const server = tls\n-  .createServer({\n-    cert: fixtures.readSync('test_cert.pem'),\n-    key: fixtures.readSync('test_key.pem')\n-  })\n+const server = net.createServer()\n   .on('listening', common.mustCall(onlistening))\n-  .on('secureConnection', common.mustCall(onsecureConnection))\n+  .on('connection', common.mustCall(onconnection))\n   .listen(0);\n \n assert.strictEqual(hooks.activitiesOfTypes('WRITEWRAP').length, 0);\n@@ -32,16 +24,17 @@ function onlistening() {\n   //\n   // Creating client and connecting it to server\n   //\n-  tls\n-    .connect(server.address().port, { rejectUnauthorized: false })\n-    .on('secureConnect', common.mustCall(onsecureConnect));\n+  net\n+    .connect(server.address().port)\n+    .on('connect', common.mustCall(onconnect));\n \n   assert.strictEqual(hooks.activitiesOfTypes('WRITEWRAP').length, 0);\n }\n \n function checkDestroyedWriteWraps(n, stage) {\n   const as = hooks.activitiesOfTypes('WRITEWRAP');\n-  assert.strictEqual(as.length, n, `${n} WRITEWRAPs when ${stage}`);\n+  assert.strictEqual(as.length, n,\n+                     `${as.length} out of ${n} WRITEWRAPs when ${stage}`);\n \n   function checkValidWriteWrap(w) {\n     assert.strictEqual(w.type, 'WRITEWRAP');\n@@ -53,41 +46,47 @@ function checkDestroyedWriteWraps(n, stage) {\n   as.forEach(checkValidWriteWrap);\n }\n \n-function onsecureConnection() {\n+function onconnection(conn) {\n+  conn.resume();\n   //\n   // Server received client connection\n   //\n-  checkDestroyedWriteWraps(3, 'server got secure connection');\n+  checkDestroyedWriteWraps(0, 'server got connection');\n }\n \n-function onsecureConnect() {\n+function onconnect() {\n   //\n   // Client connected to server\n   //\n-  checkDestroyedWriteWraps(4, 'client connected');\n+  checkDestroyedWriteWraps(0, 'client connected');\n \n   //\n   // Destroying client socket\n   //\n-  this.destroy();\n+  this.write('f'.repeat(128000), () => onafterwrite(this));\n+}\n+\n+function onafterwrite(self) {\n+  checkDestroyedWriteWraps(1, 'client destroyed');\n+  self.destroy();\n \n-  checkDestroyedWriteWraps(4, 'client destroyed');\n+  checkDestroyedWriteWraps(1, 'client destroyed');\n \n   //\n   // Closing server\n   //\n   server.close(common.mustCall(onserverClosed));\n-  checkDestroyedWriteWraps(4, 'server closing');\n+  checkDestroyedWriteWraps(1, 'server closing');\n }\n \n function onserverClosed() {\n-  checkDestroyedWriteWraps(4, 'server closed');\n+  checkDestroyedWriteWraps(1, 'server closed');\n }\n \n process.on('exit', onexit);\n \n function onexit() {\n   hooks.disable();\n   hooks.sanityCheck('WRITEWRAP');\n-  checkDestroyedWriteWraps(4, 'process exits');\n+  checkDestroyedWriteWraps(1, 'process exits');\n }"
+        }
+    ],
+    "stats": {
+        "total": 73,
+        "additions": 42,
+        "deletions": 31
+    }
+}

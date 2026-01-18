@@ -1,0 +1,60 @@
+{
+    "author": "tniessen",
+    "message": "crypto: allow to restrict valid GCM tag length\n\nThis change allows users to restrict accepted GCM authentication tag\nlengths to a single value.\n\nPR-URL: https://github.com/nodejs/node/pull/20039\nFixes: https://github.com/nodejs/node/issues/17523\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Yihong Wang <yh.wang@ibm.com>\nReviewed-By: Ben Noordhuis <info@bnoordhuis.nl>",
+    "sha": "358d8ffad650b6fb966082e7bd1460b0d6a4eacc",
+    "files": [
+        {
+            "sha": "47181f6a2c39fb532ae2821225095ccf00e3602c",
+            "filename": "doc/api/crypto.md",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 1,
+            "changes": 8,
+            "blob_url": "https://github.com/nodejs/node/blob/358d8ffad650b6fb966082e7bd1460b0d6a4eacc/doc%2Fapi%2Fcrypto.md",
+            "raw_url": "https://github.com/nodejs/node/raw/358d8ffad650b6fb966082e7bd1460b0d6a4eacc/doc%2Fapi%2Fcrypto.md",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/doc%2Fapi%2Fcrypto.md?ref=358d8ffad650b6fb966082e7bd1460b0d6a4eacc",
+            "patch": "@@ -1457,6 +1457,10 @@ to create the `Decipher` object.\n <!-- YAML\n added: v0.1.94\n changes:\n+  - version: REPLACEME\n+    pr-url: https://github.com/nodejs/node/pull/20039\n+    description: The `authTagLength` option can now be used to restrict accepted\n+                 GCM authentication tag lengths.\n   - version: v9.9.0\n     pr-url: https://github.com/nodejs/node/pull/18644\n     description: The `iv` parameter may now be `null` for ciphers which do not\n@@ -1474,7 +1478,9 @@ and initialization vector (`iv`).\n The `options` argument controls stream behavior and is optional except when a\n cipher in CCM mode is used (e.g. `'aes-128-ccm'`). In that case, the\n `authTagLength` option is required and specifies the length of the\n-authentication tag in bytes, see [CCM mode][].\n+authentication tag in bytes, see [CCM mode][]. In GCM mode, the `authTagLength`\n+option is not required but can be used to restrict accepted authentication tags\n+to those with the specified length.\n \n The `algorithm` is dependent on OpenSSL, examples are `'aes192'`, etc. On\n recent OpenSSL releases, `openssl list-cipher-algorithms` will display the"
+        },
+        {
+            "sha": "255dc6e2d42e6409062d2391f27d159570dc1fdd",
+            "filename": "src/node_crypto.cc",
+            "status": "modified",
+            "additions": 28,
+            "deletions": 5,
+            "changes": 33,
+            "blob_url": "https://github.com/nodejs/node/blob/358d8ffad650b6fb966082e7bd1460b0d6a4eacc/src%2Fnode_crypto.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/358d8ffad650b6fb966082e7bd1460b0d6a4eacc/src%2Fnode_crypto.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_crypto.cc?ref=358d8ffad650b6fb966082e7bd1460b0d6a4eacc",
+            "patch": "@@ -2797,6 +2797,10 @@ void CipherBase::InitIv(const FunctionCallbackInfo<Value>& args) {\n }\n \n \n+static bool IsValidGCMTagLength(unsigned int tag_len) {\n+  return tag_len == 4 || tag_len == 8 || tag_len >= 12 && tag_len <= 16;\n+}\n+\n bool CipherBase::InitAuthenticated(const char *cipher_type, int iv_len,\n                                    int auth_tag_len) {\n   CHECK(IsAuthenticatedMode());\n@@ -2809,7 +2813,8 @@ bool CipherBase::InitAuthenticated(const char *cipher_type, int iv_len,\n     return false;\n   }\n \n-  if (EVP_CIPHER_CTX_mode(ctx_) == EVP_CIPH_CCM_MODE) {\n+  const int mode = EVP_CIPHER_CTX_mode(ctx_);\n+  if (mode == EVP_CIPH_CCM_MODE) {\n     if (auth_tag_len < 0) {\n       char msg[128];\n       snprintf(msg, sizeof(msg), \"authTagLength required for %s\", cipher_type);\n@@ -2842,6 +2847,21 @@ bool CipherBase::InitAuthenticated(const char *cipher_type, int iv_len,\n     } else {\n       max_message_size_ = INT_MAX;\n     }\n+  } else {\n+    CHECK_EQ(mode, EVP_CIPH_GCM_MODE);\n+\n+    if (auth_tag_len >= 0) {\n+      if (!IsValidGCMTagLength(auth_tag_len)) {\n+        char msg[50];\n+        snprintf(msg, sizeof(msg),\n+            \"Invalid GCM authentication tag length: %u\", auth_tag_len);\n+        env()->ThrowError(msg);\n+        return false;\n+      }\n+\n+      // Remember the given authentication tag length for later.\n+      auth_tag_len_ = auth_tag_len;\n+    }\n   }\n \n   return true;\n@@ -2877,7 +2897,7 @@ void CipherBase::GetAuthTag(const FunctionCallbackInfo<Value>& args) {\n   // Only callable after Final and if encrypting.\n   if (cipher->ctx_ != nullptr ||\n       cipher->kind_ != kCipher ||\n-      cipher->auth_tag_len_ == 0) {\n+      cipher->auth_tag_len_ == kNoAuthTagLength) {\n     return args.GetReturnValue().SetUndefined();\n   }\n \n@@ -2902,7 +2922,9 @@ void CipherBase::SetAuthTag(const FunctionCallbackInfo<Value>& args) {\n   unsigned int tag_len = Buffer::Length(args[0]);\n   const int mode = EVP_CIPHER_CTX_mode(cipher->ctx_);\n   if (mode == EVP_CIPH_GCM_MODE) {\n-    if (tag_len > 16 || (tag_len < 12 && tag_len != 8 && tag_len != 4)) {\n+    if (cipher->auth_tag_len_ != kNoAuthTagLength &&\n+        cipher->auth_tag_len_ != tag_len ||\n+        !IsValidGCMTagLength(tag_len)) {\n       char msg[50];\n       snprintf(msg, sizeof(msg),\n           \"Invalid GCM authentication tag length: %u\", tag_len);\n@@ -2938,7 +2960,8 @@ bool CipherBase::SetAAD(const char* data, unsigned int len, int plaintext_len) {\n     if (!CheckCCMMessageLength(plaintext_len))\n       return false;\n \n-    if (kind_ == kDecipher && !auth_tag_set_ && auth_tag_len_ > 0) {\n+    if (kind_ == kDecipher && !auth_tag_set_ && auth_tag_len_ > 0 &&\n+        auth_tag_len_ != kNoAuthTagLength) {\n       if (!EVP_CIPHER_CTX_ctrl(ctx_,\n                                EVP_CTRL_CCM_SET_TAG,\n                                auth_tag_len_,\n@@ -2991,7 +3014,7 @@ CipherBase::UpdateResult CipherBase::Update(const char* data,\n \n   // on first update:\n   if (kind_ == kDecipher && IsAuthenticatedMode() && auth_tag_len_ > 0 &&\n-      !auth_tag_set_) {\n+      auth_tag_len_ != kNoAuthTagLength && !auth_tag_set_) {\n     EVP_CIPHER_CTX_ctrl(ctx_,\n                         EVP_CTRL_GCM_SET_TAG,\n                         auth_tag_len_,"
+        },
+        {
+            "sha": "3c166f5dcc89fce1a26f20786bdce80523032fca",
+            "filename": "src/node_crypto.h",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "changes": 3,
+            "blob_url": "https://github.com/nodejs/node/blob/358d8ffad650b6fb966082e7bd1460b0d6a4eacc/src%2Fnode_crypto.h",
+            "raw_url": "https://github.com/nodejs/node/raw/358d8ffad650b6fb966082e7bd1460b0d6a4eacc/src%2Fnode_crypto.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_crypto.h?ref=358d8ffad650b6fb966082e7bd1460b0d6a4eacc",
+            "patch": "@@ -359,6 +359,7 @@ class CipherBase : public BaseObject {\n     kErrorMessageSize,\n     kErrorState\n   };\n+  static const unsigned kNoAuthTagLength = static_cast<unsigned>(-1);\n \n   void Init(const char* cipher_type,\n             const char* key_buf,\n@@ -398,7 +399,7 @@ class CipherBase : public BaseObject {\n         ctx_(nullptr),\n         kind_(kind),\n         auth_tag_set_(false),\n-        auth_tag_len_(0),\n+        auth_tag_len_(kNoAuthTagLength),\n         pending_auth_failed_(false) {\n     MakeWeak<CipherBase>(this);\n   }"
+        },
+        {
+            "sha": "6c4153875264fd15793da30c2f7e82443ee0f45c",
+            "filename": "test/parallel/test-crypto-authenticated.js",
+            "status": "modified",
+            "additions": 37,
+            "deletions": 0,
+            "changes": 37,
+            "blob_url": "https://github.com/nodejs/node/blob/358d8ffad650b6fb966082e7bd1460b0d6a4eacc/test%2Fparallel%2Ftest-crypto-authenticated.js",
+            "raw_url": "https://github.com/nodejs/node/raw/358d8ffad650b6fb966082e7bd1460b0d6a4eacc/test%2Fparallel%2Ftest-crypto-authenticated.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-crypto-authenticated.js?ref=358d8ffad650b6fb966082e7bd1460b0d6a4eacc",
+            "patch": "@@ -726,9 +726,46 @@ for (const test of TEST_CASES) {\n       type: Error,\n       message: `Invalid GCM authentication tag length: ${length}`\n     });\n+\n+    common.expectsError(() => {\n+      crypto.createDecipheriv('aes-256-gcm',\n+                              'FxLKsqdmv0E9xrQhp0b1ZgI0K7JFZJM8',\n+                              'qkuZpJWCewa6Szih',\n+                              {\n+                                authTagLength: length\n+                              });\n+    }, {\n+      type: Error,\n+      message: `Invalid GCM authentication tag length: ${length}`\n+    });\n   }\n }\n \n+// Test that users can manually restrict the GCM tag length to a single value.\n+{\n+  const decipher = crypto.createDecipheriv('aes-256-gcm',\n+                                           'FxLKsqdmv0E9xrQhp0b1ZgI0K7JFZJM8',\n+                                           'qkuZpJWCewa6Szih', {\n+                                             authTagLength: 8\n+                                           });\n+\n+  common.expectsError(() => {\n+    // This tag would normally be allowed.\n+    decipher.setAuthTag(Buffer.from('1'.repeat(12)));\n+  }, {\n+    type: Error,\n+    message: 'Invalid GCM authentication tag length: 12'\n+  });\n+\n+  // The Decipher object should be left intact.\n+  decipher.setAuthTag(Buffer.from('445352d3ff85cf94', 'hex'));\n+  const text = Buffer.concat([\n+    decipher.update('3a2a3647', 'hex'),\n+    decipher.final()\n+  ]);\n+  assert.strictEqual(text.toString('utf8'), 'node');\n+}\n+\n // Test that create(De|C)ipher(iv)? throws if the mode is CCM and an invalid\n // authentication tag length has been specified.\n {"
+        }
+    ],
+    "stats": {
+        "total": 81,
+        "additions": 74,
+        "deletions": 7
+    }
+}

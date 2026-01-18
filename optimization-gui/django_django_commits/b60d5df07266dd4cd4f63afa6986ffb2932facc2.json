@@ -1,0 +1,84 @@
+{
+    "author": "SmileyChris",
+    "message": "Fixes #13252 -- Use the natural key instead of the primary key when serializing\n\ngit-svn-id: http://code.djangoproject.com/svn/django/trunk@14994 bcc190cf-cafb-0310-a4f2-bffc1f526a37",
+    "sha": "b60d5df07266dd4cd4f63afa6986ffb2932facc2",
+    "files": [
+        {
+            "sha": "9f535e3ba8833ea0ae692a9d86f9ea49b3681252",
+            "filename": "django/core/serializers/base.py",
+            "status": "modified",
+            "additions": 18,
+            "deletions": 0,
+            "changes": 18,
+            "blob_url": "https://github.com/django/django/blob/b60d5df07266dd4cd4f63afa6986ffb2932facc2/django%2Fcore%2Fserializers%2Fbase.py",
+            "raw_url": "https://github.com/django/django/raw/b60d5df07266dd4cd4f63afa6986ffb2932facc2/django%2Fcore%2Fserializers%2Fbase.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fcore%2Fserializers%2Fbase.py?ref=b60d5df07266dd4cd4f63afa6986ffb2932facc2",
+            "patch": "@@ -170,3 +170,21 @@ def save(self, save_m2m=True, using=None):\n         # prevent a second (possibly accidental) call to save() from saving\n         # the m2m data twice.\n         self.m2m_data = None\n+\n+def build_instance(Model, data, db):\n+    \"\"\"\n+    Build a model instance.\n+\n+    If the model instance doesn't have a primary key and the model supports\n+    natural keys, try to retrieve it from the database.\n+    \"\"\"\n+    obj = Model(**data)\n+    if obj.pk is None and hasattr(Model, 'natural_key') and\\\n+            hasattr(Model._default_manager, 'get_by_natural_key'):\n+        pk = obj.natural_key()\n+        try:\n+            obj.pk = Model._default_manager.db_manager(db)\\\n+                                           .get_by_natural_key(*pk).pk\n+        except Model.DoesNotExist:\n+            pass\n+    return obj"
+        },
+        {
+            "sha": "839fee12a9ff916c6f7955009e635ac7340746e4",
+            "filename": "django/core/serializers/python.py",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 7,
+            "changes": 20,
+            "blob_url": "https://github.com/django/django/blob/b60d5df07266dd4cd4f63afa6986ffb2932facc2/django%2Fcore%2Fserializers%2Fpython.py",
+            "raw_url": "https://github.com/django/django/raw/b60d5df07266dd4cd4f63afa6986ffb2932facc2/django%2Fcore%2Fserializers%2Fpython.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fcore%2Fserializers%2Fpython.py?ref=b60d5df07266dd4cd4f63afa6986ffb2932facc2",
+            "patch": "@@ -27,11 +27,13 @@ def start_object(self, obj):\n         self._current = {}\n \n     def end_object(self, obj):\n-        self.objects.append({\n-            \"model\"  : smart_unicode(obj._meta),\n-            \"pk\"     : smart_unicode(obj._get_pk_val(), strings_only=True),\n-            \"fields\" : self._current\n-        })\n+        data = {\n+            \"model\": smart_unicode(obj._meta),\n+            \"fields\": self._current\n+        }\n+        if not self.use_natural_keys or not hasattr(obj, 'natural_key'):\n+            data['pk'] = smart_unicode(obj._get_pk_val(), strings_only=True)\n+        self.objects.append(data)\n         self._current = None\n \n     def handle_field(self, obj, field):\n@@ -82,7 +84,9 @@ def Deserializer(object_list, **options):\n     for d in object_list:\n         # Look up the model and starting build a dict of data for it.\n         Model = _get_model(d[\"model\"])\n-        data = {Model._meta.pk.attname : Model._meta.pk.to_python(d[\"pk\"])}\n+        data = {}\n+        if 'pk' in d:\n+            data[Model._meta.pk.attname] = Model._meta.pk.to_python(d['pk'])\n         m2m_data = {}\n \n         # Handle each field\n@@ -127,7 +131,9 @@ def m2m_convert(value):\n             else:\n                 data[field.name] = field.to_python(field_value)\n \n-        yield base.DeserializedObject(Model(**data), m2m_data)\n+        obj = base.build_instance(Model, data, db)\n+\n+        yield base.DeserializedObject(obj, m2m_data)\n \n def _get_model(model_identifier):\n     \"\"\""
+        },
+        {
+            "sha": "36e340498800ee6e8fad01680bc722d4d2a01124",
+            "filename": "django/core/serializers/xml_serializer.py",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 18,
+            "changes": 31,
+            "blob_url": "https://github.com/django/django/blob/b60d5df07266dd4cd4f63afa6986ffb2932facc2/django%2Fcore%2Fserializers%2Fxml_serializer.py",
+            "raw_url": "https://github.com/django/django/raw/b60d5df07266dd4cd4f63afa6986ffb2932facc2/django%2Fcore%2Fserializers%2Fxml_serializer.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fcore%2Fserializers%2Fxml_serializer.py?ref=b60d5df07266dd4cd4f63afa6986ffb2932facc2",
+            "patch": "@@ -42,16 +42,12 @@ def start_object(self, obj):\n             raise base.SerializationError(\"Non-model object (%s) encountered during serialization\" % type(obj))\n \n         self.indent(1)\n-        obj_pk = obj._get_pk_val()\n-        if obj_pk is None:\n-            attrs = {\"model\": smart_unicode(obj._meta),}\n-        else:\n-            attrs = {\n-                \"pk\": smart_unicode(obj._get_pk_val()),\n-                \"model\": smart_unicode(obj._meta),\n-            }\n-\n-        self.xml.startElement(\"object\", attrs)\n+        object_data = {\"model\": smart_unicode(obj._meta)}\n+        if not self.use_natural_keys or not hasattr(obj, 'natural_key'):\n+            obj_pk = obj._get_pk_val()\n+            if obj_pk is not None:\n+                object_data['pk'] = smart_unicode(obj_pk)\n+        self.xml.startElement(\"object\", object_data)\n \n     def end_object(self, obj):\n         \"\"\"\n@@ -173,13 +169,10 @@ def _handle_object(self, node):\n         Model = self._get_model_from_node(node, \"model\")\n \n         # Start building a data dictionary from the object.\n-        # If the node is missing the pk set it to None\n-        if node.hasAttribute(\"pk\"):\n-            pk = node.getAttribute(\"pk\")\n-        else:\n-            pk = None\n-\n-        data = {Model._meta.pk.attname : Model._meta.pk.to_python(pk)}\n+        data = {}\n+        if node.hasAttribute('pk'):\n+            data[Model._meta.pk.attname] = Model._meta.pk.to_python(\n+                                                    node.getAttribute('pk'))\n \n         # Also start building a dict of m2m data (this is saved as\n         # {m2m_accessor_attribute : [list_of_related_objects]})\n@@ -210,8 +203,10 @@ def _handle_object(self, node):\n                     value = field.to_python(getInnerText(field_node).strip())\n                 data[field.name] = value\n \n+        obj = base.build_instance(Model, data, self.db)\n+\n         # Return a DeserializedObject so that the m2m data has a place to live.\n-        return base.DeserializedObject(Model(**data), m2m_data)\n+        return base.DeserializedObject(obj, m2m_data)\n \n     def _handle_fk_field_node(self, node, field):\n         \"\"\""
+        },
+        {
+            "sha": "358f869a07e4288eda11380270eb3041cbaaabba",
+            "filename": "docs/topics/serialization.txt",
+            "status": "modified",
+            "additions": 23,
+            "deletions": 0,
+            "changes": 23,
+            "blob_url": "https://github.com/django/django/blob/b60d5df07266dd4cd4f63afa6986ffb2932facc2/docs%2Ftopics%2Fserialization.txt",
+            "raw_url": "https://github.com/django/django/raw/b60d5df07266dd4cd4f63afa6986ffb2932facc2/docs%2Ftopics%2Fserialization.txt",
+            "contents_url": "https://api.github.com/repos/django/django/contents/docs%2Ftopics%2Fserialization.txt?ref=b60d5df07266dd4cd4f63afa6986ffb2932facc2",
+            "patch": "@@ -307,6 +307,12 @@ into the primary key of an actual ``Person`` object.\n     fields will be effectively unique, you can still use those fields\n     as a natural key.\n \n+.. versionchanged:: 1.3\n+\n+Deserialization of objects with no primary key will always check whether the\n+model's manager has a ``get_by_natural_key()`` method and if so, use it to\n+populate the deserialized object's primary key.\n+\n Serialization of natural keys\n ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n \n@@ -353,6 +359,23 @@ use the `--natural` command line flag to generate natural keys.\n     natural keys during serialization, but *not* be able to load those\n     key values, just don't define the ``get_by_natural_key()`` method.\n \n+.. versionchanged:: 1.3\n+\n+When ``use_natural_keys=True`` is specified, the primary key is no longer\n+provided in the serialized data of this object since it can be calculated\n+during deserialization::\n+\n+    ...\n+    {\n+        \"model\": \"store.person\",\n+        \"fields\": {\n+            \"first_name\": \"Douglas\",\n+            \"last_name\": \"Adams\",\n+            \"birth_date\": \"1952-03-11\",\n+        }\n+    }\n+    ...\n+\n Dependencies during serialization\n ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n "
+        },
+        {
+            "sha": "32c55c0707a6f3c0bb004adabff8fcece545a5b8",
+            "filename": "tests/regressiontests/serializers_regress/models.py",
+            "status": "modified",
+            "additions": 14,
+            "deletions": 0,
+            "changes": 14,
+            "blob_url": "https://github.com/django/django/blob/b60d5df07266dd4cd4f63afa6986ffb2932facc2/tests%2Fregressiontests%2Fserializers_regress%2Fmodels.py",
+            "raw_url": "https://github.com/django/django/raw/b60d5df07266dd4cd4f63afa6986ffb2932facc2/tests%2Fregressiontests%2Fserializers_regress%2Fmodels.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fserializers_regress%2Fmodels.py?ref=b60d5df07266dd4cd4f63afa6986ffb2932facc2",
+            "patch": "@@ -264,3 +264,17 @@ class LengthModel(models.Model):\n \n     def __len__(self):\n         return self.data\n+\n+#Tests for natural keys.\n+class BookManager(models.Manager):\n+    def get_by_natural_key(self, isbn13):\n+        return self.get(isbn13=isbn13)\n+\n+class Book(models.Model):\n+    isbn13 = models.CharField(max_length=14)\n+    title = models.CharField(max_length=100)\n+\n+    objects = BookManager()\n+\n+    def natural_key(self):\n+        return (self.isbn13,)"
+        },
+        {
+            "sha": "12cc4f9bf284dac7790099512df1377643fc8523",
+            "filename": "tests/regressiontests/serializers_regress/tests.py",
+            "status": "modified",
+            "additions": 28,
+            "deletions": 0,
+            "changes": 28,
+            "blob_url": "https://github.com/django/django/blob/b60d5df07266dd4cd4f63afa6986ffb2932facc2/tests%2Fregressiontests%2Fserializers_regress%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/b60d5df07266dd4cd4f63afa6986ffb2932facc2/tests%2Fregressiontests%2Fserializers_regress%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fserializers_regress%2Ftests.py?ref=b60d5df07266dd4cd4f63afa6986ffb2932facc2",
+            "patch": "@@ -414,8 +414,36 @@ def streamTest(format, self):\n     self.assertEqual(string_data, stream.getvalue())\n     stream.close()\n \n+def naturalKeyTest(format, self):\n+    book1 = {'isbn13': '978-1590597255', 'title': 'The Definitive Guide to '\n+             'Django: Web Development Done Right'}\n+    book2 = {'isbn13':'978-1590599969', 'title': 'Practical Django Projects'}\n+\n+    # Create the books.\n+    adrian = Book.objects.create(**book1)\n+    james = Book.objects.create(**book2)\n+\n+    # Serialize the books.\n+    string_data = serializers.serialize(format, Book.objects.all(), indent=2,\n+                                        use_natural_keys=True)\n+\n+    # Delete one book (to prove that the natural key generation will only\n+    # restore the primary keys of books found in the database via the\n+    # get_natural_key manager method).\n+    james.delete()\n+\n+    # Deserialize and test.\n+    books = list(serializers.deserialize(format, string_data))\n+    self.assertEqual(len(books), 2)\n+    self.assertEqual(books[0].object.title, book1['title'])\n+    self.assertEqual(books[0].object.pk, adrian.pk)\n+    self.assertEqual(books[1].object.title, book2['title'])\n+    self.assertEqual(books[1].object.pk, None)\n+\n for format in serializers.get_serializer_formats():\n     setattr(SerializerTests, 'test_' + format + '_serializer', curry(serializerTest, format))\n     setattr(SerializerTests, 'test_' + format + '_serializer_fields', curry(fieldsTest, format))\n+    setattr(SerializerTests, 'test_' + format + '_serializer_natural_key',\n+            curry(naturalKeyTest, format))\n     if format != 'python':\n         setattr(SerializerTests, 'test_' + format + '_serializer_stream', curry(streamTest, format))"
+        }
+    ],
+    "stats": {
+        "total": 134,
+        "additions": 109,
+        "deletions": 25
+    }
+}

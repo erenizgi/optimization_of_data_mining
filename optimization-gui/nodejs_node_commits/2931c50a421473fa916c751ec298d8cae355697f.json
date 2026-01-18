@@ -1,0 +1,48 @@
+{
+    "author": "MylesBorins",
+    "message": "esm: refactor dynamic modules\n\nThis is a change from the ecmascript-modules fork.\nThere is no change to behavior and we would like to\nupstream to reduce the delta between our repos.\n\nRefs: https://github.com/nodejs/ecmascript-modules#9\n\nPR-URL: https://github.com/nodejs/node/pull/24560\nRefs: https://github.com/nodejs/ecmascript-modules/pull/9\nReviewed-By: Guy Bedford <guybedford@gmail.com>\nReviewed-By: Gus Caplan <me@gus.host>",
+    "sha": "2931c50a421473fa916c751ec298d8cae355697f",
+    "files": [
+        {
+            "sha": "23bd8badbb95617e18bfaaf979ba9e82ffd4f672",
+            "filename": "lib/internal/modules/cjs/loader.js",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 12,
+            "changes": 25,
+            "blob_url": "https://github.com/nodejs/node/blob/2931c50a421473fa916c751ec298d8cae355697f/lib%2Finternal%2Fmodules%2Fcjs%2Floader.js",
+            "raw_url": "https://github.com/nodejs/node/raw/2931c50a421473fa916c751ec298d8cae355697f/lib%2Finternal%2Fmodules%2Fcjs%2Floader.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fmodules%2Fcjs%2Floader.js?ref=2931c50a421473fa916c751ec298d8cae355697f",
+            "patch": "@@ -623,23 +623,24 @@ Module.prototype.load = function(filename) {\n   if (experimentalModules) {\n     if (asyncESM === undefined) lazyLoadESM();\n     const ESMLoader = asyncESM.ESMLoader;\n-    const url = pathToFileURL(filename);\n-    const urlString = `${url}`;\n+    const url = `${pathToFileURL(filename)}`;\n+    const module = ESMLoader.moduleMap.get(url);\n+    // create module entry at load time to snapshot exports correctly\n     const exports = this.exports;\n-    if (ESMLoader.moduleMap.has(urlString) !== true) {\n+    if (module !== undefined) { // called from cjs translator\n+      module.reflect.onReady((reflect) => {\n+        reflect.exports.default.set(exports);\n+      });\n+    } else { // preemptively cache\n       ESMLoader.moduleMap.set(\n-        urlString,\n+        url,\n         new ModuleJob(ESMLoader, url, async () => {\n-          const ctx = createDynamicModule(\n-            ['default'], url);\n-          ctx.reflect.exports.default.set(exports);\n-          return ctx;\n+          return createDynamicModule(\n+            ['default'], url, (reflect) => {\n+              reflect.exports.default.set(exports);\n+            });\n         })\n       );\n-    } else {\n-      const job = ESMLoader.moduleMap.get(urlString);\n-      if (job.reflect)\n-        job.reflect.exports.default.set(exports);\n     }\n   }\n };"
+        },
+        {
+            "sha": "8358016195f11d77f9df48f1e843034c33347251",
+            "filename": "lib/internal/modules/esm/create_dynamic_module.js",
+            "status": "modified",
+            "additions": 41,
+            "deletions": 44,
+            "changes": 85,
+            "blob_url": "https://github.com/nodejs/node/blob/2931c50a421473fa916c751ec298d8cae355697f/lib%2Finternal%2Fmodules%2Fesm%2Fcreate_dynamic_module.js",
+            "raw_url": "https://github.com/nodejs/node/raw/2931c50a421473fa916c751ec298d8cae355697f/lib%2Finternal%2Fmodules%2Fesm%2Fcreate_dynamic_module.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fmodules%2Fesm%2Fcreate_dynamic_module.js?ref=2931c50a421473fa916c751ec298d8cae355697f",
+            "patch": "@@ -1,6 +1,6 @@\n 'use strict';\n \n-const { ModuleWrap } = internalBinding('module_wrap');\n+const { ModuleWrap, callbackMap } = internalBinding('module_wrap');\n const debug = require('util').debuglog('esm');\n const ArrayJoin = Function.call.bind(Array.prototype.join);\n const ArrayMap = Function.call.bind(Array.prototype.map);\n@@ -10,50 +10,47 @@ const createDynamicModule = (exports, url = '', evaluate) => {\n     `creating ESM facade for ${url} with exports: ${ArrayJoin(exports, ', ')}`\n   );\n   const names = ArrayMap(exports, (name) => `${name}`);\n-  // Create two modules: One whose exports are get- and set-able ('reflective'),\n-  // and one which re-exports all of these but additionally may\n-  // run an executor function once everything is set up.\n-  const src = `\n-  export let executor;\n-  ${ArrayJoin(ArrayMap(names, (name) => `export let $${name};`), '\\n')}\n-  /* This function is implicitly returned as the module's completion value */\n-  (() => ({\n-    setExecutor: fn => executor = fn,\n-    reflect: {\n-      exports: { ${\n-  ArrayJoin(ArrayMap(names, (name) => `\n-        ${name}: {\n-          get: () => $${name},\n-          set: v => $${name} = v\n-        }`), ', \\n')}\n-      }\n-    }\n-  }));`;\n-  const reflectiveModule = new ModuleWrap(src, `cjs-facade:${url}`);\n-  reflectiveModule.instantiate();\n-  const { setExecutor, reflect } = reflectiveModule.evaluate(-1, false)();\n-  // public exposed ESM\n-  const reexports = `\n-  import {\n-    executor,\n-    ${ArrayMap(names, (name) => `$${name}`)}\n-  } from \"\";\n-  export {\n-    ${ArrayJoin(ArrayMap(names, (name) => `$${name} as ${name}`), ', ')}\n-  }\n-  if (typeof executor === \"function\") {\n-    // add await to this later if top level await comes along\n-    executor()\n-  }`;\n-  if (typeof evaluate === 'function') {\n-    setExecutor(() => evaluate(reflect));\n-  }\n-  const module = new ModuleWrap(reexports, `${url}`);\n-  module.link(async () => reflectiveModule);\n-  module.instantiate();\n-  reflect.namespace = module.namespace();\n+\n+  const source = `\n+${ArrayJoin(ArrayMap(names, (name) =>\n+    `let $${name};\n+export { $${name} as ${name} };\n+import.meta.exports.${name} = {\n+  get: () => $${name},\n+  set: (v) => $${name} = v,\n+};`), '\\n')\n+}\n+\n+import.meta.done();\n+`;\n+\n+  const m = new ModuleWrap(source, `${url}`);\n+  m.link(() => 0);\n+  m.instantiate();\n+\n+  const readyfns = new Set();\n+  const reflect = {\n+    namespace: m.namespace(),\n+    exports: {},\n+    onReady: (cb) => { readyfns.add(cb); },\n+  };\n+\n+  callbackMap.set(m, {\n+    initializeImportMeta: (meta, wrap) => {\n+      meta.exports = reflect.exports;\n+      meta.done = () => {\n+        evaluate(reflect);\n+        reflect.onReady = (cb) => cb(reflect);\n+        for (const fn of readyfns) {\n+          readyfns.delete(fn);\n+          fn(reflect);\n+        }\n+      };\n+    },\n+  });\n+\n   return {\n-    module,\n+    module: m,\n     reflect,\n   };\n };"
+        },
+        {
+            "sha": "0d19a728aa788bdeda1817a821c40ef8cd3adc4c",
+            "filename": "lib/internal/modules/esm/translators.js",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 3,
+            "changes": 7,
+            "blob_url": "https://github.com/nodejs/node/blob/2931c50a421473fa916c751ec298d8cae355697f/lib%2Finternal%2Fmodules%2Fesm%2Ftranslators.js",
+            "raw_url": "https://github.com/nodejs/node/raw/2931c50a421473fa916c751ec298d8cae355697f/lib%2Finternal%2Fmodules%2Fesm%2Ftranslators.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fmodules%2Fesm%2Ftranslators.js?ref=2931c50a421473fa916c751ec298d8cae355697f",
+            "patch": "@@ -60,9 +60,10 @@ translators.set('cjs', async (url, isMain) => {\n   const module = CJSModule._cache[\n     isWindows ? StringReplace(pathname, winSepRegEx, '\\\\') : pathname];\n   if (module && module.loaded) {\n-    const ctx = createDynamicModule(['default'], url);\n-    ctx.reflect.exports.default.set(module.exports);\n-    return ctx;\n+    const exports = module.exports;\n+    return createDynamicModule(['default'], url, (reflect) => {\n+      reflect.exports.default.set(exports);\n+    });\n   }\n   return createDynamicModule(['default'], url, () => {\n     debug(`Loading CJSModule ${url}`);"
+        }
+    ],
+    "stats": {
+        "total": 117,
+        "additions": 58,
+        "deletions": 59
+    }
+}

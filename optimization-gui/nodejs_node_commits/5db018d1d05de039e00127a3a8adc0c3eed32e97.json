@@ -1,0 +1,48 @@
+{
+    "author": "devsnek",
+    "message": "v8: backport 9fb02b526f1cd3b859a530a01adb08bc0d089f4f\n\nRefs: https://github.com/v8/v8/commit/9fb02b526f1cd3b859a530a01adb08bc0d089f4f\n\nOriginal commit message:\n\n    Allow function callbacks to have Proxy as receiver.\n\n    R=verwaest@chromium.org\n\n    Bug: v8:5773\n    Change-Id: Ifd29a1116ee8c86b8d8d24485bbfd19e260ab66b\n    Reviewed-on: chromium-review.googlesource.com/1046088\n    Commit-Queue: Yang Guo <yangguo@chromium.org>\n    Reviewed-by: Camillo Bruni <cbruni@chromium.org>\n    Cr-Commit-Position: refs/heads/master@{#53015}\n\nPR-URL: https://github.com/nodejs/node/pull/20575\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Ben Noordhuis <info@bnoordhuis.nl>",
+    "sha": "5db018d1d05de039e00127a3a8adc0c3eed32e97",
+    "files": [
+        {
+            "sha": "adeaf85c12bac183ef2ecf32d3e2d28aff5c090e",
+            "filename": "common.gypi",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/5db018d1d05de039e00127a3a8adc0c3eed32e97/common.gypi",
+            "raw_url": "https://github.com/nodejs/node/raw/5db018d1d05de039e00127a3a8adc0c3eed32e97/common.gypi",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/common.gypi?ref=5db018d1d05de039e00127a3a8adc0c3eed32e97",
+            "patch": "@@ -27,7 +27,7 @@\n \n     # Reset this number to 0 on major V8 upgrades.\n     # Increment by one for each non-official patch applied to deps/v8.\n-    'v8_embedder_string': '-node.6',\n+    'v8_embedder_string': '-node.7',\n \n     # Enable disassembler for `--print-code` v8 options\n     'v8_enable_disassembler': 1,"
+        },
+        {
+            "sha": "bb66b082f3edf361b54fda6593de4d9a3653dbf8",
+            "filename": "deps/v8/src/builtins/builtins-api.cc",
+            "status": "modified",
+            "additions": 21,
+            "deletions": 20,
+            "changes": 41,
+            "blob_url": "https://github.com/nodejs/node/blob/5db018d1d05de039e00127a3a8adc0c3eed32e97/deps%2Fv8%2Fsrc%2Fbuiltins%2Fbuiltins-api.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/5db018d1d05de039e00127a3a8adc0c3eed32e97/deps%2Fv8%2Fsrc%2Fbuiltins%2Fbuiltins-api.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/deps%2Fv8%2Fsrc%2Fbuiltins%2Fbuiltins-api.cc?ref=5db018d1d05de039e00127a3a8adc0c3eed32e97",
+            "patch": "@@ -21,17 +21,21 @@ namespace {\n // Returns the holder JSObject if the function can legally be called with this\n // receiver.  Returns nullptr if the call is illegal.\n // TODO(dcarney): CallOptimization duplicates this logic, merge.\n-JSObject* GetCompatibleReceiver(Isolate* isolate, FunctionTemplateInfo* info,\n-                                JSObject* receiver) {\n+JSReceiver* GetCompatibleReceiver(Isolate* isolate, FunctionTemplateInfo* info,\n+                                  JSReceiver* receiver) {\n   Object* recv_type = info->signature();\n   // No signature, return holder.\n   if (!recv_type->IsFunctionTemplateInfo()) return receiver;\n+  // A Proxy cannot have been created from the signature template.\n+  if (!receiver->IsJSObject()) return nullptr;\n+\n+  JSObject* js_obj_receiver = JSObject::cast(receiver);\n   FunctionTemplateInfo* signature = FunctionTemplateInfo::cast(recv_type);\n \n   // Check the receiver. Fast path for receivers with no hidden prototypes.\n-  if (signature->IsTemplateFor(receiver)) return receiver;\n-  if (!receiver->map()->has_hidden_prototype()) return nullptr;\n-  for (PrototypeIterator iter(isolate, receiver, kStartAtPrototype,\n+  if (signature->IsTemplateFor(js_obj_receiver)) return receiver;\n+  if (!js_obj_receiver->map()->has_hidden_prototype()) return nullptr;\n+  for (PrototypeIterator iter(isolate, js_obj_receiver, kStartAtPrototype,\n                               PrototypeIterator::END_AT_NON_HIDDEN);\n        !iter.IsAtEnd(); iter.Advance()) {\n     JSObject* current = iter.GetCurrent<JSObject>();\n@@ -45,8 +49,8 @@ MUST_USE_RESULT MaybeHandle<Object> HandleApiCallHelper(\n     Isolate* isolate, Handle<HeapObject> function,\n     Handle<HeapObject> new_target, Handle<FunctionTemplateInfo> fun_data,\n     Handle<Object> receiver, BuiltinArguments args) {\n-  Handle<JSObject> js_receiver;\n-  JSObject* raw_holder;\n+  Handle<JSReceiver> js_receiver;\n+  JSReceiver* raw_holder;\n   if (is_construct) {\n     DCHECK(args.receiver()->IsTheHole(isolate));\n     if (fun_data->instance_template()->IsUndefined(isolate)) {\n@@ -68,21 +72,18 @@ MUST_USE_RESULT MaybeHandle<Object> HandleApiCallHelper(\n     raw_holder = *js_receiver;\n   } else {\n     DCHECK(receiver->IsJSReceiver());\n-\n-    if (!receiver->IsJSObject()) {\n-      // This function cannot be called with the given receiver.  Abort!\n-      THROW_NEW_ERROR(\n-          isolate, NewTypeError(MessageTemplate::kIllegalInvocation), Object);\n-    }\n-\n-    js_receiver = Handle<JSObject>::cast(receiver);\n+    js_receiver = Handle<JSReceiver>::cast(receiver);\n \n     if (!fun_data->accept_any_receiver() &&\n-        js_receiver->IsAccessCheckNeeded() &&\n-        !isolate->MayAccess(handle(isolate->context()), js_receiver)) {\n-      isolate->ReportFailedAccessCheck(js_receiver);\n-      RETURN_EXCEPTION_IF_SCHEDULED_EXCEPTION(isolate, Object);\n-      return isolate->factory()->undefined_value();\n+        js_receiver->IsAccessCheckNeeded()) {\n+      // Proxies never need access checks.\n+      DCHECK(js_receiver->IsJSObject());\n+      Handle<JSObject> js_obj_receiver = Handle<JSObject>::cast(js_receiver);\n+      if (!isolate->MayAccess(handle(isolate->context()), js_obj_receiver)) {\n+        isolate->ReportFailedAccessCheck(js_obj_receiver);\n+        RETURN_EXCEPTION_IF_SCHEDULED_EXCEPTION(isolate, Object);\n+        return isolate->factory()->undefined_value();\n+      }\n     }\n \n     raw_holder = GetCompatibleReceiver(isolate, *fun_data, *js_receiver);"
+        },
+        {
+            "sha": "40ba60ffb3660749500bbbe79689db184c94ecb4",
+            "filename": "deps/v8/test/cctest/test-api.cc",
+            "status": "modified",
+            "additions": 28,
+            "deletions": 0,
+            "changes": 28,
+            "blob_url": "https://github.com/nodejs/node/blob/5db018d1d05de039e00127a3a8adc0c3eed32e97/deps%2Fv8%2Ftest%2Fcctest%2Ftest-api.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/5db018d1d05de039e00127a3a8adc0c3eed32e97/deps%2Fv8%2Ftest%2Fcctest%2Ftest-api.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/deps%2Fv8%2Ftest%2Fcctest%2Ftest-api.cc?ref=5db018d1d05de039e00127a3a8adc0c3eed32e97",
+            "patch": "@@ -1088,6 +1088,34 @@ THREADED_PROFILED_TEST(FunctionTemplate) {\n   TestFunctionTemplateAccessor(construct_callback, Return239Callback);\n }\n \n+static void FunctionCallbackForProxyTest(\n+    const v8::FunctionCallbackInfo<Value>& info) {\n+  info.GetReturnValue().Set(info.This());\n+}\n+\n+THREADED_TEST(FunctionTemplateWithProxy) {\n+  LocalContext env;\n+  v8::Isolate* isolate = env->GetIsolate();\n+  v8::HandleScope scope(isolate);\n+\n+  v8::Local<v8::FunctionTemplate> function_template =\n+      v8::FunctionTemplate::New(isolate, FunctionCallbackForProxyTest);\n+  v8::Local<v8::Function> function =\n+      function_template->GetFunction(env.local()).ToLocalChecked();\n+  CHECK((*env)->Global()->Set(env.local(), v8_str(\"f\"), function).FromJust());\n+  v8::Local<v8::Value> proxy =\n+      CompileRun(\"var proxy = new Proxy({}, {}); proxy\");\n+  CHECK(proxy->IsProxy());\n+\n+  v8::Local<v8::Value> result = CompileRun(\"f(proxy)\");\n+  CHECK(result->Equals(env.local(), (*env)->Global()).FromJust());\n+\n+  result = CompileRun(\"f.call(proxy)\");\n+  CHECK(result->Equals(env.local(), proxy).FromJust());\n+\n+  result = CompileRun(\"Reflect.apply(f, proxy, [1])\");\n+  CHECK(result->Equals(env.local(), proxy).FromJust());\n+}\n \n static void SimpleCallback(const v8::FunctionCallbackInfo<v8::Value>& info) {\n   ApiTestFuzzer::Fuzz();"
+        }
+    ],
+    "stats": {
+        "total": 71,
+        "additions": 50,
+        "deletions": 21
+    }
+}

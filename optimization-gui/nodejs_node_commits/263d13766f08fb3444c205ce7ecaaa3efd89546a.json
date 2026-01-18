@@ -1,0 +1,72 @@
+{
+    "author": "joyeecheung",
+    "message": "src: initialize ICU version in per_process::metadata.versions\n\nInstead of\n\n- Initialize the ICU versions in JS land after consulting\n  internalBinding('config').hasIntl\n- Joining the version keys in C++\n- Splitting the keys in JS and call into C++ again to get the value for\n  each of the keys\n\nDo:\n\n- Guard the initialization code behind `NODE_HAVE_I18N_SUPPORT`\n- Do the initialization in C++ right after ICU data is loaded\n- Initialize each version directly using ICU functions/constants,\n  and put them in per_process::metadata.versions. These will be\n  copied into `process.versions` naturally later.\n  This way, the initialization of the versions won't be called\n  in worker threads again.\n\nPR-URL: https://github.com/nodejs/node/pull/25115\nReviewed-By: Steven R Loomis <srloomis@us.ibm.com>\nReviewed-By: Richard Lau <riclau@uk.ibm.com>\nReviewed-By: Minwoo Jung <minwoo@nodesource.com>\nReviewed-By: James M Snell <jasnell@gmail.com>",
+    "sha": "263d13766f08fb3444c205ce7ecaaa3efd89546a",
+    "files": [
+        {
+            "sha": "c70deafb08842e2322ab60a1abbe02a8cbe6d2db",
+            "filename": "lib/internal/bootstrap/node.js",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 21,
+            "changes": 21,
+            "blob_url": "https://github.com/nodejs/node/blob/263d13766f08fb3444c205ce7ecaaa3efd89546a/lib%2Finternal%2Fbootstrap%2Fnode.js",
+            "raw_url": "https://github.com/nodejs/node/raw/263d13766f08fb3444c205ce7ecaaa3efd89546a/lib%2Finternal%2Fbootstrap%2Fnode.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Finternal%2Fbootstrap%2Fnode.js?ref=263d13766f08fb3444c205ce7ecaaa3efd89546a",
+            "patch": "@@ -38,8 +38,6 @@ function startup() {\n   // Do this good and early, since it handles errors.\n   setupProcessFatal();\n \n-  setupProcessICUVersions();\n-\n   setupGlobalVariables();\n \n   // Bootstrappers for all threads, including worker threads and main thread\n@@ -638,25 +636,6 @@ function setupProcessFatal() {\n   };\n }\n \n-function setupProcessICUVersions() {\n-  const icu = internalBinding('config').hasIntl ?\n-    internalBinding('icu') : undefined;\n-  if (!icu) return;  // no Intl/ICU: nothing to add here.\n-  // With no argument, getVersion() returns a comma separated list\n-  // of possible types.\n-  const versionTypes = icu.getVersion().split(',');\n-\n-  for (var n = 0; n < versionTypes.length; n++) {\n-    const name = versionTypes[n];\n-    const version = icu.getVersion(name);\n-    Object.defineProperty(process.versions, name, {\n-      writable: false,\n-      enumerable: true,\n-      value: version\n-    });\n-  }\n-}\n-\n function wrapForBreakOnFirstLine(source) {\n   if (!process._breakFirstLine)\n     return source;"
+        },
+        {
+            "sha": "6ae0753f405b2422fd82c2c6fc8f2b479ba07e00",
+            "filename": "src/node.cc",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 1,
+            "changes": 6,
+            "blob_url": "https://github.com/nodejs/node/blob/263d13766f08fb3444c205ce7ecaaa3efd89546a/src%2Fnode.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/263d13766f08fb3444c205ce7ecaaa3efd89546a/src%2Fnode.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode.cc?ref=263d13766f08fb3444c205ce7ecaaa3efd89546a",
+            "patch": "@@ -877,7 +877,10 @@ void SetupProcessObject(Environment* env,\n   READONLY_PROPERTY(process, \"versions\", versions);\n \n #define V(key)                                                                 \\\n-  READONLY_STRING_PROPERTY(versions, #key, per_process::metadata.versions.key);\n+  if (!per_process::metadata.versions.key.empty()) {                           \\\n+    READONLY_STRING_PROPERTY(                                                  \\\n+        versions, #key, per_process::metadata.versions.key);                   \\\n+  }\n   NODE_VERSIONS_KEYS(V)\n #undef V\n \n@@ -1664,6 +1667,7 @@ void Init(std::vector<std::string>* argv,\n             argv->at(0).c_str());\n     exit(9);\n   }\n+  per_process::metadata.versions.InitializeIntlVersions();\n #endif\n \n   // We should set node_is_initialized here instead of in node::Start,"
+        },
+        {
+            "sha": "c081bde93bec2a830f8e2c259390b381fd213c54",
+            "filename": "src/node_i18n.cc",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 62,
+            "changes": 62,
+            "blob_url": "https://github.com/nodejs/node/blob/263d13766f08fb3444c205ce7ecaaa3efd89546a/src%2Fnode_i18n.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/263d13766f08fb3444c205ce7ecaaa3efd89546a/src%2Fnode_i18n.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_i18n.cc?ref=263d13766f08fb3444c205ce7ecaaa3efd89546a",
+            "patch": "@@ -510,67 +510,6 @@ void ICUErrorName(const FunctionCallbackInfo<Value>& args) {\n                           NewStringType::kNormal).ToLocalChecked());\n }\n \n-#define TYPE_ICU \"icu\"\n-#define TYPE_UNICODE \"unicode\"\n-#define TYPE_CLDR \"cldr\"\n-#define TYPE_TZ \"tz\"\n-\n-/**\n- * This is the workhorse function that deals with the actual version info.\n- * Get an ICU version.\n- * @param type the type of version to get. One of VERSION_TYPES\n- * @param buf optional buffer for result\n- * @param status ICU error status. If failure, assume result is undefined.\n- * @return version number, or NULL. May or may not be buf.\n- */\n-const char* GetVersion(const char* type,\n-                       char buf[U_MAX_VERSION_STRING_LENGTH],\n-                       UErrorCode* status) {\n-  if (!strcmp(type, TYPE_ICU)) {\n-    return U_ICU_VERSION;\n-  } else if (!strcmp(type, TYPE_UNICODE)) {\n-    return U_UNICODE_VERSION;\n-  } else if (!strcmp(type, TYPE_TZ)) {\n-    return icu::TimeZone::getTZDataVersion(*status);\n-  } else if (!strcmp(type, TYPE_CLDR)) {\n-    UVersionInfo versionArray;\n-    ulocdata_getCLDRVersion(versionArray, status);\n-    if (U_SUCCESS(*status)) {\n-      u_versionToString(versionArray, buf);\n-      return buf;\n-    }\n-  }\n-  // Fall through - unknown type or error case\n-  return nullptr;\n-}\n-\n-void GetVersion(const FunctionCallbackInfo<Value>& args) {\n-  Environment* env = Environment::GetCurrent(args);\n-  if ( args.Length() == 0 ) {\n-    // With no args - return a comma-separated list of allowed values\n-      args.GetReturnValue().Set(\n-          String::NewFromUtf8(env->isolate(),\n-            TYPE_ICU \",\"\n-            TYPE_UNICODE \",\"\n-            TYPE_CLDR \",\"\n-            TYPE_TZ, NewStringType::kNormal).ToLocalChecked());\n-  } else {\n-    CHECK_GE(args.Length(), 1);\n-    CHECK(args[0]->IsString());\n-    Utf8Value val(env->isolate(), args[0]);\n-    UErrorCode status = U_ZERO_ERROR;\n-    char buf[U_MAX_VERSION_STRING_LENGTH] = \"\";  // Possible output buffer.\n-    const char* versionString = GetVersion(*val, buf, &status);\n-\n-    if (U_SUCCESS(status) && versionString) {\n-      // Success.\n-      args.GetReturnValue().Set(\n-          String::NewFromUtf8(env->isolate(),\n-          versionString, NewStringType::kNormal).ToLocalChecked());\n-    }\n-  }\n-}\n-\n }  // anonymous namespace\n \n bool InitializeICUDirectory(const std::string& path) {\n@@ -868,7 +807,6 @@ void Initialize(Local<Object> target,\n   env->SetMethod(target, \"toUnicode\", ToUnicode);\n   env->SetMethod(target, \"toASCII\", ToASCII);\n   env->SetMethod(target, \"getStringWidth\", GetStringWidth);\n-  env->SetMethod(target, \"getVersion\", GetVersion);\n \n   // One-shot converters\n   env->SetMethod(target, \"icuErrName\", ICUErrorName);"
+        },
+        {
+            "sha": "ff8d408f5bdc6878917807c61f0e718a5ab15a0e",
+            "filename": "src/node_metadata.cc",
+            "status": "modified",
+            "additions": 31,
+            "deletions": 0,
+            "changes": 31,
+            "blob_url": "https://github.com/nodejs/node/blob/263d13766f08fb3444c205ce7ecaaa3efd89546a/src%2Fnode_metadata.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/263d13766f08fb3444c205ce7ecaaa3efd89546a/src%2Fnode_metadata.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_metadata.cc?ref=263d13766f08fb3444c205ce7ecaaa3efd89546a",
+            "patch": "@@ -11,6 +11,13 @@\n #include <openssl/opensslv.h>\n #endif  // HAVE_OPENSSL\n \n+#ifdef NODE_HAVE_I18N_SUPPORT\n+#include <unicode/timezone.h>\n+#include <unicode/ulocdata.h>\n+#include <unicode/uvernum.h>\n+#include <unicode/uversion.h>\n+#endif  // NODE_HAVE_I18N_SUPPORT\n+\n namespace node {\n \n namespace per_process {\n@@ -34,6 +41,25 @@ std::string GetOpenSSLVersion() {\n }\n #endif  // HAVE_OPENSSL\n \n+#ifdef NODE_HAVE_I18N_SUPPORT\n+void Metadata::Versions::InitializeIntlVersions() {\n+  UErrorCode status = U_ZERO_ERROR;\n+\n+  const char* tz_version = icu::TimeZone::getTZDataVersion(status);\n+  if (U_SUCCESS(status)) {\n+    tz = tz_version;\n+  }\n+\n+  char buf[U_MAX_VERSION_STRING_LENGTH];\n+  UVersionInfo versionArray;\n+  ulocdata_getCLDRVersion(versionArray, &status);\n+  if (U_SUCCESS(status)) {\n+    u_versionToString(versionArray, buf);\n+    cldr = buf;\n+  }\n+}\n+#endif  // NODE_HAVE_I18N_SUPPORT\n+\n Metadata::Versions::Versions() {\n   node = NODE_VERSION_STRING;\n   v8 = v8::V8::GetVersion();\n@@ -49,6 +75,11 @@ Metadata::Versions::Versions() {\n #if HAVE_OPENSSL\n   openssl = GetOpenSSLVersion();\n #endif\n+\n+#ifdef NODE_HAVE_I18N_SUPPORT\n+  icu = U_ICU_VERSION;\n+  unicode = U_UNICODE_VERSION;\n+#endif  // NODE_HAVE_I18N_SUPPORT\n }\n \n }  // namespace node"
+        },
+        {
+            "sha": "3c3a430dd7358419de9cfbd6808a8684226b4902",
+            "filename": "src/node_metadata.h",
+            "status": "modified",
+            "additions": 25,
+            "deletions": 1,
+            "changes": 26,
+            "blob_url": "https://github.com/nodejs/node/blob/263d13766f08fb3444c205ce7ecaaa3efd89546a/src%2Fnode_metadata.h",
+            "raw_url": "https://github.com/nodejs/node/raw/263d13766f08fb3444c205ce7ecaaa3efd89546a/src%2Fnode_metadata.h",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_metadata.h?ref=263d13766f08fb3444c205ce7ecaaa3efd89546a",
+            "patch": "@@ -25,14 +25,38 @@ namespace node {\n #define NODE_VERSIONS_KEY_CRYPTO(V)\n #endif\n \n+#ifdef NODE_HAVE_I18N_SUPPORT\n+#define NODE_VERSIONS_KEY_INTL(V)                                              \\\n+  V(cldr)                                                                      \\\n+  V(icu)                                                                       \\\n+  V(tz)                                                                        \\\n+  V(unicode)\n+#else\n+#define NODE_VERSIONS_KEY_INTL(V)\n+#endif  // NODE_HAVE_I18N_SUPPORT\n+\n #define NODE_VERSIONS_KEYS(V)                                                  \\\n   NODE_VERSIONS_KEYS_BASE(V)                                                   \\\n-  NODE_VERSIONS_KEY_CRYPTO(V)\n+  NODE_VERSIONS_KEY_CRYPTO(V)                                                  \\\n+  NODE_VERSIONS_KEY_INTL(V)\n \n class Metadata {\n  public:\n+  Metadata() = default;\n+  Metadata(Metadata&) = delete;\n+  Metadata(Metadata&&) = delete;\n+  Metadata operator=(Metadata&) = delete;\n+  Metadata operator=(Metadata&&) = delete;\n+\n   struct Versions {\n     Versions();\n+\n+#ifdef NODE_HAVE_I18N_SUPPORT\n+    // Must be called on the main thread after\n+    // i18n::InitializeICUDirectory()\n+    void InitializeIntlVersions();\n+#endif  // NODE_HAVE_I18N_SUPPORT\n+\n #define V(key) std::string key;\n     NODE_VERSIONS_KEYS(V)\n #undef V"
+        }
+    ],
+    "stats": {
+        "total": 146,
+        "additions": 61,
+        "deletions": 85
+    }
+}

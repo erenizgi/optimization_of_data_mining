@@ -1,0 +1,36 @@
+{
+    "author": "ambv",
+    "message": "Fixed #18191 -- Don't consider Accept-Language redundantly in cache key.\n\nThanks to choongmin for the original patch.",
+    "sha": "6a057e1595dfe45a0411c116f603801266c87395",
+    "files": [
+        {
+            "sha": "8f111592c412832aa48398c59576af2959f3113b",
+            "filename": "django/utils/cache.py",
+            "status": "modified",
+            "additions": 12,
+            "deletions": 2,
+            "changes": 14,
+            "blob_url": "https://github.com/django/django/blob/6a057e1595dfe45a0411c116f603801266c87395/django%2Futils%2Fcache.py",
+            "raw_url": "https://github.com/django/django/raw/6a057e1595dfe45a0411c116f603801266c87395/django%2Futils%2Fcache.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Futils%2Fcache.py?ref=6a057e1595dfe45a0411c116f603801266c87395",
+            "patch": "@@ -236,8 +236,18 @@ def learn_cache_key(request, response, cache_timeout=None, key_prefix=None, cach\n     if cache is None:\n         cache = get_cache(settings.CACHE_MIDDLEWARE_ALIAS)\n     if response.has_header('Vary'):\n-        headerlist = ['HTTP_'+header.upper().replace('-', '_')\n-                      for header in cc_delim_re.split(response['Vary'])]\n+        is_accept_language_redundant = settings.USE_I18N or settings.USE_L10N\n+        # If i18n or l10n are used, the generated cache key will be suffixed\n+        # with the current locale. Adding the raw value of Accept-Language is\n+        # redundant in that case and would result in storing the same content\n+        # under multiple keys in the cache. See #18191 for details.\n+        headerlist = []\n+        for header in cc_delim_re.split(response['Vary']):\n+            header = header.upper().replace('-', '_')\n+            if header == 'ACCEPT_LANGUAGE' and is_accept_language_redundant:\n+                continue\n+            headerlist.append('HTTP_' + header)\n+        headerlist.sort()\n         cache.set(cache_key, headerlist, cache_timeout)\n         return _generate_cache_key(request, request.method, headerlist, key_prefix)\n     else:"
+        },
+        {
+            "sha": "70d33a1ddf30af5a4c852873c6372977f6000500",
+            "filename": "tests/regressiontests/cache/tests.py",
+            "status": "modified",
+            "additions": 67,
+            "deletions": 0,
+            "changes": 67,
+            "blob_url": "https://github.com/django/django/blob/6a057e1595dfe45a0411c116f603801266c87395/tests%2Fregressiontests%2Fcache%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/6a057e1595dfe45a0411c116f603801266c87395/tests%2Fregressiontests%2Fcache%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fcache%2Ftests.py?ref=6a057e1595dfe45a0411c116f603801266c87395",
+            "patch": "@@ -1324,6 +1324,73 @@ def test_cache_key_i18n_translation(self):\n         key2 = get_cache_key(request)\n         self.assertEqual(key, key2)\n \n+    def check_accept_language_vary(self, accept_language, vary, reference_key):\n+        request = self._get_request()\n+        request.META['HTTP_ACCEPT_LANGUAGE'] = accept_language\n+        request.META['HTTP_ACCEPT_ENCODING'] = 'gzip;q=1.0, identity; q=0.5, *;q=0'\n+        response = HttpResponse()\n+        response['Vary'] = vary\n+        key = learn_cache_key(request, response)\n+        key2 = get_cache_key(request)\n+        self.assertEqual(key, reference_key)\n+        self.assertEqual(key2, reference_key)\n+\n+    @override_settings(USE_I18N=True, USE_L10N=False, USE_TZ=False)\n+    def test_cache_key_i18n_translation_accept_language(self):\n+        lang = translation.get_language()\n+        self.assertEqual(lang, 'en')\n+        request = self._get_request()\n+        request.META['HTTP_ACCEPT_ENCODING'] = 'gzip;q=1.0, identity; q=0.5, *;q=0'\n+        response = HttpResponse()\n+        response['Vary'] = 'accept-encoding'\n+        key = learn_cache_key(request, response)\n+        self.assertIn(lang, key, \"Cache keys should include the language name when translation is active\")\n+        self.check_accept_language_vary(\n+            'en-us',\n+            'cookie, accept-language, accept-encoding',\n+            key\n+        )\n+        self.check_accept_language_vary(\n+            'en-US',\n+            'cookie, accept-encoding, accept-language',\n+            key\n+        )\n+        self.check_accept_language_vary(\n+            'en-US,en;q=0.8',\n+            'accept-encoding, accept-language, cookie',\n+            key\n+        )\n+        self.check_accept_language_vary(\n+            'en-US,en;q=0.8,ko;q=0.6',\n+            'accept-language, cookie, accept-encoding',\n+            key\n+        )\n+        self.check_accept_language_vary(\n+            'ko-kr,ko;q=0.8,en-us;q=0.5,en;q=0.3 ',\n+            'accept-encoding, cookie, accept-language',\n+            key\n+        )\n+        self.check_accept_language_vary(\n+            'ko-KR,ko;q=0.8,en-US;q=0.6,en;q=0.4',\n+            'accept-language, accept-encoding, cookie',\n+            key\n+        )\n+        self.check_accept_language_vary(\n+            'ko;q=1.0,en;q=0.5',\n+            'cookie, accept-language, accept-encoding',\n+            key\n+        )\n+        self.check_accept_language_vary(\n+            'ko, en',\n+            'cookie, accept-encoding, accept-language',\n+            key\n+        )\n+        self.check_accept_language_vary(\n+            'ko-KR, en-US',\n+            'accept-encoding, accept-language, cookie',\n+            key\n+        )\n+\n     @override_settings(USE_I18N=False, USE_L10N=True, USE_TZ=False)\n     def test_cache_key_i18n_formatting(self):\n         request = self._get_request()"
+        }
+    ],
+    "stats": {
+        "total": 81,
+        "additions": 79,
+        "deletions": 2
+    }
+}

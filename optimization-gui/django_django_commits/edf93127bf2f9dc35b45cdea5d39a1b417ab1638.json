@@ -1,0 +1,48 @@
+{
+    "author": "akaariai",
+    "message": "Removed join() promote kwarg\n\nThe join promote=True was over-aggressive in select_related handling.\nAfter that was removed, the only other user was query.combine(). That\nuse case is very easy to handle locally, so there is no more need for\nthe join(promote=True) flag.\n\nRefs #19849.",
+    "sha": "edf93127bf2f9dc35b45cdea5d39a1b417ab1638",
+    "files": [
+        {
+            "sha": "977eb1afa2f88a0089163d346f138a75578ea841",
+            "filename": "django/db/models/sql/compiler.py",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4,
+            "blob_url": "https://github.com/django/django/blob/edf93127bf2f9dc35b45cdea5d39a1b417ab1638/django%2Fdb%2Fmodels%2Fsql%2Fcompiler.py",
+            "raw_url": "https://github.com/django/django/raw/edf93127bf2f9dc35b45cdea5d39a1b417ab1638/django%2Fdb%2Fmodels%2Fsql%2Fcompiler.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fmodels%2Fsql%2Fcompiler.py?ref=edf93127bf2f9dc35b45cdea5d39a1b417ab1638",
+            "patch": "@@ -620,7 +620,7 @@ def fill_related_selections(self, opts=None, root_alias=None, cur_depth=1,\n \n             alias = self.query.join((alias, table, f.column,\n                     f.rel.get_related_field().column),\n-                    promote=promote, join_field=f)\n+                    outer_if_first=promote, join_field=f)\n             columns, aliases = self.get_default_columns(start_alias=alias,\n                     opts=f.rel.to._meta, as_pairs=True)\n             self.query.related_select_cols.extend(\n@@ -648,7 +648,7 @@ def fill_related_selections(self, opts=None, root_alias=None, cur_depth=1,\n                 table = model._meta.db_table\n                 alias = self.query.join(\n                     (alias, table, f.rel.get_related_field().column, f.column),\n-                    promote=True, join_field=f\n+                    outer_if_first=True, join_field=f\n                 )\n                 from_parent = (opts.model if issubclass(model, opts.model)\n                                else None)"
+        },
+        {
+            "sha": "06fbf358b12db4737ab37157f288de6c71998ae2",
+            "filename": "django/db/models/sql/query.py",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 16,
+            "changes": 25,
+            "blob_url": "https://github.com/django/django/blob/edf93127bf2f9dc35b45cdea5d39a1b417ab1638/django%2Fdb%2Fmodels%2Fsql%2Fquery.py",
+            "raw_url": "https://github.com/django/django/raw/edf93127bf2f9dc35b45cdea5d39a1b417ab1638/django%2Fdb%2Fmodels%2Fsql%2Fquery.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fmodels%2Fsql%2Fquery.py?ref=edf93127bf2f9dc35b45cdea5d39a1b417ab1638",
+            "patch": "@@ -507,9 +507,11 @@ def combine(self, rhs, connector):\n             # updated alias.\n             lhs = change_map.get(lhs, lhs)\n             new_alias = self.join(\n-                (lhs, table, lhs_col, col), reuse=reuse, promote=promote,\n+                (lhs, table, lhs_col, col), reuse=reuse,\n                 outer_if_first=not conjunction, nullable=nullable,\n                 join_field=join_field)\n+            if promote:\n+                self.promote_joins([new_alias])\n             # We can't reuse the same join again in the query. If we have two\n             # distinct joins for the same connection in rhs query, then the\n             # combined query must have two joins, too.\n@@ -914,8 +916,8 @@ def count_active_tables(self):\n         \"\"\"\n         return len([1 for count in self.alias_refcount.values() if count])\n \n-    def join(self, connection, reuse=None, promote=False,\n-             outer_if_first=False, nullable=False, join_field=None):\n+    def join(self, connection, reuse=None, outer_if_first=False,\n+             nullable=False, join_field=None):\n         \"\"\"\n         Returns an alias for the join in 'connection', either reusing an\n         existing alias for that join or creating a new one. 'connection' is a\n@@ -929,14 +931,8 @@ def join(self, connection, reuse=None, promote=False,\n         (matching the connection) are reusable, or it can be a set containing\n         the aliases that can be reused.\n \n-        If 'promote' is True, the join type for the alias will be LOUTER (if\n-        the alias previously existed, the join type will be promoted from INNER\n-        to LOUTER, if necessary).\n-\n         If 'outer_if_first' is True and a new join is created, it will have the\n-        LOUTER join type. Used for example when adding ORed filters, where we\n-        want to use LOUTER joins except if some other join already restricts\n-        the join to INNER join.\n+        LOUTER join type.\n \n         A join is always created as LOUTER if the lhs alias is LOUTER to make\n         sure we do not generate chains like t1 LOUTER t2 INNER t3.\n@@ -961,8 +957,6 @@ def join(self, connection, reuse=None, promote=False,\n                 # join_field used for the under work join.\n                 continue\n             self.ref_alias(alias)\n-            if promote or (lhs and self.alias_map[lhs].join_type == self.LOUTER):\n-                self.promote_joins([alias])\n             return alias\n \n         # No reuse is possible, so we need a new alias.\n@@ -971,10 +965,9 @@ def join(self, connection, reuse=None, promote=False,\n             # Not all tables need to be joined to anything. No join type\n             # means the later columns are ignored.\n             join_type = None\n-        elif (promote or outer_if_first\n-              or self.alias_map[lhs].join_type == self.LOUTER):\n-            # We need to use LOUTER join if asked by promote or outer_if_first,\n-            # or if the LHS table is left-joined in the query.\n+        elif outer_if_first or self.alias_map[lhs].join_type == self.LOUTER:\n+            # We need to use LOUTER join if asked by outer_if_first or if the\n+            # LHS table is left-joined in the query.\n             join_type = self.LOUTER\n         else:\n             join_type = self.INNER"
+        },
+        {
+            "sha": "0e27d07c4d4313a84fd4d1a7023f0f44c23c0f41",
+            "filename": "tests/regressiontests/select_related_regress/tests.py",
+            "status": "modified",
+            "additions": 23,
+            "deletions": 0,
+            "changes": 23,
+            "blob_url": "https://github.com/django/django/blob/edf93127bf2f9dc35b45cdea5d39a1b417ab1638/tests%2Fregressiontests%2Fselect_related_regress%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/edf93127bf2f9dc35b45cdea5d39a1b417ab1638/tests%2Fregressiontests%2Fselect_related_regress%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fselect_related_regress%2Ftests.py?ref=edf93127bf2f9dc35b45cdea5d39a1b417ab1638",
+            "patch": "@@ -139,3 +139,26 @@ def test_regression_12851(self):\n         self.assertEqual(troy.name, 'Troy Buswell')\n         self.assertEqual(troy.value, 42)\n         self.assertEqual(troy.state.name, 'Western Australia')\n+\n+    def test_null_join_promotion(self):\n+        australia = Country.objects.create(name='Australia')\n+        active = ClientStatus.objects.create(name='active')\n+\n+        wa = State.objects.create(name=\"Western Australia\", country=australia)\n+        bob = Client.objects.create(name='Bob', status=active)\n+        jack = Client.objects.create(name='Jack', status=active, state=wa)\n+        qs = Client.objects.filter(state=wa).select_related('state')\n+        with self.assertNumQueries(1):\n+            self.assertEqual(list(qs), [jack])\n+            self.assertEqual(qs[0].state, wa)\n+            # The select_related join wasn't promoted as there was already an\n+            # existing (even if trimmed) inner join to state.\n+            self.assertFalse('LEFT OUTER' in str(qs.query))\n+        qs = Client.objects.select_related('state').order_by('name')\n+        with self.assertNumQueries(1):\n+            self.assertEqual(list(qs), [bob, jack])\n+            self.assertIs(qs[0].state, None)\n+            self.assertEqual(qs[1].state, wa)\n+            # The select_related join was promoted as there is already an\n+            # existing join.\n+            self.assertTrue('LEFT OUTER' in str(qs.query))"
+        }
+    ],
+    "stats": {
+        "total": 52,
+        "additions": 34,
+        "deletions": 18
+    }
+}

@@ -1,0 +1,84 @@
+{
+    "author": "killagu",
+    "message": "http: fix request with option timeout and agent\n\nWhen request with both timeout and agent, timeout not\nwork. This patch will fix it, socket timeout will set\nto request timeout before socket is connected, and\nsocket timeout will reset to agent timeout after\nresponse end.\n\nFixes: https://github.com/nodejs/node/issues/21185\n\nPR-URL: https://github.com/nodejs/node/pull/21204\nReviewed-By: Khaidi Chu <i@2333.moe>\nReviewed-By: Matteo Collina <matteo.collina@gmail.com>\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Ujjwal Sharma <usharma1998@gmail.com>",
+    "sha": "949e8851484c016c07f6cc9e5889f0f2e56baf2a",
+    "files": [
+        {
+            "sha": "fdbc99774e1b7c90e921a55192a9d444cd789474",
+            "filename": "doc/api/http.md",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2,
+            "blob_url": "https://github.com/nodejs/node/blob/949e8851484c016c07f6cc9e5889f0f2e56baf2a/doc%2Fapi%2Fhttp.md",
+            "raw_url": "https://github.com/nodejs/node/raw/949e8851484c016c07f6cc9e5889f0f2e56baf2a/doc%2Fapi%2Fhttp.md",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/doc%2Fapi%2Fhttp.md?ref=949e8851484c016c07f6cc9e5889f0f2e56baf2a",
+            "patch": "@@ -126,6 +126,8 @@ added: v0.3.4\n   * `maxFreeSockets` {number} Maximum number of sockets to leave open\n     in a free state. Only relevant if `keepAlive` is set to `true`.\n     **Default:** `256`.\n+  * `timeout` {number} Socket timeout in milliseconds.\n+    This will set the timeout after the socket is connected.\n \n The default [`http.globalAgent`][] that is used by [`http.request()`][] has all\n of these values set to their respective defaults."
+        },
+        {
+            "sha": "1a2920cf098298d57688d43f973bed0217183946",
+            "filename": "lib/_http_agent.js",
+            "status": "modified",
+            "additions": 26,
+            "deletions": 7,
+            "changes": 33,
+            "blob_url": "https://github.com/nodejs/node/blob/949e8851484c016c07f6cc9e5889f0f2e56baf2a/lib%2F_http_agent.js",
+            "raw_url": "https://github.com/nodejs/node/raw/949e8851484c016c07f6cc9e5889f0f2e56baf2a/lib%2F_http_agent.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2F_http_agent.js?ref=949e8851484c016c07f6cc9e5889f0f2e56baf2a",
+            "patch": "@@ -66,7 +66,8 @@ function Agent(options) {\n \n     if (socket.writable &&\n         this.requests[name] && this.requests[name].length) {\n-      this.requests[name].shift().onSocket(socket);\n+      const req = this.requests[name].shift();\n+      setRequestSocket(this, req, socket);\n       if (this.requests[name].length === 0) {\n         // don't leak\n         delete this.requests[name];\n@@ -176,12 +177,12 @@ Agent.prototype.addRequest = function addRequest(req, options, port/* legacy */,\n       delete this.freeSockets[name];\n \n     this.reuseSocket(socket, req);\n-    req.onSocket(socket);\n+    setRequestSocket(this, req, socket);\n     this.sockets[name].push(socket);\n   } else if (sockLen < this.maxSockets) {\n     debug('call onSocket', sockLen, freeLen);\n     // If we are under maxSockets create a new one.\n-    this.createSocket(req, options, handleSocketCreation(req, true));\n+    this.createSocket(req, options, handleSocketCreation(this, req, true));\n   } else {\n     debug('wait for socket');\n     // We are over limit so we'll add it to the queue.\n@@ -305,9 +306,10 @@ Agent.prototype.removeSocket = function removeSocket(s, options) {\n \n   if (this.requests[name] && this.requests[name].length) {\n     debug('removeSocket, have a request, make a socket');\n-    var req = this.requests[name][0];\n+    const req = this.requests[name][0];\n     // If we have pending requests and a socket gets closed make a new one\n-    this.createSocket(req, options, handleSocketCreation(req, false));\n+    const socketCreationHandler = handleSocketCreation(this, req, false);\n+    this.createSocket(req, options, socketCreationHandler);\n   }\n };\n \n@@ -337,19 +339,36 @@ Agent.prototype.destroy = function destroy() {\n   }\n };\n \n-function handleSocketCreation(request, informRequest) {\n+function handleSocketCreation(agent, request, informRequest) {\n   return function handleSocketCreation_Inner(err, socket) {\n     if (err) {\n       process.nextTick(emitErrorNT, request, err);\n       return;\n     }\n     if (informRequest)\n-      request.onSocket(socket);\n+      setRequestSocket(agent, request, socket);\n     else\n       socket.emit('free');\n   };\n }\n \n+function setRequestSocket(agent, req, socket) {\n+  req.onSocket(socket);\n+  const agentTimeout = agent.options.timeout || 0;\n+  if (req.timeout === undefined || req.timeout === agentTimeout) {\n+    return;\n+  }\n+  socket.setTimeout(req.timeout);\n+  // reset timeout after response end\n+  req.once('response', (res) => {\n+    res.once('end', () => {\n+      if (socket.timeout !== agentTimeout) {\n+        socket.setTimeout(agentTimeout);\n+      }\n+    });\n+  });\n+}\n+\n function emitErrorNT(emitter, err) {\n   emitter.emit('error', err);\n }"
+        },
+        {
+            "sha": "7d28cda681d810d066f25691450467683f70cbeb",
+            "filename": "lib/_http_client.js",
+            "status": "modified",
+            "additions": 39,
+            "deletions": 35,
+            "changes": 74,
+            "blob_url": "https://github.com/nodejs/node/blob/949e8851484c016c07f6cc9e5889f0f2e56baf2a/lib%2F_http_client.js",
+            "raw_url": "https://github.com/nodejs/node/raw/949e8851484c016c07f6cc9e5889f0f2e56baf2a/lib%2F_http_client.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2F_http_client.js?ref=949e8851484c016c07f6cc9e5889f0f2e56baf2a",
+            "patch": "@@ -656,18 +656,35 @@ function tickOnSocket(req, socket) {\n   socket.on('end', socketOnEnd);\n   socket.on('close', socketCloseListener);\n \n-  if (req.timeout) {\n-    const emitRequestTimeout = () => req.emit('timeout');\n-    socket.once('timeout', emitRequestTimeout);\n-    req.once('response', (res) => {\n-      res.once('end', () => {\n-        socket.removeListener('timeout', emitRequestTimeout);\n-      });\n-    });\n+  if (req.timeout !== undefined) {\n+    listenSocketTimeout(req);\n   }\n   req.emit('socket', socket);\n }\n \n+function listenSocketTimeout(req) {\n+  if (req.timeoutCb) {\n+    return;\n+  }\n+  const emitRequestTimeout = () => req.emit('timeout');\n+  // Set timeoutCb so it will get cleaned up on request end.\n+  req.timeoutCb = emitRequestTimeout;\n+  // Delegate socket timeout event.\n+  if (req.socket) {\n+    req.socket.once('timeout', emitRequestTimeout);\n+  } else {\n+    req.on('socket', (socket) => {\n+      socket.once('timeout', emitRequestTimeout);\n+    });\n+  }\n+  // Remove socket timeout listener after response end.\n+  req.once('response', (res) => {\n+    res.once('end', () => {\n+      req.socket.removeListener('timeout', emitRequestTimeout);\n+    });\n+  });\n+}\n+\n ClientRequest.prototype.onSocket = function onSocket(socket) {\n   process.nextTick(onSocketNT, this, socket);\n };\n@@ -717,42 +734,29 @@ function _deferToConnect(method, arguments_, cb) {\n }\n \n ClientRequest.prototype.setTimeout = function setTimeout(msecs, callback) {\n+  listenSocketTimeout(this);\n   msecs = validateTimerDuration(msecs);\n   if (callback) this.once('timeout', callback);\n \n-  const emitTimeout = () => this.emit('timeout');\n-\n-  if (this.socket && this.socket.writable) {\n-    if (this.timeoutCb)\n-      this.socket.setTimeout(0, this.timeoutCb);\n-    this.timeoutCb = emitTimeout;\n-    this.socket.setTimeout(msecs, emitTimeout);\n-    return this;\n-  }\n-\n-  // Set timeoutCb so that it'll get cleaned up on request end\n-  this.timeoutCb = emitTimeout;\n   if (this.socket) {\n-    var sock = this.socket;\n-    this.socket.once('connect', function() {\n-      sock.setTimeout(msecs, emitTimeout);\n-    });\n-    return this;\n+    setSocketTimeout(this.socket, msecs);\n+  } else {\n+    this.once('socket', (sock) => setSocketTimeout(sock, msecs));\n   }\n \n-  this.once('socket', function(sock) {\n-    if (sock.connecting) {\n-      sock.once('connect', function() {\n-        sock.setTimeout(msecs, emitTimeout);\n-      });\n-    } else {\n-      sock.setTimeout(msecs, emitTimeout);\n-    }\n-  });\n-\n   return this;\n };\n \n+function setSocketTimeout(sock, msecs) {\n+  if (sock.connecting) {\n+    sock.once('connect', function() {\n+      sock.setTimeout(msecs);\n+    });\n+  } else {\n+    sock.setTimeout(msecs);\n+  }\n+}\n+\n ClientRequest.prototype.setNoDelay = function setNoDelay(noDelay) {\n   this._deferToConnect('setNoDelay', [noDelay]);\n };"
+        },
+        {
+            "sha": "889f28b0aa704287f976aa1e29c6484fa59f50ba",
+            "filename": "lib/net.js",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "blob_url": "https://github.com/nodejs/node/blob/949e8851484c016c07f6cc9e5889f0f2e56baf2a/lib%2Fnet.js",
+            "raw_url": "https://github.com/nodejs/node/raw/949e8851484c016c07f6cc9e5889f0f2e56baf2a/lib%2Fnet.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Fnet.js?ref=949e8851484c016c07f6cc9e5889f0f2e56baf2a",
+            "patch": "@@ -408,6 +408,7 @@ function writeAfterFIN(chunk, encoding, cb) {\n }\n \n Socket.prototype.setTimeout = function(msecs, callback) {\n+  this.timeout = msecs;\n   // Type checking identical to timers.enroll()\n   msecs = validateTimerDuration(msecs);\n "
+        },
+        {
+            "sha": "51284b427654936bbed5d3c6234e1ea807c8dd7d",
+            "filename": "test/parallel/test-http-client-set-timeout.js",
+            "status": "added",
+            "additions": 46,
+            "deletions": 0,
+            "changes": 46,
+            "blob_url": "https://github.com/nodejs/node/blob/949e8851484c016c07f6cc9e5889f0f2e56baf2a/test%2Fparallel%2Ftest-http-client-set-timeout.js",
+            "raw_url": "https://github.com/nodejs/node/raw/949e8851484c016c07f6cc9e5889f0f2e56baf2a/test%2Fparallel%2Ftest-http-client-set-timeout.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-http-client-set-timeout.js?ref=949e8851484c016c07f6cc9e5889f0f2e56baf2a",
+            "patch": "@@ -0,0 +1,46 @@\n+'use strict';\n+const common = require('../common');\n+\n+// Test that `req.setTimeout` will fired exactly once.\n+\n+const assert = require('assert');\n+const http = require('http');\n+\n+const HTTP_CLIENT_TIMEOUT = 2000;\n+\n+const options = {\n+  method: 'GET',\n+  port: undefined,\n+  host: '127.0.0.1',\n+  path: '/',\n+  timeout: HTTP_CLIENT_TIMEOUT,\n+};\n+\n+const server = http.createServer(() => {\n+  // Never respond.\n+});\n+\n+server.listen(0, options.host, function() {\n+  doRequest();\n+});\n+\n+function doRequest() {\n+  options.port = server.address().port;\n+  const req = http.request(options);\n+  req.setTimeout(HTTP_CLIENT_TIMEOUT / 2);\n+  req.on('error', () => {\n+    // This space is intentionally left blank.\n+  });\n+  req.on('close', common.mustCall(() => server.close()));\n+\n+  let timeout_events = 0;\n+  req.on('timeout', common.mustCall(() => {\n+    timeout_events += 1;\n+  }));\n+  req.end();\n+\n+  setTimeout(function() {\n+    req.destroy();\n+    assert.strictEqual(timeout_events, 1);\n+  }, common.platformTimeout(HTTP_CLIENT_TIMEOUT));\n+}"
+        },
+        {
+            "sha": "a7f750a42e557b92c97273bc7c75eb54e8b44c03",
+            "filename": "test/parallel/test-http-client-timeout-option-with-agent.js",
+            "status": "added",
+            "additions": 55,
+            "deletions": 0,
+            "changes": 55,
+            "blob_url": "https://github.com/nodejs/node/blob/949e8851484c016c07f6cc9e5889f0f2e56baf2a/test%2Fparallel%2Ftest-http-client-timeout-option-with-agent.js",
+            "raw_url": "https://github.com/nodejs/node/raw/949e8851484c016c07f6cc9e5889f0f2e56baf2a/test%2Fparallel%2Ftest-http-client-timeout-option-with-agent.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-http-client-timeout-option-with-agent.js?ref=949e8851484c016c07f6cc9e5889f0f2e56baf2a",
+            "patch": "@@ -0,0 +1,55 @@\n+'use strict';\n+const common = require('../common');\n+\n+// Test that when http request uses both timeout and agent,\n+// timeout will work as expected.\n+\n+const assert = require('assert');\n+const http = require('http');\n+\n+const HTTP_AGENT_TIMEOUT = 1000;\n+const HTTP_CLIENT_TIMEOUT = 3000;\n+\n+const agent = new http.Agent({ timeout: HTTP_AGENT_TIMEOUT });\n+const options = {\n+  method: 'GET',\n+  port: undefined,\n+  host: '127.0.0.1',\n+  path: '/',\n+  timeout: HTTP_CLIENT_TIMEOUT,\n+  agent,\n+};\n+\n+const server = http.createServer(() => {\n+  // Never respond.\n+});\n+\n+server.listen(0, options.host, function() {\n+  doRequest();\n+});\n+\n+function doRequest() {\n+  options.port = server.address().port;\n+  const req = http.request(options);\n+  const start = Date.now();\n+  req.on('error', () => {\n+    // This space is intentionally left blank.\n+  });\n+  req.on('close', common.mustCall(() => server.close()));\n+\n+  let timeout_events = 0;\n+  req.on('timeout', common.mustCall(() => {\n+    timeout_events += 1;\n+    const duration = Date.now() - start;\n+    // The timeout event cannot be precisely timed. It will delay\n+    // some number of milliseconds, so test it in second units.\n+    assert.strictEqual(duration / 1000 | 0, HTTP_CLIENT_TIMEOUT / 1000);\n+  }));\n+  req.end();\n+\n+  setTimeout(function() {\n+    req.destroy();\n+    assert.strictEqual(timeout_events, 1);\n+    // Ensure the `timeout` event fired only once.\n+  }, common.platformTimeout(HTTP_CLIENT_TIMEOUT * 2));\n+}"
+        }
+    ],
+    "stats": {
+        "total": 211,
+        "additions": 169,
+        "deletions": 42
+    }
+}

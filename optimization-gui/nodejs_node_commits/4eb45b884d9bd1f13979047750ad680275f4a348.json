@@ -1,0 +1,60 @@
+{
+    "author": "joyeecheung",
+    "message": "fs: throw copyFileSync errors in JS\n\nPR-URL: https://github.com/nodejs/node/pull/18871\nRefs: https://github.com/nodejs/node/issues/18106\nReviewed-By: Michaël Zasso <targos@protonmail.com>\nReviewed-By: James M Snell <jasnell@gmail.com>\nReviewed-By: Ruben Bridgewater <ruben@bridgewater.de>",
+    "sha": "4eb45b884d9bd1f13979047750ad680275f4a348",
+    "files": [
+        {
+            "sha": "510369e44fd4affdb617b5068e1561657552714c",
+            "filename": "lib/fs.js",
+            "status": "modified",
+            "additions": 5,
+            "deletions": 2,
+            "changes": 7,
+            "blob_url": "https://github.com/nodejs/node/blob/4eb45b884d9bd1f13979047750ad680275f4a348/lib%2Ffs.js",
+            "raw_url": "https://github.com/nodejs/node/raw/4eb45b884d9bd1f13979047750ad680275f4a348/lib%2Ffs.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/lib%2Ffs.js?ref=4eb45b884d9bd1f13979047750ad680275f4a348",
+            "patch": "@@ -1859,7 +1859,7 @@ fs.copyFile = function(src, dest, flags, callback) {\n     callback = flags;\n     flags = 0;\n   } else if (typeof callback !== 'function') {\n-    throw new errors.TypeError('ERR_INVALID_ARG_TYPE', 'callback', 'Function');\n+    throw new errors.TypeError('ERR_INVALID_CALLBACK');\n   }\n \n   src = getPathFromURL(src);\n@@ -1882,10 +1882,13 @@ fs.copyFileSync = function(src, dest, flags) {\n   validatePath(src, 'src');\n   validatePath(dest, 'dest');\n \n+  const ctx = { path: src, dest };  // non-prefixed\n+\n   src = pathModule._makeLong(src);\n   dest = pathModule._makeLong(dest);\n   flags = flags | 0;\n-  binding.copyFile(src, dest, flags);\n+  binding.copyFile(src, dest, flags, undefined, ctx);\n+  handleErrorFromBinding(ctx);\n };\n \n "
+        },
+        {
+            "sha": "00fe1f178bedc3a2a5ff23cc50c13f8e864531bb",
+            "filename": "src/node_file.cc",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 8,
+            "changes": 23,
+            "blob_url": "https://github.com/nodejs/node/blob/4eb45b884d9bd1f13979047750ad680275f4a348/src%2Fnode_file.cc",
+            "raw_url": "https://github.com/nodejs/node/raw/4eb45b884d9bd1f13979047750ad680275f4a348/src%2Fnode_file.cc",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/src%2Fnode_file.cc?ref=4eb45b884d9bd1f13979047750ad680275f4a348",
+            "patch": "@@ -1232,21 +1232,28 @@ static void OpenFileHandle(const FunctionCallbackInfo<Value>& args) {\n static void CopyFile(const FunctionCallbackInfo<Value>& args) {\n   Environment* env = Environment::GetCurrent(args);\n \n-  CHECK_GE(args.Length(), 3);\n-  CHECK(args[2]->IsInt32());\n+  const int argc = args.Length();\n+  CHECK_GE(argc, 3);\n \n   BufferValue src(env->isolate(), args[0]);\n   CHECK_NE(*src, nullptr);\n+\n   BufferValue dest(env->isolate(), args[1]);\n   CHECK_NE(*dest, nullptr);\n-  int flags = args[2]->Int32Value();\n+\n+  CHECK(args[2]->IsInt32());\n+  const int flags = args[2].As<Int32>()->Value();\n \n   FSReqBase* req_wrap = GetReqWrap(env, args[3]);\n-  if (req_wrap != nullptr) {\n-    AsyncCall(env, req_wrap, args, \"copyfile\", UTF8, AfterNoArgs,\n-              uv_fs_copyfile, *src, *dest, flags);\n-  } else {\n-    SYNC_DEST_CALL(copyfile, *src, *dest, *src, *dest, flags)\n+  if (req_wrap != nullptr) {  // copyFile(src, dest, flags, req)\n+    AsyncDestCall(env, req_wrap, args, \"copyfile\",\n+                  *dest, dest.length(), UTF8, AfterNoArgs,\n+                  uv_fs_copyfile, *src, *dest, flags);\n+  } else {  // copyFile(src, dest, flags, undefined, ctx)\n+    CHECK_EQ(argc, 5);\n+    fs_req_wrap req_wrap;\n+    SyncCall(env, args[4], &req_wrap, \"copyfile\",\n+             uv_fs_copyfile, *src, *dest, flags);\n   }\n }\n "
+        },
+        {
+            "sha": "21e0838148b5efd9fa6a07c87d16412c12e2420d",
+            "filename": "test/parallel/test-fs-copyfile.js",
+            "status": "modified",
+            "additions": 18,
+            "deletions": 20,
+            "changes": 38,
+            "blob_url": "https://github.com/nodejs/node/blob/4eb45b884d9bd1f13979047750ad680275f4a348/test%2Fparallel%2Ftest-fs-copyfile.js",
+            "raw_url": "https://github.com/nodejs/node/raw/4eb45b884d9bd1f13979047750ad680275f4a348/test%2Fparallel%2Ftest-fs-copyfile.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-fs-copyfile.js?ref=4eb45b884d9bd1f13979047750ad680275f4a348",
+            "patch": "@@ -4,6 +4,7 @@ const fixtures = require('../common/fixtures');\n const tmpdir = require('../common/tmpdir');\n const assert = require('assert');\n const fs = require('fs');\n+const uv = process.binding('uv');\n const path = require('path');\n const src = fixtures.path('a.js');\n const dest = path.join(tmpdir.path, 'copyfile.out');\n@@ -37,15 +38,6 @@ verify(src, dest);\n fs.copyFileSync(src, dest, 0);\n verify(src, dest);\n \n-// Throws if destination exists and the COPYFILE_EXCL flag is provided.\n-assert.throws(() => {\n-  fs.copyFileSync(src, dest, COPYFILE_EXCL);\n-}, /^Error: EEXIST|ENOENT:.+, copyfile/);\n-\n-// Throws if the source does not exist.\n-assert.throws(() => {\n-  fs.copyFileSync(`${src}__does_not_exist`, dest, COPYFILE_EXCL);\n-}, /^Error: ENOENT: no such file or directory, copyfile/);\n \n // Copies asynchronously.\n fs.unlinkSync(dest);\n@@ -55,19 +47,30 @@ fs.copyFile(src, dest, common.mustCall((err) => {\n \n   // Copy asynchronously with flags.\n   fs.copyFile(src, dest, COPYFILE_EXCL, common.mustCall((err) => {\n-    assert(\n-      /^Error: EEXIST: file already exists, copyfile/.test(err.toString())\n-    );\n+    if (err.code === 'ENOENT') {  // Could be ENOENT or EEXIST\n+      assert.strictEqual(err.message,\n+                         'ENOENT: no such file or directory, copyfile ' +\n+                         `'${src}' -> '${dest}'`);\n+      assert.strictEqual(err.errno, uv.UV_ENOENT);\n+      assert.strictEqual(err.code, 'ENOENT');\n+      assert.strictEqual(err.syscall, 'copyfile');\n+    } else {\n+      assert.strictEqual(err.message,\n+                         'EEXIST: file already exists, copyfile ' +\n+                         `'${src}' -> '${dest}'`);\n+      assert.strictEqual(err.errno, uv.UV_EEXIST);\n+      assert.strictEqual(err.code, 'EEXIST');\n+      assert.strictEqual(err.syscall, 'copyfile');\n+    }\n   }));\n }));\n \n // Throws if callback is not a function.\n common.expectsError(() => {\n   fs.copyFile(src, dest, 0, 0);\n }, {\n-  code: 'ERR_INVALID_ARG_TYPE',\n-  type: TypeError,\n-  message: 'The \"callback\" argument must be of type Function'\n+  code: 'ERR_INVALID_CALLBACK',\n+  type: TypeError\n });\n \n // Throws if the source path is not a string.\n@@ -101,8 +104,3 @@ common.expectsError(() => {\n     }\n   );\n });\n-\n-// Errors if invalid flags are provided.\n-assert.throws(() => {\n-  fs.copyFileSync(src, dest, -1);\n-}, /^Error: EINVAL: invalid argument, copyfile/);"
+        },
+        {
+            "sha": "6718e6fe6608036a627ec0e345e1f7ed45f71f18",
+            "filename": "test/parallel/test-fs-error-messages.js",
+            "status": "modified",
+            "additions": 74,
+            "deletions": 0,
+            "changes": 74,
+            "blob_url": "https://github.com/nodejs/node/blob/4eb45b884d9bd1f13979047750ad680275f4a348/test%2Fparallel%2Ftest-fs-error-messages.js",
+            "raw_url": "https://github.com/nodejs/node/raw/4eb45b884d9bd1f13979047750ad680275f4a348/test%2Fparallel%2Ftest-fs-error-messages.js",
+            "contents_url": "https://api.github.com/repos/nodejs/node/contents/test%2Fparallel%2Ftest-fs-error-messages.js?ref=4eb45b884d9bd1f13979047750ad680275f4a348",
+            "patch": "@@ -30,6 +30,7 @@ const existingFile = fixtures.path('exit.js');\n const existingFile2 = fixtures.path('create-file.js');\n const existingDir = fixtures.path('empty');\n const existingDir2 = fixtures.path('keys');\n+const { COPYFILE_EXCL } = fs.constants;\n const uv = process.binding('uv');\n \n // Template tag function for escaping special characters in strings so that:\n@@ -634,3 +635,76 @@ if (!common.isAIX) {\n     validateError\n   );\n }\n+\n+// copyFile with invalid flags\n+{\n+  const validateError = (err) => {\n+    assert.strictEqual(err.message,\n+                       'EINVAL: invalid argument, copyfile ' +\n+                       `'${existingFile}' -> '${nonexistentFile}'`);\n+    assert.strictEqual(err.errno, uv.UV_EINVAL);\n+    assert.strictEqual(err.code, 'EINVAL');\n+    assert.strictEqual(err.syscall, 'copyfile');\n+    return true;\n+  };\n+\n+  // TODO(joyeecheung): test fs.copyFile() when uv_fs_copyfile does not\n+  // keep the loop open when the flags are invalid.\n+  // See https://github.com/libuv/libuv/pull/1747\n+\n+  assert.throws(\n+    () => fs.copyFileSync(existingFile, nonexistentFile, -1),\n+    validateError\n+  );\n+}\n+\n+// copyFile: destination exists but the COPYFILE_EXCL flag is provided.\n+{\n+  const validateError = (err) => {\n+    if (err.code === 'ENOENT') {  // Could be ENOENT or EEXIST\n+      assert.strictEqual(err.message,\n+                         'ENOENT: no such file or directory, copyfile ' +\n+                         `'${existingFile}' -> '${existingFile2}'`);\n+      assert.strictEqual(err.errno, uv.UV_ENOENT);\n+      assert.strictEqual(err.code, 'ENOENT');\n+      assert.strictEqual(err.syscall, 'copyfile');\n+    } else {\n+      assert.strictEqual(err.message,\n+                         'EEXIST: file already exists, copyfile ' +\n+                         `'${existingFile}' -> '${existingFile2}'`);\n+      assert.strictEqual(err.errno, uv.UV_EEXIST);\n+      assert.strictEqual(err.code, 'EEXIST');\n+      assert.strictEqual(err.syscall, 'copyfile');\n+    }\n+    return true;\n+  };\n+\n+  fs.copyFile(existingFile, existingFile2, COPYFILE_EXCL,\n+              common.mustCall(validateError));\n+\n+  assert.throws(\n+    () => fs.copyFileSync(existingFile, existingFile2, COPYFILE_EXCL),\n+    validateError\n+  );\n+}\n+\n+// copyFile: the source does not exist.\n+{\n+  const validateError = (err) => {\n+    assert.strictEqual(err.message,\n+                       'ENOENT: no such file or directory, copyfile ' +\n+                       `'${nonexistentFile}' -> '${existingFile2}'`);\n+    assert.strictEqual(err.errno, uv.UV_ENOENT);\n+    assert.strictEqual(err.code, 'ENOENT');\n+    assert.strictEqual(err.syscall, 'copyfile');\n+    return true;\n+  };\n+\n+  fs.copyFile(nonexistentFile, existingFile2, COPYFILE_EXCL,\n+              common.mustCall(validateError));\n+\n+  assert.throws(\n+    () => fs.copyFileSync(nonexistentFile, existingFile2, COPYFILE_EXCL),\n+    validateError\n+  );\n+}"
+        }
+    ],
+    "stats": {
+        "total": 142,
+        "additions": 112,
+        "deletions": 30
+    }
+}

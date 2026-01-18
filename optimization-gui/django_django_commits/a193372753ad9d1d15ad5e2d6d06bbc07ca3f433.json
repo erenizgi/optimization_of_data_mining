@@ -1,0 +1,48 @@
+{
+    "author": "akaariai",
+    "message": "Fixed #17886 -- Fixed join promotion in ORed nullable queries\n\nThe ORM generated a query with INNER JOIN instead of LEFT OUTER JOIN\nin a somewhat complicated case. The main issue was that there was a\nchain of nullable FK -> non-nullble FK, and the join promotion logic\ndidn't see the need to promote the non-nullable FK even if the\nprevious nullable FK was already promoted to LOUTER JOIN. This resulted\nin a query like a LOUTER b INNER c, which incorrectly prunes results.",
+    "sha": "a193372753ad9d1d15ad5e2d6d06bbc07ca3f433",
+    "files": [
+        {
+            "sha": "27a4ac9ce54b1d7c08df2e6af7344965196d7332",
+            "filename": "django/db/models/sql/query.py",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 1,
+            "changes": 7,
+            "blob_url": "https://github.com/django/django/blob/a193372753ad9d1d15ad5e2d6d06bbc07ca3f433/django%2Fdb%2Fmodels%2Fsql%2Fquery.py",
+            "raw_url": "https://github.com/django/django/raw/a193372753ad9d1d15ad5e2d6d06bbc07ca3f433/django%2Fdb%2Fmodels%2Fsql%2Fquery.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/django%2Fdb%2Fmodels%2Fsql%2Fquery.py?ref=a193372753ad9d1d15ad5e2d6d06bbc07ca3f433",
+            "patch": "@@ -910,7 +910,12 @@ def join(self, connection, always_create=False, exclusions=(),\n             # Not all tables need to be joined to anything. No join type\n             # means the later columns are ignored.\n             join_type = None\n-        elif promote or outer_if_first:\n+        elif (promote or outer_if_first\n+              or self.alias_map[lhs].join_type == self.LOUTER):\n+            # We need to use LOUTER join if asked by promote or outer_if_first,\n+            # or if the LHS table is left-joined in the query. Adding inner join\n+            # to an existing outer join effectively cancels the effect of the\n+            # outer join.\n             join_type = self.LOUTER\n         else:\n             join_type = self.INNER"
+        },
+        {
+            "sha": "f0178a02564b6cf70d75c11fd00950b7b87c1d47",
+            "filename": "tests/regressiontests/queries/models.py",
+            "status": "modified",
+            "additions": 15,
+            "deletions": 0,
+            "changes": 15,
+            "blob_url": "https://github.com/django/django/blob/a193372753ad9d1d15ad5e2d6d06bbc07ca3f433/tests%2Fregressiontests%2Fqueries%2Fmodels.py",
+            "raw_url": "https://github.com/django/django/raw/a193372753ad9d1d15ad5e2d6d06bbc07ca3f433/tests%2Fregressiontests%2Fqueries%2Fmodels.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fqueries%2Fmodels.py?ref=a193372753ad9d1d15ad5e2d6d06bbc07ca3f433",
+            "patch": "@@ -385,3 +385,18 @@ class NullableName(models.Model):\n \n     class Meta:\n         ordering = ['id']\n+\n+class ModelD(models.Model):\n+    name = models.TextField()\n+\n+class ModelC(models.Model):\n+    name = models.TextField()\n+\n+class ModelB(models.Model):\n+    name = models.TextField()\n+    c = models.ForeignKey(ModelC)\n+\n+class ModelA(models.Model):\n+    name = models.TextField()\n+    b = models.ForeignKey(ModelB, null=True)\n+    d = models.ForeignKey(ModelD)"
+        },
+        {
+            "sha": "005aa9650bb0d4356e1044894ea53c83dae654d1",
+            "filename": "tests/regressiontests/queries/tests.py",
+            "status": "modified",
+            "additions": 24,
+            "deletions": 1,
+            "changes": 25,
+            "blob_url": "https://github.com/django/django/blob/a193372753ad9d1d15ad5e2d6d06bbc07ca3f433/tests%2Fregressiontests%2Fqueries%2Ftests.py",
+            "raw_url": "https://github.com/django/django/raw/a193372753ad9d1d15ad5e2d6d06bbc07ca3f433/tests%2Fregressiontests%2Fqueries%2Ftests.py",
+            "contents_url": "https://api.github.com/repos/django/django/contents/tests%2Fregressiontests%2Fqueries%2Ftests.py?ref=a193372753ad9d1d15ad5e2d6d06bbc07ca3f433",
+            "patch": "@@ -23,7 +23,7 @@\n     Ranking, Related, Report, ReservedName, Tag, TvChef, Valid, X, Food, Eaten,\n     Node, ObjectA, ObjectB, ObjectC, CategoryItem, SimpleCategory,\n     SpecialCategory, OneToOneCategory, NullableName, ProxyCategory,\n-    SingleObject, RelatedObject)\n+    SingleObject, RelatedObject, ModelA, ModelD)\n \n \n class BaseQuerysetTest(TestCase):\n@@ -2105,3 +2105,26 @@ def test_empty_nodes(self):\n         self.assertEqual(w.as_sql(qn, connection), (None, []))\n         w = WhereNode(children=[empty_w, NothingNode()], connector='OR')\n         self.assertRaises(EmptyResultSet, w.as_sql, qn, connection)\n+\n+class NullJoinPromotionOrTest(TestCase):\n+    def setUp(self):\n+        d = ModelD.objects.create(name='foo')\n+        ModelA.objects.create(name='bar', d=d)\n+\n+    def test_ticket_17886(self):\n+        # The first Q-object is generating the match, the rest of the filters\n+        # should not remove the match even if they do not match anything. The\n+        # problem here was that b__name generates a LOUTER JOIN, then\n+        # b__c__name generates join to c, which the ORM tried to promote but\n+        # failed as that join isn't nullable.\n+        q_obj =  (\n+            Q(d__name='foo')|\n+            Q(b__name='foo')|\n+            Q(b__c__name='foo')\n+        )\n+        qset = ModelA.objects.filter(q_obj)\n+        self.assertEqual(len(qset), 1)\n+        # We generate one INNER JOIN to D. The join is direct and not nullable\n+        # so we can use INNER JOIN for it. However, we can NOT use INNER JOIN\n+        # for the b->c join, as a->b is nullable.\n+        self.assertEqual(str(qset.query).count('INNER JOIN'), 1)"
+        }
+    ],
+    "stats": {
+        "total": 47,
+        "additions": 45,
+        "deletions": 2
+    }
+}
